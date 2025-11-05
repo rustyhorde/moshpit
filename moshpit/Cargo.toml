@@ -1,0 +1,25 @@
+[package]
+name = "moshpit"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = { workspace = true }
+bincode = "2.0.1"
+bytes = "1.10.1"
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[build-dependencies]
+anyhow = { workspace = true }
+rustversion = { workspace = true }
+vergen-gix = { workspace = true }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(coverage,coverage_nightly)',
+] }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
