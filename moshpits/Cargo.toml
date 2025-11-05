@@ -1,30 +1,26 @@
 [package]
-name = "libmoshpit"
+name = "moshpits"
 version = "0.1.0"
 edition = "2024"
+
+[[bin]]
+name = "mps"
+path = "src/main.rs"
 
 [features]
 unstable = []
 
 [dependencies]
 anyhow = { workspace = true }
-bincode = "2.0.1"
-bytes = "1.10.1"
 clap = { workspace = true }
 config = { workspace = true }
-dirs2 = "3.0.1"
 getset = { workspace = true }
+libmoshpit = { version = "0.1.0", path = "../libmoshpit" }
 serde = { workspace = true }
-thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
-tracing-appender = "0.2.3"
-tracing-subscriber = { version = "=0.3.19", features = [
-    "env-filter",
-    "fmt",
-    "time",
-] }
 tracing-subscriber-init = { workspace = true }
+vergen-pretty = { workspace = true }
 
 [build-dependencies]
 anyhow = { workspace = true }
@@ -35,9 +31,6 @@ vergen-gix = { workspace = true }
 unexpected_cfgs = { level = "warn", check-cfg = [
     'cfg(coverage,coverage_nightly)',
 ] }
-
-[dev-dependencies]
-tempfile = "3.23.0"
 
 [package.metadata.docs.rs]
 all-features = true

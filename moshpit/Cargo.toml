@@ -3,12 +3,24 @@ name = "moshpit"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "mp"
+path = "src/main.rs"
+
+[features]
+unstable = []
+
 [dependencies]
 anyhow = { workspace = true }
-bincode = "2.0.1"
-bytes = "1.10.1"
-thiserror = { workspace = true }
-tokio = { workspace = true }
+clap = { workspace = true }
+config = { workspace = true }
+getset = { workspace = true }
+libmoshpit = { version = "0.1.0", path = "../libmoshpit" }
+serde = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
+tracing = { workspace = true }
+tracing-subscriber-init = { workspace = true }
+vergen-pretty = { workspace = true }
 
 [build-dependencies]
 anyhow = { workspace = true }

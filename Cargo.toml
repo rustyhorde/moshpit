@@ -1,13 +1,22 @@
 [workspace]
 resolver = "3"
 
-members = ["libmoshpit","moshpit"]
+members = ["libmoshpit", "moshpit", "moshpits"]
 
 [workspace.dependencies]
 anyhow = "1.0.100"
+clap = { version = "4.5.51", features = ["derive"] }
+config = { version = "0.15.18", features = ["toml"] }
+getset = "0.1.6"
 rustversion = "1.0.22"
+serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.17"
-tokio = { version = "1.48.0", features = ["io-util", "macros", "net", "rt-multi-thread"] }
+tokio = { version = "1.48.0", features = [
+  "io-util",
+  "macros",
+  "net",
+  "rt-multi-thread",
+] }
 tracing = { version = "0.1.41", features = [
   "max_level_trace",
   "release_max_level_trace",
