@@ -12,14 +12,16 @@ unstable = []
 
 [dependencies]
 anyhow = { workspace = true }
+aws-lc-rs = { workspace = true }
 clap = { workspace = true }
 config = { workspace = true }
 getset = { workspace = true }
 libmoshpit = { version = "0.1.0", path = "../libmoshpit" }
 serde = { workspace = true }
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["sync","time"] }
 tracing = { workspace = true }
 tracing-subscriber-init = { workspace = true }
+uuid = { workspace = true }
 vergen-pretty = { workspace = true }
 
 [build-dependencies]

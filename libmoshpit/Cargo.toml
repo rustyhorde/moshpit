@@ -9,7 +9,8 @@ unstable = []
 [dependencies]
 anyhow = { workspace = true }
 bincode = "2.0.1"
-bytes = "1.10.1"
+bon = { workspace = true }
+bytes = { workspace = true }
 clap = { workspace = true }
 config = { workspace = true }
 dirs2 = "3.0.1"
@@ -25,6 +26,7 @@ tracing-subscriber = { version = "=0.3.19", features = [
     "time",
 ] }
 tracing-subscriber-init = { workspace = true }
+uuid = { workspace = true }
 
 [build-dependencies]
 anyhow = { workspace = true }

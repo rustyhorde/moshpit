@@ -6,12 +6,24 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-use std::{ffi::OsString, net::SocketAddr};
+use std::{ffi::OsString, net::SocketAddr, sync::Arc};
 
 use anyhow::{Context as _, Result};
+use aws_lc_rs::{
+    aead::{AES_256_GCM_SIV, Aad, Nonce, RandomizedNonceKey},
+    agreement::{EphemeralPrivateKey, UnparsedPublicKey, X25519, agree_ephemeral},
+    cipher::AES_256_KEY_LEN,
+    error::Unspecified,
+    hkdf::{HKDF_SHA256, Salt},
+    rand::{SystemRandom, fill},
+};
 use clap::Parser as _;
-use libmoshpit::{Connection, MoshpitError, init_tracing, load};
-use tokio::{net::TcpListener, spawn};
+use libmoshpit::{Connection, Frame, MoshpitError, UuidWrapper, init_tracing, load};
+use tokio::{
+    net::{TcpListener, UdpSocket},
+    spawn,
+    sync::mpsc::unbounded_channel,
+};
 use tracing::{error, info, trace};
 
 use crate::{cli::Cli, config::Config};
@@ -47,42 +59,139 @@ where
         config.mps().port(),
     );
     let listener = TcpListener::bind(socket_addr).await?;
+    let udp_listener = UdpSocket::bind(socket_addr).await?;
 
-    loop {
-        match listener.accept().await {
-            Ok((socket, addr)) => {
-                info!("Accepted connection from {addr}");
-                let handler = Handler {
-                    connection: Connection::new(socket),
-                };
-                // Spawn a new task to process the connections. Tokio tasks are like
-                // asynchronous green threads and are executed concurrently.
-                let _handle = spawn(async move {
-                    // Process the connection. If an error is encountered, log it.
-                    if let Err(err) = handler.handle_connection().await {
-                        error!("connection error: {err:?} from {addr}");
-                    }
-                });
+    let udp_recv = Arc::new(udp_listener);
+    let udp_send = udp_recv.clone();
+    let (tx, mut rx) = unbounded_channel::<(Vec<u8>, SocketAddr)>();
+
+    let _tcp_handle = spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((socket, addr)) => {
+                    info!("Accepted connection from {addr}");
+                    let mut handler = Handler {
+                        connection: Connection::new(socket),
+                        rnk: None,
+                    };
+                    let _handle = spawn(async move {
+                        if let Err(err) = handler.handle_connection().await {
+                            error!("connection error: {err:?} from {addr}");
+                        } else {
+                            info!("connection can be promoted");
+                        }
+                    });
+                }
+                Err(e) => error!("couldn't get client: {e:?}"),
             }
-            Err(e) => error!("couldn't get client: {e:?}"),
         }
+    });
+
+    let _udp_handle = spawn(async move {
+        while let Some((bytes, addr)) = rx.recv().await {
+            let len = udp_send.send_to(&bytes, &addr).await.unwrap();
+            println!("{len:?} bytes sent");
+        }
+    });
+
+    let mut buf = [0; 1024];
+    loop {
+        let (len, addr) = udp_recv.recv_from(&mut buf).await?;
+        println!("{len:?} bytes received from {addr:?}");
+        tx.send((buf[..len].to_vec(), addr)).unwrap();
     }
 }
 
 struct Handler {
     connection: Connection,
+    rnk: Option<RandomizedNonceKey>,
 }
 
 impl Handler {
-    async fn handle_connection(mut self) -> Result<()> {
-        loop {
-            trace!("Waiting for frame...");
-            if let Some(frame) = self.connection.read_frame().await? {
-                trace!("Received frame: {frame}");
+    async fn handle_connection(&mut self) -> Result<()> {
+        if let Some(frame) = self.connection.read_frame().await? {
+            if let Frame::Initialize(pk) = frame {
+                self.handle_initialize(pk).await?;
             } else {
-                info!("Connection closed");
-                break;
+                error!("Expected initialize frame");
+                return Err(MoshpitError::InvalidFrame.into());
             }
+        }
+
+        if let Some(frame) = self.connection.read_frame().await? {
+            if let Frame::Check(nonce, enc) = frame {
+                self.handle_check(nonce, enc).await?;
+            } else {
+                error!("Expected check frame");
+                return Err(MoshpitError::InvalidFrame.into());
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_initialize(&mut self, pk: Vec<u8>) -> Result<()> {
+        info!("Received initialize frame with public key");
+        let rng = SystemRandom::new();
+
+        // Generate our ephemeral key pair
+        let ephemeral_priv_key = EphemeralPrivateKey::generate(&X25519, &rng)?;
+        let public_key = ephemeral_priv_key.compute_public_key()?;
+        let unparsed_public_key = UnparsedPublicKey::new(&X25519, &pk);
+
+        // Generate a (non-secret) salt value
+        let mut salt_bytes = [0u8; 32];
+        fill(&mut salt_bytes)?;
+
+        // Send the public key and salt back to the peer
+        let peer_initialize =
+            Frame::PeerInitialize(public_key.as_ref().to_vec(), salt_bytes.to_vec());
+        self.connection.write_frame(&peer_initialize).await?;
+        info!("Sent peer initialize frame with public key and salt");
+
+        // Extract pseudo-random key from secret keying materials
+        let salt = Salt::new(HKDF_SHA256, &salt_bytes);
+
+        // Setup the rnk and wait for a check frame
+        agree_ephemeral(
+            ephemeral_priv_key,
+            unparsed_public_key,
+            Unspecified,
+            |key_material| {
+                let pseudo_random_key = salt.extract(key_material);
+                let okm = pseudo_random_key.expand(&[b"aead key"], &AES_256_GCM_SIV)?;
+                let mut key_bytes = [0u8; AES_256_KEY_LEN];
+                okm.fill(&mut key_bytes)?;
+                let rnk = RandomizedNonceKey::new(&AES_256_GCM_SIV, &key_bytes)?;
+                self.rnk = Some(rnk);
+                Ok(())
+            },
+        )?;
+        Ok(())
+    }
+
+    async fn handle_check(
+        &mut self,
+        nonce_bytes: [u8; 12],
+        mut check_bytes: Vec<u8>,
+    ) -> Result<()> {
+        info!("Received check frame with encrypted check message");
+        if let Some(rnk) = &mut self.rnk {
+            let nonce = Nonce::from(&nonce_bytes);
+            let decrypted_data = rnk
+                .open_in_place(nonce, Aad::empty(), &mut check_bytes)
+                .map_err(|_| MoshpitError::DecryptionFailed)?;
+            if decrypted_data == b"Yoda" {
+                info!("Check frame verified successfully");
+                self.connection
+                    .write_frame(&Frame::KeyAgreement(UuidWrapper::default()))
+                    .await?;
+            } else {
+                error!("Check frame verification failed");
+                return Err(MoshpitError::DecryptionFailed.into());
+            }
+        } else {
+            error!("Opening key not established");
+            return Err(MoshpitError::KeyNotEstablished.into());
         }
         Ok(())
     }

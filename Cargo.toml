@@ -5,6 +5,9 @@ members = ["libmoshpit", "moshpit", "moshpits"]
 
 [workspace.dependencies]
 anyhow = "1.0.100"
+aws-lc-rs = "1.14.1"
+bon = "3.8.1"
+bytes = "1.10.1"
 clap = { version = "4.5.51", features = ["derive"] }
 config = { version = "0.15.18", features = ["toml"] }
 getset = "0.1.6"
@@ -22,6 +25,7 @@ tracing = { version = "0.1.41", features = [
   "release_max_level_trace",
 ] }
 tracing-subscriber-init = { version = "0.2.3", features = ["tstime"] }
+uuid = { version = "1.18.1", features = ["v4"] }
 vergen-gix = { version = "2.1.0-beta.6", features = [
   "build",
   "cargo",

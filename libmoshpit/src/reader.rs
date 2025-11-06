@@ -9,39 +9,24 @@
 use std::io::Cursor;
 
 use anyhow::Result;
-use bincode::{config::standard, encode_to_vec};
+use bon::Builder;
 use bytes::{Buf as _, BytesMut};
-use tokio::{
-    io::{AsyncReadExt as _, AsyncWriteExt as _, BufWriter},
-    net::TcpStream,
-};
+use tokio::{io::AsyncReadExt as _, net::tcp::OwnedReadHalf};
 use tracing::trace;
 
-use crate::{Frame, MoshpitError};
+use crate::{Frame, error::Error};
 
-/// A connection over a `TcpStream` and `BytesMut` buffer.
-#[derive(Debug)]
-pub struct Connection {
-    // The `TcpStream`. It is decorated with a `BufWriter`, which provides write
-    // level buffering. The `BufWriter` implementation provided by Tokio is
-    // sufficient for our needs.
-    stream: BufWriter<TcpStream>,
-
-    // The buffer for reading frames. Here we do manually buffer handling.
-    // A more high level approach would be to use `tokio_util::codec`, and
-    // implement your own codec for decoding and encoding frames.
+/// A reader over a `ReadHalf` and `BytesMut` buffer.
+#[derive(Builder, Debug)]
+pub struct ConnectionReader {
+    /// The `ReadHalf` of a TCP stream.
+    reader: OwnedReadHalf,
+    // The buffer for reading frames.
+    #[builder(default = BytesMut::with_capacity(4096))]
     buffer: BytesMut,
 }
 
-impl Connection {
-    /// Create a new `Connection` from the given `TcpStream`.
-    pub fn new(socket: TcpStream) -> Self {
-        Self {
-            stream: BufWriter::new(socket),
-            buffer: BytesMut::with_capacity(4096),
-        }
-    }
-
+impl ConnectionReader {
     /// Read a single `Frame` value from the underlying stream.
     ///
     /// The function waits until it has retrieved enough data to parse a frame.
@@ -75,7 +60,7 @@ impl Connection {
             // On success, the number of bytes is returned. `0` indicates "end
             // of stream".
             trace!("Reading buffer...");
-            if 0 == self.stream.read_buf(&mut self.buffer).await? {
+            if 0 == self.reader.read_buf(&mut self.buffer).await? {
                 // The remote closed the connection. For this to be a clean
                 // shutdown, there should be no data in the read buffer. If
                 // there is, this means that the peer closed the socket while
@@ -83,7 +68,7 @@ impl Connection {
                 if self.buffer.is_empty() {
                     return Ok(None);
                 }
-                return Err(MoshpitError::ConnectionResetByPeer.into());
+                return Err(Error::ConnectionResetByPeer.into());
             }
             trace!("Read {} bytes from socket", self.buffer.len());
         }
@@ -105,10 +90,6 @@ impl Connection {
         // parse of the frame, and allows us to skip allocating data structures
         // to hold the frame data unless we know the full frame has been
         // received.
-
-        // Reset the position to zero before passing the cursor to `Frame::parse`.
-        buf.set_position(0);
-
         match Frame::parse(&mut buf) {
             Ok(Some(frame)) => {
                 // The `parse` function will have advanced the cursor until the
@@ -138,48 +119,7 @@ impl Connection {
                 // an expected runtime condition.
                 Ok(None)
             }
-            Err(err) => {
-                eprintln!("Frame parse error: {err:?}");
-                Err(err)
-            }
+            Err(err) => Err(err),
         }
-    }
-
-    /// Write a single `Frame` value to the underlying stream.
-    ///
-    /// The `Frame` value is written to the socket using the various `write_*`
-    /// functions provided by `AsyncWrite`. Calling these functions directly on
-    /// a `TcpStream` is **not** advised, as this will result in a large number of
-    /// syscalls. However, it is fine to call these functions on a *buffered*
-    /// write stream. The data will be written to the buffer. Once the buffer is
-    /// full, it is flushed to the underlying socket.
-    ///
-    /// # Errors
-    /// * I/O error.
-    /// * Encoding error.
-    ///
-    pub async fn write_frame(&mut self, frame: &Frame) -> Result<()> {
-        let id = frame.id();
-        trace!("Writing frame of type id={}", id);
-        let encoded = encode_to_vec(frame, standard())?;
-        let len = encoded.len();
-        self.stream.write_u8(0).await?;
-        self.stream.write_all(len.to_be_bytes().as_slice()).await?;
-        self.stream.write_all(&encoded).await?;
-
-        // Ensure the encoded frame is written to the socket. The calls above
-        // are to the buffered stream and writes. Calling `flush` writes the
-        // remaining contents of the buffer to the socket.
-        self.stream.flush().await.map_err(Into::into)
-    }
-
-    /// Write raw bytes to the underlying stream.
-    ///
-    /// # Errors
-    /// * I/O error.
-    ///
-    pub async fn write_bytes(&mut self, bytes: &[u8]) -> Result<()> {
-        self.stream.write_all(bytes).await?;
-        self.stream.flush().await.map_err(Into::into)
     }
 }

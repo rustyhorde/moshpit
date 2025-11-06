@@ -31,6 +31,15 @@ pub enum Error {
     /// An invalid IP address was provided
     #[error("An invalid IP address was provided")]
     InvalidIpAddress,
+    /// An invalid frame was received
+    #[error("An invalid frame was received")]
+    InvalidFrame,
+    /// A key has not been established
+    #[error("A key has not been established")]
+    KeyNotEstablished,
+    /// Decryption failed
+    #[error("Decryption failed")]
+    DecryptionFailed,
 }
 
 /// Converts an `anyhow::Error` into a suitable exit code or clap message for a CLI application.
