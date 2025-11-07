@@ -1,7 +1,17 @@
 [package]
-name = "moshpits"
-version = "0.1.0"
+authors = ["Jason Ozias <jason.g.ozias@gmail.com>"]
+categories = ["command-line-interface", "network-programming", "cryptography"]
+description = "A Rust implementation of in the same vein as Mosh, the mobile shell."
+documentation = "https://docs.rs/libmoshpit"
 edition = "2024"
+homepage = "https://github.com/rustyhorde/moshpit"
+keywords = ["ssh", "mosh"]
+license = "MIT OR Apache-2.0"
+name = "moshpits"
+readme = "../README.md"
+repository = "https://github.com/rustyhorde/moshpit"
+version = "0.1.0"
+rust-version = "1.88.0"
 
 [[bin]]
 name = "mps"
