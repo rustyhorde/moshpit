@@ -63,6 +63,10 @@ pub(crate) struct Cli {
     )]
     #[getset(get = "pub(crate)")]
     tracing_absolute_path: Option<String>,
+    /// The IP address of the server you wish to connect to
+    #[clap(help = "The IP address of the server to connect to")]
+    #[getset(get = "pub(crate)")]
+    server_ip: Option<String>,
 }
 
 impl Source for Cli {
@@ -97,6 +101,13 @@ impl Source for Cli {
                 Value::new(Some(&origin), ValueKind::String(tracing_path.clone())),
             );
         }
+        let _old = map.insert(
+            "server_ip".to_string(),
+            Value::new(
+                Some(&origin),
+                ValueKind::String(self.server_ip.clone().unwrap_or_default()),
+            ),
+        );
         Ok(map)
     }
 }

@@ -6,27 +6,31 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-use std::{ffi::OsString, net::SocketAddr, sync::Arc};
+use std::{ffi::OsString, io::stdin, net::SocketAddr, sync::Arc};
 
 use anyhow::{Context as _, Result};
 use aws_lc_rs::{
-    aead::{AES_256_GCM_SIV, Aad, RandomizedNonceKey},
-    agreement::{EphemeralPrivateKey, UnparsedPublicKey, X25519, agree_ephemeral},
-    error::Unspecified,
-    hkdf::{HKDF_SHA256, Salt},
+    agreement::{EphemeralPrivateKey, X25519},
     rand::SystemRandom,
 };
 use clap::Parser as _;
-use libmoshpit::{ConnectionReader, ConnectionWriter, Frame, MoshpitError, init_tracing, load};
+use libmoshpit::{
+    ConnectionReader, ConnectionWriter, Frame, MoshpitError, UdpState, init_tracing, load,
+};
 use tokio::{
     net::{TcpStream, UdpSocket},
     spawn,
-    sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
+    sync::mpsc::unbounded_channel,
 };
 use tracing::{error, info, trace};
 use uuid::Uuid;
 
-use crate::{cli::Cli, config::Config};
+use crate::{
+    cli::Cli,
+    config::Config,
+    tcp::{reader::FrameReader, sender::FrameSender},
+    udp::{reader::UdpReader, sender::UdpSender},
+};
 
 pub(crate) async fn run<I, T>(args: Option<I>) -> Result<()>
 where
@@ -50,18 +54,59 @@ where
     trace!("Configuration loaded");
     trace!("Tracing initialized");
 
-    // The `addr` argument is passed directly to `TcpStream::connect`. This
-    // performs any asynchronous DNS lookup and attempts to establish the TCP
-    // connection. An error at either step returns an error, which is then
-    // bubbled up to the caller of `mini_redis` connect.
-    let socket_addr = SocketAddr::new(
-        config
-            .mps()
-            .ip()
-            .parse()
-            .with_context(|| MoshpitError::InvalidIpAddress)?,
-        config.mps().port(),
-    );
+    // Setup the TCP connection to the server for key exchange
+    let socket_addr = config
+        .server_ip()
+        .parse::<SocketAddr>()
+        .with_context(|| MoshpitError::InvalidServerAddress)?;
+
+    let (key_bytes, uuid) = run_key_exchange(&socket_addr).await?;
+
+    let udp_listener = UdpSocket::bind("127.0.0.1:0").await?;
+    udp_listener.connect(socket_addr).await?;
+    let udp_recv = Arc::new(udp_listener);
+    let udp_send = udp_recv.clone();
+    let (tx, rx) = unbounded_channel::<Vec<u8>>();
+    let mut udp_reader = UdpReader::builder().socket(udp_recv).build();
+    let mut udp_sender = UdpSender::builder()
+        .socket(udp_send)
+        .rx(rx)
+        .id(uuid)
+        .rnk(key_bytes)?
+        .build();
+
+    let _udp_handle = spawn(async move {
+        if let Err(e) = udp_sender.handle_send().await {
+            error!("udp sender error {e}");
+        }
+    });
+
+    let _udp_reader_handle = spawn(async move {
+        if let Err(e) = udp_reader.handle_read().await {
+            error!("udp reader error {e}");
+        }
+    });
+
+    tx.send(b"Hello, world!".to_vec())?;
+
+    loop {
+        let mut input = String::new();
+        match stdin().read_line(&mut input) {
+            Ok(_n) => {
+                tx.send(input.into_bytes())?;
+            }
+            Err(error) => {
+                println!("error: {error}");
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_key_exchange(socket_addr: &SocketAddr) -> Result<([u8; 32], Uuid)> {
+    // Setup the TCP connection to the server for key exchange
     let socket = TcpStream::connect(socket_addr).await?;
     let (sock_read, sock_write) = socket.into_split();
     let reader = ConnectionReader::builder().reader(sock_read).build();
@@ -70,134 +115,57 @@ where
     let (tx_udp_state, mut rx_udp_state) = unbounded_channel::<UdpState>();
     info!("Connected to the server!");
 
+    // Generate ephemeral X25519 key pair
     let rng = SystemRandom::new();
     let pk = EphemeralPrivateKey::generate(&X25519, &rng)?;
     let my_public_key = pk.compute_public_key()?;
+    trace!("Generated ephemeral X25519 key pair");
 
+    // Setup the TCP frame reader
     let tx_c = tx.clone();
     let tx_udp_state_c = tx_udp_state.clone();
     let _read_handle = spawn(async move {
-        let mut handler = MpsFrameHandler {
-            reader,
-            tx: tx_c,
-            tx_udp: tx_udp_state_c,
-        };
-        if let Err(e) = handler.handle_connection(pk).await {
-            error!("mp handler error {e}");
+        let mut frame_reader = FrameReader::builder()
+            .reader(reader)
+            .tx(tx_c)
+            .tx_udp(tx_udp_state_c)
+            .build();
+        if let Err(e) = frame_reader.handle_connection(pk).await {
+            error!("mps frame reader: {e}");
         }
     });
+    trace!("Spawned TCP frame reader task");
 
+    // Setup the TCP frame sender
     let _write_handle = spawn(async move {
-        let mut sender = MpsFrameSender { writer, rx };
+        let mut sender = FrameSender::builder().writer(writer).rx(rx).build();
         if let Err(e) = sender.handle_tx().await {
             error!("mp sender error {e}");
         }
     });
-    info!("Sending initialize frame...");
+    trace!("Spawned TCP frame sender task");
+
+    // Send the initialize frame with our public key
+    trace!("Sending initialize frame...");
     let frame = Frame::Initialize(my_public_key.as_ref().to_vec());
     tx.send(frame.clone())?;
 
+    // Wait for UDP state updates with the key and UUID
+    // once we have both, we can set up the UDP socket
+    let mut key_bytes = [0u8; 32];
+    let mut uuid = Uuid::nil();
     while let Some(udp_state) = rx_udp_state.recv().await {
         match udp_state {
-            UdpState::Key(_key_bytes) => {
-                info!("Received UDP key");
-                // Here you would typically set up your UDP socket with the received key
+            UdpState::Key(key_b) => {
+                trace!("Received UDP key");
+                key_bytes = key_b;
             }
-            UdpState::Uuid(uuid) => {
-                info!("Received UDP UUID: {}", uuid);
-                // Handle UUID as needed
+            UdpState::Uuid(set_uuid) => {
+                trace!("Received UDP UUID: {}", set_uuid);
+                uuid = set_uuid;
                 break;
             }
         }
     }
-
-    let udp_listener = UdpSocket::bind("127.0.0.1:0").await?;
-    let remote_addr = "127.0.0.1:40404".parse::<SocketAddr>().unwrap();
-    udp_listener.connect(remote_addr).await?;
-    let udp_recv = Arc::new(udp_listener);
-    let udp_send = udp_recv.clone();
-    let (tx, mut rx) = unbounded_channel::<(Vec<u8>, SocketAddr)>();
-
-    let _udp_handle = spawn(async move {
-        while let Some((bytes, addr)) = rx.recv().await {
-            let len = udp_send.send_to(&bytes, &addr).await.unwrap();
-            println!("{len:?} bytes sent");
-        }
-    });
-
-    tx.send((b"Hello, world!".to_vec(), remote_addr))?;
-
-    let mut buf = [0; 1024];
-    loop {
-        let (len, addr) = udp_recv.recv_from(&mut buf).await?;
-        println!("{len:?} bytes received from {addr:?}");
-    }
-}
-
-struct MpsFrameHandler {
-    reader: ConnectionReader,
-    tx: UnboundedSender<Frame>,
-    tx_udp: UnboundedSender<UdpState>,
-}
-
-impl MpsFrameHandler {
-    async fn handle_connection(&mut self, epk: EphemeralPrivateKey) -> Result<()> {
-        if let Some(frame) = self.reader.read_frame().await?
-            && let Frame::PeerInitialize(pk, salt_bytes) = frame
-        {
-            info!("Received peer initialize frame");
-            let peer_public_key = UnparsedPublicKey::new(&X25519, &pk);
-            let salt = Salt::new(HKDF_SHA256, &salt_bytes);
-
-            agree_ephemeral(epk, peer_public_key, Unspecified, |key_material| {
-                let pseudo_random_key = salt.extract(key_material);
-                let mut check = b"Yoda".to_vec();
-
-                // Derive UnboundKey for AES-256-GCM-SIV
-                let okm = pseudo_random_key.expand(&[b"aead key"], &AES_256_GCM_SIV)?;
-                let mut key_bytes = [0u8; 32];
-                self.tx_udp
-                    .send(UdpState::Key(key_bytes))
-                    .map_err(|_| Unspecified)?;
-                okm.fill(&mut key_bytes)?;
-                let rnk = RandomizedNonceKey::new(&AES_256_GCM_SIV, &key_bytes)?;
-                let nonce = rnk.seal_in_place_append_tag(Aad::empty(), &mut check)?;
-
-                self.tx
-                    .send(Frame::Check(*nonce.as_ref(), check))
-                    .map_err(|_| Unspecified)?;
-                info!("Sent check frame with encrypted check message");
-                Ok(())
-            })?;
-        }
-        if let Some(frame) = self.reader.read_frame().await?
-            && let Frame::KeyAgreement(uuid) = frame
-        {
-            info!("Received key agreement frame with UUID: {}", uuid);
-            self.tx_udp
-                .send(UdpState::Uuid(*uuid.as_ref()))
-                .map_err(|_| Unspecified)?;
-        }
-        Ok(())
-    }
-}
-
-struct MpsFrameSender {
-    writer: ConnectionWriter,
-    rx: UnboundedReceiver<Frame>,
-}
-
-impl MpsFrameSender {
-    async fn handle_tx(&mut self) -> Result<()> {
-        while let Some(frame) = self.rx.recv().await {
-            self.writer.write_frame(&frame).await?;
-        }
-        Ok(())
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-enum UdpState {
-    Key([u8; 32]),
-    Uuid(Uuid),
+    Ok((key_bytes, uuid))
 }

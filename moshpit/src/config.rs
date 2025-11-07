@@ -7,7 +7,7 @@
 // modified, or distributed except according to those terms.
 
 use getset::{CopyGetters, Getters, Setters};
-use libmoshpit::{Mps, Tracing, TracingConfigExt};
+use libmoshpit::{Tracing, TracingConfigExt};
 use serde::{Deserialize, Serialize};
 use tracing::Level;
 use tracing_subscriber_init::{TracingConfig, get_effective_level};
@@ -24,9 +24,9 @@ pub(crate) struct Config {
     #[getset(set = "pub(crate)")]
     enable_std_output: bool,
     #[getset(get = "pub(crate)")]
-    tracing: Tracing,
+    server_ip: String,
     #[getset(get = "pub(crate)")]
-    mps: Mps,
+    tracing: Tracing,
 }
 
 impl TracingConfig for Config {

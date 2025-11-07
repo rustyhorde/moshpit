@@ -40,6 +40,9 @@ pub enum Error {
     /// Decryption failed
     #[error("Decryption failed")]
     DecryptionFailed,
+    /// Invalid IP address for server
+    #[error("Invalid IP address for server")]
+    InvalidServerAddress,
 }
 
 /// Converts an `anyhow::Error` into a suitable exit code or clap message for a CLI application.

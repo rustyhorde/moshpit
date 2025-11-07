@@ -18,15 +18,20 @@ use aws_lc_rs::{
     rand::{SystemRandom, fill},
 };
 use clap::Parser as _;
-use libmoshpit::{Connection, Frame, MoshpitError, UuidWrapper, init_tracing, load};
+use libmoshpit::{Connection, Frame, MoshpitError, UdpState, UuidWrapper, init_tracing, load};
 use tokio::{
     net::{TcpListener, UdpSocket},
     spawn,
-    sync::mpsc::unbounded_channel,
+    sync::mpsc::{UnboundedSender, unbounded_channel},
 };
 use tracing::{error, info, trace};
+use uuid::Uuid;
 
-use crate::{cli::Cli, config::Config};
+use crate::{
+    cli::Cli,
+    config::Config,
+    udp::{reader::UdpReader, sender::UdpSender},
+};
 
 pub(crate) async fn run<I, T>(args: Option<I>) -> Result<()>
 where
@@ -60,45 +65,57 @@ where
     );
     let listener = TcpListener::bind(socket_addr).await?;
     let udp_listener = UdpSocket::bind(socket_addr).await?;
+    let udp_arc = Arc::new(udp_listener);
 
-    let udp_recv = Arc::new(udp_listener);
-    let udp_send = udp_recv.clone();
-    let (tx, mut rx) = unbounded_channel::<(Vec<u8>, SocketAddr)>();
-
-    let _tcp_handle = spawn(async move {
-        loop {
-            match listener.accept().await {
-                Ok((socket, addr)) => {
-                    info!("Accepted connection from {addr}");
-                    let mut handler = Handler {
-                        connection: Connection::new(socket),
-                        rnk: None,
-                    };
-                    let _handle = spawn(async move {
-                        if let Err(err) = handler.handle_connection().await {
-                            error!("connection error: {err:?} from {addr}");
-                        } else {
-                            info!("connection can be promoted");
-                        }
-                    });
-                }
-                Err(e) => error!("couldn't get client: {e:?}"),
-            }
-        }
-    });
-
-    let _udp_handle = spawn(async move {
-        while let Some((bytes, addr)) = rx.recv().await {
-            let len = udp_send.send_to(&bytes, &addr).await.unwrap();
-            println!("{len:?} bytes sent");
-        }
-    });
-
-    let mut buf = [0; 1024];
     loop {
-        let (len, addr) = udp_recv.recv_from(&mut buf).await?;
-        println!("{len:?} bytes received from {addr:?}");
-        tx.send((buf[..len].to_vec(), addr)).unwrap();
+        match listener.accept().await {
+            Ok((socket, addr)) => {
+                info!("Accepted connection from {addr}");
+                let mut handler = Handler {
+                    connection: Connection::new(socket),
+                    rnk: None,
+                };
+                let udp_recv = udp_arc.clone();
+                let udp_send = udp_arc.clone();
+                let _handle = spawn(async move {
+                    match handler.handle_connection().await {
+                        Ok((key_bytes, uuid)) => {
+                            info!("connection can be promoted");
+
+                            let (_tx, rx) = unbounded_channel::<Vec<u8>>();
+
+                            let mut udp_reader = UdpReader::builder()
+                                .socket(udp_recv)
+                                .id(uuid)
+                                .rnk(key_bytes)
+                                .unwrap()
+                                .build();
+                            let mut udp_sender = UdpSender::builder()
+                                .socket(udp_send)
+                                .rx(rx)
+                                .id(uuid)
+                                .rnk(key_bytes)
+                                .unwrap()
+                                .build();
+
+                            let _udp_reader_handle = spawn(async move {
+                                if let Err(e) = udp_reader.handle_read().await {
+                                    error!("udp reader error {e}");
+                                }
+                            });
+
+                            let _udp_handle = spawn(async move {
+                                if let Err(e) = udp_sender.handle_send().await {
+                                    error!("udp sender error {e}");
+                                }
+                            });
+                        }
+                        Err(e) => error!("connection error: {e} from {addr}"),
+                    }
+                });
+            }
+            Err(e) => error!("couldn't get client: {e:?}"),
+        }
     }
 }
 
@@ -108,10 +125,11 @@ struct Handler {
 }
 
 impl Handler {
-    async fn handle_connection(&mut self) -> Result<()> {
+    async fn handle_connection(&mut self) -> Result<([u8; 32], Uuid)> {
+        let (tx_udp_state, mut rx_udp_state) = unbounded_channel::<UdpState>();
         if let Some(frame) = self.connection.read_frame().await? {
             if let Frame::Initialize(pk) = frame {
-                self.handle_initialize(pk).await?;
+                self.handle_initialize(pk, tx_udp_state.clone()).await?;
             } else {
                 error!("Expected initialize frame");
                 return Err(MoshpitError::InvalidFrame.into());
@@ -120,16 +138,38 @@ impl Handler {
 
         if let Some(frame) = self.connection.read_frame().await? {
             if let Frame::Check(nonce, enc) = frame {
-                self.handle_check(nonce, enc).await?;
+                self.handle_check(nonce, enc, tx_udp_state).await?;
             } else {
                 error!("Expected check frame");
                 return Err(MoshpitError::InvalidFrame.into());
             }
         }
-        Ok(())
+
+        // Wait for UDP state updates with the key and UUID
+        // once we have both, we can set up the UDP socket
+        let mut key_bytes = [0u8; 32];
+        let mut uuid = Uuid::nil();
+        while let Some(udp_state) = rx_udp_state.recv().await {
+            match udp_state {
+                UdpState::Key(key_b) => {
+                    trace!("Received UDP key");
+                    key_bytes = key_b;
+                }
+                UdpState::Uuid(set_uuid) => {
+                    trace!("Received UDP UUID: {}", set_uuid);
+                    uuid = set_uuid;
+                    break;
+                }
+            }
+        }
+        Ok((key_bytes, uuid))
     }
 
-    async fn handle_initialize(&mut self, pk: Vec<u8>) -> Result<()> {
+    async fn handle_initialize(
+        &mut self,
+        pk: Vec<u8>,
+        tx_udp_state: UnboundedSender<UdpState>,
+    ) -> Result<()> {
         info!("Received initialize frame with public key");
         let rng = SystemRandom::new();
 
@@ -161,6 +201,9 @@ impl Handler {
                 let okm = pseudo_random_key.expand(&[b"aead key"], &AES_256_GCM_SIV)?;
                 let mut key_bytes = [0u8; AES_256_KEY_LEN];
                 okm.fill(&mut key_bytes)?;
+                tx_udp_state
+                    .send(UdpState::Key(key_bytes))
+                    .map_err(|_| Unspecified)?;
                 let rnk = RandomizedNonceKey::new(&AES_256_GCM_SIV, &key_bytes)?;
                 self.rnk = Some(rnk);
                 Ok(())
@@ -173,6 +216,7 @@ impl Handler {
         &mut self,
         nonce_bytes: [u8; 12],
         mut check_bytes: Vec<u8>,
+        tx_udp_state: UnboundedSender<UdpState>,
     ) -> Result<()> {
         info!("Received check frame with encrypted check message");
         if let Some(rnk) = &mut self.rnk {
@@ -182,8 +226,12 @@ impl Handler {
                 .map_err(|_| MoshpitError::DecryptionFailed)?;
             if decrypted_data == b"Yoda" {
                 info!("Check frame verified successfully");
+                let id = Uuid::new_v4();
+                tx_udp_state
+                    .send(UdpState::Uuid(id))
+                    .map_err(|_| Unspecified)?;
                 self.connection
-                    .write_frame(&Frame::KeyAgreement(UuidWrapper::default()))
+                    .write_frame(&Frame::KeyAgreement(UuidWrapper::new(id)))
                     .await?;
             } else {
                 error!("Check frame verification failed");
