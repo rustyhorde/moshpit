@@ -6,63 +6,134 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-use std::sync::Arc;
+use std::{io::Cursor, sync::Arc};
 
 use anyhow::Result;
-use aws_lc_rs::aead::{AES_256_GCM_SIV, Aad, NONCE_LEN, Nonce, RandomizedNonceKey};
+use aws_lc_rs::{
+    aead::{AES_256_GCM_SIV, RandomizedNonceKey},
+    hmac::{HMAC_SHA512, Key},
+};
 use bon::Builder;
-use bytes::BytesMut;
+use bytes::{Buf as _, BytesMut};
+use libmoshpit::{EncryptedFrame, MoshpitError};
 use tokio::net::UdpSocket;
-use tracing::{info, trace};
+use tracing::trace;
 use uuid::Uuid;
-
-const UUID_LEN: usize = 16;
-const USIZE_LEN: usize = 8;
 
 #[derive(Builder)]
 #[allow(dead_code)]
 pub(crate) struct UdpReader {
     socket: Arc<UdpSocket>,
     #[builder(default = BytesMut::with_capacity(4096))]
-    buf: BytesMut,
+    buffer: BytesMut,
     id: Uuid,
     #[builder(with = |key: [u8; 32]| -> Result<_> { RandomizedNonceKey::new(&AES_256_GCM_SIV, &key).map_err(Into::into) })]
     rnk: RandomizedNonceKey,
+    #[builder(with = |key: [u8; 64]| { Key::new(HMAC_SHA512, &key) })]
+    hmac: Key,
 }
 
 impl UdpReader {
-    pub(crate) async fn handle_read(&mut self) -> Result<()> {
+    /// Read a single `Frame` value from the underlying stream.
+    ///
+    /// The function waits until it has retrieved enough data to parse a frame.
+    /// Any data remaining in the read buffer after the frame has been parsed is
+    /// kept there for the next call to `read_frame`.
+    ///
+    /// # Returns
+    ///
+    /// On success, the received frame is returned. If the `TcpStream`
+    /// is closed in a way that doesn't break a frame in half, it returns
+    /// `None`. Otherwise, an error is returned.
+    ///
+    /// # Errors
+    /// * Connection reset by peer.
+    /// * I/O error.
+    /// * Frame parsing error.
+    ///
+    pub(crate) async fn read_encrypted_frame(&mut self) -> Result<Option<EncryptedFrame>> {
         loop {
-            let len = self.socket.recv_buf(&mut self.buf).await?;
-            trace!("Received {len} bytes over UDP");
-            self.handle_bytes(len)?;
+            trace!("Reading frame...");
+            // Attempt to parse a frame from the buffered data. If enough data
+            // has been buffered, the frame is returned.
+            if let Some(frame) = self.parse_encrypted_frame()? {
+                trace!("Parsed frame");
+                return Ok(Some(frame));
+            }
+
+            // There is not enough buffered data to read a frame. Attempt to
+            // read more data from the socket.
+            //
+            // On success, the number of bytes is returned. `0` indicates "end
+            // of stream".
+            trace!("Reading buffer...");
+            if 0 == self.socket.recv_buf(&mut self.buffer).await? {
+                // The remote closed the connection. For this to be a clean
+                // shutdown, there should be no data in the read buffer. If
+                // there is, this means that the peer closed the socket while
+                // sending a frame.
+                if self.buffer.is_empty() {
+                    return Ok(None);
+                }
+                return Err(MoshpitError::ConnectionResetByPeer.into());
+            }
+            trace!("Read {} bytes from socket", self.buffer.len());
         }
     }
 
-    fn handle_bytes(&mut self, len: usize) -> Result<()> {
-        if len < NONCE_LEN + UUID_LEN + USIZE_LEN + 1 {
-            trace!("packet too short");
-            return Ok(());
+    /// Tries to parse a frame from the buffer. If the buffer contains enough
+    /// data, the frame is returned and the data removed from the buffer. If not
+    /// enough data has been buffered yet, `Ok(None)` is returned. If the
+    /// buffered data does not represent a valid frame, `Err` is returned.
+    fn parse_encrypted_frame(&mut self) -> Result<Option<EncryptedFrame>> {
+        // Cursor is used to track the "current" location in the
+        // buffer. Cursor also implements `Buf` from the `bytes` crate
+        // which provides a number of helpful utilities for working
+        // with bytes.
+        let mut buf = Cursor::new(&self.buffer[..]);
+
+        // The first step is to check if enough data has been buffered to parse
+        // a single frame. This step is usually much faster than doing a full
+        // parse of the frame, and allows us to skip allocating data structures
+        // to hold the frame data unless we know the full frame has been
+        // received.
+
+        // Reset the position to zero before passing the cursor to `Frame::parse`.
+        buf.set_position(0);
+
+        match EncryptedFrame::parse(&mut buf, &self.hmac, &self.rnk) {
+            Ok(Some(frame)) => {
+                // The `parse` function will have advanced the cursor until the
+                // end of the frame. Since the cursor had position set to zero
+                // before `Frame::parse` was called, we obtain the length of the
+                // frame by checking the cursor position.
+                let len = usize::try_from(buf.position())?;
+
+                // Discard the parsed data from the read buffer.
+                //
+                // When `advance` is called on the read buffer, all of the data
+                // up to `len` is discarded. The details of how this works is
+                // left to `BytesMut`. This is often done by moving an internal
+                // cursor, but it may be done by reallocating and copying data.
+                self.buffer.advance(len);
+
+                // Return the parsed frame to the caller.
+                Ok(Some(frame))
+            }
+            Ok(None) => {
+                // There is not enough data present in the read buffer to parse
+                // a single frame. We must wait for more data to be received
+                // from the socket. Reading from the socket will be done in the
+                // statement after this `match`.
+                //
+                // We do not want to return `Err` from here as this "error" is
+                // an expected runtime condition.
+                Ok(None)
+            }
+            Err(err) => {
+                eprintln!("Frame parse error: {err:?}");
+                Err(err)
+            }
         }
-        let read = self.buf.split_to(len);
-        let (nonce_bytes, ciphertext) = read.split_at(NONCE_LEN);
-        let mut data = ciphertext.to_vec();
-        let nonce = Nonce::try_assume_unique_for_key(nonce_bytes)?;
-        info!("nonce: {:?}", nonce.as_ref());
-        let _ = self.rnk.open_in_place(nonce, Aad::empty(), &mut data)?;
-        info!("trying to parse uuid");
-        let (uuid_bytes, rest) = data.split_at(UUID_LEN);
-        let uuid = Uuid::from_bytes(uuid_bytes.try_into()?);
-        trace!("uuid: {uuid}");
-        let (len_bytes, message_bytes) = rest.split_at(USIZE_LEN);
-        let message_len = usize::from_be_bytes(len_bytes.try_into()?);
-        if message_bytes.len() < message_len {
-            trace!("message too short");
-            return Ok(());
-        }
-        let message = &message_bytes[..message_len];
-        trace!("message length: {}", message.len());
-        trace!("message: {}", String::from_utf8_lossy(message));
-        Ok(())
     }
 }

@@ -17,6 +17,8 @@ use uuid::Uuid;
 pub enum UdpState {
     /// Key material for encrypting/decrypting UDP packets
     Key([u8; 32]),
+    /// HMAC key for signing UDP packets
+    HmacKey([u8; 64]),
     /// Client UUID
     Uuid(Uuid),
 }

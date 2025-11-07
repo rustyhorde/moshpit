@@ -13,8 +13,9 @@ use aws_lc_rs::{
     aead::{AES_256_GCM_SIV, Aad, Nonce, RandomizedNonceKey},
     agreement::{EphemeralPrivateKey, UnparsedPublicKey, X25519, agree_ephemeral},
     cipher::AES_256_KEY_LEN,
+    digest::SHA512_OUTPUT_LEN,
     error::Unspecified,
-    hkdf::{HKDF_SHA256, Salt},
+    hkdf::{HKDF_SHA256, HKDF_SHA512, Salt},
     rand::{SystemRandom, fill},
 };
 use clap::Parser as _;
@@ -79,7 +80,7 @@ where
                 let udp_send = udp_arc.clone();
                 let _handle = spawn(async move {
                     match handler.handle_connection().await {
-                        Ok((key_bytes, uuid)) => {
+                        Ok((key_bytes, hmac_key_bytes, uuid)) => {
                             info!("connection can be promoted");
 
                             let (_tx, rx) = unbounded_channel::<Vec<u8>>();
@@ -87,6 +88,7 @@ where
                             let mut udp_reader = UdpReader::builder()
                                 .socket(udp_recv)
                                 .id(uuid)
+                                .hmac(hmac_key_bytes)
                                 .rnk(key_bytes)
                                 .unwrap()
                                 .build();
@@ -99,7 +101,7 @@ where
                                 .build();
 
                             let _udp_reader_handle = spawn(async move {
-                                if let Err(e) = udp_reader.handle_read().await {
+                                if let Err(e) = udp_reader.read_encrypted_frame().await {
                                     error!("udp reader error {e}");
                                 }
                             });
@@ -125,7 +127,7 @@ struct Handler {
 }
 
 impl Handler {
-    async fn handle_connection(&mut self) -> Result<([u8; 32], Uuid)> {
+    async fn handle_connection(&mut self) -> Result<([u8; 32], [u8; 64], Uuid)> {
         let (tx_udp_state, mut rx_udp_state) = unbounded_channel::<UdpState>();
         if let Some(frame) = self.connection.read_frame().await? {
             if let Frame::Initialize(pk) = frame {
@@ -148,12 +150,17 @@ impl Handler {
         // Wait for UDP state updates with the key and UUID
         // once we have both, we can set up the UDP socket
         let mut key_bytes = [0u8; 32];
+        let mut hmac_key_bytes = [0u8; 64];
         let mut uuid = Uuid::nil();
         while let Some(udp_state) = rx_udp_state.recv().await {
             match udp_state {
                 UdpState::Key(key_b) => {
                     trace!("Received UDP key");
                     key_bytes = key_b;
+                }
+                UdpState::HmacKey(hmac_key_b) => {
+                    trace!("Received UDP HMAC key");
+                    hmac_key_bytes = hmac_key_b;
                 }
                 UdpState::Uuid(set_uuid) => {
                     trace!("Received UDP UUID: {}", set_uuid);
@@ -162,7 +169,7 @@ impl Handler {
                 }
             }
         }
-        Ok((key_bytes, uuid))
+        Ok((key_bytes, hmac_key_bytes, uuid))
     }
 
     async fn handle_initialize(
@@ -201,8 +208,18 @@ impl Handler {
                 let okm = pseudo_random_key.expand(&[b"aead key"], &AES_256_GCM_SIV)?;
                 let mut key_bytes = [0u8; AES_256_KEY_LEN];
                 okm.fill(&mut key_bytes)?;
+                // Derive the HMAC key and send it over UDP
+                let okm_hmac =
+                    pseudo_random_key.expand(&[b"hmac key"], HKDF_SHA512.hmac_algorithm())?;
+                let mut hmac_key_bytes = [0u8; SHA512_OUTPUT_LEN];
+                okm_hmac.fill(&mut hmac_key_bytes)?;
+                error!("Derived HMAC key bytes: {}", hex::encode(hmac_key_bytes));
+
                 tx_udp_state
                     .send(UdpState::Key(key_bytes))
+                    .map_err(|_| Unspecified)?;
+                tx_udp_state
+                    .send(UdpState::HmacKey(hmac_key_bytes))
                     .map_err(|_| Unspecified)?;
                 let rnk = RandomizedNonceKey::new(&AES_256_GCM_SIV, &key_bytes)?;
                 self.rnk = Some(rnk);

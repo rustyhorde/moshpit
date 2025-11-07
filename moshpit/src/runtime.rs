@@ -60,7 +60,7 @@ where
         .parse::<SocketAddr>()
         .with_context(|| MoshpitError::InvalidServerAddress)?;
 
-    let (key_bytes, uuid) = run_key_exchange(&socket_addr).await?;
+    let (key_bytes, hmac_key_bytes, uuid) = run_key_exchange(&socket_addr).await?;
 
     let udp_listener = UdpSocket::bind("127.0.0.1:0").await?;
     udp_listener.connect(socket_addr).await?;
@@ -72,6 +72,7 @@ where
         .socket(udp_send)
         .rx(rx)
         .id(uuid)
+        .hmac(hmac_key_bytes)
         .rnk(key_bytes)?
         .build();
 
@@ -105,7 +106,7 @@ where
     Ok(())
 }
 
-async fn run_key_exchange(socket_addr: &SocketAddr) -> Result<([u8; 32], Uuid)> {
+async fn run_key_exchange(socket_addr: &SocketAddr) -> Result<([u8; 32], [u8; 64], Uuid)> {
     // Setup the TCP connection to the server for key exchange
     let socket = TcpStream::connect(socket_addr).await?;
     let (sock_read, sock_write) = socket.into_split();
@@ -153,12 +154,17 @@ async fn run_key_exchange(socket_addr: &SocketAddr) -> Result<([u8; 32], Uuid)> 
     // Wait for UDP state updates with the key and UUID
     // once we have both, we can set up the UDP socket
     let mut key_bytes = [0u8; 32];
+    let mut hmac_key_bytes = [0u8; 64];
     let mut uuid = Uuid::nil();
     while let Some(udp_state) = rx_udp_state.recv().await {
         match udp_state {
             UdpState::Key(key_b) => {
                 trace!("Received UDP key");
                 key_bytes = key_b;
+            }
+            UdpState::HmacKey(hmac_key_b) => {
+                trace!("Received UDP HMAC key");
+                hmac_key_bytes = hmac_key_b;
             }
             UdpState::Uuid(set_uuid) => {
                 trace!("Received UDP UUID: {}", set_uuid);
@@ -167,5 +173,5 @@ async fn run_key_exchange(socket_addr: &SocketAddr) -> Result<([u8; 32], Uuid)> 
             }
         }
     }
-    Ok((key_bytes, uuid))
+    Ok((key_bytes, hmac_key_bytes, uuid))
 }

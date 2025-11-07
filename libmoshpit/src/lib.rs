@@ -244,7 +244,7 @@
 mod config;
 mod connection;
 mod error;
-mod frame;
+mod frames;
 mod reader;
 mod tracing;
 mod udp;
@@ -262,7 +262,8 @@ pub use self::connection::Connection;
 pub use self::error::Error as MoshpitError;
 pub use self::error::clap_or_error;
 pub use self::error::success;
-pub use self::frame::Frame;
+pub use self::frames::encframe::EncryptedFrame;
+pub use self::frames::frame::Frame;
 pub use self::reader::ConnectionReader;
 pub use self::tracing::{TracingConfigExt, init_tracing};
 pub use self::udp::UdpClient;

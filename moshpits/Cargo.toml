@@ -18,6 +18,7 @@ bytes = { workspace = true }
 clap = { workspace = true }
 config = { workspace = true }
 getset = { workspace = true }
+hex = "0.4.3"
 libmoshpit = { version = "0.1.0", path = "../libmoshpit" }
 serde = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }

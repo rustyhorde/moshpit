@@ -10,13 +10,14 @@ use anyhow::Result;
 use aws_lc_rs::{
     aead::{AES_256_GCM_SIV, Aad, RandomizedNonceKey},
     agreement::{EphemeralPrivateKey, UnparsedPublicKey, X25519, agree_ephemeral},
+    digest::SHA512_OUTPUT_LEN,
     error::Unspecified,
-    hkdf::{HKDF_SHA256, Salt},
+    hkdf::{HKDF_SHA256, HKDF_SHA512, Salt},
 };
 use bon::Builder;
 use libmoshpit::{ConnectionReader, Frame, UdpState};
 use tokio::sync::mpsc::UnboundedSender;
-use tracing::info;
+use tracing::{error, info};
 
 #[derive(Builder)]
 pub(crate) struct FrameReader {
@@ -39,11 +40,20 @@ impl FrameReader {
                 let mut check = b"Yoda".to_vec();
 
                 // Derive UnboundKey for AES-256-GCM-SIV
-                let okm = pseudo_random_key.expand(&[b"aead key"], &AES_256_GCM_SIV)?;
+                let okm_aes = pseudo_random_key.expand(&[b"aead key"], &AES_256_GCM_SIV)?;
                 let mut key_bytes = [0u8; 32];
-                okm.fill(&mut key_bytes)?;
+                okm_aes.fill(&mut key_bytes)?;
+                // Derive the HMAC key and send it over UDP
+                let okm_hmac =
+                    pseudo_random_key.expand(&[b"hmac key"], HKDF_SHA512.hmac_algorithm())?;
+                let mut hmac_key_bytes = [0u8; SHA512_OUTPUT_LEN];
+                okm_hmac.fill(&mut hmac_key_bytes)?;
+                error!("Derived HMAC key bytes: {}", hex::encode(hmac_key_bytes));
                 self.tx_udp
                     .send(UdpState::Key(key_bytes))
+                    .map_err(|_| Unspecified)?;
+                self.tx_udp
+                    .send(UdpState::HmacKey(hmac_key_bytes))
                     .map_err(|_| Unspecified)?;
                 let rnk = RandomizedNonceKey::new(&AES_256_GCM_SIV, &key_bytes)?;
                 let nonce = rnk.seal_in_place_append_tag(Aad::empty(), &mut check)?;

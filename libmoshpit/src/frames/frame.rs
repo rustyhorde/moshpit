@@ -13,9 +13,10 @@ use bincode::{Decode, Encode, config::standard, decode_from_slice};
 use bytes::Buf as _;
 use tracing::trace;
 
-use crate::uuid::UuidWrapper;
-
-const USIZE_LENGTH: usize = 8;
+use crate::{
+    frames::{get_bytes, get_usize},
+    uuid::UuidWrapper,
+};
 
 /// A moshpit frame.
 #[derive(Clone, Debug, Decode, Encode, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -79,28 +80,6 @@ fn get_u8(src: &mut Cursor<&[u8]>) -> Option<u8> {
     Some(src.get_u8())
 }
 
-fn get_usize<'a>(src: &mut Cursor<&'a [u8]>) -> Result<Option<&'a [u8]>> {
-    if src.remaining() < USIZE_LENGTH {
-        Ok(None)
-    } else {
-        let start = usize::try_from(src.position())?;
-        let end = start + USIZE_LENGTH;
-        src.set_position(u64::try_from(end)?);
-        Ok(Some(&src.get_ref()[start..end]))
-    }
-}
-
-fn get_bytes<'a>(src: &mut Cursor<&'a [u8]>, length: usize) -> Result<Option<&'a [u8]>> {
-    if src.remaining() < length {
-        Ok(None)
-    } else {
-        let start = usize::try_from(src.position())?;
-        let end = start + length;
-        src.set_position(u64::try_from(end)?);
-        Ok(Some(&src.get_ref()[start..end]))
-    }
-}
-
 impl Display for Frame {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -126,7 +105,9 @@ mod tests {
     use anyhow::Result;
     use bincode::{config::standard, encode_to_vec};
 
-    use super::{Frame, USIZE_LENGTH, get_bytes, get_u8, get_usize};
+    use crate::frames::USIZE_LENGTH;
+
+    use super::{Frame, get_bytes, get_u8, get_usize};
 
     const TEST_USIZE: usize = 12;
 
