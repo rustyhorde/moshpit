@@ -15,7 +15,8 @@ use aws_lc_rs::{
 };
 use clap::Parser as _;
 use libmoshpit::{
-    ConnectionReader, ConnectionWriter, Frame, MoshpitError, UdpState, init_tracing, load,
+    ConnectionReader, ConnectionWriter, Frame, Kex, KexEvent, KexStateMachine, MoshpitError,
+    init_tracing, load,
 };
 use tokio::{
     net::{TcpStream, UdpSocket},
@@ -23,7 +24,6 @@ use tokio::{
     sync::mpsc::unbounded_channel,
 };
 use tracing::{error, info, trace};
-use uuid::Uuid;
 
 use crate::{
     cli::Cli,
@@ -60,10 +60,7 @@ where
         .parse::<SocketAddr>()
         .with_context(|| MoshpitError::InvalidServerAddress)?;
 
-    let (key_bytes, hmac_key_bytes, uuid, udp_arc) = run_key_exchange(&socket_addr).await?;
-
-    info!("key_bytes: {}", hex::encode(key_bytes));
-    info!("hmac_key_bytes: {}", hex::encode(hmac_key_bytes));
+    let (kex, udp_arc) = run_key_exchange(&socket_addr).await?;
 
     let udp_recv = udp_arc.clone();
     let udp_send = udp_arc.clone();
@@ -72,9 +69,9 @@ where
     let mut udp_sender = UdpSender::builder()
         .socket(udp_send)
         .rx(rx)
-        .id(uuid)
-        .hmac(hmac_key_bytes)
-        .rnk(key_bytes)?
+        .id(kex.uuid())
+        .hmac(kex.hmac_key())
+        .rnk(kex.key())?
         .build();
 
     let _udp_handle = spawn(async move {
@@ -106,16 +103,16 @@ where
     Ok(())
 }
 
-async fn run_key_exchange(
-    socket_addr: &SocketAddr,
-) -> Result<([u8; 32], [u8; 64], Uuid, Arc<UdpSocket>)> {
+async fn run_key_exchange(socket_addr: &SocketAddr) -> Result<(Kex, Arc<UdpSocket>)> {
     // Setup the TCP connection to the server for key exchange
     let socket = TcpStream::connect(socket_addr).await?;
     let (sock_read, sock_write) = socket.into_split();
     let reader = ConnectionReader::builder().reader(sock_read).build();
     let writer = ConnectionWriter::builder().writer(sock_write).build();
     let (tx, rx) = unbounded_channel();
-    let (tx_udp_state, mut rx_udp_state) = unbounded_channel::<UdpState>();
+    let (tx_event, rx_event) = unbounded_channel::<KexEvent>();
+    let mut kex_sm = KexStateMachine::builder().rx_event(rx_event).build();
+    let kex_handle = spawn(async move { kex_sm.handle_events(true).await });
     info!("Connected to the server!");
 
     // Generate ephemeral X25519 key pair
@@ -126,12 +123,12 @@ async fn run_key_exchange(
 
     // Setup the TCP frame reader
     let tx_c = tx.clone();
-    let tx_udp_state_c = tx_udp_state.clone();
+    let tx_event_c = tx_event.clone();
     let _read_handle = spawn(async move {
         let mut frame_reader = FrameReader::builder()
             .reader(reader)
             .tx(tx_c)
-            .tx_udp(tx_udp_state_c)
+            .tx_event(tx_event_c)
             .build();
         if let Err(e) = frame_reader.handle_connection(pk).await {
             error!("mps frame reader: {e}");
@@ -153,42 +150,16 @@ async fn run_key_exchange(
     let frame = Frame::Initialize(my_public_key.as_ref().to_vec());
     tx.send(frame.clone())?;
 
-    // Wait for UDP state updates with the key and UUID
-    // once we have both, we can set up the UDP socket
-    let mut key_bytes = [0u8; 32];
-    let mut hmac_key_bytes = [0u8; 64];
-    let mut uuid = Uuid::nil();
-    let mut moshpits_addr_opt = None;
-    while let Some(udp_state) = rx_udp_state.recv().await {
-        match udp_state {
-            UdpState::Addr(peer_addr) => {
-                trace!("Received UDP peer address: {}", peer_addr);
-                moshpits_addr_opt = Some(peer_addr);
-                break;
-            }
-            UdpState::Key(key_b) => {
-                trace!("Received UDP key");
-                key_bytes = key_b;
-            }
-            UdpState::HmacKey(hmac_key_b) => {
-                trace!("Received UDP HMAC key");
-                hmac_key_bytes = hmac_key_b;
-            }
-            UdpState::Uuid(set_uuid) => {
-                trace!("Received UDP UUID: {}", set_uuid);
-                uuid = set_uuid;
-            }
-        }
-    }
+    let kex = kex_handle.await??;
 
-    if let Some(moshpits_addr) = moshpits_addr_opt {
+    if let Some(moshpits_addr) = kex.moshpits_addr() {
         let socket_addr = "0.0.0.0:0".parse::<SocketAddr>()?;
         let udp_listener = UdpSocket::bind(socket_addr).await?;
         udp_listener.connect(moshpits_addr).await?;
         let frame = Frame::MoshpitAddr(udp_listener.local_addr()?);
         tx.send(frame.clone())?;
         trace!("Bound UDP socket to {}", udp_listener.local_addr()?);
-        Ok((key_bytes, hmac_key_bytes, uuid, Arc::new(udp_listener)))
+        Ok((kex, Arc::new(udp_listener)))
     } else {
         Err(MoshpitError::InvalidMoshpitsAddress.into())
     }

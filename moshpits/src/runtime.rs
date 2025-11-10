@@ -27,7 +27,8 @@ use aws_lc_rs::{
 };
 use clap::Parser as _;
 use libmoshpit::{
-    Connection, EncryptedFrame, Frame, MoshpitError, UdpState, UuidWrapper, init_tracing, load,
+    Connection, EncryptedFrame, Frame, Kex, KexEvent, KexStateMachine, MoshpitError, UuidWrapper,
+    init_tracing, load,
 };
 use tokio::{
     net::{TcpListener, UdpSocket},
@@ -89,27 +90,25 @@ where
                 let config_clone = config.clone();
                 let _handle = spawn(async move {
                     match handler.handle_connection(&config_clone).await {
-                        Ok((key_bytes, hmac_key_bytes, uuid, udp_arc)) => {
+                        Ok((kex, udp_socket)) => {
                             info!("connection can be promoted");
-                            info!("key_bytes: {}", hex::encode(key_bytes));
-                            info!("hmac_key_bytes: {}", hex::encode(hmac_key_bytes));
                             let (_tx, rx) = unbounded_channel::<Vec<u8>>();
-                            let udp_recv = udp_arc.clone();
-                            let udp_send = udp_arc.clone();
+                            let udp_recv = udp_socket.clone();
+                            let udp_send = udp_socket.clone();
 
                             let mut udp_reader = UdpReader::builder()
                                 .socket(udp_recv)
-                                .id(uuid)
-                                .hmac(hmac_key_bytes)
-                                .rnk(key_bytes)
+                                .id(kex.uuid())
+                                .hmac(kex.hmac_key())
+                                .rnk(kex.key())
                                 .unwrap()
                                 .build();
                             let mut udp_sender = UdpSender::builder()
                                 .socket(udp_send)
                                 .rx(rx)
-                                .id(uuid)
-                                .hmac(hmac_key_bytes)
-                                .rnk(key_bytes)
+                                .id(kex.uuid())
+                                .hmac(kex.hmac_key())
+                                .rnk(kex.key())
                                 .unwrap()
                                 .build();
 
@@ -147,14 +146,13 @@ struct Handler {
 }
 
 impl Handler {
-    async fn handle_connection(
-        &mut self,
-        config: &Config,
-    ) -> Result<([u8; 32], [u8; 64], Uuid, Arc<UdpSocket>)> {
-        let (tx_udp_state, mut rx_udp_state) = unbounded_channel::<UdpState>();
+    async fn handle_connection(&mut self, config: &Config) -> Result<(Kex, Arc<UdpSocket>)> {
+        let (tx_event, rx_event) = unbounded_channel::<KexEvent>();
+        let mut kex_sm = KexStateMachine::builder().rx_event(rx_event).build();
+        let kex_handle = spawn(async move { kex_sm.handle_events(false).await });
         if let Some(frame) = self.connection.read_frame().await? {
             if let Frame::Initialize(pk) = frame {
-                self.handle_initialize(pk, tx_udp_state.clone()).await?;
+                self.handle_initialize(pk, tx_event.clone()).await?;
             } else {
                 error!("Expected initialize frame");
                 return Err(MoshpitError::InvalidFrame.into());
@@ -163,7 +161,7 @@ impl Handler {
 
         if let Some(frame) = self.connection.read_frame().await? {
             if let Frame::Check(nonce, enc) = frame {
-                self.handle_check(nonce, enc, tx_udp_state).await?;
+                self.handle_check(nonce, enc, tx_event).await?;
             } else {
                 error!("Expected check frame");
                 return Err(MoshpitError::InvalidFrame.into());
@@ -182,39 +180,13 @@ impl Handler {
             }
         }
 
-        // Wait for UDP state updates with the key and UUID
-        // once we have both, we can set up the UDP socket
-        let mut key_bytes = [0u8; 32];
-        let mut hmac_key_bytes = [0u8; 64];
-        let mut uuid = Uuid::nil();
-        while let Some(udp_state) = rx_udp_state.recv().await {
-            match udp_state {
-                UdpState::Addr(_) => {
-                    // Already handled above
-                }
-                UdpState::Key(key_b) => {
-                    trace!("Received UDP key");
-                    key_bytes = key_b;
-                }
-                UdpState::HmacKey(hmac_key_b) => {
-                    trace!("Received UDP HMAC key");
-                    hmac_key_bytes = hmac_key_b;
-                }
-                UdpState::Uuid(set_uuid) => {
-                    trace!("Received UDP UUID: {}", set_uuid);
-                    uuid = set_uuid;
-                    break;
-                }
-            }
-        }
-
-        Ok((key_bytes, hmac_key_bytes, uuid, udp_arc))
+        Ok((kex_handle.await??, udp_arc))
     }
 
     async fn handle_initialize(
         &mut self,
         pk: Vec<u8>,
-        tx_udp_state: UnboundedSender<UdpState>,
+        tx_event: UnboundedSender<KexEvent>,
     ) -> Result<()> {
         info!("Received initialize frame with public key");
         let rng = SystemRandom::new();
@@ -253,11 +225,11 @@ impl Handler {
                 let mut hmac_key_bytes = [0u8; SHA512_OUTPUT_LEN];
                 okm_hmac.fill(&mut hmac_key_bytes)?;
 
-                tx_udp_state
-                    .send(UdpState::Key(key_bytes))
+                tx_event
+                    .send(KexEvent::KeyMaterial(key_bytes))
                     .map_err(|_| Unspecified)?;
-                tx_udp_state
-                    .send(UdpState::HmacKey(hmac_key_bytes))
+                tx_event
+                    .send(KexEvent::HMACKeyMaterial(hmac_key_bytes))
                     .map_err(|_| Unspecified)?;
                 let rnk = RandomizedNonceKey::new(&AES_256_GCM_SIV, &key_bytes)?;
                 self.rnk = Some(rnk);
@@ -271,7 +243,7 @@ impl Handler {
         &mut self,
         nonce_bytes: [u8; 12],
         mut check_bytes: Vec<u8>,
-        tx_udp_state: UnboundedSender<UdpState>,
+        tx_event: UnboundedSender<KexEvent>,
     ) -> Result<()> {
         info!("Received check frame with encrypted check message");
         if let Some(rnk) = &mut self.rnk {
@@ -282,9 +254,7 @@ impl Handler {
             if decrypted_data == b"Yoda" {
                 info!("Check frame verified successfully");
                 let id = Uuid::new_v4();
-                tx_udp_state
-                    .send(UdpState::Uuid(id))
-                    .map_err(|_| Unspecified)?;
+                tx_event.send(KexEvent::Uuid(id)).map_err(|_| Unspecified)?;
                 self.connection
                     .write_frame(&Frame::KeyAgreement(UuidWrapper::new(id)))
                     .await?;

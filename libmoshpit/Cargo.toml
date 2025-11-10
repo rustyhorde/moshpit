@@ -28,7 +28,7 @@ dirs2 = "3.0.1"
 getset = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
 tracing-appender = "0.2.3"
 tracing-subscriber = { version = "=0.3.19", features = [

@@ -6,26 +6,11 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-use std::net::SocketAddr;
-
 use anyhow::Result;
 use aws_lc_rs::aead::{AES_256_GCM_SIV, RandomizedNonceKey};
 use bon::Builder;
 use getset::Getters;
 use uuid::Uuid;
-
-/// State needed for UDP communication
-#[derive(Clone, Copy, Debug)]
-pub enum UdpState {
-    /// Key material for encrypting/decrypting UDP packets
-    Key([u8; 32]),
-    /// HMAC key for signing UDP packets
-    HmacKey([u8; 64]),
-    /// Client UUID
-    Uuid(Uuid),
-    /// UDP Peer Address
-    Addr(SocketAddr),
-}
 
 /// UDP client data
 #[derive(Builder, Debug, Getters)]

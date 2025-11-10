@@ -15,7 +15,7 @@ use aws_lc_rs::{
     hkdf::{HKDF_SHA256, HKDF_SHA512, Salt},
 };
 use bon::Builder;
-use libmoshpit::{ConnectionReader, Frame, UdpState};
+use libmoshpit::{ConnectionReader, Frame, KexEvent};
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::info;
 
@@ -23,7 +23,7 @@ use tracing::info;
 pub(crate) struct FrameReader {
     reader: ConnectionReader,
     tx: UnboundedSender<Frame>,
-    tx_udp: UnboundedSender<UdpState>,
+    tx_event: UnboundedSender<KexEvent>,
 }
 
 impl FrameReader {
@@ -49,11 +49,11 @@ impl FrameReader {
                 let mut hmac_key_bytes = [0u8; SHA512_OUTPUT_LEN];
                 okm_hmac.fill(&mut hmac_key_bytes)?;
 
-                self.tx_udp
-                    .send(UdpState::Key(key_bytes))
+                self.tx_event
+                    .send(KexEvent::KeyMaterial(key_bytes))
                     .map_err(|_| Unspecified)?;
-                self.tx_udp
-                    .send(UdpState::HmacKey(hmac_key_bytes))
+                self.tx_event
+                    .send(KexEvent::HMACKeyMaterial(hmac_key_bytes))
                     .map_err(|_| Unspecified)?;
                 let rnk = RandomizedNonceKey::new(&AES_256_GCM_SIV, &key_bytes)?;
                 let nonce = rnk.seal_in_place_append_tag(Aad::empty(), &mut check)?;
@@ -69,8 +69,8 @@ impl FrameReader {
             && let Frame::KeyAgreement(uuid) = frame
         {
             info!("Received key agreement frame with UUID: {}", uuid);
-            self.tx_udp
-                .send(UdpState::Uuid(*uuid.as_ref()))
+            self.tx_event
+                .send(KexEvent::Uuid(*uuid.as_ref()))
                 .map_err(|_| Unspecified)?;
         }
 
@@ -78,8 +78,8 @@ impl FrameReader {
             && let Frame::MoshpitsAddr(addr) = frame
         {
             info!("Received moshpits address frame with address: {}", addr);
-            self.tx_udp
-                .send(UdpState::Addr(addr))
+            self.tx_event
+                .send(KexEvent::MoshpitsAddr(addr))
                 .map_err(|_| Unspecified)?;
         }
         Ok(())

@@ -46,6 +46,9 @@ pub enum Error {
     /// Invalid Moshpits address
     #[error("Invalid Moshpits address")]
     InvalidMoshpitsAddress,
+    /// Invalid key exchange state
+    #[error("Invalid key exchange state")]
+    InvalidKexState,
 }
 
 /// Converts an `anyhow::Error` into a suitable exit code or clap message for a CLI application.
