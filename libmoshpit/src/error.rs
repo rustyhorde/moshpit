@@ -43,6 +43,9 @@ pub enum Error {
     /// Invalid IP address for server
     #[error("Invalid IP address for server")]
     InvalidServerAddress,
+    /// Invalid Moshpits address
+    #[error("Invalid Moshpits address")]
+    InvalidMoshpitsAddress,
 }
 
 /// Converts an `anyhow::Error` into a suitable exit code or clap message for a CLI application.

@@ -17,7 +17,10 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use aws_lc_rs::aead::{AES_256_GCM_SIV, Aad, RandomizedNonceKey};
+use aws_lc_rs::{
+    aead::{AES_256_GCM_SIV, Aad, RandomizedNonceKey},
+    hmac::{HMAC_SHA512, Key, sign},
+};
 use bon::Builder;
 use getset::MutGetters;
 use tokio::{net::UdpSocket, sync::mpsc::UnboundedReceiver};
@@ -29,6 +32,8 @@ pub(crate) struct UdpSender {
     id: Uuid,
     #[builder(with = |key: [u8; 32]| -> Result<_> { RandomizedNonceKey::new(&AES_256_GCM_SIV, &key).map_err(Into::into) })]
     rnk: RandomizedNonceKey,
+    #[builder(with = |key: [u8; 64]| { Key::new(HMAC_SHA512, &key) })]
+    hmac: Key,
     socket: Arc<UdpSocket>,
     rx: UnboundedReceiver<Vec<u8>>,
 }
@@ -44,13 +49,27 @@ impl UdpSender {
     }
 
     fn encrypt(&self, data: &[u8]) -> Result<Vec<u8>> {
-        let mut id_data = self.id.as_bytes().to_vec();
-        id_data.extend_from_slice(data);
+        trace!(
+            "data length: {}, {}",
+            data.len(),
+            String::from_utf8_lossy(data)
+        );
+        // Encrypt the id and the data then MAC
+        let mut encrypted_part = self.id.as_bytes().to_vec();
+        trace!("id length: {}", encrypted_part.len());
+        encrypted_part.extend_from_slice(data);
         let nonce = self
             .rnk
-            .seal_in_place_append_tag(Aad::empty(), &mut id_data)?;
+            .seal_in_place_append_tag(Aad::empty(), &mut encrypted_part)?;
+        // Sign the encrypted part
+        let tag = sign(&self.hmac, &encrypted_part);
+        let tag_bytes: [u8; 64] = tag.as_ref().try_into()?;
+        let len = encrypted_part.len().to_be_bytes();
+        // Prepend the nonce and length
         let mut packet = nonce.as_ref().to_vec();
-        packet.extend_from_slice(&id_data);
+        packet.extend_from_slice(&tag_bytes);
+        packet.extend_from_slice(&len);
+        packet.extend_from_slice(&encrypted_part);
         Ok(packet)
     }
 }

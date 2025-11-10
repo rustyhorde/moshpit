@@ -6,7 +6,7 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-use std::{fmt::Display, io::Cursor};
+use std::{fmt::Display, io::Cursor, net::SocketAddr};
 
 use anyhow::Result;
 use bincode::{Decode, Encode, config::standard, decode_from_slice};
@@ -29,6 +29,10 @@ pub enum Frame {
     Check([u8; 12], Vec<u8>),
     /// A key agreement message from moshpits.
     KeyAgreement(UuidWrapper),
+    /// The address the moshpits listener is bound to.
+    MoshpitsAddr(SocketAddr),
+    /// The address the moshpit listener is bound to.
+    MoshpitAddr(SocketAddr),
 }
 
 impl Frame {
@@ -40,6 +44,8 @@ impl Frame {
             Frame::PeerInitialize(_, _) => 1,
             Frame::Check(_, _) => 2,
             Frame::KeyAgreement(_) => 3,
+            Frame::MoshpitsAddr(_) => 4,
+            Frame::MoshpitAddr(_) => 5,
         }
     }
 
@@ -50,13 +56,16 @@ impl Frame {
     ///
     pub fn parse(src: &mut Cursor<&[u8]>) -> Result<Option<Self>> {
         match get_u8(src) {
-            Some(0..=3) => {
+            Some(0..=5) => {
                 if let Some(length_slice) = get_usize(src)? {
                     let length = usize::from_be_bytes(length_slice.try_into()?);
                     if let Some(data) = get_bytes(src, length)? {
                         let (frame, _): (Frame, _) = decode_from_slice(data, standard())?;
                         return Ok(Some(frame));
                     }
+                    trace!("Incomplete frame data");
+                } else {
+                    trace!("Incomplete frame length");
                 }
                 Ok(None)
             }
@@ -83,7 +92,9 @@ fn get_u8(src: &mut Cursor<&[u8]>) -> Option<u8> {
 impl Display for Frame {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Frame::Initialize(data) => write!(f, "Initialize({} bytes)", data.len()),
+            Frame::Initialize(data) => {
+                write!(f, "Initialize({} bytes)", data.len())
+            }
             Frame::PeerInitialize(pk, salt) => write!(
                 f,
                 "PeerInitialize({} bytes, {} bytes)",
@@ -94,6 +105,8 @@ impl Display for Frame {
                 write!(f, "Check({} bytes, {} bytes)", nonce.len(), data.len())
             }
             Frame::KeyAgreement(uuid) => write!(f, "KeyAgreement({uuid})"),
+            Frame::MoshpitsAddr(addr) => write!(f, "MoshpitsAddr({addr})"),
+            Frame::MoshpitAddr(addr) => write!(f, "MoshpitAddr({addr})"),
         }
     }
 }

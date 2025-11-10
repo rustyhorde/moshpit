@@ -60,12 +60,13 @@ where
         .parse::<SocketAddr>()
         .with_context(|| MoshpitError::InvalidServerAddress)?;
 
-    let (key_bytes, hmac_key_bytes, uuid) = run_key_exchange(&socket_addr).await?;
+    let (key_bytes, hmac_key_bytes, uuid, udp_arc) = run_key_exchange(&socket_addr).await?;
 
-    let udp_listener = UdpSocket::bind("127.0.0.1:0").await?;
-    udp_listener.connect(socket_addr).await?;
-    let udp_recv = Arc::new(udp_listener);
-    let udp_send = udp_recv.clone();
+    info!("key_bytes: {}", hex::encode(key_bytes));
+    info!("hmac_key_bytes: {}", hex::encode(hmac_key_bytes));
+
+    let udp_recv = udp_arc.clone();
+    let udp_send = udp_arc.clone();
     let (tx, rx) = unbounded_channel::<Vec<u8>>();
     let mut udp_reader = UdpReader::builder().socket(udp_recv).build();
     let mut udp_sender = UdpSender::builder()
@@ -102,11 +103,12 @@ where
             }
         }
     }
-
     Ok(())
 }
 
-async fn run_key_exchange(socket_addr: &SocketAddr) -> Result<([u8; 32], [u8; 64], Uuid)> {
+async fn run_key_exchange(
+    socket_addr: &SocketAddr,
+) -> Result<([u8; 32], [u8; 64], Uuid, Arc<UdpSocket>)> {
     // Setup the TCP connection to the server for key exchange
     let socket = TcpStream::connect(socket_addr).await?;
     let (sock_read, sock_write) = socket.into_split();
@@ -156,8 +158,14 @@ async fn run_key_exchange(socket_addr: &SocketAddr) -> Result<([u8; 32], [u8; 64
     let mut key_bytes = [0u8; 32];
     let mut hmac_key_bytes = [0u8; 64];
     let mut uuid = Uuid::nil();
+    let mut moshpits_addr_opt = None;
     while let Some(udp_state) = rx_udp_state.recv().await {
         match udp_state {
+            UdpState::Addr(peer_addr) => {
+                trace!("Received UDP peer address: {}", peer_addr);
+                moshpits_addr_opt = Some(peer_addr);
+                break;
+            }
             UdpState::Key(key_b) => {
                 trace!("Received UDP key");
                 key_bytes = key_b;
@@ -169,9 +177,19 @@ async fn run_key_exchange(socket_addr: &SocketAddr) -> Result<([u8; 32], [u8; 64
             UdpState::Uuid(set_uuid) => {
                 trace!("Received UDP UUID: {}", set_uuid);
                 uuid = set_uuid;
-                break;
             }
         }
     }
-    Ok((key_bytes, hmac_key_bytes, uuid))
+
+    if let Some(moshpits_addr) = moshpits_addr_opt {
+        let socket_addr = "0.0.0.0:0".parse::<SocketAddr>()?;
+        let udp_listener = UdpSocket::bind(socket_addr).await?;
+        udp_listener.connect(moshpits_addr).await?;
+        let frame = Frame::MoshpitAddr(udp_listener.local_addr()?);
+        tx.send(frame.clone())?;
+        trace!("Bound UDP socket to {}", udp_listener.local_addr()?);
+        Ok((key_bytes, hmac_key_bytes, uuid, Arc::new(udp_listener)))
+    } else {
+        Err(MoshpitError::InvalidMoshpitsAddress.into())
+    }
 }

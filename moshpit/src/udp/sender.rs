@@ -41,8 +41,14 @@ impl UdpSender {
     }
 
     fn encrypt(&self, data: &[u8]) -> Result<Vec<u8>> {
+        trace!(
+            "data length: {}, {}",
+            data.len(),
+            String::from_utf8_lossy(data)
+        );
         // Encrypt the id and the data then MAC
         let mut encrypted_part = self.id.as_bytes().to_vec();
+        trace!("id length: {}", encrypted_part.len());
         encrypted_part.extend_from_slice(data);
         let nonce = self
             .rnk

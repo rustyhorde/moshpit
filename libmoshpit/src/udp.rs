@@ -6,6 +6,8 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
+use std::net::SocketAddr;
+
 use anyhow::Result;
 use aws_lc_rs::aead::{AES_256_GCM_SIV, RandomizedNonceKey};
 use bon::Builder;
@@ -21,6 +23,8 @@ pub enum UdpState {
     HmacKey([u8; 64]),
     /// Client UUID
     Uuid(Uuid),
+    /// UDP Peer Address
+    Addr(SocketAddr),
 }
 
 /// UDP client data

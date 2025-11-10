@@ -90,6 +90,9 @@ impl ConnectionReader {
         // parse of the frame, and allows us to skip allocating data structures
         // to hold the frame data unless we know the full frame has been
         // received.
+        // Reset the position to zero before passing the cursor to `Frame::parse`.
+        buf.set_position(0);
+
         match Frame::parse(&mut buf) {
             Ok(Some(frame)) => {
                 // The `parse` function will have advanced the cursor until the

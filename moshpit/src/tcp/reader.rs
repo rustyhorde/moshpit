@@ -17,7 +17,7 @@ use aws_lc_rs::{
 use bon::Builder;
 use libmoshpit::{ConnectionReader, Frame, UdpState};
 use tokio::sync::mpsc::UnboundedSender;
-use tracing::{error, info};
+use tracing::info;
 
 #[derive(Builder)]
 pub(crate) struct FrameReader {
@@ -48,7 +48,7 @@ impl FrameReader {
                     pseudo_random_key.expand(&[b"hmac key"], HKDF_SHA512.hmac_algorithm())?;
                 let mut hmac_key_bytes = [0u8; SHA512_OUTPUT_LEN];
                 okm_hmac.fill(&mut hmac_key_bytes)?;
-                error!("Derived HMAC key bytes: {}", hex::encode(hmac_key_bytes));
+
                 self.tx_udp
                     .send(UdpState::Key(key_bytes))
                     .map_err(|_| Unspecified)?;
@@ -71,6 +71,15 @@ impl FrameReader {
             info!("Received key agreement frame with UUID: {}", uuid);
             self.tx_udp
                 .send(UdpState::Uuid(*uuid.as_ref()))
+                .map_err(|_| Unspecified)?;
+        }
+
+        if let Some(frame) = self.reader.read_frame().await?
+            && let Frame::MoshpitsAddr(addr) = frame
+        {
+            info!("Received moshpits address frame with address: {}", addr);
+            self.tx_udp
+                .send(UdpState::Addr(addr))
                 .map_err(|_| Unspecified)?;
         }
         Ok(())

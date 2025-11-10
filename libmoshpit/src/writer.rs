@@ -40,7 +40,7 @@ impl ConnectionWriter {
         trace!("Writing frame of type id={}", id);
         let encoded = encode_to_vec(frame, standard())?;
         let len = encoded.len();
-        self.writer.write_u8(0).await?;
+        self.writer.write_u8(id).await?;
         self.writer.write_all(len.to_be_bytes().as_slice()).await?;
         self.writer.write_all(&encoded).await?;
 

@@ -6,7 +6,14 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-use std::{ffi::OsString, net::SocketAddr, sync::Arc};
+use std::{
+    ffi::OsString,
+    net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicU16, Ordering},
+    },
+};
 
 use anyhow::{Context as _, Result};
 use aws_lc_rs::{
@@ -19,7 +26,9 @@ use aws_lc_rs::{
     rand::{SystemRandom, fill},
 };
 use clap::Parser as _;
-use libmoshpit::{Connection, Frame, MoshpitError, UdpState, UuidWrapper, init_tracing, load};
+use libmoshpit::{
+    Connection, EncryptedFrame, Frame, MoshpitError, UdpState, UuidWrapper, init_tracing, load,
+};
 use tokio::{
     net::{TcpListener, UdpSocket},
     spawn,
@@ -33,6 +42,8 @@ use crate::{
     config::Config,
     udp::{reader::UdpReader, sender::UdpSender},
 };
+
+static CURRENT_UDP_PORT: AtomicU16 = AtomicU16::new(50000);
 
 pub(crate) async fn run<I, T>(args: Option<I>) -> Result<()>
 where
@@ -65,25 +76,26 @@ where
         config.mps().port(),
     );
     let listener = TcpListener::bind(socket_addr).await?;
-    let udp_listener = UdpSocket::bind(socket_addr).await?;
-    let udp_arc = Arc::new(udp_listener);
 
     loop {
         match listener.accept().await {
             Ok((socket, addr)) => {
-                info!("Accepted connection from {addr}");
+                error!("Accepted connection from {addr}");
                 let mut handler = Handler {
                     connection: Connection::new(socket),
                     rnk: None,
                 };
-                let udp_recv = udp_arc.clone();
-                let udp_send = udp_arc.clone();
-                let _handle = spawn(async move {
-                    match handler.handle_connection().await {
-                        Ok((key_bytes, hmac_key_bytes, uuid)) => {
-                            info!("connection can be promoted");
 
+                let config_clone = config.clone();
+                let _handle = spawn(async move {
+                    match handler.handle_connection(&config_clone).await {
+                        Ok((key_bytes, hmac_key_bytes, uuid, udp_arc)) => {
+                            info!("connection can be promoted");
+                            info!("key_bytes: {}", hex::encode(key_bytes));
+                            info!("hmac_key_bytes: {}", hex::encode(hmac_key_bytes));
                             let (_tx, rx) = unbounded_channel::<Vec<u8>>();
+                            let udp_recv = udp_arc.clone();
+                            let udp_send = udp_arc.clone();
 
                             let mut udp_reader = UdpReader::builder()
                                 .socket(udp_recv)
@@ -96,13 +108,20 @@ where
                                 .socket(udp_send)
                                 .rx(rx)
                                 .id(uuid)
+                                .hmac(hmac_key_bytes)
                                 .rnk(key_bytes)
                                 .unwrap()
                                 .build();
 
                             let _udp_reader_handle = spawn(async move {
-                                if let Err(e) = udp_reader.read_encrypted_frame().await {
-                                    error!("udp reader error {e}");
+                                while let Ok(frame_opt) = udp_reader.read_encrypted_frame().await {
+                                    if let Some(frame) = frame_opt {
+                                        match frame {
+                                            EncryptedFrame::Bytes((id, _message)) => {
+                                                info!("Received UDP packet for id {}", id);
+                                            }
+                                        }
+                                    }
                                 }
                             });
 
@@ -111,6 +130,7 @@ where
                                     error!("udp sender error {e}");
                                 }
                             });
+                            info!("UDP sender and reader tasks spawned");
                         }
                         Err(e) => error!("connection error: {e} from {addr}"),
                     }
@@ -127,7 +147,10 @@ struct Handler {
 }
 
 impl Handler {
-    async fn handle_connection(&mut self) -> Result<([u8; 32], [u8; 64], Uuid)> {
+    async fn handle_connection(
+        &mut self,
+        config: &Config,
+    ) -> Result<([u8; 32], [u8; 64], Uuid, Arc<UdpSocket>)> {
         let (tx_udp_state, mut rx_udp_state) = unbounded_channel::<UdpState>();
         if let Some(frame) = self.connection.read_frame().await? {
             if let Frame::Initialize(pk) = frame {
@@ -147,6 +170,18 @@ impl Handler {
             }
         }
 
+        let udp_arc = self.handle_udp_setup(config).await?;
+
+        if let Some(frame) = self.connection.read_frame().await? {
+            if let Frame::MoshpitAddr(moshpit_addr) = frame {
+                info!("Received address from moshpit: {}", moshpit_addr);
+                udp_arc.connect(moshpit_addr).await?;
+            } else {
+                error!("Expected moshpit address frame");
+                return Err(MoshpitError::InvalidFrame.into());
+            }
+        }
+
         // Wait for UDP state updates with the key and UUID
         // once we have both, we can set up the UDP socket
         let mut key_bytes = [0u8; 32];
@@ -154,6 +189,9 @@ impl Handler {
         let mut uuid = Uuid::nil();
         while let Some(udp_state) = rx_udp_state.recv().await {
             match udp_state {
+                UdpState::Addr(_) => {
+                    // Already handled above
+                }
                 UdpState::Key(key_b) => {
                     trace!("Received UDP key");
                     key_bytes = key_b;
@@ -169,7 +207,8 @@ impl Handler {
                 }
             }
         }
-        Ok((key_bytes, hmac_key_bytes, uuid))
+
+        Ok((key_bytes, hmac_key_bytes, uuid, udp_arc))
     }
 
     async fn handle_initialize(
@@ -213,7 +252,6 @@ impl Handler {
                     pseudo_random_key.expand(&[b"hmac key"], HKDF_SHA512.hmac_algorithm())?;
                 let mut hmac_key_bytes = [0u8; SHA512_OUTPUT_LEN];
                 okm_hmac.fill(&mut hmac_key_bytes)?;
-                error!("Derived HMAC key bytes: {}", hex::encode(hmac_key_bytes));
 
                 tx_udp_state
                     .send(UdpState::Key(key_bytes))
@@ -259,5 +297,24 @@ impl Handler {
             return Err(MoshpitError::KeyNotEstablished.into());
         }
         Ok(())
+    }
+
+    async fn handle_udp_setup(&mut self, config: &Config) -> Result<Arc<UdpSocket>> {
+        let next_port = CURRENT_UDP_PORT.fetch_add(1, Ordering::SeqCst);
+        let socket_addr = SocketAddr::new(
+            config
+                .mps()
+                .ip()
+                .parse()
+                .with_context(|| MoshpitError::InvalidIpAddress)?,
+            next_port,
+        );
+        self.connection
+            .write_frame(&Frame::MoshpitsAddr(socket_addr))
+            .await?;
+
+        let udp_listener = UdpSocket::bind(socket_addr).await?;
+        trace!("Bound UDP socket to {}", udp_listener.local_addr()?);
+        Ok(Arc::new(udp_listener))
     }
 }

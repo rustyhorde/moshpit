@@ -163,7 +163,7 @@ impl Connection {
         trace!("Writing frame of type id={}", id);
         let encoded = encode_to_vec(frame, standard())?;
         let len = encoded.len();
-        self.stream.write_u8(0).await?;
+        self.stream.write_u8(id).await?;
         self.stream.write_all(len.to_be_bytes().as_slice()).await?;
         self.stream.write_all(&encoded).await?;
 
