@@ -12,6 +12,9 @@ use bon::Builder;
 use getset::Getters;
 use uuid::Uuid;
 
+pub(crate) mod reader;
+pub(crate) mod sender;
+
 /// UDP client data
 #[derive(Builder, Debug, Getters)]
 #[getset(get = "pub")]

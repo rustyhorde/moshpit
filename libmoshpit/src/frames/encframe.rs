@@ -20,7 +20,7 @@ use tracing::{error, info, trace};
 use uuid::Uuid;
 
 use crate::{
-    UuidWrapper,
+    MoshpitError, UuidWrapper,
     frames::{get_bytes, get_nonce, get_usize},
 };
 
@@ -41,6 +41,7 @@ impl EncryptedFrame {
     ///
     pub fn parse(
         src: &mut Cursor<&[u8]>,
+        id: Uuid,
         hmac: &Key,
         rnk: &RandomizedNonceKey,
     ) -> Result<Option<Self>> {
@@ -59,6 +60,10 @@ impl EncryptedFrame {
                         info!("trying to parse uuid");
                         let (uuid_bytes, rest) = data.split_at(UUID_LEN);
                         let uuid = Uuid::from_bytes(uuid_bytes.try_into()?);
+                        if uuid != id {
+                            error!("UUID mismatch: expected {id}, got {uuid}");
+                            return Err(MoshpitError::UuidMismatch.into());
+                        }
                         let uuid_wrapper = UuidWrapper::new(uuid);
                         trace!("uuid: {uuid_wrapper}");
                         let mut message_with_tag = rest.to_vec();

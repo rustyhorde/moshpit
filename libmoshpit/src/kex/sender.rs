@@ -8,17 +8,27 @@
 
 use anyhow::Result;
 use bon::Builder;
-use libmoshpit::{ConnectionWriter, Frame};
 use tokio::sync::mpsc::UnboundedReceiver;
 
-#[derive(Builder)]
-pub(crate) struct FrameSender {
+use crate::{ConnectionWriter, Frame};
+
+/// The key exchange sender for the moshpit
+#[derive(Builder, Debug)]
+pub struct KexSender {
+    /// The connection writer
     writer: ConnectionWriter,
+    /// The receiver for frames to send
     rx: UnboundedReceiver<Frame>,
 }
 
-impl FrameSender {
-    pub(crate) async fn handle_tx(&mut self) -> Result<()> {
+impl KexSender {
+    /// Handle sending frames
+    ///
+    /// # Errors
+    ///
+    /// * `write_frame` errors
+    ///
+    pub async fn handle_send_frames(&mut self) -> Result<()> {
         while let Some(frame) = self.rx.recv().await {
             self.writer.write_frame(&frame).await?;
         }

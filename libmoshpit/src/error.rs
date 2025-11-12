@@ -49,6 +49,9 @@ pub enum Error {
     /// Invalid key exchange state
     #[error("Invalid key exchange state")]
     InvalidKexState,
+    /// UUID mismatch
+    #[error("UUID mismatch")]
+    UuidMismatch,
 }
 
 /// Converts an `anyhow::Error` into a suitable exit code or clap message for a CLI application.

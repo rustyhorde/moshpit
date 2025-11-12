@@ -251,8 +251,6 @@ use crate::runtime::run;
 mod cli;
 mod config;
 mod runtime;
-mod tcp;
-mod udp;
 
 #[tokio::main]
 async fn main() -> Result<()> {

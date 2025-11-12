@@ -242,16 +242,14 @@
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
 mod config;
-mod connection;
 mod error;
 mod frames;
 mod kex;
-mod reader;
+mod tcp;
 mod tracing;
 mod udp;
 mod utils;
 mod uuid;
-mod writer;
 
 pub use self::config::PathDefaults;
 pub use self::config::load;
@@ -259,7 +257,6 @@ pub use self::config::mps::Mps;
 pub use self::config::tracing::FileLayer;
 pub use self::config::tracing::Layer;
 pub use self::config::tracing::Tracing;
-pub use self::connection::Connection;
 pub use self::error::Error as MoshpitError;
 pub use self::error::clap_or_error;
 pub use self::error::success;
@@ -267,11 +264,17 @@ pub use self::frames::encframe::EncryptedFrame;
 pub use self::frames::frame::Frame;
 pub use self::kex::Kex;
 pub use self::kex::KexEvent;
+pub use self::kex::KexMode;
 pub use self::kex::KexState;
 pub use self::kex::KexStateMachine;
-pub use self::reader::ConnectionReader;
+pub use self::kex::reader::KexReader;
+pub use self::kex::run_key_exchange;
+pub use self::kex::sender::KexSender;
+pub use self::tcp::reader::ConnectionReader;
+pub use self::tcp::writer::ConnectionWriter;
 pub use self::tracing::{TracingConfigExt, init_tracing};
 pub use self::udp::UdpClient;
+pub use self::udp::reader::UdpReader;
+pub use self::udp::sender::UdpSender;
 pub use self::utils::to_path_buf;
 pub use self::uuid::UuidWrapper;
-pub use self::writer::ConnectionWriter;

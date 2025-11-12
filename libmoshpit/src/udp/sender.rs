@@ -6,14 +6,6 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-// Copyright (c) 2025 moshpit developers
-//
-// Licensed under the Apache License, Version 2.0
-// <LICENSE-APACHE or https://www.apache.org/licenses/LICENSE-2.0> or the MIT
-// license <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your
-// option. All files in the project carrying such notice may not be copied,
-// modified, or distributed except according to those terms.
-
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -27,19 +19,31 @@ use tokio::{net::UdpSocket, sync::mpsc::UnboundedReceiver};
 use tracing::trace;
 use uuid::Uuid;
 
-#[derive(Builder, MutGetters)]
-pub(crate) struct UdpSender {
+/// UDP sender for encrypted frames
+#[derive(Builder, Debug, MutGetters)]
+pub struct UdpSender {
+    /// Client UUID
     id: Uuid,
+    /// Key for encrypting/decrypting UDP packets
     #[builder(with = |key: [u8; 32]| -> Result<_> { RandomizedNonceKey::new(&AES_256_GCM_SIV, &key).map_err(Into::into) })]
     rnk: RandomizedNonceKey,
+    /// Key for signing UDP packet HMAC
     #[builder(with = |key: [u8; 64]| { Key::new(HMAC_SHA512, &key) })]
     hmac: Key,
+    /// Underlying UDP socket
     socket: Arc<UdpSocket>,
+    /// Channel receiver for outgoing packets
     rx: UnboundedReceiver<Vec<u8>>,
 }
 
 impl UdpSender {
-    pub(crate) async fn handle_send(&mut self) -> Result<()> {
+    /// Handle sending packets received on the channel
+    ///
+    /// # Errors
+    ///
+    /// * I/O error.
+    ///
+    pub async fn handle_send(&mut self) -> Result<()> {
         while let Some(bytes) = self.rx.recv().await {
             let packet = self.encrypt(&bytes)?;
             let len = self.socket.send(&packet).await?;

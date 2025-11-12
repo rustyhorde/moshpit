@@ -7,4 +7,4 @@
 // modified, or distributed except according to those terms.
 
 pub(crate) mod reader;
-pub(crate) mod sender;
+pub(crate) mod writer;

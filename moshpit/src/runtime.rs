@@ -6,31 +6,18 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-use std::{ffi::OsString, io::stdin, net::SocketAddr, sync::Arc};
+use std::{ffi::OsString, io::stdin, net::SocketAddr};
 
 use anyhow::{Context as _, Result};
-use aws_lc_rs::{
-    agreement::{EphemeralPrivateKey, X25519},
-    rand::SystemRandom,
-};
 use clap::Parser as _;
 use libmoshpit::{
-    ConnectionReader, ConnectionWriter, Frame, Kex, KexEvent, KexStateMachine, MoshpitError,
-    init_tracing, load,
+    EncryptedFrame, KexMode, MoshpitError, UdpReader, UdpSender, init_tracing, load,
+    run_key_exchange,
 };
-use tokio::{
-    net::{TcpStream, UdpSocket},
-    spawn,
-    sync::mpsc::unbounded_channel,
-};
+use tokio::{net::TcpStream, spawn, sync::mpsc::unbounded_channel};
 use tracing::{error, info, trace};
 
-use crate::{
-    cli::Cli,
-    config::Config,
-    tcp::{reader::FrameReader, sender::FrameSender},
-    udp::{reader::UdpReader, sender::UdpSender},
-};
+use crate::{cli::Cli, config::Config};
 
 pub(crate) async fn run<I, T>(args: Option<I>) -> Result<()>
 where
@@ -59,13 +46,22 @@ where
         .server_ip()
         .parse::<SocketAddr>()
         .with_context(|| MoshpitError::InvalidServerAddress)?;
+    let socket = TcpStream::connect(socket_addr).await?;
+    let (sock_read, sock_write) = socket.into_split();
 
-    let (kex, udp_arc) = run_key_exchange(&socket_addr).await?;
+    // Run the key exchange
+    let (kex, udp_arc) = run_key_exchange(KexMode::Client, sock_read, sock_write).await?;
 
     let udp_recv = udp_arc.clone();
     let udp_send = udp_arc.clone();
     let (tx, rx) = unbounded_channel::<Vec<u8>>();
-    let mut udp_reader = UdpReader::builder().socket(udp_recv).build();
+    let mut udp_reader = UdpReader::builder()
+        .socket(udp_recv)
+        .id(kex.uuid())
+        .hmac(kex.hmac_key())
+        .rnk(kex.key())
+        .unwrap()
+        .build();
     let mut udp_sender = UdpSender::builder()
         .socket(udp_send)
         .rx(rx)
@@ -81,12 +77,16 @@ where
     });
 
     let _udp_reader_handle = spawn(async move {
-        if let Err(e) = udp_reader.handle_read().await {
-            error!("udp reader error {e}");
+        while let Ok(frame_opt) = udp_reader.read_encrypted_frame().await {
+            if let Some(frame) = frame_opt {
+                match frame {
+                    EncryptedFrame::Bytes((id, _message)) => {
+                        info!("Received UDP packet for id {}", id);
+                    }
+                }
+            }
         }
     });
-
-    tx.send(b"Hello, world!".to_vec())?;
 
     loop {
         let mut input = String::new();
@@ -101,66 +101,4 @@ where
         }
     }
     Ok(())
-}
-
-async fn run_key_exchange(socket_addr: &SocketAddr) -> Result<(Kex, Arc<UdpSocket>)> {
-    // Setup the TCP connection to the server for key exchange
-    let socket = TcpStream::connect(socket_addr).await?;
-    let (sock_read, sock_write) = socket.into_split();
-    let reader = ConnectionReader::builder().reader(sock_read).build();
-    let writer = ConnectionWriter::builder().writer(sock_write).build();
-    let (tx, rx) = unbounded_channel();
-    let (tx_event, rx_event) = unbounded_channel::<KexEvent>();
-    let mut kex_sm = KexStateMachine::builder().rx_event(rx_event).build();
-    let kex_handle = spawn(async move { kex_sm.handle_events(true).await });
-    info!("Connected to the server!");
-
-    // Generate ephemeral X25519 key pair
-    let rng = SystemRandom::new();
-    let pk = EphemeralPrivateKey::generate(&X25519, &rng)?;
-    let my_public_key = pk.compute_public_key()?;
-    trace!("Generated ephemeral X25519 key pair");
-
-    // Setup the TCP frame reader
-    let tx_c = tx.clone();
-    let tx_event_c = tx_event.clone();
-    let _read_handle = spawn(async move {
-        let mut frame_reader = FrameReader::builder()
-            .reader(reader)
-            .tx(tx_c)
-            .tx_event(tx_event_c)
-            .build();
-        if let Err(e) = frame_reader.handle_connection(pk).await {
-            error!("mps frame reader: {e}");
-        }
-    });
-    trace!("Spawned TCP frame reader task");
-
-    // Setup the TCP frame sender
-    let _write_handle = spawn(async move {
-        let mut sender = FrameSender::builder().writer(writer).rx(rx).build();
-        if let Err(e) = sender.handle_tx().await {
-            error!("mp sender error {e}");
-        }
-    });
-    trace!("Spawned TCP frame sender task");
-
-    // Send the initialize frame with our public key
-    trace!("Sending initialize frame...");
-    let frame = Frame::Initialize(my_public_key.as_ref().to_vec());
-    tx.send(frame.clone())?;
-
-    let kex = kex_handle.await??;
-
-    if let Some(moshpits_addr) = kex.moshpits_addr() {
-        let socket_addr = "0.0.0.0:0".parse::<SocketAddr>()?;
-        let udp_listener = UdpSocket::bind(socket_addr).await?;
-        udp_listener.connect(moshpits_addr).await?;
-        let frame = Frame::MoshpitAddr(udp_listener.local_addr()?);
-        tx.send(frame.clone())?;
-        trace!("Bound UDP socket to {}", udp_listener.local_addr()?);
-        Ok((kex, Arc::new(udp_listener)))
-    } else {
-        Err(MoshpitError::InvalidMoshpitsAddress.into())
-    }
 }

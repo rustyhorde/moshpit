@@ -2023,9 +2023,6 @@ name = "moshpit"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "aws-lc-rs",
- "bon",
- "bytes",
  "clap",
  "config",
  "getset",
@@ -2035,7 +2032,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber-init",
- "uuid",
  "vergen-gix",
  "vergen-pretty",
 ]
@@ -2045,9 +2041,6 @@ name = "moshpits"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "aws-lc-rs",
- "bon",
- "bytes",
  "clap",
  "config",
  "getset",
@@ -2057,7 +2050,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber-init",
- "uuid",
  "vergen-gix",
  "vergen-pretty",
 ]
