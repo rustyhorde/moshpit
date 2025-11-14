@@ -24,7 +24,7 @@ use tokio::{
     sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
     task::JoinHandle,
 };
-use tracing::error;
+use tracing::{error, trace};
 use uuid::Uuid;
 
 use crate::{
@@ -232,6 +232,7 @@ async fn run_client_kex(
     let kex = kex_handle.await??;
 
     if let Some(moshpits_addr) = kex.moshpits_addr() {
+        trace!("Connecting to moshpits at {moshpits_addr}");
         let socket_addr = "0.0.0.0:0".parse::<SocketAddr>()?;
         let udp_listener = UdpSocket::bind(socket_addr).await?;
         udp_listener.connect(moshpits_addr).await?;

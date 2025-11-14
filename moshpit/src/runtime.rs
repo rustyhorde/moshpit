@@ -13,10 +13,7 @@ use std::{
     thread,
 };
 
-use ansi_control_codes::{
-    explain::Explain as _,
-    parser::{Token, TokenStream},
-};
+use ansi_control_codes::parser::{Token, TokenStream};
 use anyhow::{Context as _, Result};
 use bytes::{Buf as _, BytesMut};
 use clap::Parser as _;
@@ -131,30 +128,31 @@ where
                         }
                         let result = TokenStream::from(&valid_utf8).collect::<Vec<Token<'_>>>();
 
-                        for (i, part) in result.iter().enumerate() {
+                        // for (_i, part) in result.iter().enumerate() {
+                        for part in &result {
                             match part {
-                                Token::String(string) => {
-                                    trace!("{i}. Normal String: {string}");
+                                Token::String(_string) => {
+                                    // trace!("{i}. Normal String: {string}");
                                 }
-                                Token::ControlFunction(control_function) => {
-                                    trace!(
-                                        "{i}. Control Function: {} ({})",
-                                        control_function.short_name().unwrap_or_default(),
-                                        control_function.long_name()
-                                    );
-                                    trace!(
-                                        "Short description: {}",
-                                        control_function.short_description()
-                                    );
-                                    trace!(
-                                        "Long description: {}",
-                                        control_function.long_description()
-                                    );
+                                Token::ControlFunction(_control_function) => {
+                                    // trace!(
+                                    //     "{i}. Control Function: {} ({})",
+                                    //     control_function.short_name().unwrap_or_default(),
+                                    //     control_function.long_name()
+                                    // );
+                                    // trace!(
+                                    //     "Short description: {}",
+                                    //     control_function.short_description()
+                                    // );
+                                    // trace!(
+                                    //     "Long description: {}",
+                                    //     control_function.long_description()
+                                    // );
                                 }
                             }
-                            if i < (result.len() - 1) {
-                                trace!("---------------------");
-                            }
+                            // if i < (result.len() - 1) {
+                            //     trace!("---------------------");
+                            // }
                         }
                         let _unused = stdout_tx_c.send(valid_utf8.into_bytes());
                     }

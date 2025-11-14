@@ -25,8 +25,9 @@ use aws_lc_rs::{
     rand::{SystemRandom, fill},
 };
 use bon::Builder;
+use local_ip_address::linux::local_ip;
 use tokio::{net::UdpSocket, sync::mpsc::UnboundedSender};
-use tracing::error;
+use tracing::{error, trace};
 use uuid::Uuid;
 
 use crate::{ConnectionReader, Frame, KexEvent, MoshpitError, UuidWrapper};
@@ -227,8 +228,11 @@ impl KexReader {
     async fn handle_udp_setup(&mut self, mut socket_addr: SocketAddr) -> Result<Arc<UdpSocket>> {
         let next_port = CURRENT_UDP_PORT.fetch_add(1, Ordering::SeqCst);
         socket_addr.set_port(next_port);
-        self.tx.send(Frame::MoshpitsAddr(socket_addr))?;
-        let udp_listener = UdpSocket::bind(socket_addr).await?;
+        let my_local_ip = local_ip()?;
+        let udp_socket_addr = SocketAddr::new(my_local_ip, socket_addr.port());
+        trace!("Connecting to moshpits at {udp_socket_addr}");
+        self.tx.send(Frame::MoshpitsAddr(udp_socket_addr))?;
+        let udp_listener = UdpSocket::bind(udp_socket_addr).await?;
         Ok(Arc::new(udp_listener))
     }
 }
