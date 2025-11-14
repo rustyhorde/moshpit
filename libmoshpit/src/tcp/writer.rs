@@ -10,7 +10,6 @@ use anyhow::Result;
 use bincode::{config::standard, encode_to_vec};
 use bon::Builder;
 use tokio::{io::AsyncWriteExt as _, net::tcp::OwnedWriteHalf};
-use tracing::trace;
 
 use crate::Frame;
 
@@ -37,7 +36,6 @@ impl ConnectionWriter {
     ///
     pub async fn write_frame(&mut self, frame: &Frame) -> Result<()> {
         let id = frame.id();
-        trace!("Writing frame of type id={}", id);
         let encoded = encode_to_vec(frame, standard())?;
         let len = encoded.len();
         self.writer.write_u8(id).await?;

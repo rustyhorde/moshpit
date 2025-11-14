@@ -12,7 +12,6 @@ use anyhow::Result;
 use bon::Builder;
 use bytes::{Buf as _, BytesMut};
 use tokio::{io::AsyncReadExt as _, net::tcp::OwnedReadHalf};
-use tracing::trace;
 
 use crate::{Frame, error::Error};
 
@@ -46,11 +45,9 @@ impl ConnectionReader {
     ///
     pub async fn read_frame(&mut self) -> Result<Option<Frame>> {
         loop {
-            trace!("Reading frame...");
             // Attempt to parse a frame from the buffered data. If enough data
             // has been buffered, the frame is returned.
             if let Some(frame) = self.parse_frame()? {
-                trace!("Parsed frame: {frame}");
                 return Ok(Some(frame));
             }
 
@@ -59,7 +56,6 @@ impl ConnectionReader {
             //
             // On success, the number of bytes is returned. `0` indicates "end
             // of stream".
-            trace!("Reading buffer...");
             if 0 == self.reader.read_buf(&mut self.buffer).await? {
                 // The remote closed the connection. For this to be a clean
                 // shutdown, there should be no data in the read buffer. If
@@ -70,7 +66,6 @@ impl ConnectionReader {
                 }
                 return Err(Error::ConnectionResetByPeer.into());
             }
-            trace!("Read {} bytes from socket", self.buffer.len());
         }
     }
 

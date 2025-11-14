@@ -11,7 +11,6 @@ use std::{fmt::Display, io::Cursor, net::SocketAddr};
 use anyhow::Result;
 use bincode::{Decode, Encode, config::standard, decode_from_slice};
 use bytes::Buf as _;
-use tracing::trace;
 
 use crate::{
     frames::{get_bytes, get_usize},
@@ -63,20 +62,10 @@ impl Frame {
                         let (frame, _): (Frame, _) = decode_from_slice(data, standard())?;
                         return Ok(Some(frame));
                     }
-                    trace!("Incomplete frame data");
-                } else {
-                    trace!("Incomplete frame length");
                 }
                 Ok(None)
             }
-            Some(_) => {
-                trace!("Unknown frame");
-                Ok(None)
-            }
-            None => {
-                trace!("Incomplete frame");
-                Ok(None)
-            }
+            Some(_) | None => Ok(None),
         }
     }
 }

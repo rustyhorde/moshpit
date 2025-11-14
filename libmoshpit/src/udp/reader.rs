@@ -14,9 +14,9 @@ use aws_lc_rs::{
     hmac::{HMAC_SHA512, Key},
 };
 use bon::Builder;
-use bytes::{Buf as _, BytesMut};
+use bytes::BytesMut;
 use tokio::net::UdpSocket;
-use tracing::trace;
+use tracing::{error, info};
 use uuid::Uuid;
 
 use crate::{EncryptedFrame, MoshpitError};
@@ -26,9 +26,9 @@ use crate::{EncryptedFrame, MoshpitError};
 pub struct UdpReader {
     /// Underlying UDP socket
     socket: Arc<UdpSocket>,
-    /// Read buffer
-    #[builder(default = BytesMut::with_capacity(4096))]
-    buffer: BytesMut,
+    // /// Read buffer
+    // #[builder(default = BytesMut::with_capacity(8192))]
+    // buffer: BytesMut,
     /// Client UUID
     id: Uuid,
     /// Key for decrypting UDP packets
@@ -37,6 +37,8 @@ pub struct UdpReader {
     /// Key for verifying UDP packet HMAC
     #[builder(with = |key: [u8; 64]| { Key::new(HMAC_SHA512, &key) })]
     hmac: Key,
+    #[builder(default)]
+    total_bytes_received: usize,
 }
 
 impl UdpReader {
@@ -59,31 +61,28 @@ impl UdpReader {
     ///
     pub async fn read_encrypted_frame(&mut self) -> Result<Option<EncryptedFrame>> {
         loop {
-            trace!("Reading frame...");
-            // Attempt to parse a frame from the buffered data. If enough data
-            // has been buffered, the frame is returned.
-            if let Some(frame) = self.parse_encrypted_frame()? {
-                trace!("Parsed frame");
-                return Ok(Some(frame));
-            }
+            let mut buffer = BytesMut::with_capacity(8192);
 
-            // There is not enough buffered data to read a frame. Attempt to
-            // read more data from the socket.
-            //
-            // On success, the number of bytes is returned. `0` indicates "end
-            // of stream".
-            trace!("Reading buffer...");
-            if 0 == self.socket.recv_buf(&mut self.buffer).await? {
+            let len = self.socket.recv_buf(&mut buffer).await?;
+            self.total_bytes_received += len;
+
+            if len == 0 {
                 // The remote closed the connection. For this to be a clean
                 // shutdown, there should be no data in the read buffer. If
                 // there is, this means that the peer closed the socket while
                 // sending a frame.
-                if self.buffer.is_empty() {
+                if buffer.is_empty() {
+                    info!("empty buffer after 0 bytes read, returning None");
                     return Ok(None);
                 }
                 return Err(MoshpitError::ConnectionResetByPeer.into());
             }
-            trace!("Read {} bytes from socket", self.buffer.len());
+
+            // Attempt to parse a frame from the buffered data. If enough data
+            // has been buffered, the frame is returned.
+            if let Some(frame) = self.parse_encrypted_frame(&mut buffer)? {
+                return Ok(Some(frame));
+            }
         }
     }
 
@@ -91,12 +90,12 @@ impl UdpReader {
     /// data, the frame is returned and the data removed from the buffer. If not
     /// enough data has been buffered yet, `Ok(None)` is returned. If the
     /// buffered data does not represent a valid frame, `Err` is returned.
-    fn parse_encrypted_frame(&mut self) -> Result<Option<EncryptedFrame>> {
+    fn parse_encrypted_frame(&mut self, buffer: &mut BytesMut) -> Result<Option<EncryptedFrame>> {
         // Cursor is used to track the "current" location in the
         // buffer. Cursor also implements `Buf` from the `bytes` crate
         // which provides a number of helpful utilities for working
         // with bytes.
-        let mut buf = Cursor::new(&self.buffer[..]);
+        let mut buf = Cursor::new(&buffer[..]);
 
         // The first step is to check if enough data has been buffered to parse
         // a single frame. This step is usually much faster than doing a full
@@ -114,14 +113,16 @@ impl UdpReader {
                 // before `Frame::parse` was called, we obtain the length of the
                 // frame by checking the cursor position.
                 let len = usize::try_from(buf.position())?;
-
+                info!("buf postion after parse: {len}");
                 // Discard the parsed data from the read buffer.
                 //
                 // When `advance` is called on the read buffer, all of the data
                 // up to `len` is discarded. The details of how this works is
                 // left to `BytesMut`. This is often done by moving an internal
                 // cursor, but it may be done by reallocating and copying data.
-                self.buffer.advance(len);
+                // self.buffer.advance(len);
+                buffer.clear();
+                info!("remaining buffer length: {}", buffer.len());
 
                 // Return the parsed frame to the caller.
                 Ok(Some(frame))
@@ -137,7 +138,7 @@ impl UdpReader {
                 Ok(None)
             }
             Err(err) => {
-                eprintln!("Frame parse error: {err:?}");
+                error!("Error parsing frame: {}", err);
                 Err(err)
             }
         }

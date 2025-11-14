@@ -22,12 +22,14 @@ unstable = []
 
 [dependencies]
 anyhow = { workspace = true }
+bytes.workspace = true
 clap = { workspace = true }
 config = { workspace = true }
 getset = { workspace = true }
 libmoshpit = { version = "0.1.0", path = "../libmoshpit" }
 serde = { workspace = true }
-tokio = { workspace = true, features = ["sync","time"] }
+termion = "4.0.5"
+tokio = { workspace = true, features = ["io-std", "sync", "time"] }
 tracing = { workspace = true }
 tracing-subscriber-init = { workspace = true }
 vergen-pretty = { workspace = true }

@@ -16,7 +16,6 @@ use aws_lc_rs::{
 use bon::Builder;
 use getset::MutGetters;
 use tokio::{net::UdpSocket, sync::mpsc::UnboundedReceiver};
-use tracing::trace;
 use uuid::Uuid;
 
 /// UDP sender for encrypted frames
@@ -46,21 +45,14 @@ impl UdpSender {
     pub async fn handle_send(&mut self) -> Result<()> {
         while let Some(bytes) = self.rx.recv().await {
             let packet = self.encrypt(&bytes)?;
-            let len = self.socket.send(&packet).await?;
-            trace!("Sent {len} bytes over UDP");
+            let _len = self.socket.send(&packet).await?;
         }
         Ok(())
     }
 
     fn encrypt(&self, data: &[u8]) -> Result<Vec<u8>> {
-        trace!(
-            "data length: {}, {}",
-            data.len(),
-            String::from_utf8_lossy(data)
-        );
         // Encrypt the id and the data then MAC
         let mut encrypted_part = self.id.as_bytes().to_vec();
-        trace!("id length: {}", encrypted_part.len());
         encrypted_part.extend_from_slice(data);
         let nonce = self
             .rnk

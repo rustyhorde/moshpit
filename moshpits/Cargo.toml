@@ -22,10 +22,12 @@ unstable = []
 
 [dependencies]
 anyhow = { workspace = true }
+bytes = { workspace = true }
 clap = { workspace = true }
 config = { workspace = true }
 getset = { workspace = true }
 libmoshpit = { version = "0.1.0", path = "../libmoshpit" }
+pseudoterminal = "0.2.1"
 serde = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }

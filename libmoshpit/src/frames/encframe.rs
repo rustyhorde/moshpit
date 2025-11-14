@@ -16,7 +16,7 @@ use aws_lc_rs::{
     hmac::{Key, verify},
 };
 use bincode::{Decode, Encode};
-use tracing::{error, info, trace};
+use tracing::error;
 use uuid::Uuid;
 
 use crate::{
@@ -50,14 +50,11 @@ impl EncryptedFrame {
                 && let Some(length_slice) = get_usize(src)?
             {
                 let length = usize::from_be_bytes(length_slice.try_into()?);
-                trace!("length: {length}");
                 if let Some(data) = get_bytes(src, length)? {
                     if let Ok(()) = verify(hmac, data, tag_bytes) {
-                        info!("HMAC verification succeeded");
                         let mut data = data.to_vec();
                         let nonce = Nonce::try_assume_unique_for_key(nonce_bytes)?;
                         let _ = rnk.open_in_place(nonce, Aad::empty(), &mut data)?;
-                        info!("trying to parse uuid");
                         let (uuid_bytes, rest) = data.split_at(UUID_LEN);
                         let uuid = Uuid::from_bytes(uuid_bytes.try_into()?);
                         if uuid != id {
@@ -65,13 +62,11 @@ impl EncryptedFrame {
                             return Err(MoshpitError::UuidMismatch.into());
                         }
                         let uuid_wrapper = UuidWrapper::new(uuid);
-                        trace!("uuid: {uuid_wrapper}");
                         let mut message_with_tag = rest.to_vec();
                         message_with_tag.reverse();
                         let mut message = message_with_tag.split_off(MAX_TAG_LEN);
                         message.reverse();
-                        trace!("message: {}", String::from_utf8_lossy(&message));
-                        let encframe = EncryptedFrame::Bytes((uuid_wrapper, rest.to_vec()));
+                        let encframe = EncryptedFrame::Bytes((uuid_wrapper, message.clone()));
                         return Ok(Some(encframe));
                     }
                     error!("HMAC verification failed");

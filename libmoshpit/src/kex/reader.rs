@@ -26,7 +26,7 @@ use aws_lc_rs::{
 };
 use bon::Builder;
 use tokio::{net::UdpSocket, sync::mpsc::UnboundedSender};
-use tracing::{error, info, trace};
+use tracing::error;
 use uuid::Uuid;
 
 use crate::{ConnectionReader, Frame, KexEvent, MoshpitError, UuidWrapper};
@@ -53,7 +53,6 @@ impl KexReader {
         if let Some(frame) = self.reader.read_frame().await?
             && let Frame::PeerInitialize(pk, salt_bytes) = frame
         {
-            info!("Received peer initialize frame");
             let peer_public_key = UnparsedPublicKey::new(&X25519, &pk);
             let salt = Salt::new(HKDF_SHA256, &salt_bytes);
 
@@ -83,14 +82,12 @@ impl KexReader {
                 self.tx
                     .send(Frame::Check(*nonce.as_ref(), check))
                     .map_err(|_| Unspecified)?;
-                info!("Sent check frame with encrypted check message");
                 Ok(())
             })?;
         }
         if let Some(frame) = self.reader.read_frame().await?
             && let Frame::KeyAgreement(uuid) = frame
         {
-            info!("Received key agreement frame with UUID: {}", uuid);
             self.tx_event
                 .send(KexEvent::Uuid(*uuid.as_ref()))
                 .map_err(|_| Unspecified)?;
@@ -99,7 +96,6 @@ impl KexReader {
         if let Some(frame) = self.reader.read_frame().await?
             && let Frame::MoshpitsAddr(addr) = frame
         {
-            info!("Received moshpits address frame with address: {}", addr);
             self.tx_event
                 .send(KexEvent::MoshpitsAddr(addr))
                 .map_err(|_| Unspecified)?;
@@ -116,11 +112,11 @@ impl KexReader {
             if let Frame::Initialize(pk) = frame {
                 self.handle_initialize(&pk, &self.tx_event.clone())?
             } else {
-                error!("Expected initialize frame");
+                error!("Expected initialize frame from mp");
                 return Err(MoshpitError::InvalidFrame.into());
             }
         } else {
-            error!("Expected initialize frame");
+            error!("Expected initialize frame from mp");
             return Err(MoshpitError::InvalidFrame.into());
         };
 
@@ -128,21 +124,26 @@ impl KexReader {
             if let Frame::Check(nonce, enc) = frame {
                 self.handle_check(&rnk, nonce, enc, &self.tx_event.clone())?;
             } else {
-                error!("Expected check frame");
+                error!("Expected check frame from mp");
                 return Err(MoshpitError::InvalidFrame.into());
             }
+        } else {
+            error!("Expected check frame from mp");
+            return Err(MoshpitError::InvalidFrame.into());
         }
 
         let udp_arc = self.handle_udp_setup(socket_addr).await?;
 
         if let Some(frame) = self.reader.read_frame().await? {
             if let Frame::MoshpitAddr(moshpit_addr) = frame {
-                info!("Received address from moshpit: {}", moshpit_addr);
                 udp_arc.connect(moshpit_addr).await?;
             } else {
                 error!("Expected moshpit address frame");
                 return Err(MoshpitError::InvalidFrame.into());
             }
+        } else {
+            error!("Expected moshpit address frame");
+            return Err(MoshpitError::InvalidFrame.into());
         }
 
         Ok(udp_arc)
@@ -153,7 +154,6 @@ impl KexReader {
         pk: &[u8],
         tx_event: &UnboundedSender<KexEvent>,
     ) -> Result<RandomizedNonceKey> {
-        info!("Received initialize frame with public key");
         let rng = SystemRandom::new();
 
         // Generate our ephemeral key pair
@@ -169,7 +169,6 @@ impl KexReader {
         let peer_initialize =
             Frame::PeerInitialize(public_key.as_ref().to_vec(), salt_bytes.to_vec());
         self.tx.send(peer_initialize)?;
-        info!("Sent peer initialize frame with public key and salt");
 
         // Extract pseudo-random key from secret keying materials
         let salt = Salt::new(HKDF_SHA256, &salt_bytes);
@@ -210,13 +209,11 @@ impl KexReader {
         mut check_bytes: Vec<u8>,
         tx_event: &UnboundedSender<KexEvent>,
     ) -> Result<()> {
-        info!("Received check frame with encrypted check message");
         let nonce = Nonce::from(&nonce_bytes);
         let decrypted_data = rnk
             .open_in_place(nonce, Aad::empty(), &mut check_bytes)
             .map_err(|_| MoshpitError::DecryptionFailed)?;
         if decrypted_data == b"Yoda" {
-            info!("Check frame verified successfully");
             let id = Uuid::new_v4();
             tx_event.send(KexEvent::Uuid(id)).map_err(|_| Unspecified)?;
             self.tx.send(Frame::KeyAgreement(UuidWrapper::new(id)))?;
@@ -232,7 +229,6 @@ impl KexReader {
         socket_addr.set_port(next_port);
         self.tx.send(Frame::MoshpitsAddr(socket_addr))?;
         let udp_listener = UdpSocket::bind(socket_addr).await?;
-        trace!("Bound UDP socket to {}", udp_listener.local_addr()?);
         Ok(Arc::new(udp_listener))
     }
 }

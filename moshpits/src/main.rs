@@ -244,6 +244,7 @@
 use std::process::exit;
 
 use anyhow::Result;
+use bytes as _;
 use libmoshpit::{clap_or_error, success};
 
 use crate::runtime::run;

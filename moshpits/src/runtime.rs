@@ -6,21 +6,28 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-use std::{ffi::OsString, net::SocketAddr};
+use std::{
+    ffi::OsString,
+    io::{Read as _, Write as _},
+    net::SocketAddr,
+    process::Command,
+    thread,
+};
 
 use anyhow::{Context as _, Result};
+use bytes::{Buf as _, BytesMut};
 use clap::Parser as _;
 use libmoshpit::{
     EncryptedFrame, KexMode, MoshpitError, UdpReader, UdpSender, init_tracing, load,
     run_key_exchange,
 };
+use pseudoterminal::CommandExt as _;
 use tokio::{net::TcpListener, spawn, sync::mpsc::unbounded_channel};
 use tracing::{error, info, trace};
 
 use crate::{cli::Cli, config::Config};
 
-// static CURRENT_UDP_PORT: AtomicU16 = AtomicU16::new(50000);
-
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn run<I, T>(args: Option<I>) -> Result<()>
 where
     I: IntoIterator<Item = T>,
@@ -55,16 +62,15 @@ where
 
     loop {
         match listener.accept().await {
-            Ok((socket, addr)) => {
+            Ok((socket, _addr)) => {
                 let (sock_read, sock_write) = socket.into_split();
                 let (kex, udp_arc) =
                     run_key_exchange(KexMode::Server(socket_addr), sock_read, sock_write).await?;
-                info!("Key exchange completed with client at {addr}");
-                info!("connection can be promoted");
-                let (_tx, rx) = unbounded_channel::<Vec<u8>>();
+                info!("Key exchange completed with moshpit");
+                let (tx, rx) = unbounded_channel::<Vec<u8>>();
                 let udp_recv = udp_arc.clone();
                 let udp_send = udp_arc.clone();
-
+                let (term_tx, mut term_rx) = unbounded_channel::<Vec<u8>>();
                 let mut udp_reader = UdpReader::builder()
                     .socket(udp_recv)
                     .id(kex.uuid())
@@ -85,8 +91,9 @@ where
                     while let Ok(frame_opt) = udp_reader.read_encrypted_frame().await {
                         if let Some(frame) = frame_opt {
                             match frame {
-                                EncryptedFrame::Bytes((id, _message)) => {
-                                    info!("Received UDP packet for id {}", id);
+                                EncryptedFrame::Bytes((id, message)) => {
+                                    trace!("Received UDP packet for id {}", id);
+                                    term_tx.send(message).unwrap();
                                 }
                             }
                         }
@@ -98,7 +105,49 @@ where
                         error!("udp sender error {e}");
                     }
                 });
-                info!("UDP sender and reader tasks spawned");
+
+                let _term_handle = thread::spawn(move || {
+                    info!("Starting terminal handler");
+                    let mut cmd = Command::new("/usr/bin/fish");
+                    let _ = cmd.arg("-li");
+                    let mut terminal = cmd.spawn_terminal().unwrap();
+                    if let Some((mut term_in, mut term_out)) = terminal.split() {
+                        let _in_handle = thread::spawn(move || {
+                            info!("Starting terminal input handler");
+                            while let Some(packet) = term_rx.blocking_recv() {
+                                trace!("Writing packet to terminal");
+                                if let Err(e) = term_in.write_all(&packet) {
+                                    error!("error writing to terminal: {e}");
+                                    break;
+                                }
+                            }
+                            info!("Terminal input handler exiting");
+                        });
+
+                        loop {
+                            let mut buffer = BytesMut::zeroed(4096);
+                            match term_out.read(&mut buffer) {
+                                Ok(0) => {
+                                    trace!("read 0 bytes from terminal, exiting");
+                                    break;
+                                }
+                                Ok(n) => {
+                                    trace!("Read {n} bytes from terminal");
+                                    if let Err(e) = tx.send(buffer[..n].to_vec()) {
+                                        error!("error sending udp packet: {e}");
+                                        break;
+                                    }
+                                    buffer.advance(n);
+                                }
+                                Err(e) => {
+                                    error!("error reading from terminal: {e}");
+                                    break;
+                                }
+                            }
+                        }
+                        info!("Terminal output handler exiting");
+                    }
+                });
             }
             Err(e) => error!("couldn't get client: {e:?}"),
         }

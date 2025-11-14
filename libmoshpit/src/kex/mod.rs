@@ -24,7 +24,7 @@ use tokio::{
     sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
     task::JoinHandle,
 };
-use tracing::{error, info, trace};
+use tracing::error;
 use uuid::Uuid;
 
 use crate::{ConnectionReader, ConnectionWriter, Frame, KexReader, KexSender, MoshpitError};
@@ -173,16 +173,14 @@ pub async fn run_key_exchange(
     let (tx_event, rx_event) = unbounded_channel::<KexEvent>();
     let mut kex_sm = KexStateMachine::builder().rx_event(rx_event).build();
     let kex_handle = spawn(async move { kex_sm.handle_events(mode == KexMode::Client).await });
-    info!("Connected to the server!");
 
     // Setup the TCP frame sender
     let _write_handle = spawn(async move {
         let mut sender = KexSender::builder().writer(writer).rx(rx).build();
         if let Err(e) = sender.handle_send_frames().await {
-            error!("mp sender error {e}");
+            error!("tcp frame sender error {e}");
         }
     });
-    trace!("Spawned TCP frame sender task");
 
     Ok(match mode {
         KexMode::Client => run_client_kex(tx, tx_event, reader, kex_handle).await?,
@@ -202,7 +200,6 @@ async fn run_client_kex(
     let rng = SystemRandom::new();
     let pk = EphemeralPrivateKey::generate(&X25519, &rng)?;
     let my_public_key = pk.compute_public_key()?;
-    trace!("Generated ephemeral X25519 key pair");
 
     // Setup the TCP frame reader
     let tx_c = tx.clone();
@@ -214,13 +211,11 @@ async fn run_client_kex(
             .tx_event(tx_event_c)
             .build();
         if let Err(e) = frame_reader.client_kex(pk).await {
-            error!("mps frame reader: {e}");
+            error!("tcp frame reader: {e}");
         }
     });
-    trace!("Spawned TCP frame reader task");
 
     // Send the initialize frame with our public key
-    trace!("Sending initialize frame...");
     let frame = Frame::Initialize(my_public_key.as_ref().to_vec());
     tx.send(frame.clone())?;
 
@@ -232,7 +227,6 @@ async fn run_client_kex(
         udp_listener.connect(moshpits_addr).await?;
         let frame = Frame::MoshpitAddr(udp_listener.local_addr()?);
         tx.send(frame.clone())?;
-        trace!("Bound UDP socket to {}", udp_listener.local_addr()?);
         Ok((kex, Arc::new(udp_listener)))
     } else {
         Err(MoshpitError::InvalidMoshpitsAddress.into())
