@@ -26,9 +26,6 @@ use crate::{EncryptedFrame, MoshpitError};
 pub struct UdpReader {
     /// Underlying UDP socket
     socket: Arc<UdpSocket>,
-    // /// Read buffer
-    // #[builder(default = BytesMut::with_capacity(8192))]
-    // buffer: BytesMut,
     /// Client UUID
     id: Uuid,
     /// Key for decrypting UDP packets
@@ -112,8 +109,7 @@ impl UdpReader {
                 // end of the frame. Since the cursor had position set to zero
                 // before `Frame::parse` was called, we obtain the length of the
                 // frame by checking the cursor position.
-                let len = usize::try_from(buf.position())?;
-                info!("buf postion after parse: {len}");
+                let _len = usize::try_from(buf.position())?;
                 // Discard the parsed data from the read buffer.
                 //
                 // When `advance` is called on the read buffer, all of the data
@@ -122,7 +118,6 @@ impl UdpReader {
                 // cursor, but it may be done by reallocating and copying data.
                 // self.buffer.advance(len);
                 buffer.clear();
-                info!("remaining buffer length: {}", buffer.len());
 
                 // Return the parsed frame to the caller.
                 Ok(Some(frame))

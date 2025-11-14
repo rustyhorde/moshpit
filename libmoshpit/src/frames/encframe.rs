@@ -15,7 +15,7 @@ use aws_lc_rs::{
     error::Unspecified,
     hmac::{Key, verify},
 };
-use bincode::{Decode, Encode};
+use bincode::{Decode, Encode, config::standard, decode_from_slice};
 use tracing::error;
 use uuid::Uuid;
 
@@ -31,9 +31,20 @@ const UUID_LEN: usize = 16;
 pub enum EncryptedFrame {
     /// An encrypted UDP packet.
     Bytes((UuidWrapper, Vec<u8>)),
+    /// Resize the pseudo-terminal.
+    Resize((UuidWrapper, u16, u16)),
 }
 
 impl EncryptedFrame {
+    /// Get the id associated with this frame.
+    #[must_use]
+    pub fn id(&self) -> u8 {
+        match self {
+            EncryptedFrame::Bytes(_) => 0,
+            EncryptedFrame::Resize(_) => 1,
+        }
+    }
+
     /// Parse a moshpit frame from the given byte source.
     ///
     /// # Errors
@@ -61,13 +72,13 @@ impl EncryptedFrame {
                             error!("UUID mismatch: expected {id}, got {uuid}");
                             return Err(MoshpitError::UuidMismatch.into());
                         }
-                        let uuid_wrapper = UuidWrapper::new(uuid);
                         let mut message_with_tag = rest.to_vec();
                         message_with_tag.reverse();
                         let mut message = message_with_tag.split_off(MAX_TAG_LEN);
                         message.reverse();
-                        let encframe = EncryptedFrame::Bytes((uuid_wrapper, message.clone()));
-                        return Ok(Some(encframe));
+                        let frame_data: (EncryptedFrame, _) =
+                            decode_from_slice(&message, standard())?;
+                        return Ok(Some(frame_data.0));
                     }
                     error!("HMAC verification failed");
                     return Err(Unspecified.into());

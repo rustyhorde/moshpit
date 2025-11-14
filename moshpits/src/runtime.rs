@@ -18,10 +18,10 @@ use anyhow::{Context as _, Result};
 use bytes::{Buf as _, BytesMut};
 use clap::Parser as _;
 use libmoshpit::{
-    EncryptedFrame, KexMode, MoshpitError, UdpReader, UdpSender, init_tracing, load,
-    run_key_exchange,
+    EncryptedFrame, KexMode, MoshpitError, TerminalMessage, UdpReader, UdpSender, init_tracing,
+    load, run_key_exchange,
 };
-use pseudoterminal::CommandExt as _;
+use pseudoterminal::{CommandExt as _, TerminalSize};
 use tokio::{net::TcpListener, spawn, sync::mpsc::unbounded_channel};
 use tracing::{error, info, trace};
 
@@ -67,10 +67,10 @@ where
                 let (kex, udp_arc) =
                     run_key_exchange(KexMode::Server(socket_addr), sock_read, sock_write).await?;
                 info!("Key exchange completed with moshpit");
-                let (tx, rx) = unbounded_channel::<Vec<u8>>();
+                let (tx, rx) = unbounded_channel::<EncryptedFrame>();
                 let udp_recv = udp_arc.clone();
                 let udp_send = udp_arc.clone();
-                let (term_tx, mut term_rx) = unbounded_channel::<Vec<u8>>();
+                let (term_tx, mut term_rx) = unbounded_channel::<TerminalMessage>();
                 let mut udp_reader = UdpReader::builder()
                     .socket(udp_recv)
                     .id(kex.uuid())
@@ -91,9 +91,13 @@ where
                     while let Ok(frame_opt) = udp_reader.read_encrypted_frame().await {
                         if let Some(frame) = frame_opt {
                             match frame {
-                                EncryptedFrame::Bytes((id, message)) => {
-                                    trace!("Received UDP packet for id {}", id);
-                                    term_tx.send(message).unwrap();
+                                EncryptedFrame::Bytes((_id, message)) => {
+                                    term_tx.send(TerminalMessage::Input(message)).unwrap();
+                                }
+                                EncryptedFrame::Resize((_id, columns, rows)) => {
+                                    term_tx
+                                        .send(TerminalMessage::Resize { rows, columns })
+                                        .unwrap();
                                 }
                             }
                         }
@@ -101,24 +105,32 @@ where
                 });
 
                 let _udp_handle = spawn(async move {
-                    if let Err(e) = udp_sender.handle_send().await {
+                    if let Err(e) = udp_sender.handle_frame().await {
                         error!("udp sender error {e}");
                     }
                 });
 
                 let _term_handle = thread::spawn(move || {
-                    info!("Starting terminal handler");
                     let mut cmd = Command::new("/usr/bin/fish");
                     let _ = cmd.arg("-li");
                     let mut terminal = cmd.spawn_terminal().unwrap();
                     if let Some((mut term_in, mut term_out)) = terminal.split() {
                         let _in_handle = thread::spawn(move || {
-                            info!("Starting terminal input handler");
-                            while let Some(packet) = term_rx.blocking_recv() {
-                                trace!("Writing packet to terminal");
-                                if let Err(e) = term_in.write_all(&packet) {
-                                    error!("error writing to terminal: {e}");
-                                    break;
+                            while let Some(terminal_message) = term_rx.blocking_recv() {
+                                match terminal_message {
+                                    TerminalMessage::Resize { columns, rows } => {
+                                        if let Err(e) =
+                                            terminal.set_term_size(TerminalSize { rows, columns })
+                                        {
+                                            error!("error resizing terminal: {e}");
+                                        }
+                                    }
+                                    TerminalMessage::Input(data) => {
+                                        if let Err(e) = term_in.write_all(&data) {
+                                            error!("error writing to terminal: {e}");
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                             info!("Terminal input handler exiting");
@@ -132,8 +144,11 @@ where
                                     break;
                                 }
                                 Ok(n) => {
-                                    trace!("Read {n} bytes from terminal");
-                                    if let Err(e) = tx.send(buffer[..n].to_vec()) {
+                                    let frame = EncryptedFrame::Bytes((
+                                        kex.uuid_wrapper(),
+                                        buffer[..n].to_vec(),
+                                    ));
+                                    if let Err(e) = tx.send(frame) {
                                         error!("error sending udp packet: {e}");
                                         break;
                                     }

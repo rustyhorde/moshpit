@@ -24,6 +24,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
+name = "ansi-control-codes"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4fea32e0d6400b50c211ad0d63de1623da597e9f8d9a7280dfe54e83f5216b3a"
+
+[[package]]
 name = "anstream"
 version = "0.6.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2016,6 +2022,7 @@ dependencies = [
 name = "moshpit"
 version = "0.1.0"
 dependencies = [
+ "ansi-control-codes",
  "anyhow",
  "bytes",
  "clap",

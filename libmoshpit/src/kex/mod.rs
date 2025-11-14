@@ -27,7 +27,9 @@ use tokio::{
 use tracing::error;
 use uuid::Uuid;
 
-use crate::{ConnectionReader, ConnectionWriter, Frame, KexReader, KexSender, MoshpitError};
+use crate::{
+    ConnectionReader, ConnectionWriter, Frame, KexReader, KexSender, MoshpitError, UuidWrapper,
+};
 
 pub(crate) mod reader;
 pub(crate) mod sender;
@@ -86,6 +88,14 @@ pub struct Kex {
     /// An optional moshpits socket address used by moshpit.
     #[getset(get_copy = "pub")]
     moshpits_addr: Option<SocketAddr>,
+}
+
+impl Kex {
+    /// Get the wrapped UUID
+    #[must_use]
+    pub fn uuid_wrapper(&self) -> UuidWrapper {
+        UuidWrapper::new(self.uuid)
+    }
 }
 
 impl Default for Kex {

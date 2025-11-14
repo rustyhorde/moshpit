@@ -13,6 +13,10 @@ use std::{
     thread,
 };
 
+use ansi_control_codes::{
+    explain::Explain as _,
+    parser::{Token, TokenStream},
+};
 use anyhow::{Context as _, Result};
 use bytes::{Buf as _, BytesMut};
 use clap::Parser as _;
@@ -20,7 +24,7 @@ use libmoshpit::{
     EncryptedFrame, KexMode, MoshpitError, UdpReader, UdpSender, init_tracing, load,
     run_key_exchange,
 };
-use termion::raw::IntoRawMode as _;
+use termion::{raw::IntoRawMode as _, terminal_size};
 use tokio::{net::TcpStream, spawn, sync::mpsc::unbounded_channel};
 use tracing::{error, info, trace};
 
@@ -63,7 +67,7 @@ where
 
     let udp_recv = udp_arc.clone();
     let udp_send = udp_arc.clone();
-    let (tx, rx) = unbounded_channel::<Vec<u8>>();
+    let (tx, rx) = unbounded_channel::<EncryptedFrame>();
     let mut udp_reader = UdpReader::builder()
         .socket(udp_recv)
         .id(kex.uuid())
@@ -80,10 +84,18 @@ where
         .build();
 
     let _udp_handle = spawn(async move {
-        if let Err(e) = udp_sender.handle_send().await {
+        if let Err(e) = udp_sender.handle_frame().await {
             error!("udp sender error {e}");
         }
     });
+
+    let (term_cols, term_rows) = terminal_size().unwrap_or((80, 24));
+    info!("Terminal size: {} cols, {} rows", term_cols, term_rows);
+    tx.send(EncryptedFrame::Resize((
+        kex.uuid_wrapper(),
+        term_cols,
+        term_rows,
+    )))?;
 
     let (stdout_tx, mut stdout_rx) = unbounded_channel::<Vec<u8>>();
 
@@ -93,6 +105,9 @@ where
         while let Ok(frame_opt) = udp_reader.read_encrypted_frame().await {
             if let Some(frame) = frame_opt {
                 match frame {
+                    EncryptedFrame::Resize(_) => {
+                        error!("Received Resize frame on client, which is unexpected");
+                    }
                     EncryptedFrame::Bytes((_id, message)) => {
                         let message = if prev_bytes.is_empty() {
                             message
@@ -112,6 +127,33 @@ where
                             if !chunk.invalid().is_empty() {
                                 info!("Received invalid UTF-8 chunk");
                                 prev_bytes.extend_from_slice(chunk.invalid());
+                            }
+                        }
+                        let result = TokenStream::from(&valid_utf8).collect::<Vec<Token<'_>>>();
+
+                        for (i, part) in result.iter().enumerate() {
+                            match part {
+                                Token::String(string) => {
+                                    trace!("{i}. Normal String: {string}");
+                                }
+                                Token::ControlFunction(control_function) => {
+                                    trace!(
+                                        "{i}. Control Function: {} ({})",
+                                        control_function.short_name().unwrap_or_default(),
+                                        control_function.long_name()
+                                    );
+                                    trace!(
+                                        "Short description: {}",
+                                        control_function.short_description()
+                                    );
+                                    trace!(
+                                        "Long description: {}",
+                                        control_function.long_description()
+                                    );
+                                }
+                            }
+                            if i < (result.len() - 1) {
+                                trace!("---------------------");
                             }
                         }
                         let _unused = stdout_tx_c.send(valid_utf8.into_bytes());
@@ -158,7 +200,8 @@ where
                 break;
             }
             let msg = &buf[..len];
-            tx.send(msg.to_vec()).unwrap();
+            tx.send(EncryptedFrame::Bytes((kex.uuid_wrapper(), msg.to_vec())))
+                .unwrap();
             buf.advance(len);
         }
     }

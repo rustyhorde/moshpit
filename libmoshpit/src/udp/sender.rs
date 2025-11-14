@@ -13,10 +13,13 @@ use aws_lc_rs::{
     aead::{AES_256_GCM_SIV, Aad, RandomizedNonceKey},
     hmac::{HMAC_SHA512, Key, sign},
 };
+use bincode::{config::standard, encode_to_vec};
 use bon::Builder;
 use getset::MutGetters;
 use tokio::{net::UdpSocket, sync::mpsc::UnboundedReceiver};
 use uuid::Uuid;
+
+use crate::EncryptedFrame;
 
 /// UDP sender for encrypted frames
 #[derive(Builder, Debug, MutGetters)]
@@ -32,7 +35,7 @@ pub struct UdpSender {
     /// Underlying UDP socket
     socket: Arc<UdpSocket>,
     /// Channel receiver for outgoing packets
-    rx: UnboundedReceiver<Vec<u8>>,
+    rx: UnboundedReceiver<EncryptedFrame>,
 }
 
 impl UdpSender {
@@ -42,18 +45,20 @@ impl UdpSender {
     ///
     /// * I/O error.
     ///
-    pub async fn handle_send(&mut self) -> Result<()> {
-        while let Some(bytes) = self.rx.recv().await {
-            let packet = self.encrypt(&bytes)?;
+    pub async fn handle_frame(&mut self) -> Result<()> {
+        while let Some(frame) = self.rx.recv().await {
+            let packet = self.encrypt(&frame)?;
             let _len = self.socket.send(&packet).await?;
         }
         Ok(())
     }
 
-    fn encrypt(&self, data: &[u8]) -> Result<Vec<u8>> {
-        // Encrypt the id and the data then MAC
+    fn encrypt(&self, frame: &EncryptedFrame) -> Result<Vec<u8>> {
+        // Encode the frame data
+        let data = encode_to_vec(frame, standard())?;
+        // Encrypt the id, frame_id, and the data then MAC
         let mut encrypted_part = self.id.as_bytes().to_vec();
-        encrypted_part.extend_from_slice(data);
+        encrypted_part.extend_from_slice(&data);
         let nonce = self
             .rnk
             .seal_in_place_append_tag(Aad::empty(), &mut encrypted_part)?;
