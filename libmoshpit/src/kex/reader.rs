@@ -63,7 +63,7 @@ impl KexReader {
 
                 // Derive UnboundKey for AES-256-GCM-SIV
                 let okm_aes = pseudo_random_key.expand(&[b"aead key"], &AES_256_GCM_SIV)?;
-                let mut key_bytes = [0u8; 32];
+                let mut key_bytes = [0u8; AES_256_KEY_LEN];
                 okm_aes.fill(&mut key_bytes)?;
                 // Derive the HMAC key and send it over UDP
                 let okm_hmac =

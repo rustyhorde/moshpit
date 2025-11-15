@@ -1,0 +1,49 @@
+[package]
+authors = ["Jason Ozias <jason.g.ozias@gmail.com>"]
+categories = ["command-line-interface", "network-programming", "cryptography"]
+description = "A Rust implementation of in the same vein as Mosh, the mobile shell."
+documentation = "https://docs.rs/libmoshpit"
+edition = "2024"
+homepage = "https://github.com/rustyhorde/moshpit"
+keywords = ["ssh", "mosh"]
+license = "MIT OR Apache-2.0"
+name = "keygen"
+readme = "../README.md"
+repository = "https://github.com/rustyhorde/moshpit"
+version = "0.1.0"
+rust-version = "1.88.0"
+
+[[bin]]
+name = "mp-keygen"
+path = "src/main.rs"
+
+[features]
+unstable = []
+
+[dependencies]
+anyhow = { workspace = true }
+argon2 = { version = "0.6.0-rc.2", features = ["getrandom"] }
+aws-lc-rs = { workspace = true }
+base64 = "0.22.1"
+bishop = "1.0.0"
+clap = { workspace = true }
+dialoguer = "0.12.0"
+dirs2 = "3.0.1"
+getset = { workspace = true }
+libmoshpit = { version = "0.1.0", path = "../libmoshpit" }
+vergen-pretty = { workspace = true }
+whoami = "1.6.1"
+
+[build-dependencies]
+anyhow = { workspace = true }
+rustversion = { workspace = true }
+vergen-gix = { workspace = true }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(coverage,coverage_nightly)',
+] }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
