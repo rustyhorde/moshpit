@@ -8,8 +8,8 @@
 
 use std::{io::Cursor, sync::LazyLock};
 
-use clap::{ArgAction, Parser};
-use getset::CopyGetters;
+use clap::{ArgAction, Parser, Subcommand};
+use getset::{CopyGetters, Getters};
 use vergen_pretty::{Pretty, vergen_pretty_env};
 
 static LONG_VERSION: LazyLock<String> = LazyLock::new(|| {
@@ -22,7 +22,7 @@ static LONG_VERSION: LazyLock<String> = LazyLock::new(|| {
     output
 });
 
-#[derive(Clone, CopyGetters, Debug, Parser)]
+#[derive(Clone, CopyGetters, Debug, Getters, Parser)]
 #[command(author, version, about, long_version = LONG_VERSION.as_str(), long_about = None)]
 pub(crate) struct Cli {
     /// Set logging verbosity.  More v's, more verbose.
@@ -45,4 +45,25 @@ pub(crate) struct Cli {
     )]
     #[getset(get_copy = "pub(crate)")]
     quiet: u8,
+    #[command(subcommand)]
+    #[getset(get = "pub(crate)")]
+    command: Commands,
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub(crate) enum Commands {
+    #[clap(about = "Generate a new ed25519 public/private key pair")]
+    Generate,
+    #[clap(about = "Verify a public key signature or randomart image")]
+    Verify {
+        #[clap(short, long, help = "Verify randomart", default_value_t = false)]
+        randomart: bool,
+        #[clap(help = "The signature or randomart to verify")]
+        signature: String,
+    },
+    #[clap(about = "Display the fingerprint of the given public key")]
+    Fingerprint {
+        #[clap(help = "The public key file path")]
+        public_key: String,
+    },
 }

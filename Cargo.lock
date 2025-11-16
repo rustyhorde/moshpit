@@ -1969,19 +1969,13 @@ name = "keygen"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "argon2",
- "aws-lc-rs",
- "base64",
- "bishop",
  "clap",
  "dialoguer",
- "dirs2",
  "getset",
  "libmoshpit",
  "rustversion",
  "vergen-gix",
  "vergen-pretty",
- "whoami",
 ]
 
 [[package]]
@@ -2020,8 +2014,11 @@ name = "libmoshpit"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "argon2",
  "aws-lc-rs",
+ "base64",
  "bincode",
+ "bishop",
  "bon",
  "bytes",
  "clap",
@@ -2040,6 +2037,7 @@ dependencies = [
  "tracing-subscriber-init",
  "uuid",
  "vergen-gix",
+ "whoami",
 ]
 
 [[package]]

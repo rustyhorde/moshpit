@@ -18,8 +18,11 @@ unstable = []
 
 [dependencies]
 anyhow = { workspace = true }
+argon2 = { version = "0.6.0-rc.2", features = ["getrandom"] }
 aws-lc-rs = { workspace = true }
+base64 = "0.22.1"
 bincode = "2.0.1"
+bishop = "1.0.0"
 bon = { workspace = true }
 bytes = { workspace = true }
 clap = { workspace = true }
@@ -39,6 +42,7 @@ tracing-subscriber = { version = "=0.3.19", features = [
 ] }
 tracing-subscriber-init = { workspace = true }
 uuid = { workspace = true }
+whoami = "1.6.1"
 
 [build-dependencies]
 anyhow = { workspace = true }

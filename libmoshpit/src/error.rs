@@ -52,6 +52,12 @@ pub enum Error {
     /// UUID mismatch
     #[error("UUID mismatch")]
     UuidMismatch,
+    /// No valid home directory could be found
+    #[error("There is no valid home directory")]
+    HomeDir,
+    /// Invalid public key file format
+    #[error("Invalid public key file format")]
+    InvalidPublicKeyFormat,
 }
 
 /// Converts an `anyhow::Error` into a suitable exit code or clap message for a CLI application.
