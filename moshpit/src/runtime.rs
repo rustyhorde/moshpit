@@ -11,21 +11,33 @@ use std::{
     io::{Read as _, Write as _, stdin, stdout},
     net::SocketAddr,
     path::PathBuf,
+    process,
+    sync::LazyLock,
     thread,
 };
 
+use ansi_control_codes::{
+    c0, c1,
+    parser::{Token, TokenStream},
+};
 use anyhow::{Context as _, Result};
 use bytes::{Buf as _, BytesMut};
 use clap::Parser as _;
+use crossterm::terminal::{enable_raw_mode, window_size};
 use libmoshpit::{
     EncryptedFrame, KexMode, KeyPair, MoshpitError, UdpReader, UdpSender, init_tracing, load,
     run_key_exchange,
 };
-use termion::{raw::IntoRawMode as _, terminal_size};
-use tokio::{net::TcpStream, spawn, sync::mpsc::unbounded_channel};
+use regex::Regex;
+use tokio::{net::TcpStream, select, spawn, sync::mpsc::unbounded_channel};
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, trace};
 
 use crate::{cli::Cli, config::Config};
+
+static CMD_LINE_EXIT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^133;C;cmdline_url=exit$").unwrap());
+static EXIT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^133;D;\d$").unwrap());
 
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn run<I, T>(args: Option<I>) -> Result<()>
@@ -84,6 +96,9 @@ where
     .await?;
     info!("Key exchange completed with moshpits");
 
+    // Setup the cancellation token
+    let token = CancellationToken::new();
+
     let udp_recv = udp_arc.clone();
     let udp_send = udp_arc.clone();
     let (tx, rx) = unbounded_channel::<EncryptedFrame>();
@@ -102,63 +117,111 @@ where
         .rnk(kex.key())?
         .build();
 
+    let sender_token = token.clone();
     let _udp_handle = spawn(async move {
-        if let Err(e) = udp_sender.handle_frame().await {
-            error!("udp sender error {e}");
-        }
-    });
-
-    let (term_cols, term_rows) = terminal_size().unwrap_or((80, 24));
-    tx.send(EncryptedFrame::Resize((
-        kex.uuid_wrapper(),
-        term_cols,
-        term_rows,
-    )))?;
-
-    let (stdout_tx, mut stdout_rx) = unbounded_channel::<Vec<u8>>();
-
-    let stdout_tx_c = stdout_tx.clone();
-    let _udp_reader_handle = spawn(async move {
-        let mut prev_bytes = BytesMut::with_capacity(1024);
-        while let Ok(frame_opt) = udp_reader.read_encrypted_frame().await {
-            if let Some(frame) = frame_opt {
-                match frame {
-                    EncryptedFrame::Resize(_) => {
-                        error!("Received Resize frame on client, which is unexpected");
-                    }
-                    EncryptedFrame::Bytes((_id, message)) => {
-                        let message = if prev_bytes.is_empty() {
-                            message
-                        } else {
-                            let mut combined =
-                                BytesMut::with_capacity(prev_bytes.len() + message.len());
-                            combined.extend_from_slice(&prev_bytes);
-                            combined.extend_from_slice(&message);
-                            prev_bytes.clear();
-                            combined.freeze().to_vec()
-                        };
-                        prev_bytes.clear();
-                        let mut valid_utf8 = String::new();
-                        for chunk in message.utf8_chunks() {
-                            valid_utf8.push_str(chunk.valid());
-
-                            if !chunk.invalid().is_empty() {
-                                info!("Received invalid UTF-8 chunk");
-                                prev_bytes.extend_from_slice(chunk.invalid());
-                            }
-                        }
-                        let _unused = stdout_tx_c.send(valid_utf8.into_bytes());
-                    }
+        select! {
+            () = sender_token.cancelled() => {
+                trace!("UDP sender received cancellation");
+                drop(udp_sender);
+            }
+            result = udp_sender.handle_frame() => {
+                if let Err(e) = result {
+                    error!("udp sender error {e}");
                 }
-            } else {
-                trace!("UDP reader received None frame, exiting");
             }
         }
     });
 
-    let stdout_handle = thread::spawn(move || {
-        let stdout = stdout();
-        let mut stdout = stdout.lock().into_raw_mode().unwrap();
+    let (columns, rows) = window_size().map_or((80, 24), |ws| (ws.columns, ws.rows));
+    tx.send(EncryptedFrame::Resize((kex.uuid_wrapper(), columns, rows)))?;
+
+    let (stdout_tx, mut stdout_rx) = unbounded_channel::<Vec<u8>>();
+
+    let stdout_tx_c = stdout_tx.clone();
+    let reader_token = token.clone();
+    let _udp_reader_handle = spawn(async move {
+        let mut prev_bytes = BytesMut::with_capacity(1024);
+        let mut osc_started = false;
+        let mut cmd_line_exit_detected = false;
+
+        loop {
+            select! {
+                () = reader_token.cancelled() => {
+                    trace!("UDP reader received cancellation");
+                    process::exit(0);
+                }
+                frame_res = udp_reader.read_encrypted_frame() =>{
+                    if let Ok(Some(frame)) = frame_res {
+                        match frame {
+                            EncryptedFrame::Resize(_) => {
+                                error!("Received Resize frame on client, which is unexpected");
+                            }
+                            EncryptedFrame::Bytes((_id, message)) => {
+                                let message = if prev_bytes.is_empty() {
+                                    message
+                                } else {
+                                    let mut combined =
+                                        BytesMut::with_capacity(prev_bytes.len() + message.len());
+                                    combined.extend_from_slice(&prev_bytes);
+                                    combined.extend_from_slice(&message);
+                                    prev_bytes.clear();
+                                    combined.freeze().to_vec()
+                                };
+                                prev_bytes.clear();
+                                let mut valid_utf8 = String::new();
+                                for chunk in message.utf8_chunks() {
+                                    valid_utf8.push_str(chunk.valid());
+
+                                    if !chunk.invalid().is_empty() {
+                                        info!("Received invalid UTF-8 chunk");
+                                        prev_bytes.extend_from_slice(chunk.invalid());
+                                    }
+                                }
+                                let result = TokenStream::from(&valid_utf8).collect::<Vec<Token<'_>>>();
+
+                                for part in &result {
+                                    match part {
+                                        Token::String(osc_cmd_string) => {
+                                            if osc_started
+                                                && cmd_line_exit_detected
+                                                && EXIT_RE.is_match(osc_cmd_string)
+                                            {
+                                                reader_token.cancel();
+                                                trace!(
+                                                    "exit command detected in OSC sequence: {osc_cmd_string}"
+                                                );
+                                            } else if osc_started
+                                                && CMD_LINE_EXIT_RE.is_match(osc_cmd_string)
+                                            {
+                                                cmd_line_exit_detected = true;
+                                            }
+                                        }
+                                        Token::ControlFunction(control_function) => {
+                                            if osc_started
+                                                && (*control_function == c1::ST
+                                                    || *control_function == c0::BEL)
+                                            {
+                                                osc_started = false;
+                                            } else if *control_function == c1::OSC && !osc_started {
+                                                osc_started = true;
+                                            }
+                                        }
+                                    }
+                                }
+                                let _unused = stdout_tx_c.send(valid_utf8.into_bytes());
+                            }
+                        }
+                    } else {
+                        trace!("UDP reader received None frame, exiting");
+                    }
+                }
+            }
+        }
+    });
+
+    let _stdin_handle = thread::spawn(move || {
+        let mut stdout = stdout();
+        enable_raw_mode().unwrap();
 
         while let Some(msg) = stdout_rx.blocking_recv() {
             if msg.len() == 1 && msg[0] == b'q' {
@@ -175,10 +238,9 @@ where
     });
 
     let mut stdin = stdin();
-
     loop {
         let mut buf = BytesMut::zeroed(8192);
-        let len = stdin.read(&mut buf)?;
+        let len = stdin.read(&mut buf).unwrap();
         if len > 0 {
             if len == 1 && buf[0] == b'q' {
                 info!("Exiting on 'q' input");
@@ -192,6 +254,5 @@ where
         }
     }
 
-    stdout_handle.join().unwrap();
     Ok(())
 }
