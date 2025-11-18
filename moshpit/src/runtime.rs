@@ -10,15 +10,15 @@ use std::{
     ffi::OsString,
     io::{Read as _, Write as _, stdin, stdout},
     net::SocketAddr,
+    path::PathBuf,
     thread,
 };
 
-use ansi_control_codes::parser::{Token, TokenStream};
 use anyhow::{Context as _, Result};
 use bytes::{Buf as _, BytesMut};
 use clap::Parser as _;
 use libmoshpit::{
-    EncryptedFrame, KexMode, MoshpitError, UdpReader, UdpSender, init_tracing, load,
+    EncryptedFrame, KexMode, KeyPair, MoshpitError, UdpReader, UdpSender, init_tracing, load,
     run_key_exchange,
 };
 use termion::{raw::IntoRawMode as _, terminal_size};
@@ -58,8 +58,30 @@ where
     let socket = TcpStream::connect(socket_addr).await?;
     let (sock_read, sock_write) = socket.into_split();
 
+    // Load the X25519 key pair from the configured paths or defaults
+    let (default_private_key_path, default_pub_key_ext) =
+        KeyPair::default_key_path_ext(KexMode::Client)?;
+    let private_key_path = config
+        .private_key_path()
+        .as_ref()
+        .map_or(default_private_key_path, PathBuf::from);
+    let public_key_path = config.public_key_path().as_ref().map_or(
+        private_key_path.with_extension(default_pub_key_ext),
+        PathBuf::from,
+    );
+    trace!("Loading private key from {}", private_key_path.display());
+    trace!("Loading public key from {}", public_key_path.display());
+
     // Run the key exchange
-    let (kex, udp_arc) = run_key_exchange(KexMode::Client, sock_read, sock_write).await?;
+    let (kex, udp_arc) = run_key_exchange(
+        KexMode::Client,
+        sock_read,
+        sock_write,
+        private_key_path,
+        public_key_path,
+        || Ok(Some("test".to_string())),
+    )
+    .await?;
     info!("Key exchange completed with moshpits");
 
     let udp_recv = udp_arc.clone();
@@ -125,34 +147,6 @@ where
                                 prev_bytes.extend_from_slice(chunk.invalid());
                             }
                         }
-                        let result = TokenStream::from(&valid_utf8).collect::<Vec<Token<'_>>>();
-
-                        // for (_i, part) in result.iter().enumerate() {
-                        for part in &result {
-                            match part {
-                                Token::String(_string) => {
-                                    // trace!("{i}. Normal String: {string}");
-                                }
-                                Token::ControlFunction(_control_function) => {
-                                    // trace!(
-                                    //     "{i}. Control Function: {} ({})",
-                                    //     control_function.short_name().unwrap_or_default(),
-                                    //     control_function.long_name()
-                                    // );
-                                    // trace!(
-                                    //     "Short description: {}",
-                                    //     control_function.short_description()
-                                    // );
-                                    // trace!(
-                                    //     "Long description: {}",
-                                    //     control_function.long_description()
-                                    // );
-                                }
-                            }
-                            // if i < (result.len() - 1) {
-                            //     trace!("---------------------");
-                            // }
-                        }
                         let _unused = stdout_tx_c.send(valid_utf8.into_bytes());
                     }
                 }
@@ -184,7 +178,6 @@ where
 
     loop {
         let mut buf = BytesMut::zeroed(8192);
-
         let len = stdin.read(&mut buf)?;
         if len > 0 {
             if len == 1 && buf[0] == b'q' {

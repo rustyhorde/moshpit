@@ -8,6 +8,7 @@
 
 use std::{
     net::SocketAddr,
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicU16, Ordering},
@@ -17,12 +18,12 @@ use std::{
 use anyhow::Result;
 use aws_lc_rs::{
     aead::{AES_256_GCM_SIV, Aad, Nonce, RandomizedNonceKey},
-    agreement::{EphemeralPrivateKey, UnparsedPublicKey, X25519, agree_ephemeral},
+    agreement::{ParsedPublicKey, PrivateKey, UnparsedPublicKey, X25519, agree},
     cipher::AES_256_KEY_LEN,
     digest::SHA512_OUTPUT_LEN,
     error::Unspecified,
     hkdf::{HKDF_SHA256, HKDF_SHA512, Salt},
-    rand::{SystemRandom, fill},
+    rand::fill,
 };
 use bon::Builder;
 use local_ip_address::linux::local_ip;
@@ -30,7 +31,9 @@ use tokio::{net::UdpSocket, sync::mpsc::UnboundedSender};
 use tracing::{error, trace};
 use uuid::Uuid;
 
-use crate::{ConnectionReader, Frame, KexEvent, MoshpitError, UuidWrapper};
+use crate::{
+    ConnectionReader, Frame, KexEvent, MoshpitError, UuidWrapper, load_private_key, load_public_key,
+};
 
 static CURRENT_UDP_PORT: AtomicU16 = AtomicU16::new(50000);
 
@@ -50,14 +53,14 @@ impl KexReader {
     ///
     /// # Errors
     ///
-    pub async fn client_kex(&mut self, epk: EphemeralPrivateKey) -> Result<()> {
+    pub async fn client_kex(&mut self, epk: &PrivateKey) -> Result<()> {
         if let Some(frame) = self.reader.read_frame().await?
             && let Frame::PeerInitialize(pk, salt_bytes) = frame
         {
             let peer_public_key = UnparsedPublicKey::new(&X25519, &pk);
             let salt = Salt::new(HKDF_SHA256, &salt_bytes);
 
-            agree_ephemeral(epk, peer_public_key, Unspecified, |key_material| {
+            agree(epk, peer_public_key, Unspecified, |key_material| {
                 let pseudo_random_key = salt.extract(key_material);
                 let mut check = b"Yoda".to_vec();
 
@@ -108,10 +111,20 @@ impl KexReader {
     ///
     /// # Errors
     ///
-    pub async fn server_kex(&mut self, socket_addr: SocketAddr) -> Result<Arc<UdpSocket>> {
+    pub async fn server_kex(
+        &mut self,
+        socket_addr: SocketAddr,
+        private_key_path: &PathBuf,
+        public_key_path: &PathBuf,
+    ) -> Result<Arc<UdpSocket>> {
         let rnk = if let Some(frame) = self.reader.read_frame().await? {
             if let Frame::Initialize(pk) = frame {
-                self.handle_initialize(&pk, &self.tx_event.clone())?
+                self.handle_initialize(
+                    &pk,
+                    &self.tx_event.clone(),
+                    private_key_path,
+                    public_key_path,
+                )?
             } else {
                 error!("Expected initialize frame from mp");
                 return Err(MoshpitError::InvalidFrame.into());
@@ -154,13 +167,28 @@ impl KexReader {
         &mut self,
         pk: &[u8],
         tx_event: &UnboundedSender<KexEvent>,
+        private_key_path: &PathBuf,
+        public_key_path: &PathBuf,
     ) -> Result<RandomizedNonceKey> {
-        let rng = SystemRandom::new();
+        // Load the moshpits public and private key
+        let (unenc_key_pair_opt, _enc_key_pair_opt) = load_private_key(private_key_path)?;
+        let public_key_bytes = load_public_key(public_key_path)?;
 
-        // Generate our ephemeral key pair
-        let ephemeral_priv_key = EphemeralPrivateKey::generate(&X25519, &rng)?;
-        let public_key = ephemeral_priv_key.compute_public_key()?;
+        let (private_key, public_key) = if let Some(unenc_key_pair) = unenc_key_pair_opt {
+            unenc_key_pair.take()
+        } else {
+            return Err(anyhow::anyhow!("No valid private key found"));
+        };
+
+        if public_key.as_ref() != public_key_bytes.as_slice() {
+            return Err(anyhow::anyhow!(
+                "public key from file does not match computed public key"
+            ));
+        }
+
+        // Setup the public key from the peer
         let unparsed_public_key = UnparsedPublicKey::new(&X25519, &pk);
+        let parsed_public_key = ParsedPublicKey::try_from(&unparsed_public_key)?;
 
         // Generate a (non-secret) salt value
         let mut salt_bytes = [0u8; 32];
@@ -175,9 +203,9 @@ impl KexReader {
         let salt = Salt::new(HKDF_SHA256, &salt_bytes);
 
         // Setup the rnk and wait for a check frame
-        let rnk = agree_ephemeral(
-            ephemeral_priv_key,
-            unparsed_public_key,
+        let rnk = agree(
+            &private_key,
+            parsed_public_key,
             Unspecified,
             |key_material| {
                 let pseudo_random_key = salt.extract(key_material);

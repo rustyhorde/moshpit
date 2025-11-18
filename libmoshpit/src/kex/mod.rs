@@ -6,12 +6,12 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use aws_lc_rs::{
-    agreement::{EphemeralPrivateKey, X25519},
-    rand::SystemRandom,
+    agreement::{PrivateKey, X25519},
+    cipher::AES_256_KEY_LEN,
 };
 use bon::Builder;
 use getset::CopyGetters;
@@ -29,6 +29,7 @@ use uuid::Uuid;
 
 use crate::{
     ConnectionReader, ConnectionWriter, Frame, KexReader, KexSender, MoshpitError, UuidWrapper,
+    decrypt_private_key, load_private_key, load_public_key,
 };
 
 pub(crate) mod reader;
@@ -175,6 +176,9 @@ pub async fn run_key_exchange(
     mode: KexMode,
     sock_read: OwnedReadHalf,
     sock_write: OwnedWriteHalf,
+    private_key_path: PathBuf,
+    public_key_path: PathBuf,
+    passphrase_fn: impl Fn() -> Result<Option<String>>,
 ) -> Result<(Kex, Arc<UdpSocket>)> {
     // Setup the TCP connection to the server for key exchange
     let reader = ConnectionReader::builder().reader(sock_read).build();
@@ -193,9 +197,29 @@ pub async fn run_key_exchange(
     });
 
     Ok(match mode {
-        KexMode::Client => run_client_kex(tx, tx_event, reader, kex_handle).await?,
+        KexMode::Client => {
+            run_client_kex(
+                tx,
+                tx_event,
+                reader,
+                kex_handle,
+                private_key_path,
+                public_key_path,
+                passphrase_fn,
+            )
+            .await?
+        }
         KexMode::Server(socket_addr) => {
-            run_server_kex(socket_addr, tx, tx_event, reader, kex_handle).await?
+            run_server_kex(
+                socket_addr,
+                tx,
+                tx_event,
+                reader,
+                kex_handle,
+                private_key_path,
+                public_key_path,
+            )
+            .await?
         }
     })
 }
@@ -205,11 +229,46 @@ async fn run_client_kex(
     tx_event: UnboundedSender<KexEvent>,
     reader: ConnectionReader,
     kex_handle: JoinHandle<Result<Kex>>,
+    private_key_path: PathBuf,
+    public_key_path: PathBuf,
+    passphrase_fn: impl Fn() -> Result<Option<String>>,
 ) -> Result<(Kex, Arc<UdpSocket>)> {
-    // Generate ephemeral X25519 key pair
-    let rng = SystemRandom::new();
-    let pk = EphemeralPrivateKey::generate(&X25519, &rng)?;
-    let my_public_key = pk.compute_public_key()?;
+    // Load the moshpit public and private key
+    let (unenc_key_pair_opt, enc_key_pair_opt) = load_private_key(&private_key_path)?;
+    let public_key_bytes = load_public_key(&public_key_path)?;
+
+    let (pk, my_public_key) = if let Some(enc_key_pair) = enc_key_pair_opt {
+        // Get the passphrase
+        if let Some(passphrase) = passphrase_fn()? {
+            let salt_bytes = enc_key_pair.salt_bytes();
+            let nonce_bytes = enc_key_pair.nonce_bytes();
+            let mut encrypted_private_key_bytes =
+                enc_key_pair.encrypted_private_key_bytes().clone();
+            decrypt_private_key(
+                &passphrase,
+                salt_bytes,
+                nonce_bytes,
+                &mut encrypted_private_key_bytes,
+            )?;
+
+            let private_key = PrivateKey::from_private_key(
+                &X25519,
+                &encrypted_private_key_bytes[..AES_256_KEY_LEN],
+            )?;
+            let public_key = private_key.compute_public_key()?;
+
+            if public_key.as_ref() != public_key_bytes.as_slice() {
+                return Err(anyhow::anyhow!("Public key does not match the private key"));
+            }
+            (private_key, public_key)
+        } else {
+            return Err(anyhow::anyhow!("No valid private key found"));
+        }
+    } else if let Some(unenc_key_pair) = unenc_key_pair_opt {
+        unenc_key_pair.take()
+    } else {
+        return Err(anyhow::anyhow!("No valid private key found"));
+    };
 
     // Setup the TCP frame reader
     let tx_c = tx.clone();
@@ -220,7 +279,7 @@ async fn run_client_kex(
             .tx(tx_c)
             .tx_event(tx_event_c)
             .build();
-        if let Err(e) = frame_reader.client_kex(pk).await {
+        if let Err(e) = frame_reader.client_kex(&pk).await {
             error!("tcp frame reader: {e}");
         }
     });
@@ -250,6 +309,8 @@ async fn run_server_kex(
     tx_event: UnboundedSender<KexEvent>,
     reader: ConnectionReader,
     kex_handle: JoinHandle<Result<Kex>>,
+    private_key_path: PathBuf,
+    public_key_path: PathBuf,
 ) -> Result<(Kex, Arc<UdpSocket>)> {
     // Setup the TCP frame reader
     let tx_c = tx.clone();
@@ -259,6 +320,8 @@ async fn run_server_kex(
         .tx(tx_c)
         .tx_event(tx_event_c)
         .build();
-    let udp_arc = frame_reader.server_kex(socket_addr).await?;
+    let udp_arc = frame_reader
+        .server_kex(socket_addr, &private_key_path, &public_key_path)
+        .await?;
     Ok((kex_handle.await??, udp_arc))
 }

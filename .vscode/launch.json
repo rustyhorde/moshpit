@@ -51,7 +51,7 @@
                     "--package=moshpit"
                 ]
             },
-            "args": []
+            "args": ["127.0.0.1:40404"]
         },
         {
             "name": "Debug unit tests in executable 'mp'",

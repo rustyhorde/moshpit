@@ -15,7 +15,7 @@ use std::{
 use anyhow::Result;
 use clap::Parser as _;
 use dialoguer::{Confirm, Input, Password};
-use libmoshpit::{KeyPair, extract_public_key_bytes, fingerprint};
+use libmoshpit::{KexMode, KeyPair, extract_public_key_bytes, fingerprint};
 
 use crate::cli::{Cli, Commands};
 
@@ -89,7 +89,8 @@ fn generate_keypair() -> Result<()> {
 }
 
 fn setup_paths() -> Result<(PathBuf, PathBuf)> {
-    let (default_priv_key_path, default_pub_key_ext) = KeyPair::default_key_path_ext()?;
+    let (default_priv_key_path, default_pub_key_ext) =
+        KeyPair::default_key_path_ext(KexMode::Client)?;
     let key_path_prompt = format!(
         "Enter file in which to save the key ({})",
         default_priv_key_path.display()

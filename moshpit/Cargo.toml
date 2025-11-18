@@ -21,7 +21,6 @@ path = "src/main.rs"
 unstable = []
 
 [dependencies]
-ansi-control-codes = { version = "1.0.1", features = ["parser", "explain"] }
 anyhow = { workspace = true }
 bytes.workspace = true
 clap = { workspace = true }

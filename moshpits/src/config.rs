@@ -27,6 +27,10 @@ pub(crate) struct Config {
     tracing: Tracing,
     #[getset(get = "pub(crate)")]
     mps: Mps,
+    #[getset(get = "pub(crate)")]
+    private_key_path: Option<String>,
+    #[getset(get = "pub(crate)")]
+    public_key_path: Option<String>,
 }
 
 impl TracingConfig for Config {

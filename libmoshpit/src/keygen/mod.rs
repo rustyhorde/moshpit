@@ -14,10 +14,8 @@ use std::{
 
 use anyhow::{Error, Result};
 use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
-#[cfg(test)]
-use aws_lc_rs::aead::Nonce;
 use aws_lc_rs::{
-    aead::{AES_256_GCM_SIV, Aad, RandomizedNonceKey},
+    aead::{AES_256_GCM_SIV, Aad, Nonce, RandomizedNonceKey},
     agreement::{PrivateKey, PublicKey, X25519},
     cipher::AES_256_KEY_LEN,
     digest::SHA512_OUTPUT_LEN,
@@ -30,7 +28,7 @@ use bytes::{Buf as _, BytesMut};
 use getset::Getters;
 use whoami::fallible::{hostname, username};
 
-use crate::MoshpitError;
+use crate::{KexMode, MoshpitError};
 
 pub(crate) mod pk;
 
@@ -97,6 +95,14 @@ pub struct UnencryptedKeyPair {
     public_key: PublicKey,
 }
 
+impl UnencryptedKeyPair {
+    /// Get the Private/Public key pair.
+    #[must_use]
+    pub fn take(self) -> (PrivateKey, PublicKey) {
+        (self.private_key, self.public_key)
+    }
+}
+
 /// A moshpit encrypted key pair.  A password is
 /// required to decrypt the private key.
 #[derive(Debug, Getters)]
@@ -133,11 +139,12 @@ impl KeyPair {
     /// # Errors
     /// If the home directory cannot be determined, an error is returned.
     ///
-    pub fn default_key_path_ext() -> Result<(PathBuf, &'static str)> {
+    pub fn default_key_path_ext(mode: KexMode) -> Result<(PathBuf, &'static str)> {
         let base_dir = dirs2::home_dir().ok_or(MoshpitError::HomeDir)?.join(".mp");
-        let default_priv_key_path = base_dir.join("id_ed25519");
-        let default_pub_key_ext = "pub";
-        Ok((default_priv_key_path, default_pub_key_ext))
+        Ok(match mode {
+            KexMode::Client => (base_dir.join("id_ed25519"), "pub"),
+            KexMode::Server(_socket_addr) => (base_dir.join("mps_host_ed25519_key"), "pub"),
+        })
     }
 
     /// Generates a new moshpit key pair, optionally protected by a passphrase.
@@ -422,8 +429,12 @@ fn encrypt_private_key(
     Ok(())
 }
 
-#[cfg(test)]
-fn decrypt_private_key(
+/// Decrypts the provided encrypted private key bytes in place using the
+///
+/// # Errors
+/// If decryption fails, an error is returned.
+///
+pub fn decrypt_private_key(
     passphrase: &str,
     salt_bytes: &[u8],
     nonce_bytes: &[u8],
@@ -448,6 +459,40 @@ fn decrypt_private_key(
 
 fn as_be_bytes(value: usize) -> Result<[u8; 4]> {
     Ok(u32::try_from(value)?.to_be_bytes())
+}
+
+/// Load a moshpit public key from the provided public key path.
+///
+/// # Errors
+///
+/// If the public key cannot be read or is invalid, an error is returned.
+///
+pub fn load_public_key(pub_key_path: &PathBuf) -> Result<Vec<u8>> {
+    // Read the file contents into a buffer
+    let mut buffered_reader = File::open(pub_key_path)?;
+    let mut file_bytes = vec![];
+    let _len = buffered_reader.read_to_end(&mut file_bytes)?;
+
+    let pub_key_str = String::from_utf8_lossy(&file_bytes);
+    let pub_key_parts: Vec<&str> = pub_key_str.split_whitespace().collect();
+    if pub_key_parts.len() != 3 {
+        return Err(MoshpitError::InvalidKeyHeader.into());
+    }
+
+    let pub_key_part = pub_key_parts[1].as_bytes();
+
+    // Attempt the base64 decode the input
+    let decoded = STANDARD.decode(pub_key_part)?;
+
+    // Parse the public key file
+    let mut public_key_bytes = BytesMut::from(&decoded[..]);
+    let key_alg = get_val_by_len(&mut public_key_bytes)?;
+    if key_alg != KEY_ALGORITHM.as_bytes() {
+        return Err(MoshpitError::InvalidKeyHeader.into());
+    }
+    let pub_key_bytes = get_val_by_len(&mut public_key_bytes)?;
+
+    Ok(pub_key_bytes.to_vec())
 }
 
 /// Load a moshpit key pair from the provided private key path.
@@ -596,24 +641,11 @@ mod tests {
         let salt_bytes = encrypted_key_pair.salt_bytes.as_slice();
         let nonce_bytes = encrypted_key_pair.nonce_bytes.as_slice();
         let encrypted_private_key_bytes = encrypted_key_pair.encrypted_private_key_bytes.clone();
-        for byte in &encrypted_private_key_bytes {
-            print!("0x{byte:02x}");
-        }
-        println!();
         let mut decrypted_bytes = encrypted_key_pair.encrypted_private_key_bytes.clone();
 
         let decrypt_res =
             decrypt_private_key("test", salt_bytes, nonce_bytes, &mut decrypted_bytes);
         assert!(decrypt_res.is_ok());
-        for byte in &decrypted_bytes {
-            print!("0x{byte:02x}");
-        }
-        println!();
-        eprintln!(
-            "{} {}",
-            encrypted_private_key_bytes.len(),
-            decrypted_bytes.len()
-        );
         assert!(encrypted_private_key_bytes != decrypted_bytes);
         Ok(())
     }

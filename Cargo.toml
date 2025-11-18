@@ -8,7 +8,7 @@ anyhow = "1.0.100"
 aws-lc-rs = "1.15.0"
 bon = "3.8.1"
 bytes = "1.11.0"
-clap = { version = "4.5.51", features = ["derive"] }
+clap = { version = "4.5.52", features = ["derive"] }
 config = { version = "0.15.19", features = ["toml"] }
 getset = "0.1.6"
 rustversion = "1.0.22"
