@@ -26,7 +26,7 @@ use aws_lc_rs::{
     rand::fill,
 };
 use bon::Builder;
-use local_ip_address::linux::local_ip;
+use local_ip_address::local_ip;
 use tokio::{net::UdpSocket, sync::mpsc::UnboundedSender};
 use tracing::{error, trace};
 use uuid::Uuid;
