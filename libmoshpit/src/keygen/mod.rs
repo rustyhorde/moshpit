@@ -7,15 +7,18 @@
 // modified, or distributed except according to those terms.
 
 use std::{
-    io::{BufWriter, Write},
+    fs::File,
+    io::{BufWriter, Read, Write},
     path::PathBuf,
 };
 
-use anyhow::Result;
+use anyhow::{Error, Result};
 use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
+#[cfg(test)]
+use aws_lc_rs::aead::Nonce;
 use aws_lc_rs::{
     aead::{AES_256_GCM_SIV, Aad, RandomizedNonceKey},
-    agreement::{PrivateKey, X25519},
+    agreement::{PrivateKey, PublicKey, X25519},
     cipher::AES_256_KEY_LEN,
     digest::SHA512_OUTPUT_LEN,
     encoding::{AsBigEndian as _, Curve25519SeedBin},
@@ -23,6 +26,7 @@ use aws_lc_rs::{
     rand::fill,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use bytes::{Buf as _, BytesMut};
 use getset::Getters;
 use whoami::fallible::{hostname, username};
 
@@ -36,6 +40,79 @@ const NONE_CIPHER: &str = "none";
 const NONE_KDF: &str = "none";
 const KEY_CIPHER: &str = "aes-256-gcm-siv";
 const HKDF_INFO: &[&[u8]] = &[b"moshpit HKDF"];
+
+/// The AEAD cipher algorithms supported by moshpit key generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AEADCipher {
+    /// Unencrypted private key.
+    None,
+    /// AES-256-GCM-SIV encrypted private key.
+    Aes256GcmSiv,
+}
+
+impl AEADCipher {
+    /// Returns the string representation of the AEAD cipher algorithm.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            AEADCipher::None => NONE_CIPHER,
+            AEADCipher::Aes256GcmSiv => KEY_CIPHER,
+        }
+    }
+
+    /// Return the byte representation of the AEAD cipher algorithm.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        self.as_str().as_bytes()
+    }
+}
+
+impl TryFrom<&str> for AEADCipher {
+    type Error = Error;
+
+    fn try_from(value: &str) -> Result<Self> {
+        TryFrom::try_from(value.as_bytes())
+    }
+}
+
+impl TryFrom<&[u8]> for AEADCipher {
+    type Error = Error;
+
+    fn try_from(value: &[u8]) -> Result<Self> {
+        match value {
+            b"none" => Ok(AEADCipher::None),
+            b"aes-256-gcm-siv" => Ok(AEADCipher::Aes256GcmSiv),
+            _ => Err(MoshpitError::UnsupportedAeadCipher.into()),
+        }
+    }
+}
+
+/// A moshpit unencrypted key pair consisting of a private and public key.
+#[derive(Debug, Getters)]
+#[getset(get = "pub")]
+pub struct UnencryptedKeyPair {
+    /// The private key half of the key pair.
+    private_key: PrivateKey,
+    /// The public key half of the key pair.
+    public_key: PublicKey,
+}
+
+/// A moshpit encrypted key pair.  A password is
+/// required to decrypt the private key.
+#[derive(Debug, Getters)]
+#[getset(get = "pub")]
+pub struct EncryptedKeyPair {
+    /// The Argon2 KDF hahh.  Used to verify a passphrase before decryption.
+    kdf: String,
+    /// The public key half of the key pair.
+    public_key: Vec<u8>,
+    /// The HMAC salt bytes used to extend the passphrase into key material.
+    salt_bytes: Vec<u8>,
+    /// The nonce bytes used for AEAD encryption/decryption.
+    nonce_bytes: Vec<u8>,
+    /// The encrypted private key bytes.
+    encrypted_private_key_bytes: Vec<u8>,
+}
 
 /// A moshpit key pair consisting of a private and public key.
 #[derive(Debug, Getters)]
@@ -345,6 +422,199 @@ fn encrypt_private_key(
     Ok(())
 }
 
+#[cfg(test)]
+fn decrypt_private_key(
+    passphrase: &str,
+    salt_bytes: &[u8],
+    nonce_bytes: &[u8],
+    encrypted_private_key_bytes: &mut [u8],
+) -> Result<()> {
+    // Encrypt the private key bytes with the passphrase
+    let key_bytes = passphrase.as_bytes();
+
+    // Extend the passphrase to 32 bytes (256 bits) for AES-256-GCM-SIV with HKDF_SHA512
+    let salt = Salt::new(HKDF_SHA512, salt_bytes);
+    let pseudo_random_key = salt.extract(key_bytes);
+    let okm_aes = pseudo_random_key.expand(HKDF_INFO, &AES_256_GCM_SIV)?;
+    let mut key_bytes = [0u8; AES_256_KEY_LEN];
+    okm_aes.fill(&mut key_bytes)?;
+
+    // Decrypt the private key in place with an empty tag
+    let rnk = RandomizedNonceKey::new(&AES_256_GCM_SIV, &key_bytes)?;
+    let nonce = Nonce::try_assume_unique_for_key(nonce_bytes)?;
+    let _ = rnk.open_in_place(nonce, Aad::empty(), encrypted_private_key_bytes)?;
+    Ok(())
+}
+
 fn as_be_bytes(value: usize) -> Result<[u8; 4]> {
     Ok(u32::try_from(value)?.to_be_bytes())
+}
+
+/// Load a moshpit key pair from the provided private key path.
+///
+/// # Errors
+/// If the private key cannot be read or is invalid, an error is returned.
+///
+pub fn load_private_key(
+    priv_key_path: &PathBuf,
+) -> Result<(Option<UnencryptedKeyPair>, Option<EncryptedKeyPair>)> {
+    // Read the file contents into a buffer
+    let mut buffered_reader = File::open(priv_key_path)?;
+    let mut file_bytes = vec![];
+    let _len = buffered_reader.read_to_end(&mut file_bytes)?;
+
+    // Attempt the base64 decode the input
+    let decoded = STANDARD.decode(&file_bytes)?;
+
+    // Parse the private key file
+    let mut private_key_bytes = BytesMut::from(&decoded[..]);
+    let magic_key = private_key_bytes.split_to(KEY_HEADER.len());
+    let magic_key_bytes = magic_key.freeze();
+    if &magic_key_bytes[..] != KEY_HEADER {
+        return Err(MoshpitError::InvalidKeyHeader.into());
+    }
+    let cipher = get_val_by_len(&mut private_key_bytes)?;
+    let kdf = get_val_by_len(&mut private_key_bytes)?;
+    let key_alg = get_val_by_len(&mut private_key_bytes)?;
+    if key_alg != KEY_ALGORITHM.as_bytes() {
+        return Err(MoshpitError::InvalidKeyHeader.into());
+    }
+
+    if cipher == NONE_CIPHER.as_bytes() && kdf == NONE_KDF.as_bytes() {
+        let pub_key_bytes = get_val_by_len(&mut private_key_bytes)?;
+        let priv_key_bytes = get_val_by_len(&mut private_key_bytes)?;
+
+        let private_key = PrivateKey::from_private_key(&X25519, &priv_key_bytes)?;
+        let public_key = private_key.compute_public_key()?;
+        if public_key.as_ref() != pub_key_bytes.as_ref() {
+            return Err(MoshpitError::PublicKeyMismatch.into());
+        }
+        let unencrypted_key_pair = UnencryptedKeyPair {
+            private_key,
+            public_key,
+        };
+        Ok((Some(unencrypted_key_pair), None))
+    } else {
+        let pub_key_bytes = get_val_by_len(&mut private_key_bytes)?;
+        let salt_bytes = get_val_by_len(&mut private_key_bytes)?;
+        let nonce_bytes = get_val_by_len(&mut private_key_bytes)?;
+        let encrypted_priv_key_bytes = get_val_by_len(&mut private_key_bytes)?;
+
+        let encrypted_key_pair = EncryptedKeyPair {
+            kdf: String::from_utf8_lossy(&kdf).to_string(),
+            public_key: pub_key_bytes.to_vec(),
+            salt_bytes: salt_bytes.to_vec(),
+            nonce_bytes: nonce_bytes.to_vec(),
+            encrypted_private_key_bytes: encrypted_priv_key_bytes.to_vec(),
+        };
+        Ok((None, Some(encrypted_key_pair)))
+    }
+}
+
+fn get_val_by_len(bytes: &mut BytesMut) -> Result<BytesMut> {
+    let len_bytes = usize::try_from(bytes.get_u32())?;
+    let val_bytes = bytes.split_to(len_bytes);
+    Ok(val_bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use anyhow::Result;
+    use argon2::{Argon2, PasswordHash, PasswordVerifier as _};
+
+    use super::{decrypt_private_key, load_private_key};
+
+    // SHA256:wyKn0zB58msvX/02OmeJfcKRauGoQ2lMhdD/cKcrS6A= jozias@CachyOS
+    //
+    // +-[X25519 SHA256]-+
+    //|^O*=*o       ..oo|
+    //|Xo..++        = o|
+    //| + . ..      + BE|
+    //|    o  ..     * *|
+    //|   . . .S. +   +.|
+    //|  .     o + ...++|
+    //| .     . .   .+=X|
+    //|  o . o       o=B|
+    //|   +.o..     . oo|
+    //+----[SHA256]-----+
+    //
+    // SHA256:QjvDiq17SSkBEX7XarpkwP9boipvmghbO5djkhCZzyw= jozias@CachyOS
+    //
+    // +-[X25519 SHA256]-+
+    // |^OO+*o           |
+    // |+= .o+       .   |
+    // |.o.. o.     . .  |
+    // |.+=o. ..   .   o |
+    // | oO..o  S .     o|
+    // | *+=. .    .  E .|
+    // |**=o .    o    . |
+    // |*B= + .  . .     |
+    // |O++*.. .o.       |
+    // +----[SHA256]-----+
+    //
+    #[test]
+    fn test_load_private_key_unenc() {
+        let priv_key_path = PathBuf::from("tests/keys/id_ed25519_test");
+        let result = load_private_key(&priv_key_path);
+        assert!(result.is_ok());
+        let (unencrypted_key_pair_opt, encrypted_key_pair_opt) = result.unwrap();
+        assert!(unencrypted_key_pair_opt.is_some());
+        assert!(encrypted_key_pair_opt.is_none());
+        let unencrypted_key_pair = unencrypted_key_pair_opt.unwrap();
+        let public_key_bytes = unencrypted_key_pair.public_key.as_ref();
+        let expected_public_key_bytes = vec![
+            0x38, 0x43, 0x92, 0xD7, 0x3E, 0xEA, 0x2F, 0x77, 0x6B, 0x45, 0x7B, 0x99, 0xFD, 0xD6,
+            0x9D, 0x5B, 0x11, 0xF2, 0x3E, 0x8D, 0xB7, 0x13, 0x0B, 0xF7, 0x54, 0xF0, 0xC8, 0x49,
+            0x93, 0xD4, 0xF5, 0x5B,
+        ];
+        assert_eq!(public_key_bytes, expected_public_key_bytes.as_slice());
+    }
+
+    #[test]
+    fn test_load_private_key_enc() -> Result<()> {
+        let priv_key_path = PathBuf::from("tests/keys/id_ed25519_test_enc");
+        let result = load_private_key(&priv_key_path);
+        assert!(result.is_ok());
+        let (unencrypted_key_pair_opt, encrypted_key_pair_opt) = result.unwrap();
+        assert!(unencrypted_key_pair_opt.is_none());
+        assert!(encrypted_key_pair_opt.is_some());
+        let encrypted_key_pair = encrypted_key_pair_opt.unwrap();
+        assert!(encrypted_key_pair.kdf.starts_with("$argon2id$"));
+        let public_key_bytes = encrypted_key_pair.public_key.as_slice();
+        let expected_public_key_bytes = vec![
+            0x45, 0xDA, 0x9E, 0xCC, 0x73, 0xE8, 0x69, 0xE1, 0x98, 0xAF, 0xD9, 0x57, 0xD0, 0xAA,
+            0xA4, 0x2D, 0xA9, 0x52, 0xD0, 0x9C, 0xE3, 0x7B, 0x0A, 0x93, 0xEA, 0x9D, 0xDF, 0x6F,
+            0x4D, 0x54, 0x3F, 0x2F,
+        ];
+        assert_eq!(public_key_bytes, expected_public_key_bytes.as_slice());
+        let parsed_hash = PasswordHash::new(&encrypted_key_pair.kdf)?;
+        let argon2 = Argon2::default();
+        assert!(argon2.verify_password(b"test", &parsed_hash).is_ok());
+
+        let salt_bytes = encrypted_key_pair.salt_bytes.as_slice();
+        let nonce_bytes = encrypted_key_pair.nonce_bytes.as_slice();
+        let encrypted_private_key_bytes = encrypted_key_pair.encrypted_private_key_bytes.clone();
+        for byte in &encrypted_private_key_bytes {
+            print!("0x{byte:02x}");
+        }
+        println!();
+        let mut decrypted_bytes = encrypted_key_pair.encrypted_private_key_bytes.clone();
+
+        let decrypt_res =
+            decrypt_private_key("test", salt_bytes, nonce_bytes, &mut decrypted_bytes);
+        assert!(decrypt_res.is_ok());
+        for byte in &decrypted_bytes {
+            print!("0x{byte:02x}");
+        }
+        println!();
+        eprintln!(
+            "{} {}",
+            encrypted_private_key_bytes.len(),
+            decrypted_bytes.len()
+        );
+        assert!(encrypted_private_key_bytes != decrypted_bytes);
+        Ok(())
+    }
 }

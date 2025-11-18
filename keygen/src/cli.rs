@@ -54,7 +54,7 @@ pub(crate) struct Cli {
 pub(crate) enum Commands {
     #[clap(about = "Generate a new ed25519 public/private key pair")]
     Generate,
-    #[clap(about = "Verify a public key signature or randomart image")]
+    #[clap(about = "Verify a public key fingerprint or randomart image")]
     Verify {
         #[clap(short, long, help = "Verify randomart", default_value_t = false)]
         randomart: bool,

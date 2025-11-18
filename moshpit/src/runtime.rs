@@ -87,7 +87,6 @@ where
     });
 
     let (term_cols, term_rows) = terminal_size().unwrap_or((80, 24));
-    info!("Terminal size: {} cols, {} rows", term_cols, term_rows);
     tx.send(EncryptedFrame::Resize((
         kex.uuid_wrapper(),
         term_cols,
@@ -161,7 +160,6 @@ where
                 trace!("UDP reader received None frame, exiting");
             }
         }
-        info!("UDP reader exiting");
     });
 
     let stdout_handle = thread::spawn(move || {
@@ -183,15 +181,12 @@ where
     });
 
     let mut stdin = stdin();
-    let mut total_bytes = 0;
 
     loop {
         let mut buf = BytesMut::zeroed(8192);
 
         let len = stdin.read(&mut buf)?;
         if len > 0 {
-            total_bytes += len;
-            trace!("Read {len} bytes from stdin, total bytes: {total_bytes}");
             if len == 1 && buf[0] == b'q' {
                 info!("Exiting on 'q' input");
                 stdout_tx.send(b"q".to_vec()).unwrap();

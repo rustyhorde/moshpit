@@ -58,6 +58,15 @@ pub enum Error {
     /// Invalid public key file format
     #[error("Invalid public key file format")]
     InvalidPublicKeyFormat,
+    /// An invalid key header was found
+    #[error("An invalid key header was found")]
+    InvalidKeyHeader,
+    /// A public key mismatch occurred
+    #[error("A public key mismatch occurred")]
+    PublicKeyMismatch,
+    /// An unsupported AEAD cipher was specified
+    #[error("An unsupported AEAD cipher was specified")]
+    UnsupportedAeadCipher,
 }
 
 /// Converts an `anyhow::Error` into a suitable exit code or clap message for a CLI application.

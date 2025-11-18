@@ -1,7 +1,7 @@
 [package]
 authors = ["Jason Ozias <jason.g.ozias@gmail.com>"]
 categories = ["command-line-interface", "network-programming", "cryptography"]
-description = "A Rust implementation of in the same vein as Mosh, the mobile shell."
+description = "Perform various key tasks for moshpit"
 documentation = "https://docs.rs/libmoshpit"
 edition = "2024"
 homepage = "https://github.com/rustyhorde/moshpit"
