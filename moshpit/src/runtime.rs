@@ -225,10 +225,6 @@ where
         enable_raw_mode().unwrap();
 
         while let Some(msg) = stdout_rx.blocking_recv() {
-            if msg.len() == 1 && msg[0] == b'q' {
-                info!("Exiting stdout thread on 'q' input");
-                break;
-            }
             if let Err(e) = stdout.write_all(&msg) {
                 error!("Error writing to stdout: {e}");
             }
@@ -243,17 +239,10 @@ where
         let mut buf = BytesMut::zeroed(8192);
         let len = stdin.read(&mut buf).unwrap();
         if len > 0 {
-            if len == 1 && buf[0] == b'q' {
-                info!("Exiting on 'q' input");
-                stdout_tx.send(b"q".to_vec()).unwrap();
-                break;
-            }
             let msg = &buf[..len];
             tx.send(EncryptedFrame::Bytes((kex.uuid_wrapper(), msg.to_vec())))
                 .unwrap();
             buf.advance(len);
         }
     }
-
-    Ok(())
 }
