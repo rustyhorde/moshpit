@@ -36,8 +36,7 @@ use tracing::{error, info, trace};
 
 use crate::{cli::Cli, config::Config};
 
-static CMD_LINE_EXIT_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^133;C;cmdline_url=exit$").unwrap());
+static EXIT_TITLE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^0;exit$").unwrap());
 static EXIT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^133;D;\d$").unwrap());
 
 #[allow(clippy::too_many_lines)]
@@ -143,7 +142,6 @@ where
     let _udp_reader_handle = spawn(async move {
         let mut prev_bytes = BytesMut::with_capacity(1024);
         let mut osc_started = false;
-        let mut cmd_line_exit_detected = false;
 
         loop {
             select! {
@@ -182,20 +180,8 @@ where
 
                                 for part in &result {
                                     match part {
-                                        Token::String(osc_cmd_string) => {
-                                            if osc_started
-                                                && cmd_line_exit_detected
-                                                && EXIT_RE.is_match(osc_cmd_string)
-                                            {
-                                                reader_token.cancel();
-                                                trace!(
-                                                    "exit command detected in OSC sequence: {osc_cmd_string}"
-                                                );
-                                            } else if osc_started
-                                                && CMD_LINE_EXIT_RE.is_match(osc_cmd_string)
-                                            {
-                                                cmd_line_exit_detected = true;
-                                            }
+                                        Token::String(osc_cmd_string) => if osc_started && (EXIT_RE.is_match(osc_cmd_string) || EXIT_TITLE_RE.is_match(osc_cmd_string)) {
+                                            reader_token.cancel();
                                         }
                                         Token::ControlFunction(control_function) => {
                                             if osc_started
