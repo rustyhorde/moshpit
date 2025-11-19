@@ -31,6 +31,7 @@ getset = { workspace = true }
 libmoshpit = { version = "0.1.0", path = "../libmoshpit" }
 regex = "1.12.2"
 serde = { workspace = true }
+terminal_size = "0.4.3"
 tokio = { workspace = true, features = ["io-std", "sync", "time"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }

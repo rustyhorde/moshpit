@@ -23,12 +23,13 @@ use ansi_control_codes::{
 use anyhow::{Context as _, Result};
 use bytes::{Buf as _, BytesMut};
 use clap::Parser as _;
-use crossterm::terminal::{enable_raw_mode, window_size};
+use crossterm::terminal::enable_raw_mode;
 use libmoshpit::{
     EncryptedFrame, KexMode, KeyPair, MoshpitError, UdpReader, UdpSender, init_tracing, load,
     run_key_exchange,
 };
 use regex::Regex;
+use terminal_size::terminal_size;
 use tokio::{net::TcpStream, select, spawn, sync::mpsc::unbounded_channel};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, trace};
@@ -132,7 +133,7 @@ where
         }
     });
 
-    let (columns, rows) = window_size().map_or((80, 24), |ws| (ws.columns, ws.rows));
+    let (columns, rows) = terminal_size().map_or((80, 24), |(width, height)| (width.0, height.0));
     tx.send(EncryptedFrame::Resize((kex.uuid_wrapper(), columns, rows)))?;
 
     let (stdout_tx, mut stdout_rx) = unbounded_channel::<Vec<u8>>();
