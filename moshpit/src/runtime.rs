@@ -9,37 +9,29 @@
 use std::{
     ffi::OsString,
     io::{Read as _, Write as _, stdin, stdout},
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::PathBuf,
-    process,
-    sync::LazyLock,
     thread,
 };
 
-use ansi_control_codes::{
-    c0, c1,
-    parser::{Token, TokenStream},
-};
 use anyhow::{Context as _, Result};
-use bytes::{Buf as _, BytesMut};
 use clap::Parser as _;
 use crossterm::terminal::enable_raw_mode;
 use libmoshpit::{
-    EncryptedFrame, KexMode, KeyPair, MoshpitError, UdpReader, UdpSender, init_tracing, load,
+    EncryptedFrame, Kex, KexMode, KeyPair, MoshpitError, UdpReader, UdpSender, init_tracing, load,
     run_key_exchange,
 };
-use regex::Regex;
 use terminal_size::terminal_size;
-use tokio::{net::TcpStream, select, spawn, sync::mpsc::unbounded_channel};
+use tokio::{
+    net::TcpStream,
+    spawn,
+    sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
+};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, trace};
 
 use crate::{cli::Cli, config::Config};
 
-static EXIT_TITLE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^0;exit$").unwrap());
-static EXIT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^133;D;\d$").unwrap());
-
-#[allow(clippy::too_many_lines)]
 pub(crate) async fn run<I, T>(args: Option<I>) -> Result<()>
 where
     I: IntoIterator<Item = T>,
@@ -63,10 +55,15 @@ where
     trace!("Tracing initialized");
 
     // Setup the TCP connection to the server for key exchange
-    let socket_addr = config
-        .server_ip()
-        .parse::<SocketAddr>()
+    let ip_addr = config
+        .server_destination()
+        .parse::<IpAddr>()
         .with_context(|| MoshpitError::InvalidServerAddress)?;
+    let socket_addr = SocketAddr::new(ip_addr, config.server_port());
+    // let socket_addr = config
+    //     .server_destination()
+    //     .parse::<SocketAddr>()
+    //     .with_context(|| MoshpitError::InvalidServerAddress)?;
     let socket = TcpStream::connect(socket_addr).await?;
     let (sock_read, sock_write) = socket.into_split();
 
@@ -118,97 +115,34 @@ where
         .build();
 
     let sender_token = token.clone();
-    let _udp_handle = spawn(async move {
-        select! {
-            () = sender_token.cancelled() => {
-                trace!("UDP sender received cancellation");
-                drop(udp_sender);
-            }
-            result = udp_sender.handle_frame() => {
-                if let Err(e) = result {
-                    error!("udp sender error {e}");
-                }
-            }
-        }
-    });
+    let _udp_handle = spawn(async move { udp_sender.frame_loop(sender_token).await });
 
     let (columns, rows) = terminal_size().map_or((80, 24), |(width, height)| (width.0, height.0));
     tx.send(EncryptedFrame::Resize((kex.uuid_wrapper(), columns, rows)))?;
 
-    let (stdout_tx, mut stdout_rx) = unbounded_channel::<Vec<u8>>();
+    let (stdout_tx, stdout_rx) = unbounded_channel::<Vec<u8>>();
 
     let stdout_tx_c = stdout_tx.clone();
     let reader_token = token.clone();
     let _udp_reader_handle = spawn(async move {
-        let mut prev_bytes = BytesMut::with_capacity(1024);
-        let mut osc_started = false;
-
-        loop {
-            select! {
-                () = reader_token.cancelled() => {
-                    trace!("UDP reader received cancellation");
-                    process::exit(0);
-                }
-                frame_res = udp_reader.read_encrypted_frame() =>{
-                    if let Ok(Some(frame)) = frame_res {
-                        match frame {
-                            EncryptedFrame::Resize(_) => {
-                                error!("Received Resize frame on client, which is unexpected");
-                            }
-                            EncryptedFrame::Bytes((_id, message)) => {
-                                let message = if prev_bytes.is_empty() {
-                                    message
-                                } else {
-                                    let mut combined =
-                                        BytesMut::with_capacity(prev_bytes.len() + message.len());
-                                    combined.extend_from_slice(&prev_bytes);
-                                    combined.extend_from_slice(&message);
-                                    prev_bytes.clear();
-                                    combined.freeze().to_vec()
-                                };
-                                prev_bytes.clear();
-                                let mut valid_utf8 = String::new();
-                                for chunk in message.utf8_chunks() {
-                                    valid_utf8.push_str(chunk.valid());
-
-                                    if !chunk.invalid().is_empty() {
-                                        info!("Received invalid UTF-8 chunk");
-                                        prev_bytes.extend_from_slice(chunk.invalid());
-                                    }
-                                }
-                                let result = TokenStream::from(&valid_utf8).collect::<Vec<Token<'_>>>();
-
-                                for part in &result {
-                                    match part {
-                                        Token::String(osc_cmd_string) => if osc_started && (EXIT_RE.is_match(osc_cmd_string) || EXIT_TITLE_RE.is_match(osc_cmd_string)) {
-                                            reader_token.cancel();
-                                        }
-                                        Token::ControlFunction(control_function) => {
-                                            if osc_started
-                                                && (*control_function == c1::ST
-                                                    || *control_function == c0::BEL)
-                                            {
-                                                osc_started = false;
-                                            } else if *control_function == c1::OSC && !osc_started {
-                                                osc_started = true;
-                                            }
-                                        }
-                                    }
-                                }
-                                let _unused = stdout_tx_c.send(valid_utf8.into_bytes());
-                            }
-                        }
-                    } else {
-                        trace!("UDP reader received None frame, exiting");
-                    }
-                }
-            }
-        }
+        udp_reader
+            .client_frame_loop(reader_token, stdout_tx_c)
+            .await;
     });
 
-    let _stdin_handle = thread::spawn(move || {
+    handle_io(stdout_rx, &tx, &kex)?;
+    Ok(())
+}
+
+fn handle_io(
+    mut stdout_rx: UnboundedReceiver<Vec<u8>>,
+    tx: &UnboundedSender<EncryptedFrame>,
+    kex: &Kex,
+) -> Result<()> {
+    enable_raw_mode()?;
+
+    let _stdout_handle = thread::spawn(move || {
         let mut stdout = stdout();
-        enable_raw_mode().unwrap();
 
         while let Some(msg) = stdout_rx.blocking_recv() {
             if let Err(e) = stdout.write_all(&msg) {
@@ -222,13 +156,13 @@ where
 
     let mut stdin = stdin();
     loop {
-        let mut buf = BytesMut::zeroed(8192);
-        let len = stdin.read(&mut buf).unwrap();
+        let mut buf = [0u8; 4096];
+        let len = stdin.read(&mut buf)?;
         if len > 0 {
             let msg = &buf[..len];
-            tx.send(EncryptedFrame::Bytes((kex.uuid_wrapper(), msg.to_vec())))
-                .unwrap();
-            buf.advance(len);
+            if let Err(e) = tx.send(EncryptedFrame::Bytes((kex.uuid_wrapper(), msg.to_vec()))) {
+                error!("{e}");
+            }
         }
     }
 }

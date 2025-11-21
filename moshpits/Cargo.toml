@@ -30,6 +30,7 @@ libmoshpit = { version = "0.1.0", path = "../libmoshpit" }
 pseudoterminal = "0.2.1"
 serde = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
+tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber-init = { workspace = true }
 vergen-pretty = { workspace = true }

@@ -20,13 +20,12 @@ pub(crate) struct Config {
     verbose: u8,
     #[getset(get_copy = "pub(crate)")]
     quiet: u8,
-    #[getset(get_copy = "pub(crate)")]
-    #[getset(set = "pub(crate)")]
-    enable_std_output: bool,
-    #[getset(get = "pub(crate)")]
-    server_ip: String,
     #[getset(get = "pub(crate)")]
     tracing: Tracing,
+    #[getset(get_copy = "pub(crate)")]
+    server_port: u16,
+    #[getset(get = "pub(crate)")]
+    server_destination: String,
     #[getset(get = "pub(crate)")]
     private_key_path: Option<String>,
     #[getset(get = "pub(crate)")]
@@ -65,7 +64,7 @@ impl TracingConfig for Config {
 
 impl TracingConfigExt for Config {
     fn enable_stdout(&self) -> bool {
-        self.enable_std_output
+        false
     }
 
     fn directives(&self) -> Option<&String> {

@@ -17,6 +17,7 @@ rust-version = "1.88.0"
 unstable = []
 
 [dependencies]
+ansi-control-codes = { version = "1.0.1", features = ["parser", "explain"] }
 anyhow = { workspace = true }
 argon2 = { version = "0.6.0-rc.2", features = ["getrandom"] }
 aws-lc-rs = { workspace = true }
@@ -30,9 +31,11 @@ config = { workspace = true }
 dirs2 = "3.0.1"
 getset = { workspace = true }
 local-ip-address = "0.6.5"
+regex = "1.12.2"
 serde = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["sync","time"] }
+tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = "0.2.3"
 tracing-subscriber = { version = "=0.3.19", features = [

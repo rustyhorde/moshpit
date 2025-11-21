@@ -28,6 +28,7 @@ use tokio::{
     spawn,
     sync::mpsc::unbounded_channel,
 };
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, trace};
 
 use crate::{cli::Cli, config::Config};
@@ -97,7 +98,6 @@ where
     }
 }
 
-#[allow(clippy::too_many_lines)]
 async fn handle_connection(
     socket: TcpStream,
     socket_addr: SocketAddr,
@@ -136,27 +136,13 @@ async fn handle_connection(
         .build();
 
     let _udp_reader_handle = spawn(async move {
-        while let Ok(frame_opt) = udp_reader.read_encrypted_frame().await {
-            if let Some(frame) = frame_opt {
-                match frame {
-                    EncryptedFrame::Bytes((_id, message)) => {
-                        term_tx.send(TerminalMessage::Input(message)).unwrap();
-                    }
-                    EncryptedFrame::Resize((_id, columns, rows)) => {
-                        term_tx
-                            .send(TerminalMessage::Resize { rows, columns })
-                            .unwrap();
-                    }
-                }
-            }
+        if let Err(e) = udp_reader.server_frame_loop(term_tx).await {
+            error!("{e}");
         }
     });
 
-    let _udp_handle = spawn(async move {
-        if let Err(e) = udp_sender.handle_frame().await {
-            error!("udp sender error {e}");
-        }
-    });
+    let token = CancellationToken::new();
+    let _udp_handle = spawn(async move { udp_sender.frame_loop(token).await });
 
     let _term_handle = thread::spawn(move || {
         let mut cmd = Command::new("/usr/bin/fish");

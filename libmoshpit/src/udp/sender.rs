@@ -16,7 +16,9 @@ use aws_lc_rs::{
 use bincode::{config::standard, encode_to_vec};
 use bon::Builder;
 use getset::MutGetters;
-use tokio::{net::UdpSocket, sync::mpsc::UnboundedReceiver};
+use tokio::{net::UdpSocket, select, sync::mpsc::UnboundedReceiver};
+use tokio_util::sync::CancellationToken;
+use tracing::trace;
 use uuid::Uuid;
 
 use crate::EncryptedFrame;
@@ -45,12 +47,20 @@ impl UdpSender {
     ///
     /// * I/O error.
     ///
-    pub async fn handle_frame(&mut self) -> Result<()> {
-        while let Some(frame) = self.rx.recv().await {
-            let packet = self.encrypt(&frame)?;
-            let _len = self.socket.send(&packet).await?;
+    pub async fn frame_loop(&mut self, token: CancellationToken) -> Result<()> {
+        loop {
+            select! {
+                () = token.cancelled() => {
+                    trace!("UDP sender received cancellation");
+                    return Ok(());
+                }
+                frame_opt = self.rx.recv() => {
+                    if let Some(frame) = frame_opt {
+                        let _bytes_sent = self.socket.send(&self.encrypt(&frame)?).await?;
+                    }
+                }
+            }
         }
-        Ok(())
     }
 
     fn encrypt(&self, frame: &EncryptedFrame) -> Result<Vec<u8>> {

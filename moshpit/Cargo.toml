@@ -21,15 +21,12 @@ path = "src/main.rs"
 unstable = []
 
 [dependencies]
-ansi-control-codes = { version = "1.0.1", features = ["parser", "explain"] }
 anyhow = { workspace = true }
-bytes.workspace = true
 clap = { workspace = true }
 config = { workspace = true }
 crossterm = "0.29.0"
 getset = { workspace = true }
 libmoshpit = { version = "0.1.0", path = "../libmoshpit" }
-regex = "1.12.2"
 serde = { workspace = true }
 terminal_size = "0.4.3"
 tokio = { workspace = true, features = ["io-std", "sync", "time"] }

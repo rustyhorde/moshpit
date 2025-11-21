@@ -6,8 +6,17 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-use std::{io::Cursor, sync::Arc};
+use std::{
+    io::Cursor,
+    process,
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 
+use ansi_control_codes::{
+    c0, c1,
+    parser::{Token, TokenStream},
+};
 use anyhow::Result;
 use aws_lc_rs::{
     aead::{AES_256_GCM_SIV, RandomizedNonceKey},
@@ -15,11 +24,15 @@ use aws_lc_rs::{
 };
 use bon::Builder;
 use bytes::BytesMut;
-use tokio::net::UdpSocket;
-use tracing::{error, info};
+use regex::Regex;
+use tokio::{net::UdpSocket, select, sync::mpsc::UnboundedSender, time::sleep};
+use tokio_util::sync::CancellationToken;
+use tracing::{error, info, trace};
 use uuid::Uuid;
 
-use crate::{EncryptedFrame, MoshpitError};
+use crate::{EncryptedFrame, MoshpitError, TerminalMessage};
+
+static EXIT_TITLE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^0;exit$").unwrap());
 
 /// UDP reader for encrypted frames
 #[derive(Builder, Debug)]
@@ -39,6 +52,111 @@ pub struct UdpReader {
 }
 
 impl UdpReader {
+    /// Run the server frame reading loop
+    ///
+    /// # Errors
+    /// * I/O error.
+    /// * Frame parsing error.
+    ///
+    pub async fn server_frame_loop(
+        &mut self,
+        term_tx: UnboundedSender<TerminalMessage>,
+    ) -> Result<()> {
+        while let Ok(frame_opt) = self.read_encrypted_frame().await {
+            if let Some(frame) = frame_opt {
+                match frame {
+                    EncryptedFrame::Bytes((_id, message)) => {
+                        term_tx.send(TerminalMessage::Input(message))?;
+                    }
+                    EncryptedFrame::Resize((_id, columns, rows)) => {
+                        term_tx.send(TerminalMessage::Resize { rows, columns })?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Run the client frame reading loop
+    ///
+    /// # Errors
+    /// * I/O error.
+    /// * Frame parsing error.
+    ///
+    pub async fn client_frame_loop(
+        &mut self,
+        token: CancellationToken,
+        stdout_tx: UnboundedSender<Vec<u8>>,
+    ) {
+        let mut prev_bytes = BytesMut::with_capacity(1024);
+        let mut osc_started = false;
+
+        loop {
+            select! {
+                () = token.cancelled() => {
+                    trace!("UDP reader received cancellation");
+                    process::exit(0);
+                }
+                frame_res = self.read_encrypted_frame() =>{
+                    if let Ok(Some(frame)) = frame_res {
+                        match frame {
+                            EncryptedFrame::Resize(_) => {
+                                error!("Received Resize frame on client, which is unexpected");
+                            }
+                            EncryptedFrame::Bytes((_id, message)) => {
+                                let message = if prev_bytes.is_empty() {
+                                    message
+                                } else {
+                                    let mut combined =
+                                        BytesMut::with_capacity(prev_bytes.len() + message.len());
+                                    combined.extend_from_slice(&prev_bytes);
+                                    combined.extend_from_slice(&message);
+                                    prev_bytes.clear();
+                                    combined.freeze().to_vec()
+                                };
+                                prev_bytes.clear();
+                                let mut valid_utf8 = String::new();
+                                for chunk in message.utf8_chunks() {
+                                    valid_utf8.push_str(chunk.valid());
+
+                                    if !chunk.invalid().is_empty() {
+                                        info!("Received invalid UTF-8 chunk");
+                                        prev_bytes.extend_from_slice(chunk.invalid());
+                                    }
+                                }
+                                let result = TokenStream::from(&valid_utf8).collect::<Vec<Token<'_>>>();
+
+                                for part in &result {
+                                    match part {
+                                        Token::String(osc_cmd_string) => if osc_started && EXIT_TITLE_RE.is_match(osc_cmd_string) {
+                                            sleep(Duration::from_millis(500)).await;
+                                            token.cancel();
+                                        }
+                                        Token::ControlFunction(control_function) => {
+                                            if osc_started
+                                                && (*control_function == c1::ST
+                                                    || *control_function == c0::BEL)
+                                            {
+                                                osc_started = false;
+                                            } else if *control_function == c1::OSC && !osc_started {
+                                                osc_started = true;
+                                            }
+                                        }
+                                    }
+                                }
+                                if let Err(e) = stdout_tx.send(valid_utf8.into_bytes()) {
+                                    error!("Error sending to stdout channel: {e}");
+                                }
+                            }
+                        }
+                    } else {
+                        trace!("UDP reader received None frame, exiting");
+                    }
+                }
+            }
+        }
+    }
+
     /// Read a single `Frame` value from the underlying stream.
     ///
     /// The function waits until it has retrieved enough data to parse a frame.
