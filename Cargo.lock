@@ -2185,6 +2185,7 @@ dependencies = [
  "clap",
  "config",
  "crossterm",
+ "dialoguer",
  "getset",
  "libmoshpit",
  "rustversion",

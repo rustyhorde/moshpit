@@ -16,6 +16,7 @@ use std::{
 use anyhow::{Context as _, Result};
 use clap::Parser as _;
 use crossterm::terminal::enable_raw_mode;
+use dialoguer::Password;
 use libmoshpit::{
     EncryptedFrame, Kex, KexMode, KeyPair, MoshpitError, UdpReader, UdpSender, init_tracing, load,
     parse_server_destination, run_key_exchange,
@@ -81,7 +82,7 @@ where
         sock_write,
         private_key_path,
         public_key_path,
-        || Ok(Some("test".to_string())),
+        read_passpharase,
     )
     .await?;
     info!("Key exchange completed with moshpits");
@@ -158,4 +159,16 @@ fn handle_io(
             }
         }
     }
+}
+
+fn read_passpharase() -> Result<Option<String>> {
+    Password::new()
+        .with_prompt("Please enter your private key passphrase")
+        .with_confirmation(
+            "Confirm the passphrase",
+            "The entered passphrases do not match",
+        )
+        .interact()
+        .map(Some)
+        .map_err(Into::into)
 }
