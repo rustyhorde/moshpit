@@ -67,6 +67,9 @@ pub enum Error {
     /// An unsupported AEAD cipher was specified
     #[error("An unsupported AEAD cipher was specified")]
     UnsupportedAeadCipher,
+    /// An invalid server destination format was provided
+    #[error("An invalid server destination format was provided")]
+    InvalidServerDestination,
 }
 
 /// Converts an `anyhow::Error` into a suitable exit code or clap message for a CLI application.

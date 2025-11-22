@@ -86,7 +86,7 @@ pub(crate) struct Cli {
     #[getset(get_copy = "pub(crate)")]
     server_port: u16,
     /// The destination of the server to connect to
-    /// This takes the form of <user>@<ip address> where the user is optional
+    /// This takes the form of 'user@ip address' where the user is optional
     /// and will default to the user executing the command.
     #[clap(help = "The IP address of the server to connect to")]
     #[getset(get = "pub(crate)")]

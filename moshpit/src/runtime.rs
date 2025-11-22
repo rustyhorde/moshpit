@@ -9,7 +9,6 @@
 use std::{
     ffi::OsString,
     io::{Read as _, Write as _, stdin, stdout},
-    net::{IpAddr, SocketAddr},
     path::PathBuf,
     thread,
 };
@@ -19,7 +18,7 @@ use clap::Parser as _;
 use crossterm::terminal::enable_raw_mode;
 use libmoshpit::{
     EncryptedFrame, Kex, KexMode, KeyPair, MoshpitError, UdpReader, UdpSender, init_tracing, load,
-    run_key_exchange,
+    parse_server_destination, run_key_exchange,
 };
 use terminal_size::terminal_size;
 use tokio::{
@@ -55,15 +54,9 @@ where
     trace!("Tracing initialized");
 
     // Setup the TCP connection to the server for key exchange
-    let ip_addr = config
-        .server_destination()
-        .parse::<IpAddr>()
-        .with_context(|| MoshpitError::InvalidServerAddress)?;
-    let socket_addr = SocketAddr::new(ip_addr, config.server_port());
-    // let socket_addr = config
-    //     .server_destination()
-    //     .parse::<SocketAddr>()
-    //     .with_context(|| MoshpitError::InvalidServerAddress)?;
+    let (user, socket_addr) =
+        parse_server_destination(config.server_destination(), config.server_port())?;
+    trace!("Connecting to server at {socket_addr} as {user}");
     let socket = TcpStream::connect(socket_addr).await?;
     let (sock_read, sock_write) = socket.into_split();
 

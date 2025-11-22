@@ -290,5 +290,6 @@ pub use self::tracing::{TracingConfigExt, init_tracing};
 pub use self::udp::UdpClient;
 pub use self::udp::reader::UdpReader;
 pub use self::udp::sender::UdpSender;
+pub use self::utils::parse_server_destination;
 pub use self::utils::to_path_buf;
 pub use self::uuid::UuidWrapper;
