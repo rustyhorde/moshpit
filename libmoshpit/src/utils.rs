@@ -52,6 +52,18 @@ pub fn parse_server_destination(dest: &str, port: u16) -> Result<(String, Socket
     }
 }
 
+static EXIT_TITLE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^0;exit$").unwrap());
+static EXIT_TITLE_RELAXED_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"0;exit").unwrap());
+
+/// Check if a terminal title indicates an exit command
+pub fn is_exit_title(title: &str, relaxed: bool) -> bool {
+    if relaxed {
+        EXIT_TITLE_RELAXED_RE.is_match(title)
+    } else {
+        EXIT_TITLE_RE.is_match(title)
+    }
+}
+
 #[cfg(test)]
 #[allow(dead_code)]
 pub(crate) trait Mock {

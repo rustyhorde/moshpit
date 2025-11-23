@@ -10,7 +10,7 @@ use std::{
     io::Cursor,
     process,
     sync::{
-        Arc, LazyLock,
+        Arc,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
@@ -27,15 +27,12 @@ use aws_lc_rs::{
 };
 use bon::Builder;
 use bytes::BytesMut;
-use regex::Regex;
 use tokio::{net::UdpSocket, select, sync::mpsc::UnboundedSender, time::sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, trace};
 use uuid::Uuid;
 
-use crate::{EncryptedFrame, MoshpitError, TerminalMessage};
-
-static EXIT_TITLE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^0;exit$").unwrap());
+use crate::{EncryptedFrame, MoshpitError, TerminalMessage, utils::is_exit_title};
 
 /// UDP reader for encrypted frames
 #[derive(Builder, Debug)]
@@ -63,16 +60,25 @@ impl UdpReader {
     ///
     pub async fn server_frame_loop(
         &mut self,
+        token: CancellationToken,
         term_tx: UnboundedSender<TerminalMessage>,
     ) -> Result<()> {
-        while let Ok(frame_opt) = self.read_encrypted_frame().await {
-            if let Some(frame) = frame_opt {
-                match frame {
-                    EncryptedFrame::Bytes((_id, message)) => {
-                        term_tx.send(TerminalMessage::Input(message))?;
-                    }
-                    EncryptedFrame::Resize((_id, columns, rows)) => {
-                        term_tx.send(TerminalMessage::Resize { rows, columns })?;
+        loop {
+            select! {
+                () = token.cancelled() => {
+                    trace!("udp reader server frame loop cancelled");
+                    break;
+                }
+                frame_res = self.read_encrypted_frame() =>{
+                    if let Ok(Some(frame)) = frame_res {
+                        match frame {
+                            EncryptedFrame::Bytes((_id, message)) => {
+                                term_tx.send(TerminalMessage::Input(message))?;
+                            }
+                            EncryptedFrame::Resize((_id, columns, rows)) => {
+                                term_tx.send(TerminalMessage::Resize { rows, columns })?;
+                            }
+                        }
                     }
                 }
             }
@@ -97,7 +103,7 @@ impl UdpReader {
         loop {
             select! {
                 () = token.cancelled() => {
-                    trace!("UDP reader received cancellation");
+                    trace!("udp reader client frame loop cancelled");
                     process::exit(0);
                 }
                 frame_res = self.read_encrypted_frame() =>{
@@ -131,7 +137,7 @@ impl UdpReader {
 
                                 for part in &result {
                                     match part {
-                                        Token::String(osc_cmd_string) => if osc_started && EXIT_TITLE_RE.is_match(osc_cmd_string) {
+                                        Token::String(osc_cmd_string) => if osc_started && is_exit_title(osc_cmd_string, false) {
                                             sleep(Duration::from_millis(500)).await;
                                             token.cancel();
                                         }

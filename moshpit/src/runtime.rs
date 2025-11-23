@@ -80,6 +80,7 @@ where
         KexMode::Client,
         sock_read,
         sock_write,
+        None,
         private_key_path,
         public_key_path,
         read_passpharase,

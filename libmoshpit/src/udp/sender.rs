@@ -57,8 +57,8 @@ impl UdpSender {
         loop {
             select! {
                 () = token.cancelled() => {
-                    trace!("UDP sender received cancellation");
-                    return Ok(());
+                    trace!("udp sender frame loop cancelled");
+                    break;
                 }
                 frame_opt = self.rx.recv() => {
                     if let Some(frame) = frame_opt {
@@ -68,6 +68,7 @@ impl UdpSender {
                 }
             }
         }
+        Ok(())
     }
 
     fn encrypt(&self, frame: &EncryptedFrame, count: usize) -> Result<Vec<u8>> {

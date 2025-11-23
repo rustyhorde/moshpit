@@ -6,7 +6,7 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{collections::BTreeSet, net::SocketAddr, path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use aws_lc_rs::{
@@ -21,7 +21,10 @@ use tokio::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
     },
     spawn,
-    sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
+    sync::{
+        Mutex,
+        mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
+    },
     task::JoinHandle,
 };
 use tracing::{error, trace};
@@ -176,6 +179,7 @@ pub async fn run_key_exchange(
     mode: KexMode,
     sock_read: OwnedReadHalf,
     sock_write: OwnedWriteHalf,
+    port_pool: Option<Arc<Mutex<BTreeSet<u16>>>>,
     private_key_path: PathBuf,
     public_key_path: PathBuf,
     passphrase_fn: impl Fn() -> Result<Option<String>>,
@@ -212,6 +216,7 @@ pub async fn run_key_exchange(
         KexMode::Server(socket_addr) => {
             run_server_kex(
                 socket_addr,
+                port_pool,
                 tx,
                 tx_event,
                 reader,
@@ -303,8 +308,10 @@ async fn run_client_kex(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_server_kex(
     socket_addr: SocketAddr,
+    port_pool_opt: Option<Arc<Mutex<BTreeSet<u16>>>>,
     tx: UnboundedSender<Frame>,
     tx_event: UnboundedSender<KexEvent>,
     reader: ConnectionReader,
@@ -320,8 +327,14 @@ async fn run_server_kex(
         .tx(tx_c)
         .tx_event(tx_event_c)
         .build();
-    let udp_arc = frame_reader
-        .server_kex(socket_addr, &private_key_path, &public_key_path)
-        .await?;
-    Ok((kex_handle.await??, udp_arc))
+    if let Some(port_pool) = port_pool_opt {
+        let udp_arc = frame_reader
+            .server_kex(socket_addr, port_pool, &private_key_path, &public_key_path)
+            .await?;
+        Ok((kex_handle.await??, udp_arc))
+    } else {
+        Err(anyhow::anyhow!(
+            "Port pool is required for server key exchange"
+        ))
+    }
 }

@@ -6,14 +6,7 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-use std::{
-    net::SocketAddr,
-    path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicU16, Ordering},
-    },
-};
+use std::{collections::BTreeSet, net::SocketAddr, path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use aws_lc_rs::{
@@ -27,15 +20,16 @@ use aws_lc_rs::{
 };
 use bon::Builder;
 use local_ip_address::local_ip;
-use tokio::{net::UdpSocket, sync::mpsc::UnboundedSender};
+use tokio::{
+    net::UdpSocket,
+    sync::{Mutex, mpsc::UnboundedSender},
+};
 use tracing::{error, trace};
 use uuid::Uuid;
 
 use crate::{
     ConnectionReader, Frame, KexEvent, MoshpitError, UuidWrapper, load_private_key, load_public_key,
 };
-
-static CURRENT_UDP_PORT: AtomicU16 = AtomicU16::new(50000);
 
 /// The key exchange reader for the moshpit
 #[derive(Builder, Debug)]
@@ -114,6 +108,7 @@ impl KexReader {
     pub async fn server_kex(
         &mut self,
         socket_addr: SocketAddr,
+        port_pool: Arc<Mutex<BTreeSet<u16>>>,
         private_key_path: &PathBuf,
         public_key_path: &PathBuf,
     ) -> Result<Arc<UdpSocket>> {
@@ -146,7 +141,7 @@ impl KexReader {
             return Err(MoshpitError::InvalidFrame.into());
         }
 
-        let udp_arc = self.handle_udp_setup(socket_addr).await?;
+        let udp_arc = self.handle_udp_setup(socket_addr, port_pool).await?;
 
         if let Some(frame) = self.reader.read_frame().await? {
             if let Frame::MoshpitAddr(moshpit_addr) = frame {
@@ -253,12 +248,17 @@ impl KexReader {
         Ok(())
     }
 
-    async fn handle_udp_setup(&mut self, mut socket_addr: SocketAddr) -> Result<Arc<UdpSocket>> {
-        let next_port = CURRENT_UDP_PORT.fetch_add(1, Ordering::SeqCst);
+    async fn handle_udp_setup(
+        &mut self,
+        mut socket_addr: SocketAddr,
+        port_pool: Arc<Mutex<BTreeSet<u16>>>,
+    ) -> Result<Arc<UdpSocket>> {
+        let mut port_p = port_pool.lock().await;
+        let next_port = port_p.pop_first().unwrap_or(49999);
         socket_addr.set_port(next_port);
         let my_local_ip = local_ip()?;
         let udp_socket_addr = SocketAddr::new(my_local_ip, socket_addr.port());
-        trace!("Connecting to moshpits at {udp_socket_addr}");
+        trace!("binding moshpits socket at {udp_socket_addr}");
         self.tx.send(Frame::MoshpitsAddr(udp_socket_addr))?;
         let udp_listener = UdpSocket::bind(udp_socket_addr).await?;
         Ok(Arc::new(udp_listener))
