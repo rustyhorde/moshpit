@@ -10,7 +10,7 @@ use std::io::Cursor;
 
 use anyhow::Result;
 use aws_lc_rs::{
-    aead::{Aad, MAX_TAG_LEN, Nonce, RandomizedNonceKey},
+    aead::{AES_256_GCM_SIV, Aad, Nonce, RandomizedNonceKey},
     digest::SHA512_OUTPUT_LEN,
     error::Unspecified,
     hmac::{Key, verify},
@@ -55,6 +55,7 @@ impl EncryptedFrame {
         id: Uuid,
         hmac: &Key,
         rnk: &RandomizedNonceKey,
+        count: usize,
     ) -> Result<Option<Self>> {
         if let Some(nonce_bytes) = get_nonce(src)? {
             if let Some(tag_bytes) = get_bytes(src, SHA512_OUTPUT_LEN)?
@@ -65,7 +66,8 @@ impl EncryptedFrame {
                     if let Ok(()) = verify(hmac, data, tag_bytes) {
                         let mut data = data.to_vec();
                         let nonce = Nonce::try_assume_unique_for_key(nonce_bytes)?;
-                        let _ = rnk.open_in_place(nonce, Aad::empty(), &mut data)?;
+                        let aad = Aad::from(count.to_be_bytes());
+                        let _ = rnk.open_in_place(nonce, aad, &mut data)?;
                         let (uuid_bytes, rest) = data.split_at(UUID_LEN);
                         let uuid = Uuid::from_bytes(uuid_bytes.try_into()?);
                         if uuid != id {
@@ -74,7 +76,7 @@ impl EncryptedFrame {
                         }
                         let mut message_with_tag = rest.to_vec();
                         message_with_tag.reverse();
-                        let mut message = message_with_tag.split_off(MAX_TAG_LEN);
+                        let mut message = message_with_tag.split_off(AES_256_GCM_SIV.tag_len());
                         message.reverse();
                         let frame_data: (EncryptedFrame, _) =
                             decode_from_slice(&message, standard())?;

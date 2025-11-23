@@ -168,6 +168,7 @@ fn read_passpharase() -> Result<Option<String>> {
             "Confirm the passphrase",
             "The entered passphrases do not match",
         )
+        .report(false)
         .interact()
         .map(Some)
         .map_err(Into::into)

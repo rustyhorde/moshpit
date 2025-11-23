@@ -9,7 +9,10 @@
 use std::{
     io::Cursor,
     process,
-    sync::{Arc, LazyLock},
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -47,8 +50,8 @@ pub struct UdpReader {
     /// Key for verifying UDP packet HMAC
     #[builder(with = |key: [u8; 64]| { Key::new(HMAC_SHA512, &key) })]
     hmac: Key,
-    #[builder(default)]
-    total_bytes_received: usize,
+    #[builder(default = AtomicUsize::new(0))]
+    recv_count: AtomicUsize,
 }
 
 impl UdpReader {
@@ -179,7 +182,6 @@ impl UdpReader {
             let mut buffer = BytesMut::with_capacity(8192);
 
             let len = self.socket.recv_buf(&mut buffer).await?;
-            self.total_bytes_received += len;
 
             if len == 0 {
                 // The remote closed the connection. For this to be a clean
@@ -211,6 +213,7 @@ impl UdpReader {
         // which provides a number of helpful utilities for working
         // with bytes.
         let mut buf = Cursor::new(&buffer[..]);
+        let count = self.recv_count.fetch_add(1, Ordering::SeqCst);
 
         // The first step is to check if enough data has been buffered to parse
         // a single frame. This step is usually much faster than doing a full
@@ -221,7 +224,7 @@ impl UdpReader {
         // Reset the position to zero before passing the cursor to `Frame::parse`.
         buf.set_position(0);
 
-        match EncryptedFrame::parse(&mut buf, self.id, &self.hmac, &self.rnk) {
+        match EncryptedFrame::parse(&mut buf, self.id, &self.hmac, &self.rnk, count) {
             Ok(Some(frame)) => {
                 // The `parse` function will have advanced the cursor until the
                 // end of the frame. Since the cursor had position set to zero
@@ -241,6 +244,7 @@ impl UdpReader {
                 Ok(Some(frame))
             }
             Ok(None) => {
+                let _count = self.recv_count.fetch_sub(1, Ordering::SeqCst);
                 // There is not enough data present in the read buffer to parse
                 // a single frame. We must wait for more data to be received
                 // from the socket. Reading from the socket will be done in the

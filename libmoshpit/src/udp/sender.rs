@@ -6,7 +6,10 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use anyhow::Result;
 use aws_lc_rs::{
@@ -38,6 +41,9 @@ pub struct UdpSender {
     socket: Arc<UdpSocket>,
     /// Channel receiver for outgoing packets
     rx: UnboundedReceiver<EncryptedFrame>,
+    /// Count of frames sent
+    #[builder(default = AtomicUsize::new(0))]
+    send_count: AtomicUsize,
 }
 
 impl UdpSender {
@@ -56,22 +62,24 @@ impl UdpSender {
                 }
                 frame_opt = self.rx.recv() => {
                     if let Some(frame) = frame_opt {
-                        let _bytes_sent = self.socket.send(&self.encrypt(&frame)?).await?;
+                        let count = self.send_count.fetch_add(1, Ordering::SeqCst);
+                        let _bytes_sent = self.socket.send(&self.encrypt(&frame, count)?).await?;
                     }
                 }
             }
         }
     }
 
-    fn encrypt(&self, frame: &EncryptedFrame) -> Result<Vec<u8>> {
+    fn encrypt(&self, frame: &EncryptedFrame, count: usize) -> Result<Vec<u8>> {
         // Encode the frame data
         let data = encode_to_vec(frame, standard())?;
+        let aad = Aad::from(count.to_be_bytes());
         // Encrypt the id, frame_id, and the data then MAC
         let mut encrypted_part = self.id.as_bytes().to_vec();
         encrypted_part.extend_from_slice(&data);
         let nonce = self
             .rnk
-            .seal_in_place_append_tag(Aad::empty(), &mut encrypted_part)?;
+            .seal_in_place_append_tag(aad, &mut encrypted_part)?;
         // Sign the encrypted part
         let tag = sign(&self.hmac, &encrypted_part);
         let tag_bytes: [u8; 64] = tag.as_ref().try_into()?;
