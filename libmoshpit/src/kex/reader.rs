@@ -286,7 +286,7 @@ impl KexReader {
     #[cfg(target_os = "macos")]
     async fn validate_user(&self, user: &str) -> Result<bool> {
         let mut is_valid_user = Command::new("dscl");
-        let _ = is_valid_user.args(&[".", "-read", format!("/Users/{}", user).as_str()]);
+        let _ = is_valid_user.args([".", "-read", format!("/Users/{user}").as_str()]);
         let output = is_valid_user
             .output()
             .await
@@ -318,10 +318,10 @@ impl KexReader {
     #[cfg(target_os = "macos")]
     async fn get_home_dir_shell(&self, user: &str) -> Result<(String, String)> {
         let mut cmd = Command::new("dscl");
-        let _ = cmd.args(&[
+        let _ = cmd.args([
             ".",
             "-read",
-            format!("/Users/{}", user).as_str(),
+            format!("/Users/{user}").as_str(),
             "NFSHomeDirectory",
             "UserShell",
         ]);
@@ -334,10 +334,10 @@ impl KexReader {
             let mut home_dir = String::new();
             let mut shell = String::new();
             for line in stdout.lines() {
-                if line.starts_with("NFSHomeDirectory:") {
-                    home_dir = line["NFSHomeDirectory:".len()..].trim().to_string();
-                } else if line.starts_with("UserShell:") {
-                    shell = line["UserShell:".len()..].trim().to_string();
+                if let Some(stripped) = line.strip_prefix("NFSHomeDirectory:") {
+                    home_dir = stripped.trim().to_string();
+                } else if let Some(stripped) = line.strip_prefix("UserShell:") {
+                    shell = stripped.trim().to_string();
                 }
             }
             trace!("User '{user}' home directory: {home_dir}, shell: {shell}");
