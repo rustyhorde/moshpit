@@ -14,7 +14,8 @@ use std::{
     path::PathBuf,
     process::Command,
     sync::Arc,
-    thread,
+    thread::{self, sleep},
+    time::Duration,
 };
 
 use anyhow::{Context as _, Result};
@@ -209,6 +210,7 @@ async fn handle_connection(
                         }
                         if is_exit_title(&utf8_buf, true) {
                             trace!("exit title detected, exiting");
+                            sleep(Duration::from_millis(500));
                             token.cancel();
                             break;
                         }

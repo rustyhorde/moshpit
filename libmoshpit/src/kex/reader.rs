@@ -22,6 +22,7 @@ use bon::Builder;
 use local_ip_address::local_ip;
 use tokio::{
     net::UdpSocket,
+    process::Command,
     sync::{Mutex, mpsc::UnboundedSender},
 };
 use tracing::{error, trace};
@@ -113,7 +114,14 @@ impl KexReader {
         public_key_path: &PathBuf,
     ) -> Result<Arc<UdpSocket>> {
         let rnk = if let Some(frame) = self.reader.read_frame().await? {
-            if let Frame::Initialize(pk) = frame {
+            if let Frame::Initialize(user, pk, fpk) = frame {
+                let user_str = String::from_utf8_lossy(&user);
+                let (_home_dir, _shell) = if self.validate_user(&user_str).await? {
+                    self.get_home_dir_shell(&user_str).await?
+                } else {
+                    return Err(MoshpitError::KeyNotEstablished.into());
+                };
+                trace!("Full public key: {}", String::from_utf8_lossy(&fpk));
                 self.handle_initialize(
                     &pk,
                     &self.tx_event.clone(),
@@ -167,7 +175,7 @@ impl KexReader {
     ) -> Result<RandomizedNonceKey> {
         // Load the moshpits public and private key
         let (unenc_key_pair_opt, _enc_key_pair_opt) = load_private_key(private_key_path)?;
-        let public_key_bytes = load_public_key(public_key_path)?;
+        let (_, public_key_bytes) = load_public_key(public_key_path)?;
 
         let (private_key, public_key) = if let Some(unenc_key_pair) = unenc_key_pair_opt {
             unenc_key_pair.take()
@@ -262,5 +270,79 @@ impl KexReader {
         self.tx.send(Frame::MoshpitsAddr(udp_socket_addr))?;
         let udp_listener = UdpSocket::bind(udp_socket_addr).await?;
         Ok(Arc::new(udp_listener))
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn validate_user(&self, user: &str) -> Result<bool> {
+        let mut is_valid_user = Command::new("id");
+        let _ = is_valid_user.arg(user);
+        let output = is_valid_user
+            .output()
+            .await
+            .map_err(|_e| MoshpitError::KeyNotEstablished)?;
+        Ok(output.status.success())
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn validate_user(&self, user: &str) -> Result<bool> {
+        let mut is_valid_user = Command::new("dscl");
+        let _ = is_valid_user.args(&[".", "-read", format!("/Users/{}", user).as_str()]);
+        let output = is_valid_user
+            .output()
+            .await
+            .map_err(|_e| MoshpitError::KeyNotEstablished)?;
+        Ok(output.status.success())
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn get_home_dir_shell(&self, user: &str) -> Result<(String, String)> {
+        let mut cmd = Command::new("getent");
+        let _ = cmd.args(["passwd", user]);
+        let output = cmd
+            .output()
+            .await
+            .map_err(|_e| MoshpitError::KeyNotEstablished)?;
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let parts: Vec<&str> = stdout.split(':').collect();
+            if parts.len() >= 7 {
+                let home_dir = parts[5].to_string();
+                let shell = parts[6].trim().to_string();
+                trace!("User '{user}' home directory: {home_dir}, shell: {shell}");
+                return Ok((home_dir, shell));
+            }
+        }
+        Err(MoshpitError::KeyNotEstablished.into())
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn get_home_dir_shell(&self, user: &str) -> Result<(String, String)> {
+        let mut cmd = Command::new("dscl");
+        let _ = cmd.args(&[
+            ".",
+            "-read",
+            format!("/Users/{}", user).as_str(),
+            "NFSHomeDirectory",
+            "UserShell",
+        ]);
+        let output = cmd
+            .output()
+            .await
+            .map_err(|_e| MoshpitError::KeyNotEstablished)?;
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let mut home_dir = String::new();
+            let mut shell = String::new();
+            for line in stdout.lines() {
+                if line.starts_with("NFSHomeDirectory:") {
+                    home_dir = line["NFSHomeDirectory:".len()..].trim().to_string();
+                } else if line.starts_with("UserShell:") {
+                    shell = line["UserShell:".len()..].trim().to_string();
+                }
+            }
+            trace!("User '{user}' home directory: {home_dir}, shell: {shell}");
+            return Ok((home_dir, shell));
+        }
+        Err(MoshpitError::KeyNotEstablished.into())
     }
 }

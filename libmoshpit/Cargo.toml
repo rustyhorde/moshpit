@@ -34,7 +34,7 @@ local-ip-address = "0.6.5"
 regex = "1.12.2"
 serde = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["sync","time"] }
+tokio = { workspace = true, features = ["process","sync","time"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = "0.2.3"

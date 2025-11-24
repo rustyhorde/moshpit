@@ -467,7 +467,7 @@ fn as_be_bytes(value: usize) -> Result<[u8; 4]> {
 ///
 /// If the public key cannot be read or is invalid, an error is returned.
 ///
-pub fn load_public_key(pub_key_path: &PathBuf) -> Result<Vec<u8>> {
+pub fn load_public_key(pub_key_path: &PathBuf) -> Result<(Vec<u8>, Vec<u8>)> {
     // Read the file contents into a buffer
     let mut buffered_reader = File::open(pub_key_path)?;
     let mut file_bytes = vec![];
@@ -492,7 +492,7 @@ pub fn load_public_key(pub_key_path: &PathBuf) -> Result<Vec<u8>> {
     }
     let pub_key_bytes = get_val_by_len(&mut public_key_bytes)?;
 
-    Ok(pub_key_bytes.to_vec())
+    Ok((file_bytes, pub_key_bytes.to_vec()))
 }
 
 /// Load a moshpit key pair from the provided private key path.

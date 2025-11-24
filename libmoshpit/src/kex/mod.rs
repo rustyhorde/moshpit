@@ -240,7 +240,7 @@ async fn run_client_kex(
 ) -> Result<(Kex, Arc<UdpSocket>)> {
     // Load the moshpit public and private key
     let (unenc_key_pair_opt, enc_key_pair_opt) = load_private_key(&private_key_path)?;
-    let public_key_bytes = load_public_key(&public_key_path)?;
+    let (full_public_key_bytes, public_key_bytes) = load_public_key(&public_key_path)?;
 
     let (pk, my_public_key) = if let Some(enc_key_pair) = enc_key_pair_opt {
         // Get the passphrase
@@ -290,7 +290,11 @@ async fn run_client_kex(
     });
 
     // Send the initialize frame with our public key
-    let frame = Frame::Initialize(my_public_key.as_ref().to_vec());
+    let frame = Frame::Initialize(
+        b"jozias".to_vec(),
+        my_public_key.as_ref().to_vec(),
+        full_public_key_bytes,
+    );
     tx.send(frame.clone())?;
 
     let kex = kex_handle.await??;

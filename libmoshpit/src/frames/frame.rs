@@ -21,7 +21,7 @@ use crate::{
 #[derive(Clone, Debug, Decode, Encode, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Frame {
     /// An initialization frame from moshpit.
-    Initialize(Vec<u8>),
+    Initialize(Vec<u8>, Vec<u8>, Vec<u8>),
     /// A peer initialization frame from moshpits.
     PeerInitialize(Vec<u8>, Vec<u8>),
     /// A check message from moshpit.
@@ -39,7 +39,7 @@ impl Frame {
     #[must_use]
     pub fn id(&self) -> u8 {
         match self {
-            Frame::Initialize(_) => 0,
+            Frame::Initialize(_, _, _) => 0,
             Frame::PeerInitialize(_, _) => 1,
             Frame::Check(_, _) => 2,
             Frame::KeyAgreement(_) => 3,
@@ -81,8 +81,14 @@ fn get_u8(src: &mut Cursor<&[u8]>) -> Option<u8> {
 impl Display for Frame {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Frame::Initialize(data) => {
-                write!(f, "Initialize({} bytes)", data.len())
+            Frame::Initialize(user, pk, full_pk) => {
+                write!(
+                    f,
+                    "Initialize({} bytes, {} bytes, {} bytes)",
+                    user.len(),
+                    pk.len(),
+                    full_pk.len()
+                )
             }
             Frame::PeerInitialize(pk, salt) => write!(
                 f,
@@ -251,10 +257,11 @@ mod tests {
 
     #[test]
     fn test_parse() -> Result<()> {
+        let user = b"user".to_vec();
         let data = b"hello world".to_vec();
-        let frame = Frame::Initialize(data.clone());
+        let full_data = b"full key data".to_vec();
+        let frame = Frame::Initialize(user.clone(), data.clone(), full_data.clone());
         let encoded_frame = encode_to_vec(&frame, standard())?;
-
         let length = encoded_frame.len();
         let length_bytes = length.to_be_bytes();
 
