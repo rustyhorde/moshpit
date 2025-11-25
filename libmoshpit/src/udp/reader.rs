@@ -65,10 +65,7 @@ impl UdpReader {
     ) -> Result<()> {
         loop {
             select! {
-                () = token.cancelled() => {
-                    trace!("udp reader server frame loop cancelled");
-                    break;
-                }
+                () = token.cancelled() => break,
                 frame_res = self.read_encrypted_frame() =>{
                     if let Ok(Some(frame)) = frame_res {
                         match frame {
@@ -102,10 +99,7 @@ impl UdpReader {
 
         loop {
             select! {
-                () = token.cancelled() => {
-                    trace!("udp reader client frame loop cancelled");
-                    process::exit(0);
-                }
+                () = token.cancelled() => process::exit(0),
                 frame_res = self.read_encrypted_frame() =>{
                     if let Ok(Some(frame)) = frame_res {
                         match frame {

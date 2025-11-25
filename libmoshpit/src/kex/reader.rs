@@ -83,7 +83,6 @@ impl KexReader {
                     Ok(())
                 })?;
             } else {
-                error!("bad initialize");
                 self.tx_event
                     .send(KexEvent::Failure)
                     .map_err(|_| Unspecified)?;
@@ -121,14 +120,13 @@ impl KexReader {
         public_key_path: &PathBuf,
     ) -> Result<Arc<UdpSocket>> {
         let rnk = if let Some(frame) = self.reader.read_frame().await? {
-            if let Frame::Initialize(user, pk, fpk) = frame {
+            if let Frame::Initialize(user, pk, _fpk) = frame {
                 let user_str = String::from_utf8_lossy(&user);
                 let (_home_dir, _shell) = if self.validate_user(&user_str).await? {
                     self.get_home_dir_shell(&user_str).await?
                 } else {
                     return Err(MoshpitError::KeyNotEstablished.into());
                 };
-                trace!("Full public key: {}", String::from_utf8_lossy(&fpk));
                 self.handle_initialize(
                     &pk,
                     &self.tx_event.clone(),
@@ -315,7 +313,6 @@ impl KexReader {
             if parts.len() >= 7 {
                 let home_dir = parts[5].to_string();
                 let shell = parts[6].trim().to_string();
-                trace!("User '{user}' home directory: {home_dir}, shell: {shell}");
                 return Ok((home_dir, shell));
             }
         }

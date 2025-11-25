@@ -21,7 +21,6 @@ use bon::Builder;
 use getset::MutGetters;
 use tokio::{net::UdpSocket, select, sync::mpsc::UnboundedReceiver};
 use tokio_util::sync::CancellationToken;
-use tracing::trace;
 use uuid::Uuid;
 
 use crate::EncryptedFrame;
@@ -56,10 +55,7 @@ impl UdpSender {
     pub async fn frame_loop(&mut self, token: CancellationToken) -> Result<()> {
         loop {
             select! {
-                () = token.cancelled() => {
-                    trace!("udp sender frame loop cancelled");
-                    break;
-                }
+                () = token.cancelled() => break,
                 frame_opt = self.rx.recv() => {
                     if let Some(frame) = frame_opt {
                         let count = self.send_count.fetch_add(1, Ordering::SeqCst);

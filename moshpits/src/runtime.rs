@@ -81,10 +81,10 @@ where
         match listener.accept().await {
             Ok((socket, _addr)) => {
                 if let Err(e) = handle_connection(config_c, socket).await {
-                    error!("error handling connection: {e}");
+                    trace!("{e}");
                 }
             }
-            Err(e) => error!("couldn't get client: {e:?}"),
+            Err(e) => error!("{e}"),
         }
     }
 }
@@ -131,7 +131,6 @@ async fn handle_connection(config: Config, socket: TcpStream) -> Result<()> {
         if let Some(port) = rx_pool.recv().await {
             let mut pool = port_pool.lock().await;
             let _ = pool.insert(port);
-            trace!("Port {port} returned to pool");
         }
     });
     let _term_handle = thread::spawn(move || {
@@ -155,7 +154,6 @@ async fn handle_connection(config: Config, socket: TcpStream) -> Result<()> {
                         }
                     }
                 }
-                info!("Terminal input handler exiting");
             });
 
             loop {
@@ -174,7 +172,6 @@ async fn handle_connection(config: Config, socket: TcpStream) -> Result<()> {
                             break;
                         }
                         if is_exit_title(&utf8_buf, true) {
-                            trace!("exit title detected, exiting");
                             sleep(Duration::from_millis(500));
                             token.cancel();
                             break;
@@ -190,7 +187,6 @@ async fn handle_connection(config: Config, socket: TcpStream) -> Result<()> {
             if let Ok(local_addr) = udp_arc.local_addr() {
                 let _ = tx_pool.send(local_addr.port());
             }
-            info!("Terminal output handler exiting");
         }
     });
     Ok(())

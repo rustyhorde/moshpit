@@ -10,7 +10,6 @@ use std::{
     fmt::{self, Display, Formatter},
     net::SocketAddr,
     sync::Arc,
-    time::Duration,
 };
 
 use anyhow::Result;
@@ -29,7 +28,6 @@ use tokio::{
     spawn,
     sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
     task::JoinHandle,
-    time::sleep,
 };
 use tracing::{error, trace};
 use uuid::Uuid;
@@ -156,7 +154,6 @@ impl KexStateMachine {
                     break;
                 }
                 _ => {
-                    trace!("invalid kex state");
                     return Err(MoshpitError::InvalidKexState.into());
                 }
             }
@@ -211,7 +208,7 @@ pub async fn run_key_exchange<T: KexConfig>(
     let _write_handle = spawn(async move {
         let mut sender = KexSender::builder().writer(writer).rx(rx).build();
         if let Err(e) = sender.handle_send_frames().await {
-            error!("tcp frame sender error {e}");
+            error!("{e}");
         }
     });
 
@@ -224,9 +221,7 @@ pub async fn run_key_exchange<T: KexConfig>(
             match run_server_kex(config, socket_addr, tx, tx_event, reader, kex_handle).await {
                 Ok(result) => result,
                 Err(e) => {
-                    error!("kex server error");
                     let _blah = tx_c.send(Frame::KexFailure);
-                    sleep(Duration::from_millis(500)).await;
                     Err(e)?
                 }
             }
@@ -293,7 +288,7 @@ async fn run_client_kex<T: KexConfig>(
             .tx_event(tx_event_c)
             .build();
         if let Err(e) = frame_reader.client_kex(&pk).await {
-            error!("tcp frame reader: {e}");
+            trace!("{e}");
         }
     });
 
