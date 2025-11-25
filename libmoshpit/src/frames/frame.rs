@@ -32,6 +32,8 @@ pub enum Frame {
     MoshpitsAddr(SocketAddr),
     /// The address the moshpit listener is bound to.
     MoshpitAddr(SocketAddr),
+    /// Key exchange failure notification.
+    KexFailure,
 }
 
 impl Frame {
@@ -45,6 +47,7 @@ impl Frame {
             Frame::KeyAgreement(_) => 3,
             Frame::MoshpitsAddr(_) => 4,
             Frame::MoshpitAddr(_) => 5,
+            Frame::KexFailure => 6,
         }
     }
 
@@ -55,7 +58,7 @@ impl Frame {
     ///
     pub fn parse(src: &mut Cursor<&[u8]>) -> Result<Option<Self>> {
         match get_u8(src) {
-            Some(0..=5) => {
+            Some(0..=6) => {
                 if let Some(length_slice) = get_usize(src)? {
                     let length = usize::from_be_bytes(length_slice.try_into()?);
                     if let Some(data) = get_bytes(src, length)? {
@@ -102,6 +105,7 @@ impl Display for Frame {
             Frame::KeyAgreement(uuid) => write!(f, "KeyAgreement({uuid})"),
             Frame::MoshpitsAddr(addr) => write!(f, "MoshpitsAddr({addr})"),
             Frame::MoshpitAddr(addr) => write!(f, "MoshpitAddr({addr})"),
+            Frame::KexFailure => write!(f, "KexFailure"),
         }
     }
 }

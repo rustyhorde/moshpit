@@ -47,7 +47,7 @@ pub enum Error {
     #[error("Invalid Moshpits address")]
     InvalidMoshpitsAddress,
     /// Invalid key exchange state
-    #[error("Invalid key exchange state")]
+    #[error("key exchange failed")]
     InvalidKexState,
     /// UUID mismatch
     #[error("UUID mismatch")]

@@ -253,6 +253,7 @@ mod udp;
 mod utils;
 mod uuid;
 
+pub use self::config::KexConfig;
 pub use self::config::PathDefaults;
 pub use self::config::load;
 pub use self::config::mps::Mps;

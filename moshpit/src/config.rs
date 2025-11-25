@@ -6,16 +6,24 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
+use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
+
+use anyhow::Result;
 use getset::{CopyGetters, Getters, Setters};
-use libmoshpit::{Tracing, TracingConfigExt};
+use libmoshpit::{KexConfig, KexMode, KeyPair, Tracing, TracingConfigExt};
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 use tracing::Level;
 use tracing_subscriber_init::{TracingConfig, get_effective_level};
 
-#[derive(
-    Clone, CopyGetters, Debug, Default, Deserialize, Eq, Getters, PartialEq, Serialize, Setters,
-)]
+#[derive(Clone, CopyGetters, Debug, Deserialize, Eq, Getters, PartialEq, Serialize, Setters)]
 pub(crate) struct Config {
+    #[serde(skip_deserializing)]
+    #[getset(get_copy = "pub(crate)")]
+    mode: KexMode,
+    #[serde(skip_deserializing)]
+    #[getset(get = "pub(crate)", set = "pub(crate)")]
+    user: String,
     #[getset(get_copy = "pub(crate)")]
     verbose: u8,
     #[getset(get_copy = "pub(crate)")]
@@ -30,6 +38,56 @@ pub(crate) struct Config {
     private_key_path: Option<String>,
     #[getset(get = "pub(crate)")]
     public_key_path: Option<String>,
+}
+
+impl Config {
+    fn load_key_paths(&self) -> Result<(PathBuf, PathBuf)> {
+        let (default_private_key_path, default_pub_key_ext) =
+            KeyPair::default_key_path_ext(self.mode)?;
+        let private_key_path = self
+            .private_key_path
+            .as_ref()
+            .map_or(default_private_key_path, PathBuf::from);
+        let public_key_path = self.public_key_path.as_ref().map_or(
+            private_key_path.with_extension(default_pub_key_ext),
+            PathBuf::from,
+        );
+        Ok((private_key_path, public_key_path))
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            mode: KexMode::Client,
+            user: String::new(),
+            verbose: 0,
+            quiet: 0,
+            tracing: Tracing::default(),
+            server_port: 60001,
+            server_destination: String::new(),
+            private_key_path: None,
+            public_key_path: None,
+        }
+    }
+}
+
+impl KexConfig for Config {
+    fn mode(&self) -> KexMode {
+        self.mode
+    }
+
+    fn port_pool(&self) -> Option<Arc<Mutex<BTreeSet<u16>>>> {
+        None
+    }
+
+    fn key_pair_paths(&self) -> Result<(PathBuf, PathBuf)> {
+        self.load_key_paths()
+    }
+
+    fn user(&self) -> Option<String> {
+        self.user.clone().into()
+    }
 }
 
 impl TracingConfig for Config {

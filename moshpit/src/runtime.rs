@@ -9,7 +9,6 @@
 use std::{
     ffi::OsString,
     io::{Read as _, Write as _, stdin, stdout},
-    path::PathBuf,
     thread,
 };
 
@@ -18,7 +17,7 @@ use clap::Parser as _;
 use crossterm::terminal::enable_raw_mode;
 use dialoguer::Password;
 use libmoshpit::{
-    EncryptedFrame, Kex, KexMode, KeyPair, MoshpitError, UdpReader, UdpSender, init_tracing, load,
+    EncryptedFrame, Kex, MoshpitError, UdpReader, UdpSender, init_tracing, load,
     parse_server_destination, run_key_exchange,
 };
 use terminal_size::terminal_size;
@@ -45,7 +44,8 @@ where
     };
 
     // Load the configuration
-    let config = load::<Cli, Config, Cli>(&cli, &cli).with_context(|| MoshpitError::ConfigLoad)?;
+    let mut config =
+        load::<Cli, Config, Cli>(&cli, &cli).with_context(|| MoshpitError::ConfigLoad)?;
 
     // Initialize tracing
     init_tracing(&config, config.tracing().file(), &cli, None)
@@ -57,35 +57,13 @@ where
     // Setup the TCP connection to the server for key exchange
     let (user, socket_addr) =
         parse_server_destination(config.server_destination(), config.server_port())?;
-    trace!("Connecting to server at {socket_addr} as {user}");
+    let _ = config.set_user(user);
+    trace!("Connecting to server at {socket_addr}");
     let socket = TcpStream::connect(socket_addr).await?;
     let (sock_read, sock_write) = socket.into_split();
 
-    // Load the X25519 key pair from the configured paths or defaults
-    let (default_private_key_path, default_pub_key_ext) =
-        KeyPair::default_key_path_ext(KexMode::Client)?;
-    let private_key_path = config
-        .private_key_path()
-        .as_ref()
-        .map_or(default_private_key_path, PathBuf::from);
-    let public_key_path = config.public_key_path().as_ref().map_or(
-        private_key_path.with_extension(default_pub_key_ext),
-        PathBuf::from,
-    );
-    trace!("Loading private key from {}", private_key_path.display());
-    trace!("Loading public key from {}", public_key_path.display());
-
     // Run the key exchange
-    let (kex, udp_arc) = run_key_exchange(
-        KexMode::Client,
-        sock_read,
-        sock_write,
-        None,
-        private_key_path,
-        public_key_path,
-        read_passpharase,
-    )
-    .await?;
+    let (kex, udp_arc) = run_key_exchange(config, sock_read, sock_write, read_passpharase).await?;
     info!("Key exchange completed with moshpits");
 
     // Setup the cancellation token

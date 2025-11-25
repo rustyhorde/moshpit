@@ -11,7 +11,6 @@ use std::{
     ffi::OsString,
     io::{Read as _, Write as _},
     net::SocketAddr,
-    path::PathBuf,
     process::Command,
     sync::Arc,
     thread::{self, sleep},
@@ -22,8 +21,8 @@ use anyhow::{Context as _, Result};
 use bytes::{Buf as _, BytesMut};
 use clap::Parser as _;
 use libmoshpit::{
-    EncryptedFrame, KexMode, KeyPair, MoshpitError, TerminalMessage, UdpReader, UdpSender,
-    init_tracing, is_exit_title, load, run_key_exchange,
+    EncryptedFrame, KexMode, MoshpitError, TerminalMessage, UdpReader, UdpSender, init_tracing,
+    is_exit_title, load, run_key_exchange,
 };
 use pseudoterminal::{CommandExt as _, TerminalSize};
 use tokio::{
@@ -49,7 +48,8 @@ where
     };
 
     // Load the configuration
-    let config = load::<Cli, Config, Cli>(&cli, &cli).with_context(|| MoshpitError::ConfigLoad)?;
+    let mut config =
+        load::<Cli, Config, Cli>(&cli, &cli).with_context(|| MoshpitError::ConfigLoad)?;
 
     // Initialize tracing
     init_tracing(&config, config.tracing().file(), &cli, None)
@@ -66,41 +66,21 @@ where
             .with_context(|| MoshpitError::InvalidIpAddress)?,
         config.mps().port(),
     );
+    let _ = config.set_mode(KexMode::Server(socket_addr));
     let listener = TcpListener::bind(socket_addr).await?;
-
-    // Load the X25519 key pair from the configured paths or defaults
-    let (default_private_key_path, default_pub_key_ext) =
-        KeyPair::default_key_path_ext(KexMode::Server(socket_addr))?;
-    let private_key_path = config
-        .private_key_path()
-        .as_ref()
-        .map_or(default_private_key_path, PathBuf::from);
-    let public_key_path = config.public_key_path().as_ref().map_or(
-        private_key_path.with_extension(default_pub_key_ext),
-        PathBuf::from,
-    );
-    trace!("Loading private key from {}", private_key_path.display());
-    trace!("Loading public key from {}", public_key_path.display());
 
     let mut port_pool = BTreeSet::new();
     for i in 50000..60000 {
         let _ = port_pool.insert(i);
     }
     let port_pool_arc = Arc::new(Mutex::new(port_pool));
+    let _ = config.set_port_pool(port_pool_arc);
 
     loop {
-        let port_pool_c = port_pool_arc.clone();
+        let config_c = config.clone();
         match listener.accept().await {
             Ok((socket, _addr)) => {
-                if let Err(e) = handle_connection(
-                    socket,
-                    socket_addr,
-                    port_pool_c,
-                    private_key_path.clone(),
-                    public_key_path.clone(),
-                )
-                .await
-                {
+                if let Err(e) = handle_connection(config_c, socket).await {
                     error!("error handling connection: {e}");
                 }
             }
@@ -110,25 +90,10 @@ where
 }
 
 #[allow(clippy::too_many_lines)]
-async fn handle_connection(
-    socket: TcpStream,
-    socket_addr: SocketAddr,
-    port_pool: Arc<Mutex<BTreeSet<u16>>>,
-    private_key_path: PathBuf,
-    public_key_path: PathBuf,
-) -> Result<()> {
+async fn handle_connection(config: Config, socket: TcpStream) -> Result<()> {
     let (sock_read, sock_write) = socket.into_split();
-    let port_pool_c = port_pool.clone();
-    let (kex, udp_arc) = run_key_exchange(
-        KexMode::Server(socket_addr),
-        sock_read,
-        sock_write,
-        Some(port_pool_c),
-        private_key_path,
-        public_key_path,
-        || Ok(None),
-    )
-    .await?;
+    let port_pool = config.port_pool().clone();
+    let (kex, udp_arc) = run_key_exchange(config, sock_read, sock_write, || Ok(None)).await?;
     info!("Key exchange completed with moshpit");
 
     let (tx, rx) = unbounded_channel::<EncryptedFrame>();

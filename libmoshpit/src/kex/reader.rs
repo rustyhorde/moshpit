@@ -49,41 +49,48 @@ impl KexReader {
     /// # Errors
     ///
     pub async fn client_kex(&mut self, epk: &PrivateKey) -> Result<()> {
-        if let Some(frame) = self.reader.read_frame().await?
-            && let Frame::PeerInitialize(pk, salt_bytes) = frame
-        {
-            let peer_public_key = UnparsedPublicKey::new(&X25519, &pk);
-            let salt = Salt::new(HKDF_SHA256, &salt_bytes);
+        if let Some(frame) = self.reader.read_frame().await? {
+            if let Frame::PeerInitialize(pk, salt_bytes) = frame {
+                let peer_public_key = UnparsedPublicKey::new(&X25519, &pk);
+                let salt = Salt::new(HKDF_SHA256, &salt_bytes);
 
-            agree(epk, peer_public_key, Unspecified, |key_material| {
-                let pseudo_random_key = salt.extract(key_material);
-                let mut check = b"Yoda".to_vec();
+                agree(epk, peer_public_key, Unspecified, |key_material| {
+                    let pseudo_random_key = salt.extract(key_material);
+                    let mut check = b"Yoda".to_vec();
 
-                // Derive UnboundKey for AES-256-GCM-SIV
-                let okm_aes = pseudo_random_key.expand(&[b"aead key"], &AES_256_GCM_SIV)?;
-                let mut key_bytes = [0u8; AES_256_KEY_LEN];
-                okm_aes.fill(&mut key_bytes)?;
-                // Derive the HMAC key and send it over UDP
-                let okm_hmac =
-                    pseudo_random_key.expand(&[b"hmac key"], HKDF_SHA512.hmac_algorithm())?;
-                let mut hmac_key_bytes = [0u8; SHA512_OUTPUT_LEN];
-                okm_hmac.fill(&mut hmac_key_bytes)?;
+                    // Derive UnboundKey for AES-256-GCM-SIV
+                    let okm_aes = pseudo_random_key.expand(&[b"aead key"], &AES_256_GCM_SIV)?;
+                    let mut key_bytes = [0u8; AES_256_KEY_LEN];
+                    okm_aes.fill(&mut key_bytes)?;
+                    // Derive the HMAC key and send it over UDP
+                    let okm_hmac =
+                        pseudo_random_key.expand(&[b"hmac key"], HKDF_SHA512.hmac_algorithm())?;
+                    let mut hmac_key_bytes = [0u8; SHA512_OUTPUT_LEN];
+                    okm_hmac.fill(&mut hmac_key_bytes)?;
 
+                    self.tx_event
+                        .send(KexEvent::KeyMaterial(key_bytes))
+                        .map_err(|_| Unspecified)?;
+                    self.tx_event
+                        .send(KexEvent::HMACKeyMaterial(hmac_key_bytes))
+                        .map_err(|_| Unspecified)?;
+                    let rnk = RandomizedNonceKey::new(&AES_256_GCM_SIV, &key_bytes)?;
+                    let nonce = rnk.seal_in_place_append_tag(Aad::empty(), &mut check)?;
+
+                    self.tx
+                        .send(Frame::Check(*nonce.as_ref(), check))
+                        .map_err(|_| Unspecified)?;
+                    Ok(())
+                })?;
+            } else {
+                error!("bad initialize");
                 self.tx_event
-                    .send(KexEvent::KeyMaterial(key_bytes))
+                    .send(KexEvent::Failure)
                     .map_err(|_| Unspecified)?;
-                self.tx_event
-                    .send(KexEvent::HMACKeyMaterial(hmac_key_bytes))
-                    .map_err(|_| Unspecified)?;
-                let rnk = RandomizedNonceKey::new(&AES_256_GCM_SIV, &key_bytes)?;
-                let nonce = rnk.seal_in_place_append_tag(Aad::empty(), &mut check)?;
-
-                self.tx
-                    .send(Frame::Check(*nonce.as_ref(), check))
-                    .map_err(|_| Unspecified)?;
-                Ok(())
-            })?;
+                return Err(MoshpitError::KeyNotEstablished.into());
+            }
         }
+
         if let Some(frame) = self.reader.read_frame().await?
             && let Frame::KeyAgreement(uuid) = frame
         {

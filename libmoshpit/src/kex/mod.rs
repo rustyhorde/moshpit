@@ -6,7 +6,12 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-use std::{collections::BTreeSet, net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{
+    fmt::{self, Display, Formatter},
+    net::SocketAddr,
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::Result;
 use aws_lc_rs::{
@@ -15,24 +20,23 @@ use aws_lc_rs::{
 };
 use bon::Builder;
 use getset::CopyGetters;
+use serde::{Deserialize, Serialize};
 use tokio::{
     net::{
         UdpSocket,
         tcp::{OwnedReadHalf, OwnedWriteHalf},
     },
     spawn,
-    sync::{
-        Mutex,
-        mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
-    },
+    sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
     task::JoinHandle,
+    time::sleep,
 };
 use tracing::{error, trace};
 use uuid::Uuid;
 
 use crate::{
-    ConnectionReader, ConnectionWriter, Frame, KexReader, KexSender, MoshpitError, UuidWrapper,
-    decrypt_private_key, load_private_key, load_public_key,
+    ConnectionReader, ConnectionWriter, Frame, KexConfig, KexReader, KexSender, MoshpitError,
+    UuidWrapper, decrypt_private_key, load_private_key, load_public_key,
 };
 
 pub(crate) mod reader;
@@ -49,6 +53,8 @@ pub enum KexEvent {
     Uuid(Uuid),
     /// moshpits socket address
     MoshpitsAddr(SocketAddr),
+    /// Key exchange failure
+    Failure,
 }
 
 /// The moshpit key exchange state
@@ -150,6 +156,7 @@ impl KexStateMachine {
                     break;
                 }
                 _ => {
+                    trace!("invalid kex state");
                     return Err(MoshpitError::InvalidKexState.into());
                 }
             }
@@ -163,28 +170,36 @@ impl KexStateMachine {
 }
 
 /// The key exchange mode
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub enum KexMode {
     /// Client mode
+    #[default]
     Client,
     /// Server mode
     Server(SocketAddr),
+}
+
+impl Display for KexMode {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            KexMode::Client => write!(f, "Client"),
+            KexMode::Server(addr) => write!(f, "Server({addr})"),
+        }
+    }
 }
 
 /// Run the client side of the key exchange
 ///
 /// # Errors
 ///
-pub async fn run_key_exchange(
-    mode: KexMode,
+pub async fn run_key_exchange<T: KexConfig>(
+    config: T,
     sock_read: OwnedReadHalf,
     sock_write: OwnedWriteHalf,
-    port_pool: Option<Arc<Mutex<BTreeSet<u16>>>>,
-    private_key_path: PathBuf,
-    public_key_path: PathBuf,
     passphrase_fn: impl Fn() -> Result<Option<String>>,
 ) -> Result<(Kex, Arc<UdpSocket>)> {
     // Setup the TCP connection to the server for key exchange
+    let mode = config.mode();
     let reader = ConnectionReader::builder().reader(sock_read).build();
     let writer = ConnectionWriter::builder().writer(sock_write).build();
     let (tx, rx) = unbounded_channel();
@@ -202,42 +217,35 @@ pub async fn run_key_exchange(
 
     Ok(match mode {
         KexMode::Client => {
-            run_client_kex(
-                tx,
-                tx_event,
-                reader,
-                kex_handle,
-                private_key_path,
-                public_key_path,
-                passphrase_fn,
-            )
-            .await?
+            run_client_kex(config, tx, tx_event, reader, kex_handle, passphrase_fn).await?
         }
         KexMode::Server(socket_addr) => {
-            run_server_kex(
-                socket_addr,
-                port_pool,
-                tx,
-                tx_event,
-                reader,
-                kex_handle,
-                private_key_path,
-                public_key_path,
-            )
-            .await?
+            let tx_c = tx.clone();
+            match run_server_kex(config, socket_addr, tx, tx_event, reader, kex_handle).await {
+                Ok(result) => result,
+                Err(e) => {
+                    error!("kex server error");
+                    let _blah = tx_c.send(Frame::KexFailure);
+                    sleep(Duration::from_millis(500)).await;
+                    Err(e)?
+                }
+            }
         }
     })
 }
 
-async fn run_client_kex(
+async fn run_client_kex<T: KexConfig>(
+    config: T,
     tx: UnboundedSender<Frame>,
     tx_event: UnboundedSender<KexEvent>,
     reader: ConnectionReader,
     kex_handle: JoinHandle<Result<Kex>>,
-    private_key_path: PathBuf,
-    public_key_path: PathBuf,
     passphrase_fn: impl Fn() -> Result<Option<String>>,
 ) -> Result<(Kex, Arc<UdpSocket>)> {
+    let (private_key_path, public_key_path) = config.key_pair_paths()?;
+    trace!("Loading private key from {}", private_key_path.display());
+    trace!("Loading public key from {}", public_key_path.display());
+
     // Load the moshpit public and private key
     let (unenc_key_pair_opt, enc_key_pair_opt) = load_private_key(&private_key_path)?;
     let (full_public_key_bytes, public_key_bytes) = load_public_key(&public_key_path)?;
@@ -291,7 +299,7 @@ async fn run_client_kex(
 
     // Send the initialize frame with our public key
     let frame = Frame::Initialize(
-        b"jozias".to_vec(),
+        config.user().unwrap_or_default().as_bytes().to_vec(),
         my_public_key.as_ref().to_vec(),
         full_public_key_bytes,
     );
@@ -312,17 +320,19 @@ async fn run_client_kex(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_server_kex(
+async fn run_server_kex<T: KexConfig>(
+    config: T,
     socket_addr: SocketAddr,
-    port_pool_opt: Option<Arc<Mutex<BTreeSet<u16>>>>,
     tx: UnboundedSender<Frame>,
     tx_event: UnboundedSender<KexEvent>,
     reader: ConnectionReader,
     kex_handle: JoinHandle<Result<Kex>>,
-    private_key_path: PathBuf,
-    public_key_path: PathBuf,
 ) -> Result<(Kex, Arc<UdpSocket>)> {
+    let port_pool_opt = config.port_pool();
+    let (private_key_path, public_key_path) = config.key_pair_paths()?;
+    trace!("Loading private key from {}", private_key_path.display());
+    trace!("Loading public key from {}", public_key_path.display());
+
     // Setup the TCP frame reader
     let tx_c = tx.clone();
     let tx_event_c = tx_event.clone();

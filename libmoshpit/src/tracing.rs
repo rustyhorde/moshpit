@@ -205,7 +205,6 @@ mod test {
         assert_eq!(config.default_file_path(), "moshpit");
         assert_eq!(config.default_file_name(), "moshpit.toml");
         let res = init_tracing(&config, &config, &config, None);
-        eprintln!("Result: {res:?}");
         assert!(res.is_ok());
     }
 
@@ -217,7 +216,6 @@ mod test {
         assert_eq!(config.default_file_path(), "moshpit");
         assert_eq!(config.default_file_name(), "moshpit.toml");
         let res = init_tracing(&config, &config, &config, None);
-        eprintln!("Result: {res:?}");
         assert!(res.is_ok());
     }
 
