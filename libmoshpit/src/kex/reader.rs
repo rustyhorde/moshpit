@@ -6,7 +6,14 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-use std::{collections::BTreeSet, net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{
+    collections::BTreeSet,
+    fs::OpenOptions,
+    io::{BufRead, BufReader},
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::Result;
 use aws_lc_rs::{
@@ -31,6 +38,9 @@ use uuid::Uuid;
 use crate::{
     ConnectionReader, Frame, KexEvent, MoshpitError, UuidWrapper, load_private_key, load_public_key,
 };
+
+const AEAD_KEY_INFO: &[u8] = b"AEAD KEY";
+const HMAC_KEY_INFO: &[u8] = b"HMAC KEY";
 
 /// The key exchange reader for the moshpit
 #[derive(Builder, Debug)]
@@ -59,12 +69,12 @@ impl KexReader {
                     let mut check = b"Yoda".to_vec();
 
                     // Derive UnboundKey for AES-256-GCM-SIV
-                    let okm_aes = pseudo_random_key.expand(&[b"aead key"], &AES_256_GCM_SIV)?;
+                    let okm_aes = pseudo_random_key.expand(&[AEAD_KEY_INFO], &AES_256_GCM_SIV)?;
                     let mut key_bytes = [0u8; AES_256_KEY_LEN];
                     okm_aes.fill(&mut key_bytes)?;
                     // Derive the HMAC key and send it over UDP
                     let okm_hmac =
-                        pseudo_random_key.expand(&[b"hmac key"], HKDF_SHA512.hmac_algorithm())?;
+                        pseudo_random_key.expand(&[HMAC_KEY_INFO], HKDF_SHA512.hmac_algorithm())?;
                     let mut hmac_key_bytes = [0u8; SHA512_OUTPUT_LEN];
                     okm_hmac.fill(&mut hmac_key_bytes)?;
 
@@ -120,13 +130,16 @@ impl KexReader {
         public_key_path: &PathBuf,
     ) -> Result<Arc<UdpSocket>> {
         let rnk = if let Some(frame) = self.reader.read_frame().await? {
-            if let Frame::Initialize(user, pk, _fpk) = frame {
+            if let Frame::Initialize(user, pk, fpk) = frame {
                 let user_str = String::from_utf8_lossy(&user);
-                let (_home_dir, _shell) = if self.validate_user(&user_str).await? {
+                let (home_dir, _shell) = if self.validate_user(&user_str).await? {
                     self.get_home_dir_shell(&user_str).await?
                 } else {
                     return Err(MoshpitError::KeyNotEstablished.into());
                 };
+                if !check_authorized_keys(&home_dir, &fpk)? {
+                    return Err(MoshpitError::KeyNotEstablished.into());
+                }
                 self.handle_initialize(
                     &pk,
                     &self.tx_event.clone(),
@@ -217,12 +230,12 @@ impl KexReader {
             Unspecified,
             |key_material| {
                 let pseudo_random_key = salt.extract(key_material);
-                let okm = pseudo_random_key.expand(&[b"aead key"], &AES_256_GCM_SIV)?;
+                let okm = pseudo_random_key.expand(&[AEAD_KEY_INFO], &AES_256_GCM_SIV)?;
                 let mut key_bytes = [0u8; AES_256_KEY_LEN];
                 okm.fill(&mut key_bytes)?;
                 // Derive the HMAC key and send it over UDP
                 let okm_hmac =
-                    pseudo_random_key.expand(&[b"hmac key"], HKDF_SHA512.hmac_algorithm())?;
+                    pseudo_random_key.expand(&[HMAC_KEY_INFO], HKDF_SHA512.hmac_algorithm())?;
                 let mut hmac_key_bytes = [0u8; SHA512_OUTPUT_LEN];
                 okm_hmac.fill(&mut hmac_key_bytes)?;
 
@@ -344,9 +357,53 @@ impl KexReader {
                     shell = stripped.trim().to_string();
                 }
             }
-            trace!("User '{user}' home directory: {home_dir}, shell: {shell}");
             return Ok((home_dir, shell));
         }
         Err(MoshpitError::KeyNotEstablished.into())
     }
+}
+
+fn check_authorized_keys(home_dir: &str, fpk: &[u8]) -> Result<bool> {
+    let moshpit_path = PathBuf::from(home_dir).join(".mp");
+    let authorized_keys_path = moshpit_path.join("authorized_keys");
+    if check_permissions(&moshpit_path, &authorized_keys_path)? {
+        let authorized_keys_file = OpenOptions::new()
+            .read(true)
+            .open(&authorized_keys_path)
+            .map_err(|_e| MoshpitError::KeyNotEstablished)?;
+        let buffered_reader = BufReader::new(authorized_keys_file);
+        let fpk_str = String::from_utf8_lossy(fpk);
+
+        for line in buffered_reader.lines().map_while(Result::ok) {
+            if line == fpk_str {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn check_permissions(moshpit_path: &Path, authorized_keys_path: &Path) -> Result<bool> {
+    #[cfg(target_family = "unix")]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let moshpit_metadata = moshpit_path.metadata()?;
+        let authorized_keys_metadata = authorized_keys_path.metadata()?;
+
+        // Check that .mp directory has mode 0o700 (rwx------ = 0o40700 with S_IFDIR bit)
+        // We mask with 0o777 to get just the permission bits
+        let dir_perms = moshpit_metadata.mode() & 0o777;
+        if dir_perms != 0o700 {
+            return Ok(false);
+        }
+
+        // Check that authorized_keys file is owned by the user and not writable by others
+        let file_perms = authorized_keys_metadata.mode() & 0o777;
+        if file_perms != 0o600 {
+            return Ok(false);
+        }
+    }
+    // On non-Unix systems, skip permission checks
+    Ok(true)
 }

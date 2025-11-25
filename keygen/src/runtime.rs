@@ -8,9 +8,12 @@
 
 use std::{
     ffi::OsString,
-    fs::{OpenOptions, create_dir_all},
+    fs::{DirBuilder, OpenOptions},
     path::{Path, PathBuf},
 };
+
+#[cfg(target_family = "unix")]
+use std::os::unix::fs::DirBuilderExt;
 
 use anyhow::Result;
 use clap::Parser as _;
@@ -107,7 +110,17 @@ fn setup_paths() -> Result<(PathBuf, PathBuf)> {
     let mut pub_key_path = priv_key_path.clone();
     let _ = pub_key_path.set_extension(default_pub_key_ext);
     if let Some(priv_parent) = priv_key_path.parent() {
-        create_dir_all(priv_parent)?;
+        #[cfg(target_family = "unix")]
+        {
+            DirBuilder::new()
+                .mode(0o700)
+                .recursive(true)
+                .create(priv_parent)?;
+        }
+        #[cfg(not(target_family = "unix"))]
+        {
+            DirBuilder::new().recursive(true).create(priv_parent)?;
+        }
     }
     Ok((priv_key_path, pub_key_path))
 }
