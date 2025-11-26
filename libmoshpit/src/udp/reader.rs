@@ -29,7 +29,7 @@ use bon::Builder;
 use bytes::BytesMut;
 use tokio::{net::UdpSocket, select, sync::mpsc::UnboundedSender, time::sleep};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, trace};
+use tracing::{error, info};
 use uuid::Uuid;
 
 use crate::{EncryptedFrame, MoshpitError, TerminalMessage, utils::is_exit_title};
@@ -147,14 +147,11 @@ impl UdpReader {
                                         }
                                     }
                                 }
-                                trace!("Processed valid UTF-8 chunk");
                                 if let Err(e) = stdout_tx.send(valid_utf8.into_bytes()) {
                                     error!("Error sending to stdout channel: {e}");
                                 }
                             }
                         }
-                    } else {
-                        trace!("UDP reader received None frame, exiting");
                     }
                 }
             }
@@ -197,8 +194,15 @@ impl UdpReader {
 
             // Attempt to parse a frame from the buffered data. If enough data
             // has been buffered, the frame is returned.
-            if let Some(frame) = self.parse_encrypted_frame(&mut buffer)? {
-                return Ok(Some(frame));
+            match self.parse_encrypted_frame(&mut buffer) {
+                Ok(Some(frame)) => return Ok(Some(frame)),
+                Ok(None) => {
+                    // Not enough data has been buffered yet to parse a full
+                    // frame. Continue the loop to read more data from the socket.
+                }
+                Err(_err) => {
+                    error!("Error parsing frame");
+                }
             }
         }
     }
