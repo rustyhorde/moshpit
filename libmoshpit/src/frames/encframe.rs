@@ -16,7 +16,7 @@ use aws_lc_rs::{
     hmac::{Key, verify},
 };
 use bincode::{Decode, Encode, config::standard, decode_from_slice};
-use tracing::error;
+use tracing::{error, trace};
 use uuid::Uuid;
 
 use crate::{
@@ -67,6 +67,7 @@ impl EncryptedFrame {
                         let mut data = data.to_vec();
                         let nonce = Nonce::try_assume_unique_for_key(nonce_bytes)?;
                         let aad = Aad::from(count.to_be_bytes());
+                        trace!("count: {count}");
                         let _ = rnk.open_in_place(nonce, aad, &mut data)?;
                         let (uuid_bytes, rest) = data.split_at(UUID_LEN);
                         let uuid = Uuid::from_bytes(uuid_bytes.try_into()?);

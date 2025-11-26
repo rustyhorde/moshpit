@@ -60,6 +60,8 @@ where
     let _ = config.set_user(user);
     trace!("Connecting to server at {socket_addr}");
     let socket = TcpStream::connect(socket_addr).await?;
+    let remote_addr = socket.peer_addr()?;
+    info!("Connected to server at {remote_addr}");
     let (sock_read, sock_write) = socket.into_split();
 
     // Run the key exchange

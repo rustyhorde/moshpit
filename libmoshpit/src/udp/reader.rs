@@ -147,6 +147,7 @@ impl UdpReader {
                                         }
                                     }
                                 }
+                                trace!("Processed valid UTF-8 chunk");
                                 if let Err(e) = stdout_tx.send(valid_utf8.into_bytes()) {
                                     error!("Error sending to stdout channel: {e}");
                                 }
@@ -182,7 +183,7 @@ impl UdpReader {
             let mut buffer = BytesMut::with_capacity(8192);
 
             let len = self.socket.recv_buf(&mut buffer).await?;
-
+            trace!("Received {len} bytes from UDP socket");
             if len == 0 {
                 // The remote closed the connection. For this to be a clean
                 // shutdown, there should be no data in the read buffer. If
@@ -255,7 +256,7 @@ impl UdpReader {
                 Ok(None)
             }
             Err(err) => {
-                error!("Error parsing frame: {}", err);
+                error!("Error parsing frame: {err}");
                 Err(err)
             }
         }
