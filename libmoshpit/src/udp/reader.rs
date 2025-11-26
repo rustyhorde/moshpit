@@ -123,7 +123,6 @@ impl UdpReader {
                                     valid_utf8.push_str(chunk.valid());
 
                                     if !chunk.invalid().is_empty() {
-                                        info!("Received invalid UTF-8 chunk");
                                         prev_bytes.extend_from_slice(chunk.invalid());
                                     }
                                 }
@@ -200,9 +199,7 @@ impl UdpReader {
                     // Not enough data has been buffered yet to parse a full
                     // frame. Continue the loop to read more data from the socket.
                 }
-                Err(_err) => {
-                    error!("Error parsing frame");
-                }
+                Err(_err) => {}
             }
         }
     }
@@ -259,7 +256,7 @@ impl UdpReader {
                 Ok(None)
             }
             Err(err) => {
-                error!("Error parsing frame: {err}");
+                let _count = self.recv_count.fetch_sub(1, Ordering::SeqCst);
                 Err(err)
             }
         }
