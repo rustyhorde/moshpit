@@ -183,7 +183,6 @@ impl UdpReader {
             let mut buffer = BytesMut::with_capacity(8192);
 
             let len = self.socket.recv_buf(&mut buffer).await?;
-            trace!("Received {len} bytes from UDP socket");
             if len == 0 {
                 // The remote closed the connection. For this to be a clean
                 // shutdown, there should be no data in the read buffer. If
