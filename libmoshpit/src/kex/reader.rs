@@ -36,7 +36,8 @@ use tracing::{error, trace};
 use uuid::Uuid;
 
 use crate::{
-    ConnectionReader, Frame, KexEvent, MoshpitError, UuidWrapper, load_private_key, load_public_key,
+    ConnectionReader, Frame, KexEvent, MoshpitError, ServerKex, UuidWrapper, load_private_key,
+    load_public_key,
 };
 
 const AEAD_KEY_INFO: &[u8] = b"AEAD KEY";
@@ -128,11 +129,11 @@ impl KexReader {
         port_pool: Arc<Mutex<BTreeSet<u16>>>,
         private_key_path: &PathBuf,
         public_key_path: &PathBuf,
-    ) -> Result<Arc<UdpSocket>> {
-        let rnk = if let Some(frame) = self.reader.read_frame().await? {
+    ) -> Result<(ServerKex, Arc<UdpSocket>)> {
+        let (rnk, skex) = if let Some(frame) = self.reader.read_frame().await? {
             if let Frame::Initialize(user, pk, fpk) = frame {
                 let user_str = String::from_utf8_lossy(&user);
-                let (home_dir, _shell) = if self.validate_user(&user_str).await? {
+                let (home_dir, shell) = if self.validate_user(&user_str).await? {
                     self.get_home_dir_shell(&user_str).await?
                 } else {
                     return Err(MoshpitError::KeyNotEstablished.into());
@@ -140,12 +141,18 @@ impl KexReader {
                 if !check_authorized_keys(&home_dir, &fpk)? {
                     return Err(MoshpitError::KeyNotEstablished.into());
                 }
-                self.handle_initialize(
-                    &pk,
-                    &self.tx_event.clone(),
-                    private_key_path,
-                    public_key_path,
-                )?
+                (
+                    self.handle_initialize(
+                        &pk,
+                        &self.tx_event.clone(),
+                        private_key_path,
+                        public_key_path,
+                    )?,
+                    ServerKex::builder()
+                        .user(user_str.to_string())
+                        .shell(shell)
+                        .build(),
+                )
             } else {
                 error!("Expected initialize frame from mp");
                 return Err(MoshpitError::InvalidFrame.into());
@@ -181,7 +188,7 @@ impl KexReader {
             return Err(MoshpitError::InvalidFrame.into());
         }
 
-        Ok(udp_arc)
+        Ok((skex, udp_arc))
     }
 
     fn handle_initialize(

@@ -63,7 +63,8 @@ where
     let (sock_read, sock_write) = socket.into_split();
 
     // Run the key exchange
-    let (kex, udp_arc) = run_key_exchange(config, sock_read, sock_write, read_passpharase).await?;
+    let (kex, udp_arc, _skex_opt) =
+        run_key_exchange(config, sock_read, sock_write, read_passpharase).await?;
     info!("Key exchange completed with moshpits");
 
     // Setup the cancellation token

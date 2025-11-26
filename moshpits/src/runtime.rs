@@ -93,7 +93,8 @@ where
 async fn handle_connection(config: Config, socket: TcpStream) -> Result<()> {
     let (sock_read, sock_write) = socket.into_split();
     let port_pool = config.port_pool().clone();
-    let (kex, udp_arc) = run_key_exchange(config, sock_read, sock_write, || Ok(None)).await?;
+    let (kex, udp_arc, _skex_opt) =
+        run_key_exchange(config, sock_read, sock_write, || Ok(None)).await?;
     info!("Key exchange completed with moshpit");
 
     let (tx, rx) = unbounded_channel::<EncryptedFrame>();

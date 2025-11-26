@@ -18,7 +18,7 @@ use aws_lc_rs::{
     cipher::AES_256_KEY_LEN,
 };
 use bon::Builder;
-use getset::CopyGetters;
+use getset::{CopyGetters, Getters};
 use serde::{Deserialize, Serialize};
 use tokio::{
     net::{
@@ -117,6 +117,17 @@ impl Default for Kex {
     }
 }
 
+/// Extended key exchange for the moshpits side of the exchange
+#[derive(Builder, Clone, Debug, Getters)]
+pub struct ServerKex {
+    /// The user associated with the key exchange
+    #[getset(get = "pub")]
+    user: String,
+    /// The shell associated with the key exchange
+    #[getset(get = "pub")]
+    shell: String,
+}
+
 impl KexStateMachine {
     /// Handle key exchange events
     ///
@@ -194,7 +205,7 @@ pub async fn run_key_exchange<T: KexConfig>(
     sock_read: OwnedReadHalf,
     sock_write: OwnedWriteHalf,
     passphrase_fn: impl Fn() -> Result<Option<String>>,
-) -> Result<(Kex, Arc<UdpSocket>)> {
+) -> Result<(Kex, Arc<UdpSocket>, Option<ServerKex>)> {
     // Setup the TCP connection to the server for key exchange
     let mode = config.mode();
     let reader = ConnectionReader::builder().reader(sock_read).build();
@@ -236,7 +247,7 @@ async fn run_client_kex<T: KexConfig>(
     reader: ConnectionReader,
     kex_handle: JoinHandle<Result<Kex>>,
     passphrase_fn: impl Fn() -> Result<Option<String>>,
-) -> Result<(Kex, Arc<UdpSocket>)> {
+) -> Result<(Kex, Arc<UdpSocket>, Option<ServerKex>)> {
     let (private_key_path, public_key_path) = config.key_pair_paths()?;
     trace!("Loading private key from {}", private_key_path.display());
     trace!("Loading public key from {}", public_key_path.display());
@@ -309,7 +320,7 @@ async fn run_client_kex<T: KexConfig>(
         udp_listener.connect(moshpits_addr).await?;
         let frame = Frame::MoshpitAddr(udp_listener.local_addr()?);
         tx.send(frame.clone())?;
-        Ok((kex, Arc::new(udp_listener)))
+        Ok((kex, Arc::new(udp_listener), None))
     } else {
         Err(MoshpitError::InvalidMoshpitsAddress.into())
     }
@@ -322,7 +333,7 @@ async fn run_server_kex<T: KexConfig>(
     tx_event: UnboundedSender<KexEvent>,
     reader: ConnectionReader,
     kex_handle: JoinHandle<Result<Kex>>,
-) -> Result<(Kex, Arc<UdpSocket>)> {
+) -> Result<(Kex, Arc<UdpSocket>, Option<ServerKex>)> {
     let port_pool_opt = config.port_pool();
     let (private_key_path, public_key_path) = config.key_pair_paths()?;
     trace!("Loading private key from {}", private_key_path.display());
@@ -337,10 +348,10 @@ async fn run_server_kex<T: KexConfig>(
         .tx_event(tx_event_c)
         .build();
     if let Some(port_pool) = port_pool_opt {
-        let udp_arc = frame_reader
+        let (skex, udp_arc) = frame_reader
             .server_kex(socket_addr, port_pool, &private_key_path, &public_key_path)
             .await?;
-        Ok((kex_handle.await??, udp_arc))
+        Ok((kex_handle.await??, udp_arc, Some(skex)))
     } else {
         Err(anyhow::anyhow!(
             "Port pool is required for server key exchange"

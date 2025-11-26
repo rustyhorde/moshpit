@@ -270,6 +270,7 @@ pub use self::kex::KexEvent;
 pub use self::kex::KexMode;
 pub use self::kex::KexState;
 pub use self::kex::KexStateMachine;
+pub use self::kex::ServerKex;
 pub use self::kex::reader::KexReader;
 pub use self::kex::run_key_exchange;
 pub use self::kex::sender::KexSender;
