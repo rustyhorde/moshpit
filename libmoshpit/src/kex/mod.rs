@@ -317,16 +317,10 @@ async fn run_client_kex<T: KexConfig>(
     if let Some(moshpits_addr) = kex.moshpits_addr() {
         trace!("Connecting to moshpits at {moshpits_addr}");
         let my_local_ip = local_ip()?;
-        trace!("Detected local IP address: {my_local_ip}");
-        let socket_addr = SocketAddr::new(my_local_ip, 50000);
+        let socket_addr = SocketAddr::new(my_local_ip, 0);
         let udp_listener = UdpSocket::bind(socket_addr).await?;
-        let remote_addr = SocketAddr::new("184.59.84.12".parse()?, moshpits_addr.port());
-        trace!("Connecting UDP socket to remote address {remote_addr}");
-        udp_listener.connect(remote_addr).await?;
-        let blah_addr = SocketAddr::new("173.90.56.12".parse()?, udp_listener.local_addr()?.port());
-        trace!("Sending moshpits address {blah_addr} to server");
-        // let frame = Frame::MoshpitAddr(udp_listener.local_addr()?);
-        let frame = Frame::MoshpitAddr(blah_addr);
+        udp_listener.connect(moshpits_addr).await?;
+        let frame = Frame::MoshpitAddr(udp_listener.local_addr()?);
         tx.send(frame.clone())?;
         Ok((kex, Arc::new(udp_listener), None))
     } else {
