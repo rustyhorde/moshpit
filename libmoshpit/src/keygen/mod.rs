@@ -13,7 +13,7 @@ use std::{
 };
 
 use anyhow::{Error, Result};
-use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
+use argon2::{Argon2, PasswordHasher, password_hash::phc::SaltString};
 use aws_lc_rs::{
     aead::{AES_256_GCM_SIV, Aad, Nonce, RandomizedNonceKey},
     agreement::{PrivateKey, PublicKey, X25519},
@@ -390,7 +390,7 @@ fn generate_passphrase_hash(passphrase_opt: Option<&String>) -> Option<String> {
         let salt = SaltString::generate();
         let argon2 = Argon2::default();
         argon2
-            .hash_password(passphrase.as_bytes(), &salt)
+            .hash_password(passphrase.as_bytes(), salt.as_bytes())
             .ok()
             .map(|h| h.to_string())
     })
