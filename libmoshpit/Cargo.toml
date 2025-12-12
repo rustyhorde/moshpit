@@ -19,7 +19,7 @@ unstable = []
 [dependencies]
 ansi-control-codes = { version = "1.0.1", features = ["parser", "explain"] }
 anyhow = { workspace = true }
-argon2 = { version = "0.6.0-rc.2", features = ["getrandom"] }
+argon2 = { version = "=0.6.0-rc.3", features = ["getrandom"] }
 aws-lc-rs = { workspace = true }
 base64 = "0.22.1"
 bincode = "2.0.1"
