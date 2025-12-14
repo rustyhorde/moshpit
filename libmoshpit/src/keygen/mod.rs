@@ -390,7 +390,7 @@ fn generate_passphrase_hash(passphrase_opt: Option<&String>) -> Option<String> {
         let salt = SaltString::generate();
         let argon2 = Argon2::default();
         argon2
-            .hash_password(passphrase.as_bytes(), salt.as_bytes())
+            .hash_password_with_salt(passphrase.as_bytes(), salt.as_bytes())
             .ok()
             .map(|h| h.to_string())
     })
