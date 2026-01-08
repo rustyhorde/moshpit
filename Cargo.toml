@@ -27,10 +27,10 @@ tracing = { version = "0.1.41", features = [
 ] }
 tracing-subscriber-init = { version = "0.2.3", features = ["tstime"] }
 uuid = { version = "1.18.1", features = ["v4"] }
-vergen-gix = { version = "2.1.0-beta.6", features = [
+vergen-gix = { version = "10.0.0-beta.5", features = [
   "build",
   "cargo",
   "rustc",
   "si",
 ] }
-vergen-pretty = { version = "2.1.1", features = ["bincode", "serde"] }
+vergen-pretty = { version = "10.0.0-beta.5", features = ["bincode", "serde"] }
