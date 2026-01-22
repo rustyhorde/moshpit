@@ -90,9 +90,9 @@ dependencies = [
 
 [[package]]
 name = "argon2"
-version = "0.6.0-rc.5"
+version = "0.6.0-rc.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a26e88a084142953a0415c47ddf4081eddf9a6d310012bbe92e9827d03e447f0"
+checksum = "39b5afeb474438603309cd6e638f6baff5b8f4eb4605d63c761516712e044e5c"
 dependencies = [
  "base64ct",
  "blake2",
@@ -2395,9 +2395,9 @@ dependencies = [
 
 [[package]]
 name = "proc-macro2"
-version = "1.0.105"
+version = "1.0.106"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "535d180e0ecab6268a3e718bb9fd44db66bbbc256257165fc699dadf70d16fe7"
+checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
 ]
