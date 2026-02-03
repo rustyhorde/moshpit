@@ -7,7 +7,7 @@ members = ["libmoshpit", "moshpit", "moshpits"]
 anyhow = "1.0.100"
 aws-lc-rs = "1.14.1"
 bon = "3.8.1"
-bytes = "1.10.1"
+bytes = "1.11.1"
 clap = { version = "4.5.51", features = ["derive"] }
 config = { version = "0.15.18", features = ["toml"] }
 getset = "0.1.6"
