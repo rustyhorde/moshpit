@@ -66,15 +66,20 @@ impl UdpReader {
         loop {
             select! {
                 () = token.cancelled() => break,
-                frame_res = self.read_encrypted_frame() =>{
-                    if let Ok(Some(frame)) = frame_res {
-                        match frame {
+                frame_res = self.read_encrypted_frame() => {
+                    match frame_res {
+                        Ok(Some(frame)) => match frame {
                             EncryptedFrame::Bytes((_id, message)) => {
                                 term_tx.send(TerminalMessage::Input(message))?;
                             }
                             EncryptedFrame::Resize((_id, columns, rows)) => {
                                 term_tx.send(TerminalMessage::Resize { rows, columns })?;
                             }
+                        },
+                        Ok(None) => break,
+                        Err(e) => {
+                            error!("udp read error, client likely disconnected: {e}");
+                            break;
                         }
                     }
                 }
