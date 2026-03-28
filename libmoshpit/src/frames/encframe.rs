@@ -35,6 +35,8 @@ pub enum EncryptedFrame {
     Resize((UuidWrapper, u16, u16)),
     /// Request retransmission of the given sequence numbers.
     Nak(Vec<u64>),
+    /// Server is shutting down; client should exit cleanly.
+    Shutdown,
 }
 
 impl EncryptedFrame {
@@ -45,6 +47,7 @@ impl EncryptedFrame {
             EncryptedFrame::Bytes(_) => 0,
             EncryptedFrame::Resize(_) => 1,
             EncryptedFrame::Nak(_) => 2,
+            EncryptedFrame::Shutdown => 3,
         }
     }
 

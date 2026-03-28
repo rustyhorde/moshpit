@@ -63,15 +63,18 @@ impl UdpSender {
             select! {
                 () = token.cancelled() => break,
                 frame_opt = self.rx.recv() => {
-                    if let Some(frame) = frame_opt {
-                        let seq = self.send_seq;
-                        self.send_seq += 1;
-                        let wire = self.encrypt(&frame, seq)?;
-                        let _prev = self.retransmit_buffer.insert(seq, wire.clone());
-                        // Evict packets that fell outside the retransmit window
-                        let cutoff = seq.saturating_sub(RETRANSMIT_WINDOW);
-                        self.retransmit_buffer.retain(|&s, _| s >= cutoff);
-                        let _bytes_sent = self.socket.send(&wire).await?;
+                    match frame_opt {
+                        Some(frame) => {
+                            let seq = self.send_seq;
+                            self.send_seq += 1;
+                            let wire = self.encrypt(&frame, seq)?;
+                            let _prev = self.retransmit_buffer.insert(seq, wire.clone());
+                            // Evict packets that fell outside the retransmit window
+                            let cutoff = seq.saturating_sub(RETRANSMIT_WINDOW);
+                            self.retransmit_buffer.retain(|&s, _| s >= cutoff);
+                            let _bytes_sent = self.socket.send(&wire).await?;
+                        }
+                        None => break,
                     }
                 },
                 seqs = self.retransmit_rx.recv(), if retransmit_active => {

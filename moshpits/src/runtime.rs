@@ -27,7 +27,7 @@ use libmoshpit::{
 use pseudoterminal::{CommandExt as _, TerminalSize};
 use tokio::{
     net::{TcpListener, TcpStream},
-    spawn,
+    select, spawn,
     sync::{Mutex, mpsc::unbounded_channel},
 };
 use tokio_util::sync::CancellationToken;
@@ -76,21 +76,41 @@ where
     let port_pool_arc = Arc::new(Mutex::new(port_pool));
     let _ = config.set_port_pool(port_pool_arc);
 
+    let server_token = CancellationToken::new();
     loop {
         let config_c = config.clone();
-        match listener.accept().await {
-            Ok((socket, _addr)) => {
-                if let Err(e) = handle_connection(config_c, socket).await {
-                    trace!("{e}");
+        let st = server_token.clone();
+        select! {
+            _ = tokio::signal::ctrl_c() => {
+                info!("Received Ctrl-C, shutting down server");
+                server_token.cancel();
+                // Allow active connections time to send Shutdown frames to clients
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                break;
+            }
+            accept_res = listener.accept() => {
+                match accept_res {
+                    Ok((socket, _addr)) => {
+                        let _conn = spawn(async move {
+                            if let Err(e) = handle_connection(config_c, socket, st).await {
+                                trace!("{e}");
+                            }
+                        });
+                    }
+                    Err(e) => error!("{e}"),
                 }
             }
-            Err(e) => error!("{e}"),
         }
     }
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
-async fn handle_connection(config: Config, socket: TcpStream) -> Result<()> {
+async fn handle_connection(
+    config: Config,
+    socket: TcpStream,
+    server_token: CancellationToken,
+) -> Result<()> {
     let (sock_read, sock_write) = socket.into_split();
     let port_pool = config.port_pool().clone();
     let (kex, udp_arc, _skex_opt) =
@@ -138,6 +158,17 @@ async fn handle_connection(config: Config, socket: TcpStream) -> Result<()> {
             let _ = pool.insert(port);
         }
     });
+
+    // When the server shuts down, notify the connected client then cancel the local token
+    let watcher_tx = tx.clone();
+    let watcher_conn_token = token.clone();
+    let _shutdown_watcher = spawn(async move {
+        server_token.cancelled().await;
+        drop(watcher_tx.send(EncryptedFrame::Shutdown));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        watcher_conn_token.cancel();
+    });
+
     let _term_handle = thread::spawn(move || {
         let mut cmd = Command::new("/usr/bin/fish");
         let _ = cmd.arg("-li");

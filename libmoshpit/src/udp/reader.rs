@@ -168,7 +168,7 @@ impl UdpReader {
                                     EncryptedFrame::Resize((_id, columns, rows)) => {
                                         term_tx.send(TerminalMessage::Resize { rows, columns })?;
                                     }
-                                    EncryptedFrame::Nak(_) => {}
+                                    EncryptedFrame::Nak(_) | EncryptedFrame::Shutdown => {}
                                 }
                             }
                         }
@@ -205,15 +205,20 @@ impl UdpReader {
                 _ = nak_check.tick() => {
                     self.check_nak_timeouts();
                 },
-                frame_res = self.read_encrypted_frame() =>{
-                    if let Ok(Some((frame, seq))) = frame_res {
-                        for ready in self.handle_arrival(frame, seq) {
-                            match ready {
-                                EncryptedFrame::Resize(_) => {
-                                    error!("Received Resize frame on client, which is unexpected");
-                                }
-                                EncryptedFrame::Nak(_) => {}
-                                EncryptedFrame::Bytes((_id, message)) => {
+                frame_res = self.read_encrypted_frame() => {
+                    match frame_res {
+                        Ok(Some((frame, seq))) => {
+                            for ready in self.handle_arrival(frame, seq) {
+                                match ready {
+                                    EncryptedFrame::Resize(_) => {
+                                        error!("Received Resize frame on client, which is unexpected");
+                                    }
+                                    EncryptedFrame::Nak(_) => {}
+                                    EncryptedFrame::Shutdown => {
+                                        info!("Server is shutting down, exiting");
+                                        process::exit(0);
+                                    }
+                                    EncryptedFrame::Bytes((_id, message)) => {
                                 let message = if prev_bytes.is_empty() {
                                     message
                                 } else {
@@ -256,8 +261,17 @@ impl UdpReader {
                                 if let Err(e) = stdout_tx.send(valid_utf8.into_bytes()) {
                                     error!("Error sending to stdout channel: {e}");
                                 }
+                                    }
                                 }
                             }
+                        }
+                        Ok(None) => {
+                            info!("server closed UDP connection");
+                            process::exit(0);
+                        }
+                        Err(e) => {
+                            error!("udp read error, server likely disconnected: {e}");
+                            process::exit(1);
                         }
                     }
                 }

@@ -29,7 +29,7 @@ getset = { workspace = true }
 libmoshpit = { version = "0.1.0", path = "../libmoshpit" }
 pseudoterminal = "0.2.1"
 serde = { workspace = true }
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["signal", "sync", "time"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber-init = { workspace = true }
