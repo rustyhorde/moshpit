@@ -10,7 +10,7 @@ use std::{net::SocketAddr, path::PathBuf, sync::LazyLock};
 
 use anyhow::Result;
 use regex::Regex;
-use whoami::fallible::username;
+use whoami::username;
 
 use crate::MoshpitError;
 
@@ -75,7 +75,7 @@ pub(crate) mod test {
     use anyhow::Result;
     use tracing::Level;
     use tracing_subscriber_init::TracingConfig;
-    use whoami::fallible::username;
+    use whoami::username;
 
     use crate::TracingConfigExt;
 

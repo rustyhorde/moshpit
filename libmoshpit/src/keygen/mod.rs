@@ -26,7 +26,7 @@ use aws_lc_rs::{
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::{Buf as _, BytesMut};
 use getset::Getters;
-use whoami::fallible::{hostname, username};
+use whoami::{hostname, username};
 
 use crate::{KexMode, MoshpitError};
 

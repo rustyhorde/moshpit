@@ -12,7 +12,7 @@ use anyhow::Result;
 use aws_lc_rs::digest::{self, SHA256};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bishop::{BishopArt, DrawingOptions};
-use whoami::fallible::{hostname, username};
+use whoami::{hostname, username};
 
 use crate::MoshpitError;
 
