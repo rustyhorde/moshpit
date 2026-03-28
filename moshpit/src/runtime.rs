@@ -75,16 +75,20 @@ where
     let udp_recv = udp_arc.clone();
     let udp_send = udp_arc.clone();
     let (tx, rx) = unbounded_channel::<EncryptedFrame>();
+    let (retransmit_tx, retransmit_rx) = unbounded_channel::<Vec<u64>>();
     let mut udp_reader = UdpReader::builder()
         .socket(udp_recv)
         .id(kex.uuid())
         .hmac(kex.hmac_key())
         .rnk(kex.key())
         .unwrap()
+        .nak_out_tx(tx.clone())
+        .retransmit_tx(retransmit_tx)
         .build();
     let mut udp_sender = UdpSender::builder()
         .socket(udp_send)
         .rx(rx)
+        .retransmit_rx(retransmit_rx)
         .id(kex.uuid())
         .hmac(kex.hmac_key())
         .rnk(kex.key())?

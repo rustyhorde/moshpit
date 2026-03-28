@@ -7,13 +7,11 @@
 // modified, or distributed except according to those terms.
 
 use std::{
+    collections::{BTreeMap, HashMap},
     io::Cursor,
     process,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
-    time::Duration,
+    sync::Arc,
+    time::{Duration, Instant},
 };
 
 use ansi_control_codes::{
@@ -27,12 +25,22 @@ use aws_lc_rs::{
 };
 use bon::Builder;
 use bytes::BytesMut;
-use tokio::{net::UdpSocket, select, sync::mpsc::UnboundedSender, time::sleep};
+use tokio::{
+    net::UdpSocket,
+    select,
+    sync::mpsc::UnboundedSender,
+    time::{interval, sleep},
+};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use uuid::Uuid;
 
 use crate::{EncryptedFrame, MoshpitError, TerminalMessage, utils::is_exit_title};
+
+/// Interval between NAK timeout checks.
+const NAK_CHECK_INTERVAL: Duration = Duration::from_millis(20);
+/// Delay before requesting retransmission of a missing packet.
+const NAK_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// UDP reader for encrypted frames
 #[derive(Builder, Debug)]
@@ -47,11 +55,90 @@ pub struct UdpReader {
     /// Key for verifying UDP packet HMAC
     #[builder(with = |key: [u8; 64]| { Key::new(HMAC_SHA512, &key) })]
     hmac: Key,
-    #[builder(default = AtomicUsize::new(0))]
-    recv_count: AtomicUsize,
+    /// Injects NAK frames into the outbound stream when gaps are detected
+    nak_out_tx: Option<UnboundedSender<EncryptedFrame>>,
+    /// Tells the local sender to retransmit when a NAK from the peer is received
+    retransmit_tx: Option<UnboundedSender<Vec<u64>>>,
+    /// Next expected sequence number
+    #[builder(default)]
+    next_seq: u64,
+    /// Out-of-order frames waiting for missing predecessors
+    #[builder(default)]
+    recv_buffer: BTreeMap<u64, EncryptedFrame>,
+    /// Tracks when each gap was first detected for NAK timeout
+    #[builder(default)]
+    gap_first_seen: HashMap<u64, Instant>,
 }
 
 impl UdpReader {
+    /// Buffer an arrived `(frame, seq)` pair and return any frames now ready to deliver
+    /// in order. Incoming `Nak` frames are routed to the local sender's retransmit channel
+    /// rather than returned.
+    fn handle_arrival(&mut self, frame: EncryptedFrame, seq: u64) -> Vec<EncryptedFrame> {
+        // Peer is requesting us to retransmit — forward to the local sender
+        if let EncryptedFrame::Nak(ref seqs) = frame {
+            if let Some(ref tx) = self.retransmit_tx {
+                drop(tx.send(seqs.clone()));
+            }
+            return vec![];
+        }
+
+        // Duplicate or replay
+        if seq < self.next_seq {
+            return vec![];
+        }
+
+        if seq == self.next_seq {
+            self.next_seq += 1;
+            let _removed = self.gap_first_seen.remove(&seq);
+            let mut ready = vec![frame];
+            // Drain consecutive buffered frames
+            while let Some(buffered) = self.recv_buffer.remove(&self.next_seq) {
+                let _removed = self.gap_first_seen.remove(&self.next_seq);
+                self.next_seq += 1;
+                ready.push(buffered);
+            }
+            ready
+        } else {
+            // Out of order: buffer and record gaps
+            let _prev = self.recv_buffer.insert(seq, frame);
+            for missing in self.next_seq..seq {
+                let _entry = self
+                    .gap_first_seen
+                    .entry(missing)
+                    .or_insert_with(Instant::now);
+            }
+            vec![]
+        }
+    }
+
+    /// Send NAKs for gaps whose timeout has elapsed and reset their timer for potential re-NAK.
+    fn check_nak_timeouts(&mut self) {
+        let now = Instant::now();
+        let timed_out: Vec<u64> = self
+            .gap_first_seen
+            .iter()
+            .filter_map(|(&seq, &t)| {
+                if now.duration_since(t) >= NAK_TIMEOUT {
+                    Some(seq)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !timed_out.is_empty() {
+            // Reset timers so we re-NAK if the retransmitted packet is also dropped
+            for &seq in &timed_out {
+                if let Some(t) = self.gap_first_seen.get_mut(&seq) {
+                    *t = now;
+                }
+            }
+            if let Some(ref tx) = self.nak_out_tx {
+                drop(tx.send(EncryptedFrame::Nak(timed_out)));
+            }
+        }
+    }
+
     /// Run the server frame reading loop
     ///
     /// # Errors
@@ -63,19 +150,28 @@ impl UdpReader {
         token: CancellationToken,
         term_tx: UnboundedSender<TerminalMessage>,
     ) -> Result<()> {
+        let mut nak_check = interval(NAK_CHECK_INTERVAL);
         loop {
             select! {
                 () = token.cancelled() => break,
+                _ = nak_check.tick() => {
+                    self.check_nak_timeouts();
+                },
                 frame_res = self.read_encrypted_frame() => {
                     match frame_res {
-                        Ok(Some(frame)) => match frame {
-                            EncryptedFrame::Bytes((_id, message)) => {
-                                term_tx.send(TerminalMessage::Input(message))?;
+                        Ok(Some((frame, seq))) => {
+                            for ready in self.handle_arrival(frame, seq) {
+                                match ready {
+                                    EncryptedFrame::Bytes((_id, message)) => {
+                                        term_tx.send(TerminalMessage::Input(message))?;
+                                    }
+                                    EncryptedFrame::Resize((_id, columns, rows)) => {
+                                        term_tx.send(TerminalMessage::Resize { rows, columns })?;
+                                    }
+                                    EncryptedFrame::Nak(_) => {}
+                                }
                             }
-                            EncryptedFrame::Resize((_id, columns, rows)) => {
-                                term_tx.send(TerminalMessage::Resize { rows, columns })?;
-                            }
-                        },
+                        }
                         Ok(None) => break,
                         Err(e) => {
                             error!("udp read error, client likely disconnected: {e}");
@@ -101,17 +197,23 @@ impl UdpReader {
     ) {
         let mut prev_bytes = BytesMut::with_capacity(1024);
         let mut osc_started = false;
+        let mut nak_check = interval(NAK_CHECK_INTERVAL);
 
         loop {
             select! {
                 () = token.cancelled() => process::exit(0),
+                _ = nak_check.tick() => {
+                    self.check_nak_timeouts();
+                },
                 frame_res = self.read_encrypted_frame() =>{
-                    if let Ok(Some(frame)) = frame_res {
-                        match frame {
-                            EncryptedFrame::Resize(_) => {
-                                error!("Received Resize frame on client, which is unexpected");
-                            }
-                            EncryptedFrame::Bytes((_id, message)) => {
+                    if let Ok(Some((frame, seq))) = frame_res {
+                        for ready in self.handle_arrival(frame, seq) {
+                            match ready {
+                                EncryptedFrame::Resize(_) => {
+                                    error!("Received Resize frame on client, which is unexpected");
+                                }
+                                EncryptedFrame::Nak(_) => {}
+                                EncryptedFrame::Bytes((_id, message)) => {
                                 let message = if prev_bytes.is_empty() {
                                     message
                                 } else {
@@ -154,6 +256,7 @@ impl UdpReader {
                                 if let Err(e) = stdout_tx.send(valid_utf8.into_bytes()) {
                                     error!("Error sending to stdout channel: {e}");
                                 }
+                                }
                             }
                         }
                     }
@@ -179,7 +282,7 @@ impl UdpReader {
     /// * I/O error.
     /// * Frame parsing error.
     ///
-    pub async fn read_encrypted_frame(&mut self) -> Result<Option<EncryptedFrame>> {
+    pub async fn read_encrypted_frame(&mut self) -> Result<Option<(EncryptedFrame, u64)>> {
         loop {
             let mut buffer = BytesMut::with_capacity(8192);
 
@@ -199,7 +302,7 @@ impl UdpReader {
             // Attempt to parse a frame from the buffered data. If enough data
             // has been buffered, the frame is returned.
             match self.parse_encrypted_frame(&mut buffer) {
-                Ok(Some(frame)) => return Ok(Some(frame)),
+                Ok(Some((frame, seq))) => return Ok(Some((frame, seq))),
                 Ok(None) => {
                     // Not enough data has been buffered yet to parse a full
                     // frame. Continue the loop to read more data from the socket.
@@ -209,61 +312,22 @@ impl UdpReader {
         }
     }
 
-    /// Tries to parse a frame from the buffer. If the buffer contains enough
-    /// data, the frame is returned and the data removed from the buffer. If not
-    /// enough data has been buffered yet, `Ok(None)` is returned. If the
-    /// buffered data does not represent a valid frame, `Err` is returned.
-    fn parse_encrypted_frame(&mut self, buffer: &mut BytesMut) -> Result<Option<EncryptedFrame>> {
-        // Cursor is used to track the "current" location in the
-        // buffer. Cursor also implements `Buf` from the `bytes` crate
-        // which provides a number of helpful utilities for working
-        // with bytes.
+    /// Tries to parse a frame from the buffer. Returns the frame and its sequence number on
+    /// success, `Ok(None)` when the buffer has insufficient data, or `Err` on a bad frame.
+    fn parse_encrypted_frame(
+        &self,
+        buffer: &mut BytesMut,
+    ) -> Result<Option<(EncryptedFrame, u64)>> {
         let mut buf = Cursor::new(&buffer[..]);
-        let count = self.recv_count.fetch_add(1, Ordering::SeqCst);
-
-        // The first step is to check if enough data has been buffered to parse
-        // a single frame. This step is usually much faster than doing a full
-        // parse of the frame, and allows us to skip allocating data structures
-        // to hold the frame data unless we know the full frame has been
-        // received.
-
-        // Reset the position to zero before passing the cursor to `Frame::parse`.
         buf.set_position(0);
 
-        match EncryptedFrame::parse(&mut buf, self.id, &self.hmac, &self.rnk, count) {
-            Ok(Some(frame)) => {
-                // The `parse` function will have advanced the cursor until the
-                // end of the frame. Since the cursor had position set to zero
-                // before `Frame::parse` was called, we obtain the length of the
-                // frame by checking the cursor position.
-                let _len = usize::try_from(buf.position())?;
-                // Discard the parsed data from the read buffer.
-                //
-                // When `advance` is called on the read buffer, all of the data
-                // up to `len` is discarded. The details of how this works is
-                // left to `BytesMut`. This is often done by moving an internal
-                // cursor, but it may be done by reallocating and copying data.
-                // self.buffer.advance(len);
+        match EncryptedFrame::parse(&mut buf, self.id, &self.hmac, &self.rnk) {
+            Ok(Some((frame, seq))) => {
                 buffer.clear();
-
-                // Return the parsed frame to the caller.
-                Ok(Some(frame))
+                Ok(Some((frame, seq)))
             }
-            Ok(None) => {
-                let _count = self.recv_count.fetch_sub(1, Ordering::SeqCst);
-                // There is not enough data present in the read buffer to parse
-                // a single frame. We must wait for more data to be received
-                // from the socket. Reading from the socket will be done in the
-                // statement after this `match`.
-                //
-                // We do not want to return `Err` from here as this "error" is
-                // an expected runtime condition.
-                Ok(None)
-            }
-            Err(err) => {
-                let _count = self.recv_count.fetch_sub(1, Ordering::SeqCst);
-                Err(err)
-            }
+            Ok(None) => Ok(None),
+            Err(err) => Err(err),
         }
     }
 }
