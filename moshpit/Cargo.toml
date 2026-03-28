@@ -30,7 +30,7 @@ getset = { workspace = true }
 libmoshpit = { version = "0.1.0", path = "../libmoshpit" }
 serde = { workspace = true }
 terminal_size = "0.4.4"
-tokio = { workspace = true, features = ["io-std", "sync", "time"] }
+tokio = { workspace = true, features = ["io-std", "signal", "sync", "time"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber-init = { workspace = true }

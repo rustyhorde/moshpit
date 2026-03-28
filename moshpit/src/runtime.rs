@@ -23,6 +23,7 @@ use libmoshpit::{
 use terminal_size::terminal_size;
 use tokio::{
     net::TcpStream,
+    signal::unix::{SignalKind, signal},
     spawn,
     sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
 };
@@ -108,6 +109,30 @@ where
         udp_reader
             .client_frame_loop(reader_token, stdout_tx_c)
             .await;
+    });
+
+    let resize_tx = tx.clone();
+    let resize_uuid = kex.uuid_wrapper();
+    let resize_token = token.clone();
+    let _resize_handle = spawn(async move {
+        match signal(SignalKind::window_change()) {
+            Ok(mut sigwinch) => loop {
+                tokio::select! {
+                    () = resize_token.cancelled() => break,
+                    _ = sigwinch.recv() => {
+                        let (columns, rows) = terminal_size()
+                            .map_or((80, 24), |(width, height)| (width.0, height.0));
+                        if let Err(e) =
+                            resize_tx.send(EncryptedFrame::Resize((resize_uuid, columns, rows)))
+                        {
+                            error!("Failed to send resize frame: {e}");
+                            break;
+                        }
+                    }
+                }
+            },
+            Err(e) => error!("Failed to register SIGWINCH handler: {e}"),
+        }
     });
 
     handle_io(stdout_rx, &tx, &kex)?;
