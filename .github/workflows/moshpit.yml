@@ -85,7 +85,7 @@ jobs:
     strategy:
       matrix:
         os: [windows-latest]
-        channel: ["1.91.1", "stable", "beta", "nightly"]
+        channel: ["1.91.1", "beta", "nightly"]
         target: [x86_64-pc-windows-gnu, x86_64-pc-windows-msvc]
     uses: rustyhorde/workflows/.github/workflows/test-all-features.yml@main
     with:
