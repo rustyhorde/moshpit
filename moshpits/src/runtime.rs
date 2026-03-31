@@ -11,7 +11,6 @@ use std::{
     ffi::OsString,
     io::{Read as _, Write as _},
     net::SocketAddr,
-    process::Command,
     sync::Arc,
     thread::{self, sleep},
     time::Duration,
@@ -24,7 +23,7 @@ use libmoshpit::{
     EncryptedFrame, KexMode, MoshpitError, TerminalMessage, UdpReader, UdpSender, init_tracing,
     is_exit_title, load, run_key_exchange,
 };
-use pseudoterminal::{CommandExt as _, TerminalSize};
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tokio::{
     net::{TcpListener, TcpStream},
     select, spawn,
@@ -170,28 +169,31 @@ async fn handle_connection(
     });
 
     let _term_handle = thread::spawn(move || {
-        let mut cmd = Command::new("/usr/bin/fish");
-        let _ = cmd.arg("-li");
-        let mut terminal = cmd.spawn_terminal().unwrap();
-        if let Some((mut term_in, mut term_out)) = terminal.split() {
-            let _in_handle = thread::spawn(move || {
-                while let Some(terminal_message) = term_rx.blocking_recv() {
-                    match terminal_message {
-                        TerminalMessage::Resize { columns, rows } => {
-                            if let Err(e) = terminal.set_term_size(TerminalSize { rows, columns }) {
-                                error!("error resizing terminal: {e}");
-                            }
-                        }
-                        TerminalMessage::Input(data) => {
-                            if let Err(e) = term_in.write_all(&data) {
-                                error!("error writing to terminal: {e}");
-                                break;
-                            }
-                        }
-                    }
-                }
-            });
+        #[cfg(unix)]
+        let cmd = {
+            let mut c = CommandBuilder::new("/usr/bin/fish");
+            c.arg("-li");
+            c
+        };
+        #[cfg(windows)]
+        let cmd = CommandBuilder::new("cmd.exe");
 
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let _child = pair.slave.spawn_command(cmd).unwrap();
+        let master = pair.master;
+
+        let mut term_out = master.try_clone_reader().unwrap();
+        let mut term_in = master.take_writer().unwrap();
+
+        let _read_handle = thread::spawn(move || {
             loop {
                 let mut buffer = BytesMut::zeroed(4096);
                 match term_out.read(&mut buffer) {
@@ -222,6 +224,27 @@ async fn handle_connection(
             }
             if let Ok(local_addr) = udp_arc.local_addr() {
                 let _ = tx_pool.send(local_addr.port());
+            }
+        });
+
+        while let Some(terminal_message) = term_rx.blocking_recv() {
+            match terminal_message {
+                TerminalMessage::Resize { columns, rows } => {
+                    if let Err(e) = master.resize(PtySize {
+                        rows,
+                        cols: columns,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    }) {
+                        error!("error resizing terminal: {e}");
+                    }
+                }
+                TerminalMessage::Input(data) => {
+                    if let Err(e) = term_in.write_all(&data) {
+                        error!("error writing to terminal: {e}");
+                        break;
+                    }
+                }
             }
         }
     });
