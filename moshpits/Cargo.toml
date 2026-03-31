@@ -11,7 +11,7 @@ name = "moshpits"
 readme = "../README.md"
 repository = "https://github.com/rustyhorde/moshpit"
 version = "0.1.0"
-rust-version = "1.88.0"
+rust-version = "1.91.1"
 
 [[bin]]
 name = "mps"

@@ -11,7 +11,7 @@ name = "libmoshpit"
 readme = "../README.md"
 repository = "https://github.com/rustyhorde/moshpit"
 version = "0.1.0"
-rust-version = "1.88.0"
+rust-version = "1.91.1"
 
 [features]
 unstable = []
@@ -19,10 +19,10 @@ unstable = []
 [dependencies]
 ansi-control-codes = { version = "1.0.1", features = ["parser", "explain"] }
 anyhow = { workspace = true }
-argon2 = { version = "0.6.0-rc.4", features = ["getrandom"] }
+argon2 = { version = "0.6.0-rc.8", features = ["getrandom"] }
 aws-lc-rs = { workspace = true }
 base64 = "0.22.1"
-bincode-next = "2.1.0"
+bincode-next = "3.0.0-rc.9"
 bishop = "1.0.0"
 bon = { workspace = true }
 bytes = { workspace = true }
