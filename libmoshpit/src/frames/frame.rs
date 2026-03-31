@@ -9,7 +9,7 @@
 use std::{fmt::Display, io::Cursor, net::SocketAddr};
 
 use anyhow::Result;
-use bincode::{Decode, Encode, config::standard, decode_from_slice};
+use bincode_next::{Decode, Encode, config::standard, decode_from_slice};
 use bytes::Buf as _;
 
 use crate::{
@@ -115,7 +115,7 @@ mod tests {
     use std::io::Cursor;
 
     use anyhow::Result;
-    use bincode::{config::standard, encode_to_vec};
+    use bincode_next::{config::standard, encode_to_vec};
 
     use crate::frames::USIZE_LENGTH;
 

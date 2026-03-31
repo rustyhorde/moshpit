@@ -13,7 +13,7 @@ use aws_lc_rs::{
     aead::{AES_256_GCM_SIV, Aad, RandomizedNonceKey},
     hmac::{HMAC_SHA512, Key, sign},
 };
-use bincode::{config::standard, encode_to_vec};
+use bincode_next::{config::standard, encode_to_vec};
 use bon::Builder;
 use getset::MutGetters;
 use tokio::{net::UdpSocket, select, sync::mpsc::UnboundedReceiver};

@@ -15,7 +15,7 @@ use aws_lc_rs::{
     error::Unspecified,
     hmac::{Key, verify},
 };
-use bincode::{Decode, Encode, config::standard, decode_from_slice};
+use bincode_next::{Decode, Encode, config::standard, decode_from_slice};
 use tracing::error;
 use uuid::Uuid;
 
