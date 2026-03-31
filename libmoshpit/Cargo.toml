@@ -47,6 +47,13 @@ tracing-subscriber-init = { workspace = true }
 uuid = { workspace = true }
 whoami = "2.1.1"
 
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+] }
+
 [build-dependencies]
 anyhow = { workspace = true }
 rustversion = { workspace = true }

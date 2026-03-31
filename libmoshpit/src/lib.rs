@@ -215,6 +215,8 @@
         unqualified_local_imports,
     )
 )]
+// Allow unsafe code on Windows (required for Windows Security API calls)
+#![cfg_attr(all(nightly, windows), allow(unsafe_code, unsafe_op_in_unsafe_fn))]
 // clippy lints
 #![cfg_attr(nightly, deny(clippy::all, clippy::pedantic))]
 // rustdoc lints

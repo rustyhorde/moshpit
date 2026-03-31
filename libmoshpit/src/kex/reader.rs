@@ -319,6 +319,17 @@ impl KexReader {
         Ok(output.status.success())
     }
 
+    #[cfg(target_os = "windows")]
+    async fn validate_user(&self, user: &str) -> Result<bool> {
+        let mut is_valid_user = Command::new("net");
+        let _ = is_valid_user.args(["user", user]);
+        let output = is_valid_user
+            .output()
+            .await
+            .map_err(|_e| MoshpitError::KeyNotEstablished)?;
+        Ok(output.status.success())
+    }
+
     #[cfg(target_os = "linux")]
     async fn get_home_dir_shell(&self, user: &str) -> Result<(String, String)> {
         let mut cmd = Command::new("getent");
@@ -368,6 +379,31 @@ impl KexReader {
         }
         Err(MoshpitError::KeyNotEstablished.into())
     }
+
+    #[cfg(target_os = "windows")]
+    async fn get_home_dir_shell(&self, user: &str) -> Result<(String, String)> {
+        let mut cmd = Command::new("net");
+        let _ = cmd.args(["user", user]);
+        let output = cmd
+            .output()
+            .await
+            .map_err(|_e| MoshpitError::KeyNotEstablished)?;
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let mut home_dir = String::new();
+            for line in stdout.lines() {
+                if line.to_lowercase().starts_with("home directory") {
+                    home_dir = line[14..].trim().to_string();
+                    break;
+                }
+            }
+            if home_dir.is_empty() {
+                home_dir = format!("C:\\Users\\{user}");
+            }
+            return Ok((home_dir, String::from("cmd.exe")));
+        }
+        Err(MoshpitError::KeyNotEstablished.into())
+    }
 }
 
 fn check_authorized_keys(home_dir: &str, fpk: &[u8]) -> Result<bool> {
@@ -390,6 +426,7 @@ fn check_authorized_keys(home_dir: &str, fpk: &[u8]) -> Result<bool> {
     Ok(false)
 }
 
+#[cfg_attr(windows, allow(clippy::unnecessary_wraps))]
 fn check_permissions(moshpit_path: &Path, authorized_keys_path: &Path) -> Result<bool> {
     #[cfg(target_family = "unix")]
     {
@@ -411,6 +448,121 @@ fn check_permissions(moshpit_path: &Path, authorized_keys_path: &Path) -> Result
             return Ok(false);
         }
     }
-    // On non-Unix systems, skip permission checks
+    #[cfg(target_os = "windows")]
+    {
+        if !windows_only_owner_has_access(moshpit_path)
+            || !windows_only_owner_has_access(authorized_keys_path)
+        {
+            return Ok(false);
+        }
+    }
     Ok(true)
+}
+
+/// Verify that every `ACCESS_ALLOWED` ACE on `path` belongs to the file owner
+/// or the SYSTEM account, which is the Windows equivalent of `mode 0o700/0o600`.
+#[cfg(target_os = "windows")]
+fn windows_only_owner_has_access(path: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::{
+        Win32::Foundation::{HLOCAL, LocalFree},
+        Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT},
+        Win32::Security::{
+            ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, CreateWellKnownSid,
+            DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation,
+            OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, WinLocalSystemSid,
+        },
+        core::PCWSTR,
+    };
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut p_dacl: *mut ACL = std::ptr::null_mut();
+    let mut p_owner = PSID(std::ptr::null_mut());
+    let mut p_sd = PSECURITY_DESCRIPTOR(std::ptr::null_mut());
+
+    // Retrieve the DACL and owner SID for the path.
+    let err = unsafe {
+        GetNamedSecurityInfoW(
+            PCWSTR(wide.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION,
+            Some(&raw mut p_owner),
+            None,
+            Some(&raw mut p_dacl),
+            None,
+            &raw mut p_sd,
+        )
+    };
+    if err.0 != 0 {
+        return false;
+    }
+
+    // Build the SYSTEM SID; SYSTEM is permitted to have access on Windows.
+    let mut system_sid_buf = [0u8; 68];
+    let mut system_sid_size: u32 = 68;
+    let system_sid = PSID(system_sid_buf.as_mut_ptr().cast());
+    let ok = unsafe {
+        CreateWellKnownSid(
+            WinLocalSystemSid,
+            None,
+            Some(system_sid),
+            &raw mut system_sid_size,
+        )
+    };
+    if ok.is_err() {
+        unsafe {
+            let _ = LocalFree(Some(HLOCAL(p_sd.0)));
+        }
+        return false;
+    }
+
+    let result = if p_dacl.is_null() {
+        // A null DACL grants unrestricted access to everyone — not secure.
+        false
+    } else {
+        let mut acl_info = ACL_SIZE_INFORMATION::default();
+        let ok = unsafe {
+            GetAclInformation(
+                p_dacl,
+                std::ptr::addr_of_mut!(acl_info).cast::<core::ffi::c_void>(),
+                u32::try_from(size_of::<ACL_SIZE_INFORMATION>())
+                    .expect("ACL_SIZE_INFORMATION fits in u32"),
+                AclSizeInformation,
+            )
+        };
+        if ok.is_err() {
+            unsafe {
+                let _ = LocalFree(Some(HLOCAL(p_sd.0)));
+            }
+            return false;
+        }
+
+        let mut secure = true;
+        for i in 0..acl_info.AceCount {
+            let mut p_ace: *mut core::ffi::c_void = std::ptr::null_mut();
+            if unsafe { GetAce(p_dacl, i, &raw mut p_ace) }.is_ok() {
+                let ace = unsafe { &*(p_ace as *const ACCESS_ALLOWED_ACE) };
+                // AceType 0 == ACCESS_ALLOWED_ACE_TYPE; deny ACEs for others are fine.
+                if ace.Header.AceType == 0u8 {
+                    let ace_sid = PSID(std::ptr::addr_of!(ace.SidStart) as *mut core::ffi::c_void);
+                    let is_owner = unsafe { EqualSid(ace_sid, p_owner) }.is_ok();
+                    let is_system = unsafe { EqualSid(ace_sid, system_sid) }.is_ok();
+                    if !is_owner && !is_system {
+                        secure = false;
+                        break;
+                    }
+                }
+            }
+        }
+        secure
+    };
+
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(p_sd.0)));
+    }
+    result
 }
