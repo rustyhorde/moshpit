@@ -17,7 +17,7 @@ use clap::Parser as _;
 use crossterm::terminal::enable_raw_mode;
 use dialoguer::Password;
 use libmoshpit::{
-    EncryptedFrame, Kex, MoshpitError, UdpReader, UdpSender, init_tracing, load,
+    EncryptedFrame, Kex, MoshpitError, UdpReader, UdpSender, UuidWrapper, init_tracing, load,
     parse_server_destination, run_key_exchange,
 };
 use terminal_size::terminal_size;
@@ -112,35 +112,69 @@ where
             .await;
     });
 
-    #[cfg(unix)]
-    let _resize_handle = {
-        let resize_tx = tx.clone();
-        let resize_uuid = kex.uuid_wrapper();
-        let resize_token = token.clone();
-        spawn(async move {
-            match signal(SignalKind::window_change()) {
-                Ok(mut sigwinch) => loop {
-                    tokio::select! {
-                        () = resize_token.cancelled() => break,
-                        _ = sigwinch.recv() => {
-                            let (columns, rows) = terminal_size()
-                                .map_or((80, 24), |(width, height)| (width.0, height.0));
-                            if let Err(e) =
-                                resize_tx.send(EncryptedFrame::Resize((resize_uuid, columns, rows)))
-                            {
-                                error!("Failed to send resize frame: {e}");
-                                break;
-                            }
-                        }
-                    }
-                },
-                Err(e) => error!("Failed to register SIGWINCH handler: {e}"),
-            }
-        })
-    };
+    spawn_resize_handler(tx.clone(), kex.uuid_wrapper(), token.clone());
 
     handle_io(stdout_rx, &tx, &kex)?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn spawn_resize_handler(
+    resize_tx: UnboundedSender<EncryptedFrame>,
+    resize_uuid: UuidWrapper,
+    resize_token: CancellationToken,
+) {
+    let _resize_handle = spawn(async move {
+        match signal(SignalKind::window_change()) {
+            Ok(mut sigwinch) => loop {
+                tokio::select! {
+                    () = resize_token.cancelled() => break,
+                    _ = sigwinch.recv() => {
+                        let (columns, rows) = terminal_size()
+                            .map_or((80, 24), |(width, height)| (width.0, height.0));
+                        if let Err(e) =
+                            resize_tx.send(EncryptedFrame::Resize((resize_uuid, columns, rows)))
+                        {
+                            error!("Failed to send resize frame: {e}");
+                            break;
+                        }
+                    }
+                }
+            },
+            Err(e) => error!("Failed to register SIGWINCH handler: {e}"),
+        }
+    });
+}
+
+// On Windows there is no SIGWINCH.  Instead, poll GetConsoleScreenBufferInfo
+// (via terminal_size) every 250 ms and send a Resize frame whenever the
+// dimensions change.  This avoids touching the console input buffer so it
+// does not conflict with the stdin reader below.
+#[cfg(windows)]
+fn spawn_resize_handler(
+    resize_tx: UnboundedSender<EncryptedFrame>,
+    resize_uuid: UuidWrapper,
+    resize_token: CancellationToken,
+) {
+    let _resize_handle = thread::spawn(move || {
+        let mut last_size = terminal_size().map_or((80, 24), |(w, h)| (w.0, h.0));
+        loop {
+            if resize_token.is_cancelled() {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(250));
+            let current_size = terminal_size().map_or(last_size, |(w, h)| (w.0, h.0));
+            if current_size != last_size {
+                last_size = current_size;
+                let (columns, rows) = current_size;
+                if let Err(e) = resize_tx.send(EncryptedFrame::Resize((resize_uuid, columns, rows)))
+                {
+                    error!("Failed to send resize frame: {e}");
+                    break;
+                }
+            }
+        }
+    });
 }
 
 fn handle_io(
