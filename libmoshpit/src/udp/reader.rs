@@ -32,7 +32,7 @@ use tokio::{
     time::{interval, sleep},
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::{EncryptedFrame, MoshpitError, TerminalMessage, utils::is_exit_title};
@@ -41,6 +41,8 @@ use crate::{EncryptedFrame, MoshpitError, TerminalMessage, utils::is_exit_title}
 const NAK_CHECK_INTERVAL: Duration = Duration::from_millis(20);
 /// Delay before requesting retransmission of a missing packet.
 const NAK_TIMEOUT: Duration = Duration::from_millis(50);
+/// Maximum number of NAK retries before giving up on a permanently lost packet.
+const MAX_NAK_RETRIES: u32 = 50;
 
 /// UDP reader for encrypted frames
 #[derive(Builder, Debug)]
@@ -68,6 +70,9 @@ pub struct UdpReader {
     /// Tracks when each gap was first detected for NAK timeout
     #[builder(default)]
     gap_first_seen: HashMap<u64, Instant>,
+    /// Number of NAK retries per gap, used to give up on permanently lost packets
+    #[builder(default)]
+    gap_nak_count: HashMap<u64, u32>,
 }
 
 impl UdpReader {
@@ -91,10 +96,12 @@ impl UdpReader {
         if seq == self.next_seq {
             self.next_seq += 1;
             let _removed = self.gap_first_seen.remove(&seq);
+            let _removed = self.gap_nak_count.remove(&seq);
             let mut ready = vec![frame];
             // Drain consecutive buffered frames
             while let Some(buffered) = self.recv_buffer.remove(&self.next_seq) {
                 let _removed = self.gap_first_seen.remove(&self.next_seq);
+                let _removed = self.gap_nak_count.remove(&self.next_seq);
                 self.next_seq += 1;
                 ready.push(buffered);
             }
@@ -112,9 +119,53 @@ impl UdpReader {
         }
     }
 
-    /// Send NAKs for gaps whose timeout has elapsed and reset their timer for potential re-NAK.
-    fn check_nak_timeouts(&mut self) {
+    /// Send NAKs for gaps whose timeout has elapsed, reset their timer for potential re-NAK,
+    /// and skip any gaps that have exceeded the maximum retry count. Returns frames from
+    /// `recv_buffer` that become deliverable after skipping permanently lost packets.
+    fn check_nak_timeouts(&mut self) -> Vec<EncryptedFrame> {
         let now = Instant::now();
+
+        // 1. Find gaps that have exceeded the retry limit — these packets are permanently lost
+        let give_up: Vec<u64> = self
+            .gap_nak_count
+            .iter()
+            .filter_map(|(&seq, &count)| {
+                if count >= MAX_NAK_RETRIES {
+                    Some(seq)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let mut delivered = vec![];
+
+        if !give_up.is_empty() {
+            for &seq in &give_up {
+                warn!("Giving up on packet {seq} after {MAX_NAK_RETRIES} NAK retries");
+                let _removed = self.gap_first_seen.remove(&seq);
+                let _removed = self.gap_nak_count.remove(&seq);
+            }
+
+            // Advance next_seq past given-up and buffered frames
+            let give_up_set: std::collections::HashSet<u64> = give_up.into_iter().collect();
+            loop {
+                if give_up_set.contains(&self.next_seq) {
+                    // Permanently lost packet — skip it
+                    self.next_seq += 1;
+                } else if let Some(buffered) = self.recv_buffer.remove(&self.next_seq) {
+                    // Buffered packet now deliverable
+                    let _removed = self.gap_first_seen.remove(&self.next_seq);
+                    let _removed = self.gap_nak_count.remove(&self.next_seq);
+                    delivered.push(buffered);
+                    self.next_seq += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // 2. Normal NAK logic — request retransmission for recent gaps
         let timed_out: Vec<u64> = self
             .gap_first_seen
             .iter()
@@ -132,11 +183,14 @@ impl UdpReader {
                 if let Some(t) = self.gap_first_seen.get_mut(&seq) {
                     *t = now;
                 }
+                *self.gap_nak_count.entry(seq).or_insert(0) += 1;
             }
             if let Some(ref tx) = self.nak_out_tx {
                 drop(tx.send(EncryptedFrame::Nak(timed_out)));
             }
         }
+
+        delivered
     }
 
     /// Run the server frame reading loop
@@ -155,7 +209,17 @@ impl UdpReader {
             select! {
                 () = token.cancelled() => break,
                 _ = nak_check.tick() => {
-                    self.check_nak_timeouts();
+                    for ready in self.check_nak_timeouts() {
+                        match ready {
+                            EncryptedFrame::Bytes((_id, message)) => {
+                                term_tx.send(TerminalMessage::Input(message))?;
+                            }
+                            EncryptedFrame::Resize((_id, columns, rows)) => {
+                                term_tx.send(TerminalMessage::Resize { rows, columns })?;
+                            }
+                            EncryptedFrame::Nak(_) | EncryptedFrame::Shutdown => {}
+                        }
+                    }
                 },
                 frame_res = self.read_encrypted_frame() => {
                     match frame_res {
@@ -203,7 +267,23 @@ impl UdpReader {
             select! {
                 () = token.cancelled() => process::exit(0),
                 _ = nak_check.tick() => {
-                    self.check_nak_timeouts();
+                    for ready in self.check_nak_timeouts() {
+                        match ready {
+                            EncryptedFrame::Bytes((_id, message)) => {
+                                if let Err(e) = stdout_tx.send(message) {
+                                    error!("Error sending to stdout channel: {e}");
+                                }
+                            }
+                            EncryptedFrame::Resize(_) => {
+                                error!("Received Resize frame on client, which is unexpected");
+                            }
+                            EncryptedFrame::Nak(_) => {}
+                            EncryptedFrame::Shutdown => {
+                                info!("Server is shutting down, exiting");
+                                process::exit(0);
+                            }
+                        }
+                    }
                 },
                 frame_res = self.read_encrypted_frame() => {
                     match frame_res {
