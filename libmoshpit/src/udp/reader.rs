@@ -28,7 +28,7 @@ use bytes::BytesMut;
 use tokio::{
     net::UdpSocket,
     select,
-    sync::mpsc::UnboundedSender,
+    sync::mpsc::Sender,
     time::{interval, sleep},
 };
 use tokio_util::sync::CancellationToken;
@@ -42,7 +42,7 @@ const NAK_CHECK_INTERVAL: Duration = Duration::from_millis(20);
 /// Delay before requesting retransmission of a missing packet.
 const NAK_TIMEOUT: Duration = Duration::from_millis(50);
 /// Maximum number of NAK retries before giving up on a permanently lost packet.
-const MAX_NAK_RETRIES: u32 = 50;
+const MAX_NAK_RETRIES: u32 = 10;
 
 /// UDP reader for encrypted frames
 #[derive(Builder, Debug)]
@@ -58,9 +58,9 @@ pub struct UdpReader {
     #[builder(with = |key: [u8; 64]| { Key::new(HMAC_SHA512, &key) })]
     hmac: Key,
     /// Injects NAK frames into the outbound stream when gaps are detected
-    nak_out_tx: Option<UnboundedSender<EncryptedFrame>>,
+    nak_out_tx: Option<Sender<EncryptedFrame>>,
     /// Tells the local sender to retransmit when a NAK from the peer is received
-    retransmit_tx: Option<UnboundedSender<Vec<u64>>>,
+    retransmit_tx: Option<Sender<Vec<u64>>>,
     /// Next expected sequence number
     #[builder(default)]
     next_seq: u64,
@@ -82,8 +82,10 @@ impl UdpReader {
     fn handle_arrival(&mut self, frame: EncryptedFrame, seq: u64) -> Vec<EncryptedFrame> {
         // Peer is requesting us to retransmit — forward to the local sender
         if let EncryptedFrame::Nak(ref seqs) = frame {
-            if let Some(ref tx) = self.retransmit_tx {
-                drop(tx.send(seqs.clone()));
+            if let Some(ref tx) = self.retransmit_tx
+                && let Err(e) = tx.try_send(seqs.clone())
+            {
+                warn!("Failed to forward retransmit request: {e}");
             }
             return vec![];
         }
@@ -185,8 +187,10 @@ impl UdpReader {
                 }
                 *self.gap_nak_count.entry(seq).or_insert(0) += 1;
             }
-            if let Some(ref tx) = self.nak_out_tx {
-                drop(tx.send(EncryptedFrame::Nak(timed_out)));
+            if let Some(ref tx) = self.nak_out_tx
+                && let Err(e) = tx.try_send(EncryptedFrame::Nak(timed_out))
+            {
+                warn!("Failed to send NAK: {e}");
             }
         }
 
@@ -202,7 +206,7 @@ impl UdpReader {
     pub async fn server_frame_loop(
         &mut self,
         token: CancellationToken,
-        term_tx: UnboundedSender<TerminalMessage>,
+        term_tx: Sender<TerminalMessage>,
     ) -> Result<()> {
         let mut nak_check = interval(NAK_CHECK_INTERVAL);
         loop {
@@ -212,10 +216,10 @@ impl UdpReader {
                     for ready in self.check_nak_timeouts() {
                         match ready {
                             EncryptedFrame::Bytes((_id, message)) => {
-                                term_tx.send(TerminalMessage::Input(message))?;
+                                term_tx.send(TerminalMessage::Input(message)).await?;
                             }
                             EncryptedFrame::Resize((_id, columns, rows)) => {
-                                term_tx.send(TerminalMessage::Resize { rows, columns })?;
+                                term_tx.send(TerminalMessage::Resize { rows, columns }).await?;
                             }
                             EncryptedFrame::Nak(_) | EncryptedFrame::Shutdown => {}
                         }
@@ -227,10 +231,10 @@ impl UdpReader {
                             for ready in self.handle_arrival(frame, seq) {
                                 match ready {
                                     EncryptedFrame::Bytes((_id, message)) => {
-                                        term_tx.send(TerminalMessage::Input(message))?;
+                                        term_tx.send(TerminalMessage::Input(message)).await?;
                                     }
                                     EncryptedFrame::Resize((_id, columns, rows)) => {
-                                        term_tx.send(TerminalMessage::Resize { rows, columns })?;
+                                        term_tx.send(TerminalMessage::Resize { rows, columns }).await?;
                                     }
                                     EncryptedFrame::Nak(_) | EncryptedFrame::Shutdown => {}
                                 }
@@ -257,7 +261,7 @@ impl UdpReader {
     pub async fn client_frame_loop(
         &mut self,
         token: CancellationToken,
-        stdout_tx: UnboundedSender<Vec<u8>>,
+        stdout_tx: Sender<Vec<u8>>,
     ) {
         let mut prev_bytes = BytesMut::with_capacity(1024);
         let mut osc_started = false;
@@ -270,7 +274,7 @@ impl UdpReader {
                     for ready in self.check_nak_timeouts() {
                         match ready {
                             EncryptedFrame::Bytes((_id, message)) => {
-                                if let Err(e) = stdout_tx.send(message) {
+                                if let Err(e) = stdout_tx.send(message).await {
                                     error!("Error sending to stdout channel: {e}");
                                 }
                             }
@@ -338,7 +342,7 @@ impl UdpReader {
                                         }
                                     }
                                 }
-                                if let Err(e) = stdout_tx.send(valid_utf8.into_bytes()) {
+                                if let Err(e) = stdout_tx.send(valid_utf8.into_bytes()).await {
                                     error!("Error sending to stdout channel: {e}");
                                 }
                                     }
@@ -401,7 +405,9 @@ impl UdpReader {
                     // Not enough data has been buffered yet to parse a full
                     // frame. Continue the loop to read more data from the socket.
                 }
-                Err(_err) => {}
+                Err(err) => {
+                    warn!("Failed to parse encrypted frame: {err}");
+                }
             }
         }
     }

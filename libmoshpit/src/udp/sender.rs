@@ -16,7 +16,7 @@ use aws_lc_rs::{
 use bincode_next::{config::standard, encode_to_vec};
 use bon::Builder;
 use getset::MutGetters;
-use tokio::{net::UdpSocket, select, sync::mpsc::UnboundedReceiver};
+use tokio::{net::UdpSocket, select, sync::mpsc::Receiver};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -24,6 +24,12 @@ use crate::EncryptedFrame;
 
 /// Number of sent packets kept in the retransmit buffer.
 const RETRANSMIT_WINDOW: u64 = 512;
+
+/// Maximum payload size for UDP frames to avoid IP fragmentation.
+/// Accounts for ~140 bytes of wire overhead (nonce, seq, HMAC, length, UUID, AEAD tag, bincode)
+/// subtracted from a conservative 1400-byte UDP payload target (below 1500-byte Ethernet MTU
+/// minus IP/UDP headers).
+pub const MAX_UDP_PAYLOAD: usize = 1200;
 
 /// UDP sender for encrypted frames
 #[derive(Builder, Debug, MutGetters)]
@@ -39,9 +45,9 @@ pub struct UdpSender {
     /// Underlying UDP socket
     socket: Arc<UdpSocket>,
     /// Channel receiver for outgoing packets
-    rx: UnboundedReceiver<EncryptedFrame>,
+    rx: Receiver<EncryptedFrame>,
     /// Channel receiver for retransmit requests from the local reader
-    retransmit_rx: UnboundedReceiver<Vec<u64>>,
+    retransmit_rx: Receiver<Vec<u64>>,
     /// Next sequence number for outgoing packets
     #[builder(default)]
     send_seq: u64,

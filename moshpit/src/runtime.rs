@@ -26,7 +26,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::{
     net::TcpStream,
     spawn,
-    sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
+    sync::mpsc::{Receiver, Sender, channel},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, trace};
@@ -76,8 +76,8 @@ where
 
     let udp_recv = udp_arc.clone();
     let udp_send = udp_arc.clone();
-    let (tx, rx) = unbounded_channel::<EncryptedFrame>();
-    let (retransmit_tx, retransmit_rx) = unbounded_channel::<Vec<u64>>();
+    let (tx, rx) = channel::<EncryptedFrame>(256);
+    let (retransmit_tx, retransmit_rx) = channel::<Vec<u64>>(64);
     let mut udp_reader = UdpReader::builder()
         .socket(udp_recv)
         .id(kex.uuid())
@@ -100,9 +100,10 @@ where
     let _udp_handle = spawn(async move { udp_sender.frame_loop(sender_token).await });
 
     let (columns, rows) = terminal_size().map_or((80, 24), |(width, height)| (width.0, height.0));
-    tx.send(EncryptedFrame::Resize((kex.uuid_wrapper(), columns, rows)))?;
+    tx.send(EncryptedFrame::Resize((kex.uuid_wrapper(), columns, rows)))
+        .await?;
 
-    let (stdout_tx, stdout_rx) = unbounded_channel::<Vec<u8>>();
+    let (stdout_tx, stdout_rx) = channel::<Vec<u8>>(256);
 
     let stdout_tx_c = stdout_tx.clone();
     let reader_token = token.clone();
@@ -120,7 +121,7 @@ where
 
 #[cfg(unix)]
 fn spawn_resize_handler(
-    resize_tx: UnboundedSender<EncryptedFrame>,
+    resize_tx: Sender<EncryptedFrame>,
     resize_uuid: UuidWrapper,
     resize_token: CancellationToken,
 ) {
@@ -133,7 +134,7 @@ fn spawn_resize_handler(
                         let (columns, rows) = terminal_size()
                             .map_or((80, 24), |(width, height)| (width.0, height.0));
                         if let Err(e) =
-                            resize_tx.send(EncryptedFrame::Resize((resize_uuid, columns, rows)))
+                            resize_tx.send(EncryptedFrame::Resize((resize_uuid, columns, rows))).await
                         {
                             error!("Failed to send resize frame: {e}");
                             break;
@@ -152,7 +153,7 @@ fn spawn_resize_handler(
 // does not conflict with the stdin reader below.
 #[cfg(windows)]
 fn spawn_resize_handler(
-    resize_tx: UnboundedSender<EncryptedFrame>,
+    resize_tx: Sender<EncryptedFrame>,
     resize_uuid: UuidWrapper,
     resize_token: CancellationToken,
 ) {
@@ -167,7 +168,8 @@ fn spawn_resize_handler(
             if current_size != last_size {
                 last_size = current_size;
                 let (columns, rows) = current_size;
-                if let Err(e) = resize_tx.send(EncryptedFrame::Resize((resize_uuid, columns, rows)))
+                if let Err(e) =
+                    resize_tx.blocking_send(EncryptedFrame::Resize((resize_uuid, columns, rows)))
                 {
                     error!("Failed to send resize frame: {e}");
                     break;
@@ -178,8 +180,8 @@ fn spawn_resize_handler(
 }
 
 fn handle_io(
-    mut stdout_rx: UnboundedReceiver<Vec<u8>>,
-    tx: &UnboundedSender<EncryptedFrame>,
+    mut stdout_rx: Receiver<Vec<u8>>,
+    tx: &Sender<EncryptedFrame>,
     kex: &Kex,
 ) -> Result<()> {
     enable_raw_mode()?;
@@ -203,7 +205,9 @@ fn handle_io(
         let len = stdin.read(&mut buf)?;
         if len > 0 {
             let msg = &buf[..len];
-            if let Err(e) = tx.send(EncryptedFrame::Bytes((kex.uuid_wrapper(), msg.to_vec()))) {
+            if let Err(e) =
+                tx.blocking_send(EncryptedFrame::Bytes((kex.uuid_wrapper(), msg.to_vec())))
+            {
                 error!("{e}");
             }
         }

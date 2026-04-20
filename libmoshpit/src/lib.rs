@@ -285,6 +285,7 @@ pub use self::term::TerminalMessage;
 pub use self::tracing::{TracingConfigExt, init_tracing};
 pub use self::udp::UdpClient;
 pub use self::udp::reader::UdpReader;
+pub use self::udp::sender::MAX_UDP_PAYLOAD;
 pub use self::udp::sender::UdpSender;
 pub use self::utils::is_exit_title;
 pub use self::utils::parse_server_destination;

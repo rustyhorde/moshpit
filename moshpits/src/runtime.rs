@@ -20,14 +20,14 @@ use anyhow::{Context as _, Result};
 use bytes::{Buf as _, BytesMut};
 use clap::Parser as _;
 use libmoshpit::{
-    EncryptedFrame, KexMode, MoshpitError, TerminalMessage, UdpReader, UdpSender, init_tracing,
-    is_exit_title, load, run_key_exchange,
+    EncryptedFrame, KexMode, MAX_UDP_PAYLOAD, MoshpitError, TerminalMessage, UdpReader, UdpSender,
+    init_tracing, is_exit_title, load, run_key_exchange,
 };
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tokio::{
     net::{TcpListener, TcpStream},
     select, spawn,
-    sync::{Mutex, mpsc::unbounded_channel},
+    sync::{Mutex, mpsc::channel},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, trace};
@@ -116,11 +116,11 @@ async fn handle_connection(
         run_key_exchange(config, sock_read, sock_write, || Ok(None)).await?;
     info!("Key exchange completed with moshpit");
 
-    let (tx, rx) = unbounded_channel::<EncryptedFrame>();
-    let (retransmit_tx, retransmit_rx) = unbounded_channel::<Vec<u64>>();
+    let (tx, rx) = channel::<EncryptedFrame>(256);
+    let (retransmit_tx, retransmit_rx) = channel::<Vec<u64>>(64);
     let udp_recv = udp_arc.clone();
     let udp_send = udp_arc.clone();
-    let (term_tx, mut term_rx) = unbounded_channel::<TerminalMessage>();
+    let (term_tx, mut term_rx) = channel::<TerminalMessage>(256);
     let mut udp_reader = UdpReader::builder()
         .socket(udp_recv)
         .id(kex.uuid())
@@ -150,7 +150,7 @@ async fn handle_connection(
     let sender_token = token.clone();
     let _udp_handle = spawn(async move { udp_sender.frame_loop(sender_token).await });
 
-    let (tx_pool, mut rx_pool) = unbounded_channel();
+    let (tx_pool, mut rx_pool) = channel(1);
     let _port_handler = spawn(async move {
         if let Some(port) = rx_pool.recv().await {
             let mut pool = port_pool.lock().await;
@@ -163,7 +163,7 @@ async fn handle_connection(
     let watcher_conn_token = token.clone();
     let _shutdown_watcher = spawn(async move {
         server_token.cancelled().await;
-        drop(watcher_tx.send(EncryptedFrame::Shutdown));
+        drop(watcher_tx.send(EncryptedFrame::Shutdown).await);
         tokio::time::sleep(Duration::from_millis(100)).await;
         watcher_conn_token.cancel();
     });
@@ -204,10 +204,13 @@ async fn handle_connection(
                     Ok(n) => {
                         let buf = buffer[..n].to_vec();
                         let utf8_buf = String::from_utf8_lossy(&buf);
-                        let frame = EncryptedFrame::Bytes((kex.uuid_wrapper(), buf.clone()));
-                        if let Err(e) = tx.send(frame) {
-                            error!("error sending udp packet: {e}");
-                            break;
+                        // Fragment into MTU-safe chunks to avoid IP fragmentation
+                        for chunk in buf.chunks(MAX_UDP_PAYLOAD) {
+                            let frame = EncryptedFrame::Bytes((kex.uuid_wrapper(), chunk.to_vec()));
+                            if let Err(e) = tx.blocking_send(frame) {
+                                error!("error sending udp packet: {e}");
+                                break;
+                            }
                         }
                         if is_exit_title(&utf8_buf, true) {
                             sleep(Duration::from_millis(500));
@@ -223,7 +226,7 @@ async fn handle_connection(
                 }
             }
             if let Ok(local_addr) = udp_arc.local_addr() {
-                let _ = tx_pool.send(local_addr.port());
+                drop(tx_pool.send(local_addr.port()));
             }
         });
 
