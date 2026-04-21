@@ -41,11 +41,6 @@ anyhow = { workspace = true }
 rustversion = { workspace = true }
 vergen-gix = { workspace = true }
 
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = [
-    'cfg(coverage,coverage_nightly)',
-] }
-
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]

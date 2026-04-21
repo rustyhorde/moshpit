@@ -59,11 +59,6 @@ anyhow = { workspace = true }
 rustversion = { workspace = true }
 vergen-gix = { workspace = true }
 
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = [
-    'cfg(coverage,coverage_nightly)',
-] }
-
 [dev-dependencies]
 tempfile = "3.23.0"
 
