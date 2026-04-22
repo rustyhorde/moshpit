@@ -226,7 +226,7 @@ async fn handle_connection(
                 }
             }
             if let Ok(local_addr) = udp_arc.local_addr() {
-                drop(tx_pool.send(local_addr.port()));
+                let _ = tx_pool.blocking_send(local_addr.port());
             }
         });
 
