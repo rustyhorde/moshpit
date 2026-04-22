@@ -116,9 +116,8 @@ where
 
     spawn_resize_handler(tx.clone(), kex.uuid_wrapper(), token.clone());
 
-    let tx_io = tx;
     let kex_io = kex;
-    spawn_blocking(move || handle_io(stdout_rx, tx_io, kex_io)).await??;
+    spawn_blocking(move || handle_io(stdout_rx, &tx, kex_io)).await??;
     Ok(())
 }
 
@@ -184,7 +183,7 @@ fn spawn_resize_handler(
 
 fn handle_io(
     mut stdout_rx: Receiver<Vec<u8>>,
-    tx: Sender<EncryptedFrame>,
+    tx: &Sender<EncryptedFrame>,
     kex: Kex,
 ) -> Result<()> {
     enable_raw_mode()?;
