@@ -7,7 +7,7 @@
 // modified, or distributed except according to those terms.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, VecDeque},
     ffi::OsString,
     io::{Read as _, Write as _},
     net::SocketAddr,
@@ -20,19 +20,31 @@ use anyhow::{Context as _, Result};
 use bytes::{Buf as _, BytesMut};
 use clap::Parser as _;
 use libmoshpit::{
-    EncryptedFrame, KexMode, MAX_UDP_PAYLOAD, MoshpitError, TerminalMessage, UdpReader, UdpSender,
-    init_tracing, is_exit_title, load, run_key_exchange,
+    EncryptedFrame, KexMode, MAX_UDP_PAYLOAD, MoshpitError, SessionRegistry, TerminalMessage,
+    UdpReader, UdpSender, UuidWrapper, init_tracing, is_exit_title, load, new_session_registry,
+    run_key_exchange,
 };
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tokio::{
     net::{TcpListener, TcpStream},
     select, spawn,
-    sync::{Mutex, mpsc::channel},
+    sync::{
+        Mutex,
+        mpsc::{Receiver, Sender, channel},
+    },
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, trace};
+use uuid::Uuid;
 
-use crate::{cli::Cli, config::Config};
+use crate::{
+    cli::Cli,
+    config::Config,
+    session::{
+        FullSessionRegistry, SCROLLBACK_CAPACITY, SessionOutputHandle, SessionRecord,
+        new_full_registry,
+    },
+};
 
 pub(crate) async fn run<I, T>(args: Option<I>) -> Result<()>
 where
@@ -75,10 +87,15 @@ where
     let port_pool_arc = Arc::new(Mutex::new(port_pool));
     let _ = config.set_port_pool(port_pool_arc);
 
+    let session_registry = new_session_registry();
+    let _ = config.set_session_registry(session_registry);
+    let full_registry = new_full_registry();
+
     let server_token = CancellationToken::new();
     loop {
         let config_c = config.clone();
         let st = server_token.clone();
+        let fr_c = full_registry.clone();
         select! {
             _ = tokio::signal::ctrl_c() => {
                 info!("Received Ctrl-C, shutting down server");
@@ -91,7 +108,7 @@ where
                 match accept_res {
                     Ok((socket, _addr)) => {
                         let _conn = spawn(async move {
-                            if let Err(e) = handle_connection(config_c, socket, st).await {
+                            if let Err(e) = handle_connection(config_c, socket, st, fr_c).await {
                                 trace!("{e}");
                             }
                         });
@@ -109,18 +126,89 @@ async fn handle_connection(
     config: Config,
     socket: TcpStream,
     server_token: CancellationToken,
+    full_registry: FullSessionRegistry,
 ) -> Result<()> {
     let (sock_read, sock_write) = socket.into_split();
-    let port_pool = config.port_pool().clone();
-    let (kex, udp_arc, _skex_opt) =
+    let port_pool = config.port_pool();
+    let session_registry = config.session_registry();
+    let (kex, udp_arc, skex_opt) =
         run_key_exchange(config, sock_read, sock_write, || Ok(None)).await?;
     info!("Key exchange completed with moshpit");
+
+    let skex = skex_opt.ok_or_else(|| anyhow::anyhow!("missing server kex info"))?;
+    let session_uuid = skex.session_uuid();
+    let is_resume = skex.is_resume();
+    let udp_port = udp_arc.local_addr()?.port();
 
     let (tx, rx) = channel::<EncryptedFrame>(256);
     let (retransmit_tx, retransmit_rx) = channel::<Vec<u64>>(64);
     let udp_recv = udp_arc.clone();
     let udp_send = udp_arc.clone();
-    let (term_tx, mut term_rx) = channel::<TerminalMessage>(256);
+
+    let conn_token = CancellationToken::new();
+
+    // Resolve channels and decide whether to spawn a new PTY.
+    let (term_tx, maybe_term_rx, output_handle, scrollback) = if is_resume {
+        let reg = full_registry.lock().await;
+        if let Some(record) = reg.get(&session_uuid) {
+            let term_tx = record.term_tx.clone();
+            let output_handle = record.output_handle.clone();
+            let scrollback = record.scrollback.clone();
+            drop(reg);
+
+            // Replace the output handle with the new connection's channels.
+            {
+                let mut h = output_handle.lock().await;
+                // Shut down the stale reader/sender for the previous connection.
+                if let Some(old_token) = h.conn_token.take() {
+                    old_token.cancel();
+                }
+                h.kex_uuid = kex.uuid();
+                h.tx = Some(tx.clone());
+                h.conn_token = Some(conn_token.clone());
+                h.udp_port = Some(udp_port);
+            }
+
+            // Replay scrollback so the client terminal catches up.
+            let sb_data: Vec<u8> = scrollback.lock().await.iter().copied().collect();
+            for chunk in sb_data.chunks(MAX_UDP_PAYLOAD) {
+                tx.send(EncryptedFrame::Bytes((kex.uuid_wrapper(), chunk.to_vec())))
+                    .await?;
+            }
+            info!("Resumed session {session_uuid}");
+
+            (
+                term_tx,
+                None::<Receiver<TerminalMessage>>,
+                output_handle,
+                scrollback,
+            )
+        } else {
+            // Session expired; start fresh.
+            drop(reg);
+            info!("Session {session_uuid} not found (expired?); starting new session");
+            new_session(
+                &kex,
+                &conn_token,
+                udp_port,
+                session_uuid,
+                tx.clone(),
+                &full_registry,
+            )
+            .await?
+        }
+    } else {
+        new_session(
+            &kex,
+            &conn_token,
+            udp_port,
+            session_uuid,
+            tx.clone(),
+            &full_registry,
+        )
+        .await?
+    };
+
     let mut udp_reader = UdpReader::builder()
         .socket(udp_recv)
         .id(kex.uuid())
@@ -138,8 +226,7 @@ async fn handle_connection(
         .rnk(kex.key())?
         .build();
 
-    let token = CancellationToken::new();
-    let reader_token = token.clone();
+    let reader_token = conn_token.clone();
     let term_tx_c = term_tx.clone();
     let _udp_reader_handle = spawn(async move {
         if let Err(e) = udp_reader.server_frame_loop(reader_token, term_tx_c).await {
@@ -147,20 +234,12 @@ async fn handle_connection(
         }
     });
 
-    let sender_token = token.clone();
+    let sender_token = conn_token.clone();
     let _udp_handle = spawn(async move { udp_sender.frame_loop(sender_token).await });
 
-    let (tx_pool, mut rx_pool) = channel(1);
-    let _port_handler = spawn(async move {
-        if let Some(port) = rx_pool.recv().await {
-            let mut pool = port_pool.lock().await;
-            let _ = pool.insert(port);
-        }
-    });
-
-    // When the server shuts down, notify the connected client then cancel the local token
+    // Notify client on server shutdown, then cancel the connection token.
     let watcher_tx = tx.clone();
-    let watcher_conn_token = token.clone();
+    let watcher_conn_token = conn_token.clone();
     let _shutdown_watcher = spawn(async move {
         server_token.cancelled().await;
         drop(watcher_tx.send(EncryptedFrame::Shutdown).await);
@@ -168,6 +247,167 @@ async fn handle_connection(
         watcher_conn_token.cancel();
     });
 
+    // For new sessions, spawn the long-lived PTY thread.
+    if let Some(term_rx) = maybe_term_rx {
+        spawn_pty(
+            session_uuid,
+            term_rx,
+            output_handle,
+            scrollback,
+            port_pool,
+            session_registry,
+            full_registry,
+        );
+    }
+
+    Ok(())
+}
+
+/// Create a new session record, register it in both registries, and return the live
+/// channels needed to wire up the UDP reader/sender.
+async fn new_session(
+    kex: &libmoshpit::Kex,
+    conn_token: &CancellationToken,
+    udp_port: u16,
+    session_uuid: Uuid,
+    tx: Sender<EncryptedFrame>,
+    full_registry: &FullSessionRegistry,
+) -> Result<(
+    Sender<TerminalMessage>,
+    Option<Receiver<TerminalMessage>>,
+    Arc<Mutex<SessionOutputHandle>>,
+    Arc<Mutex<VecDeque<u8>>>,
+)> {
+    let (term_tx, term_rx) = channel::<TerminalMessage>(256);
+    let output_handle = Arc::new(Mutex::new(SessionOutputHandle {
+        kex_uuid: kex.uuid(),
+        tx: Some(tx),
+        conn_token: Some(conn_token.clone()),
+        udp_port: Some(udp_port),
+    }));
+    let scrollback = Arc::new(Mutex::new(VecDeque::with_capacity(SCROLLBACK_CAPACITY)));
+
+    {
+        let mut fr = full_registry.lock().await;
+        drop(fr.insert(
+            session_uuid,
+            SessionRecord {
+                term_tx: term_tx.clone(),
+                output_handle: output_handle.clone(),
+                scrollback: scrollback.clone(),
+            },
+        ));
+    }
+
+    Ok((term_tx, Some(term_rx), output_handle, scrollback))
+}
+
+/// Spawn the background thread that reads PTY output, writes scrollback, and forwards
+/// frames to the currently connected client.  Cleans up session state when the shell exits.
+fn spawn_pty_reader(
+    session_uuid: Uuid,
+    mut term_out: Box<dyn std::io::Read + Send>,
+    output_handle: Arc<Mutex<SessionOutputHandle>>,
+    scrollback: Arc<Mutex<VecDeque<u8>>>,
+    port_pool: Arc<Mutex<BTreeSet<u16>>>,
+    session_registry: SessionRegistry,
+    full_registry: FullSessionRegistry,
+) {
+    let _read_handle = thread::spawn(move || {
+        loop {
+            let mut buffer = BytesMut::zeroed(4096);
+            match term_out.read(&mut buffer) {
+                Ok(0) => {
+                    trace!("read 0 bytes from terminal, exiting");
+                    break;
+                }
+                Ok(n) => {
+                    let buf = &buffer[..n];
+                    let utf8_buf = String::from_utf8_lossy(buf);
+
+                    // Fragment into MTU-safe chunks.
+                    for chunk in buf.chunks(MAX_UDP_PAYLOAD) {
+                        // Write to scrollback ring buffer.
+                        {
+                            let mut sb = scrollback.blocking_lock();
+                            let available = SCROLLBACK_CAPACITY.saturating_sub(sb.len());
+                            if chunk.len() > available {
+                                for _ in 0..(chunk.len() - available) {
+                                    let _ = sb.pop_front();
+                                }
+                            }
+                            sb.extend(chunk.iter().copied());
+                        }
+
+                        // Send to the currently connected client (if any).
+                        let send_ok = {
+                            let h = output_handle.blocking_lock();
+                            if let Some(ref sender) = h.tx {
+                                let uuid_wrapper = UuidWrapper::new(h.kex_uuid);
+                                let sender_clone = sender.clone();
+                                drop(h);
+                                let frame = EncryptedFrame::Bytes((uuid_wrapper, chunk.to_vec()));
+                                sender_clone.blocking_send(frame).is_ok()
+                            } else {
+                                drop(h);
+                                true // headless: just buffer
+                            }
+                        };
+                        if !send_ok {
+                            // Client dropped; clear tx but keep the PTY running.
+                            output_handle.blocking_lock().tx = None;
+                        }
+                    }
+
+                    if is_exit_title(&utf8_buf, true) {
+                        sleep(Duration::from_millis(500));
+                        break;
+                    }
+                    buffer.advance(n);
+                }
+                Err(e) => {
+                    error!("error reading from terminal: {e}");
+                    break;
+                }
+            }
+        }
+
+        // PTY process has exited — clean up the session.
+        {
+            let mut h = output_handle.blocking_lock();
+            if let Some(token) = h.conn_token.take() {
+                token.cancel();
+            }
+            if let Some(port) = h.udp_port.take() {
+                let mut pool = port_pool.blocking_lock();
+                let _ = pool.insert(port);
+            }
+            h.tx = None;
+        }
+        {
+            let mut sr = session_registry.blocking_lock();
+            drop(sr.remove(&session_uuid));
+        }
+        {
+            let mut fr = full_registry.blocking_lock();
+            drop(fr.remove(&session_uuid));
+        }
+    });
+}
+
+/// Spawn the long-lived PTY OS thread for a new session.
+///
+/// The thread owns the PTY master and keeps running until the shell exits, regardless of
+/// how many clients connect and disconnect.
+fn spawn_pty(
+    session_uuid: Uuid,
+    mut term_rx: Receiver<TerminalMessage>,
+    output_handle: Arc<Mutex<SessionOutputHandle>>,
+    scrollback: Arc<Mutex<VecDeque<u8>>>,
+    port_pool: Arc<Mutex<BTreeSet<u16>>>,
+    session_registry: SessionRegistry,
+    full_registry: FullSessionRegistry,
+) {
     let _term_handle = thread::spawn(move || {
         #[cfg(unix)]
         let cmd = {
@@ -190,45 +430,18 @@ async fn handle_connection(
         let _child = pair.slave.spawn_command(cmd).unwrap();
         let master = pair.master;
 
-        let mut term_out = master.try_clone_reader().unwrap();
+        let term_out = master.try_clone_reader().unwrap();
         let mut term_in = master.take_writer().unwrap();
 
-        let _read_handle = thread::spawn(move || {
-            loop {
-                let mut buffer = BytesMut::zeroed(4096);
-                match term_out.read(&mut buffer) {
-                    Ok(0) => {
-                        trace!("read 0 bytes from terminal, exiting");
-                        break;
-                    }
-                    Ok(n) => {
-                        let buf = buffer[..n].to_vec();
-                        let utf8_buf = String::from_utf8_lossy(&buf);
-                        // Fragment into MTU-safe chunks to avoid IP fragmentation
-                        for chunk in buf.chunks(MAX_UDP_PAYLOAD) {
-                            let frame = EncryptedFrame::Bytes((kex.uuid_wrapper(), chunk.to_vec()));
-                            if let Err(e) = tx.blocking_send(frame) {
-                                error!("error sending udp packet: {e}");
-                                break;
-                            }
-                        }
-                        if is_exit_title(&utf8_buf, true) {
-                            sleep(Duration::from_millis(500));
-                            token.cancel();
-                            break;
-                        }
-                        buffer.advance(n);
-                    }
-                    Err(e) => {
-                        error!("error reading from terminal: {e}");
-                        break;
-                    }
-                }
-            }
-            if let Ok(local_addr) = udp_arc.local_addr() {
-                let _ = tx_pool.blocking_send(local_addr.port());
-            }
-        });
+        spawn_pty_reader(
+            session_uuid,
+            term_out,
+            output_handle,
+            scrollback,
+            port_pool,
+            session_registry,
+            full_registry,
+        );
 
         while let Some(terminal_message) = term_rx.blocking_recv() {
             match terminal_message {
@@ -251,5 +464,4 @@ async fn handle_connection(
             }
         }
     });
-    Ok(())
 }

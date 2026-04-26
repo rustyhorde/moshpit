@@ -10,7 +10,7 @@ use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use getset::{CloneGetters, CopyGetters, Getters, Setters};
-use libmoshpit::{KexConfig, KexMode, KeyPair, Mps, Tracing, TracingConfigExt};
+use libmoshpit::{KexConfig, KexMode, KeyPair, Mps, SessionRegistry, Tracing, TracingConfigExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::Level;
@@ -26,6 +26,9 @@ pub(crate) struct Config {
     #[serde(skip)]
     #[getset(get_clone = "pub(crate)", set = "pub(crate)")]
     port_pool: Arc<Mutex<BTreeSet<u16>>>,
+    #[serde(skip)]
+    #[getset(get_clone = "pub(crate)", set = "pub(crate)")]
+    session_registry: SessionRegistry,
     #[getset(get_copy = "pub(crate)")]
     verbose: u8,
     #[getset(get_copy = "pub(crate)")]
@@ -69,6 +72,10 @@ impl KexConfig for Config {
 
     fn key_pair_paths(&self) -> Result<(PathBuf, PathBuf)> {
         self.load_key_paths()
+    }
+
+    fn session_registry(&self) -> Option<SessionRegistry> {
+        Some(self.session_registry.clone())
     }
 
     fn user(&self) -> Option<String> {

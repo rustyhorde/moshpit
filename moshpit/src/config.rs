@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::Level;
 use tracing_subscriber_init::{TracingConfig, get_effective_level};
+use uuid::Uuid;
 
 #[derive(Clone, CopyGetters, Debug, Deserialize, Eq, Getters, PartialEq, Serialize, Setters)]
 pub(crate) struct Config {
@@ -38,6 +39,10 @@ pub(crate) struct Config {
     private_key_path: Option<String>,
     #[getset(get = "pub(crate)")]
     public_key_path: Option<String>,
+    /// UUID of a previous session to attempt to resume (not persisted to config file).
+    #[serde(skip)]
+    #[getset(get_copy = "pub(crate)", set = "pub(crate)")]
+    resume_session_uuid: Option<Uuid>,
 }
 
 impl Config {
@@ -68,6 +73,7 @@ impl Default for Config {
             server_destination: String::new(),
             private_key_path: None,
             public_key_path: None,
+            resume_session_uuid: None,
         }
     }
 }
@@ -87,6 +93,10 @@ impl KexConfig for Config {
 
     fn user(&self) -> Option<String> {
         self.user.clone().into()
+    }
+
+    fn resume_session_uuid(&self) -> Option<Uuid> {
+        self.resume_session_uuid
     }
 }
 

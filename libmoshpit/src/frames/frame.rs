@@ -34,6 +34,12 @@ pub enum Frame {
     MoshpitAddr(SocketAddr),
     /// Key exchange failure notification.
     KexFailure,
+    /// A stable session token sent from moshpits to moshpit after key agreement.
+    /// The client stores this UUID and presents it on reconnect to resume the session.
+    SessionToken(UuidWrapper),
+    /// A request from moshpit to resume a previous session.
+    /// Contains (`session_uuid`, `user_bytes`, `ephemeral_public_key`, `full_public_key`).
+    ResumeRequest(UuidWrapper, Vec<u8>, Vec<u8>, Vec<u8>),
 }
 
 impl Frame {
@@ -48,6 +54,8 @@ impl Frame {
             Frame::MoshpitsAddr(_) => 4,
             Frame::MoshpitAddr(_) => 5,
             Frame::KexFailure => 6,
+            Frame::SessionToken(_) => 7,
+            Frame::ResumeRequest(_, _, _, _) => 8,
         }
     }
 
@@ -58,7 +66,7 @@ impl Frame {
     ///
     pub fn parse(src: &mut Cursor<&[u8]>) -> Result<Option<Self>> {
         match get_u8(src) {
-            Some(0..=6) => {
+            Some(0..=8) => {
                 if let Some(length_slice) = get_usize(src)? {
                     let length = usize::from_be_bytes(length_slice.try_into()?);
                     if let Some(data) = get_bytes(src, length)? {
@@ -106,6 +114,14 @@ impl Display for Frame {
             Frame::MoshpitsAddr(addr) => write!(f, "MoshpitsAddr({addr})"),
             Frame::MoshpitAddr(addr) => write!(f, "MoshpitAddr({addr})"),
             Frame::KexFailure => write!(f, "KexFailure"),
+            Frame::SessionToken(uuid) => write!(f, "SessionToken({uuid})"),
+            Frame::ResumeRequest(uuid, user, epk, fpk) => write!(
+                f,
+                "ResumeRequest({uuid}, {} bytes, {} bytes, {} bytes)",
+                user.len(),
+                epk.len(),
+                fpk.len()
+            ),
         }
     }
 }

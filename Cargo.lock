@@ -2295,6 +2295,7 @@ dependencies = [
  "config",
  "crossterm",
  "dialoguer",
+ "dirs2",
  "getset",
  "libmoshpit",
  "rustversion",
@@ -2304,6 +2305,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber-init",
+ "uuid",
  "vergen-gix",
  "vergen-pretty",
 ]
@@ -2325,6 +2327,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber-init",
+ "uuid",
  "vergen-gix",
  "vergen-pretty",
 ]

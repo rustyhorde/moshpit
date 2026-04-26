@@ -8,17 +8,22 @@
 
 use std::{
     ffi::OsString,
+    fs::{DirBuilder, OpenOptions},
     io::{Read as _, Write as _, stdin, stdout},
+    path::{Path, PathBuf},
     thread,
 };
+
+#[cfg(target_family = "unix")]
+use std::os::unix::fs::DirBuilderExt;
 
 use anyhow::{Context as _, Result};
 use clap::Parser as _;
 use crossterm::terminal::enable_raw_mode;
-use dialoguer::Password;
+use dialoguer::{Confirm, Password};
 use libmoshpit::{
-    EncryptedFrame, Kex, MoshpitError, UdpReader, UdpSender, UuidWrapper, init_tracing, load,
-    parse_server_destination, run_key_exchange,
+    EncryptedFrame, Kex, KexConfig as _, KeyPair, MoshpitError, UdpReader, UdpSender, UuidWrapper,
+    init_tracing, load, parse_server_destination, run_key_exchange,
 };
 use terminal_size::terminal_size;
 #[cfg(unix)]
@@ -31,6 +36,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, trace};
+use uuid::Uuid;
 
 use crate::{cli::Cli, config::Config};
 
@@ -57,9 +63,20 @@ where
     trace!("Configuration loaded");
     trace!("Tracing initialized");
 
-    // Setup the TCP connection to the server for key exchange
+    // Prompt to generate a keypair if one does not exist at the configured paths
+    maybe_generate_keypair(&config)?;
+
+    // Check for an existing session to resume
     let (user, socket_addr) =
         parse_server_destination(config.server_destination(), config.server_port())?;
+    let server_ip = socket_addr.ip().to_string();
+    let server_port = config.server_port();
+    if let Some(uuid) = read_session_uuid(&server_ip, server_port) {
+        let _ = config.set_resume_session_uuid(Some(uuid));
+        trace!("Attempting to resume session {uuid}");
+    }
+
+    // Setup the TCP connection to the server for key exchange
     let _ = config.set_user(user);
     trace!("Connecting to server at {socket_addr}");
     let socket = TcpStream::connect(socket_addr).await?;
@@ -70,6 +87,18 @@ where
     // Run the key exchange
     let (kex, udp_arc, _skex_opt) =
         run_key_exchange(config, sock_read, sock_write, read_passpharase).await?;
+
+    // Persist (or update) the session token for future reconnects
+    if let Some(session_uuid) = kex.session_uuid() {
+        if let Err(e) = write_session_uuid(&server_ip, server_port, session_uuid) {
+            trace!("Failed to write session file: {e}");
+        }
+        if kex.is_resume() {
+            info!("Session {session_uuid} resumed");
+        } else {
+            info!("New session {session_uuid} started");
+        }
+    }
     info!("Key exchange completed with moshpits");
 
     // Setup the cancellation token
@@ -216,6 +245,94 @@ fn handle_io(
     }
 }
 
+fn maybe_generate_keypair(config: &Config) -> Result<()> {
+    let (priv_key_path, pub_key_path) = config.key_pair_paths()?;
+    if priv_key_path.try_exists()? && pub_key_path.try_exists()? {
+        return Ok(());
+    }
+
+    println!("No keypair found at the configured location.");
+    println!("  Private key: {}", priv_key_path.display());
+    println!("  Public key:  {}", pub_key_path.display());
+
+    let generate = Confirm::new()
+        .with_prompt("Generate a new keypair now?")
+        .default(true)
+        .wait_for_newline(true)
+        .interact()?;
+
+    if !generate {
+        return Ok(());
+    }
+
+    // Create the parent directory for the private key if needed
+    if let Some(parent) = priv_key_path.parent() {
+        create_key_dir(parent)?;
+    }
+
+    // Optionally protect the private key with a passphrase
+    let passphrase: String = Password::new()
+        .with_prompt(format!(
+            "Enter passphrase for \"{}\" (empty for no passphrase)",
+            priv_key_path.display()
+        ))
+        .with_confirmation(
+            "Enter same passphrase again",
+            "Passphrases do not match. Try again.",
+        )
+        .allow_empty_password(true)
+        .report(false)
+        .interact()?;
+    let passphrase_opt = if passphrase.is_empty() {
+        None
+    } else {
+        Some(passphrase)
+    };
+
+    let keypair = KeyPair::generate_key_pair(passphrase_opt.as_ref())?;
+
+    let mut priv_key_file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&priv_key_path)?;
+    keypair.write_private_key(&mut priv_key_file)?;
+
+    let mut pub_key_file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&pub_key_path)?;
+    keypair.write_public_key(&mut pub_key_file)?;
+
+    println!(
+        "Your identification has been saved in {}",
+        priv_key_path.display()
+    );
+    println!(
+        "Your public key has been saved in {}",
+        pub_key_path.display()
+    );
+    println!("The key fingerprint is:");
+    println!("{}", keypair.fingerprint()?);
+    println!("The key's randomart image is:");
+    print!("{}", keypair.randomart());
+
+    Ok(())
+}
+
+#[cfg(target_family = "unix")]
+fn create_key_dir(path: &Path) -> Result<()> {
+    DirBuilder::new().mode(0o700).recursive(true).create(path)?;
+    Ok(())
+}
+
+#[cfg(not(target_family = "unix"))]
+fn create_key_dir(path: &Path) -> Result<()> {
+    DirBuilder::new().recursive(true).create(path)?;
+    Ok(())
+}
+
 fn read_passpharase() -> Result<Option<String>> {
     Password::new()
         .with_prompt("Please enter your private key passphrase")
@@ -227,4 +344,45 @@ fn read_passpharase() -> Result<Option<String>> {
         .interact()
         .map(Some)
         .map_err(Into::into)
+}
+
+/// Returns the path `~/.mp/sessions/<host>_<port>` for session UUID persistence.
+fn session_file_path(host: &str, port: u16) -> Option<PathBuf> {
+    let home = dirs2::home_dir()?;
+    // Sanitize host so it is safe as a file-name component.
+    let safe_host: String = host
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    Some(
+        home.join(".mp")
+            .join("sessions")
+            .join(format!("{safe_host}_{port}")),
+    )
+}
+
+/// Read a persisted session UUID from disk, if any.
+fn read_session_uuid(host: &str, port: u16) -> Option<Uuid> {
+    let path = session_file_path(host, port)?;
+    let mut file = std::fs::File::open(&path).ok()?;
+    let mut buf = String::new();
+    let _ = file.read_to_string(&mut buf).ok();
+    buf.trim().parse::<Uuid>().ok()
+}
+
+/// Write (or overwrite) the session UUID to disk.
+fn write_session_uuid(host: &str, port: u16, session_uuid: Uuid) -> Result<()> {
+    let path = session_file_path(host, port).ok_or_else(|| anyhow::anyhow!("no home dir"))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::File::create(&path)?;
+    write!(file, "{session_uuid}")?;
+    Ok(())
 }

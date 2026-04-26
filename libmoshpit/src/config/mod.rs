@@ -14,7 +14,7 @@ use dirs2::config_dir;
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
-use crate::{KexMode, error::Error, to_path_buf};
+use crate::{KexMode, error::Error, session::SessionRegistry, to_path_buf};
 
 pub(crate) mod mps;
 pub(crate) mod tracing;
@@ -50,6 +50,16 @@ pub trait KexConfig {
     fn key_pair_paths(&self) -> Result<(PathBuf, PathBuf)>;
     /// The username to use for the key exchange, only relevant for client mode
     fn user(&self) -> Option<String>;
+    /// The session registry for tracking active sessions, only relevant for server mode.
+    /// Returns `None` by default; server implementations override this.
+    fn session_registry(&self) -> Option<SessionRegistry> {
+        None
+    }
+    /// The session UUID to attempt resuming, only relevant for client mode.
+    /// Returns `None` by default; client implementations override this.
+    fn resume_session_uuid(&self) -> Option<uuid::Uuid> {
+        None
+    }
 }
 
 /// Load the configuration

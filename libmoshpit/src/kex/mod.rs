@@ -52,6 +52,8 @@ pub enum KexEvent {
     Uuid(Uuid),
     /// moshpits socket address
     MoshpitsAddr(SocketAddr),
+    /// Session information: (stable session UUID, `is_resume` flag)
+    SessionInfo(Uuid, bool),
     /// Key exchange failure
     Failure,
 }
@@ -66,6 +68,8 @@ pub enum KexState {
     AwaitingHMACKeyMaterial,
     /// Awaiting moshpit client UUID
     AwaitingUuid,
+    /// Awaiting session token from moshpits (client mode only, between Uuid and `MoshpitsAddr`)
+    AwaitingSessionToken,
     /// Awaiting moshpits socket address
     AwaitingMoshpitsAddr,
     /// Key exchange is complete
@@ -91,12 +95,18 @@ pub struct Kex {
     /// HMAC key for signing UDP packets
     #[getset(get_copy = "pub")]
     hmac_key: [u8; 64],
-    /// moshpit client UUID
+    /// moshpit client UUID (per-connection, changes on every reconnect)
     #[getset(get_copy = "pub")]
     uuid: Uuid,
     /// An optional moshpits socket address used by moshpit.
     #[getset(get_copy = "pub")]
     moshpits_addr: Option<SocketAddr>,
+    /// Stable session UUID, set for client mode after `SessionToken` received.
+    #[getset(get_copy = "pub")]
+    session_uuid: Option<Uuid>,
+    /// Whether this connection is resuming an existing session.
+    #[getset(get_copy = "pub")]
+    is_resume: bool,
 }
 
 impl Kex {
@@ -114,12 +124,14 @@ impl Default for Kex {
             hmac_key: [0u8; 64],
             uuid: Uuid::nil(),
             moshpits_addr: None,
+            session_uuid: None,
+            is_resume: false,
         }
     }
 }
 
 /// Extended key exchange for the moshpits side of the exchange
-#[derive(Builder, Clone, Debug, Getters)]
+#[derive(Builder, Clone, Debug, CopyGetters, Getters)]
 pub struct ServerKex {
     /// The user associated with the key exchange
     #[getset(get = "pub")]
@@ -127,6 +139,13 @@ pub struct ServerKex {
     /// The shell associated with the key exchange
     #[getset(get = "pub")]
     shell: String,
+    /// The stable session UUID assigned to this connection
+    #[getset(get_copy = "pub")]
+    session_uuid: Uuid,
+    /// Whether this connection is resuming an existing session
+    #[getset(get_copy = "pub")]
+    #[builder(default)]
+    is_resume: bool,
 }
 
 impl KexStateMachine {
@@ -154,11 +173,19 @@ impl KexStateMachine {
                 (KexState::AwaitingUuid, KexEvent::Uuid(uuid)) => {
                     kex.uuid = uuid;
                     if client_mode {
-                        self.state = KexState::AwaitingMoshpitsAddr;
+                        self.state = KexState::AwaitingSessionToken;
                     } else {
                         self.state = KexState::Complete;
                         break;
                     }
+                }
+                (
+                    KexState::AwaitingSessionToken,
+                    KexEvent::SessionInfo(session_uuid, is_resume),
+                ) => {
+                    kex.session_uuid = Some(session_uuid);
+                    kex.is_resume = is_resume;
+                    self.state = KexState::AwaitingMoshpitsAddr;
                 }
                 (KexState::AwaitingMoshpitsAddr, KexEvent::MoshpitsAddr(addr)) => {
                     self.state = KexState::Complete;
@@ -293,24 +320,35 @@ async fn run_client_kex<T: KexConfig>(
     // Setup the TCP frame reader
     let tx_c = tx.clone();
     let tx_event_c = tx_event.clone();
+    let requested = config.resume_session_uuid();
     let _read_handle = spawn(async move {
         let mut frame_reader = KexReader::builder()
             .reader(reader)
             .tx(tx_c)
             .tx_event(tx_event_c)
+            .maybe_requested_session_uuid(requested)
             .build();
         if let Err(e) = frame_reader.client_kex(&pk).await {
             trace!("{e}");
         }
     });
 
-    // Send the initialize frame with our public key
-    let frame = Frame::Initialize(
-        config.user().unwrap_or_default().as_bytes().to_vec(),
-        my_public_key.as_ref().to_vec(),
-        full_public_key_bytes,
-    );
-    tx.send(frame.clone())?;
+    // Send the initialize or resume-request frame with our public key
+    let frame = if let Some(session_uuid) = config.resume_session_uuid() {
+        Frame::ResumeRequest(
+            UuidWrapper::new(session_uuid),
+            config.user().unwrap_or_default().as_bytes().to_vec(),
+            my_public_key.as_ref().to_vec(),
+            full_public_key_bytes,
+        )
+    } else {
+        Frame::Initialize(
+            config.user().unwrap_or_default().as_bytes().to_vec(),
+            my_public_key.as_ref().to_vec(),
+            full_public_key_bytes,
+        )
+    };
+    tx.send(frame)?;
 
     let kex = kex_handle.await??;
 
@@ -338,6 +376,7 @@ async fn run_server_kex<T: KexConfig>(
 ) -> Result<(Kex, Arc<UdpSocket>, Option<ServerKex>)> {
     let port_pool_opt = config.port_pool();
     let (private_key_path, public_key_path) = config.key_pair_paths()?;
+    let session_registry = config.session_registry();
     trace!("Loading private key from {}", private_key_path.display());
     trace!("Loading public key from {}", public_key_path.display());
 
@@ -351,7 +390,13 @@ async fn run_server_kex<T: KexConfig>(
         .build();
     if let Some(port_pool) = port_pool_opt {
         let (skex, udp_arc) = frame_reader
-            .server_kex(socket_addr, port_pool, &private_key_path, &public_key_path)
+            .server_kex(
+                socket_addr,
+                port_pool,
+                &private_key_path,
+                &public_key_path,
+                session_registry,
+            )
             .await?;
         Ok((kex_handle.await??, udp_arc, Some(skex)))
     } else {

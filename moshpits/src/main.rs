@@ -244,6 +244,7 @@ use crate::runtime::run;
 mod cli;
 mod config;
 mod runtime;
+mod session;
 
 #[tokio::main]
 async fn main() -> Result<()> {

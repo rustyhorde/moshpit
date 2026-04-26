@@ -37,7 +37,7 @@ use uuid::Uuid;
 
 use crate::{
     ConnectionReader, Frame, KexEvent, MoshpitError, ServerKex, UuidWrapper, load_private_key,
-    load_public_key,
+    load_public_key, session::SessionRegistry,
 };
 
 const AEAD_KEY_INFO: &[u8] = b"AEAD KEY";
@@ -52,6 +52,8 @@ pub struct KexReader {
     tx: UnboundedSender<Frame>,
     /// The key exchange event sender
     tx_event: UnboundedSender<KexEvent>,
+    /// The session UUID the client is requesting to resume (None for fresh connections).
+    requested_session_uuid: Option<Uuid>,
 }
 
 impl KexReader {
@@ -109,6 +111,17 @@ impl KexReader {
                 .map_err(|_| Unspecified)?;
         }
 
+        // Receive stable session token (sent by server after KeyAgreement)
+        if let Some(frame) = self.reader.read_frame().await?
+            && let Frame::SessionToken(session_uuid_wrapper) = frame
+        {
+            let session_uuid = *session_uuid_wrapper.as_ref();
+            let is_resume = self.requested_session_uuid == Some(session_uuid);
+            self.tx_event
+                .send(KexEvent::SessionInfo(session_uuid, is_resume))
+                .map_err(|_| Unspecified)?;
+        }
+
         if let Some(frame) = self.reader.read_frame().await?
             && let Frame::MoshpitsAddr(addr) = frame
         {
@@ -129,10 +142,21 @@ impl KexReader {
         port_pool: Arc<Mutex<BTreeSet<u16>>>,
         private_key_path: &PathBuf,
         public_key_path: &PathBuf,
+        session_registry: Option<SessionRegistry>,
     ) -> Result<(ServerKex, Arc<UdpSocket>)> {
-        let (rnk, skex) = if let Some(frame) = self.reader.read_frame().await? {
-            if let Frame::Initialize(user, pk, fpk) = frame {
-                let user_str = String::from_utf8_lossy(&user);
+        let (rnk, user_str, shell, requested_session_uuid_opt) =
+            if let Some(frame) = self.reader.read_frame().await? {
+                let (user, pk, fpk, req_uuid) = match frame {
+                    Frame::Initialize(user, pk, fpk) => (user, pk, fpk, None),
+                    Frame::ResumeRequest(session_uuid_wrapper, user, pk, fpk) => {
+                        (user, pk, fpk, Some(*session_uuid_wrapper.as_ref()))
+                    }
+                    _ => {
+                        error!("Expected initialize frame from mp");
+                        return Err(MoshpitError::InvalidFrame.into());
+                    }
+                };
+                let user_str = String::from_utf8_lossy(&user).to_string();
                 let (home_dir, shell) = if self.validate_user(&user_str).await? {
                     self.get_home_dir_shell(&user_str).await?
                 } else {
@@ -141,26 +165,17 @@ impl KexReader {
                 if !check_authorized_keys(&home_dir, &fpk)? {
                     return Err(MoshpitError::KeyNotEstablished.into());
                 }
-                (
-                    self.handle_initialize(
-                        &pk,
-                        &self.tx_event.clone(),
-                        private_key_path,
-                        public_key_path,
-                    )?,
-                    ServerKex::builder()
-                        .user(user_str.to_string())
-                        .shell(shell)
-                        .build(),
-                )
+                let rnk = self.handle_initialize(
+                    &pk,
+                    &self.tx_event.clone(),
+                    private_key_path,
+                    public_key_path,
+                )?;
+                (rnk, user_str, shell, req_uuid)
             } else {
                 error!("Expected initialize frame from mp");
                 return Err(MoshpitError::InvalidFrame.into());
-            }
-        } else {
-            error!("Expected initialize frame from mp");
-            return Err(MoshpitError::InvalidFrame.into());
-        };
+            };
 
         if let Some(frame) = self.reader.read_frame().await? {
             if let Frame::Check(nonce, enc) = frame {
@@ -173,6 +188,33 @@ impl KexReader {
             error!("Expected check frame from mp");
             return Err(MoshpitError::InvalidFrame.into());
         }
+
+        // Determine session UUID: reuse existing session if user matches, else create new
+        let (session_uuid, is_resume) = match (requested_session_uuid_opt, &session_registry) {
+            (Some(req_uuid), Some(registry)) => {
+                let reg = registry.lock().await;
+                if let Some(stored_user) = reg.get(&req_uuid) {
+                    if *stored_user == user_str {
+                        (req_uuid, true)
+                    } else {
+                        (Uuid::new_v4(), false)
+                    }
+                } else {
+                    (Uuid::new_v4(), false)
+                }
+            }
+            _ => (Uuid::new_v4(), false),
+        };
+
+        // Register new sessions in the lightweight registry
+        if !is_resume && let Some(ref registry) = session_registry {
+            let mut reg = registry.lock().await;
+            drop(reg.insert(session_uuid, user_str.clone()));
+        }
+
+        // Inform the client of its stable session UUID
+        self.tx
+            .send(Frame::SessionToken(UuidWrapper::new(session_uuid)))?;
 
         let udp_arc = self.handle_udp_setup(socket_addr, port_pool).await?;
 
@@ -187,6 +229,13 @@ impl KexReader {
             error!("Expected moshpit address frame");
             return Err(MoshpitError::InvalidFrame.into());
         }
+
+        let skex = ServerKex::builder()
+            .user(user_str)
+            .shell(shell)
+            .session_uuid(session_uuid)
+            .is_resume(is_resume)
+            .build();
 
         Ok((skex, udp_arc))
     }
