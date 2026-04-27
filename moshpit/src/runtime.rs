@@ -405,7 +405,7 @@ fn spawn_resize_handler(
             if resize_token.is_cancelled() {
                 break;
             }
-            thread::sleep(std::time::Duration::from_millis(250));
+            thread::sleep(Duration::from_millis(250));
             let current_size = terminal_size().map_or(last_size, |(w, h)| (w.0, h.0));
             if current_size != last_size {
                 last_size = current_size;
@@ -567,20 +567,21 @@ fn tty_id() -> Option<String> {
 /// - stable across process restarts within the same window
 /// - different between simultaneously open windows
 #[cfg(windows)]
+#[allow(unsafe_code)]
 fn tty_id() -> Option<String> {
     use std::io::IsTerminal as _;
+    // Call Win32 GetConsoleWindow() via raw FFI — no extra crate required.
+    unsafe extern "system" {
+        fn GetConsoleWindow() -> *mut std::ffi::c_void;
+    }
     if !stdin().is_terminal() {
         return None;
-    }
-    // Call Win32 GetConsoleWindow() via raw FFI — no extra crate required.
-    extern "system" {
-        fn GetConsoleWindow() -> *mut std::ffi::c_void;
     }
     let hwnd = unsafe { GetConsoleWindow() };
     if hwnd.is_null() {
         None
     } else {
-        Some(format!("{hwnd:x}"))
+        Some(format!("{:x}", hwnd.addr()))
     }
 }
 
