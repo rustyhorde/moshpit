@@ -1,0 +1,39 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH mps 1  "mps 0.1.0" 
+.SH NAME
+mps \- Start the moshpits server
+.SH SYNOPSIS
+\fBmps\fR [\fB\-v\fR|\fB\-\-verbose\fR]... [\fB\-q\fR|\fB\-\-quiet\fR]... [\fB\-e\fR|\fB\-\-enable\-std\-output\fR] [\fB\-c\fR|\fB\-\-config\-absolute\-path\fR] [\fB\-t\fR|\fB\-\-tracing\-absolute\-path\fR] [\fB\-p\fR|\fB\-\-private\-key\-path\fR] [\fB\-k\fR|\fB\-\-public\-key\-path\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] 
+.SH DESCRIPTION
+Start the moshpits server
+.SH OPTIONS
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Turn up logging verbosity (multiple will turn it up more)
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+Turn down logging verbosity (multiple will turn it down more)
+.TP
+\fB\-e\fR, \fB\-\-enable\-std\-output\fR
+Enable logging to stdout/stderr
+.TP
+\fB\-c\fR, \fB\-\-config\-absolute\-path\fR \fI<PATH>\fR
+Specify the absolute path to the config file
+.TP
+\fB\-t\fR, \fB\-\-tracing\-absolute\-path\fR \fI<PATH>\fR
+Specify the absolute path to the tracing output file
+.TP
+\fB\-p\fR, \fB\-\-private\-key\-path\fR \fI<PATH>\fR
+Specify the absolute path to the private key file
+.TP
+\fB\-k\fR, \fB\-\-public\-key\-path\fR \fI<PATH>\fR
+Specify the absolute path to the public key file
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Print version
+.SH VERSION
+v0.1.0

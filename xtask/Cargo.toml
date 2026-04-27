@@ -1,0 +1,17 @@
+[package]
+authors = ["Jason Ozias <jason.g.ozias@gmail.com>"]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+name = "xtask"
+publish = false
+version = "0.1.0"
+
+[[bin]]
+name = "xtask"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+clap_complete = "4.6.3"
+clap_mangen = "0.3.0"

@@ -1,0 +1,168 @@
+on:
+  push:
+    tags:
+      - "v[0-9]*"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  CARGO_TERM_COLOR: always
+
+name: 🚀 Release 🚀
+
+jobs:
+  # ── Build release binaries ───────────────────────────────────────────────────
+  build:
+    name: 🔨 Build Linux x86_64 🔨
+    runs-on: ubuntu-latest
+    outputs:
+      pkgver: ${{ steps.version.outputs.pkgver }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: version
+        run: echo "pkgver=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.91.1"
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Install build dependencies (cmake + C compiler for aws-lc-rs)
+        run: sudo apt-get update && sudo apt-get install -y cmake gcc
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release binaries
+        run: |
+          export VERGEN_IDEMPOTENT=1
+          cargo build --release --locked --bin mp --bin mps --bin mp-keygen
+
+      - name: Generate xtask dist artifacts
+        run: |
+          cargo xtask dist mp
+          cargo xtask dist mps
+          cargo xtask dist mp-keygen
+
+      - name: Stage release assets
+        run: |
+          mkdir -p release-assets
+          cp target/release/mp     release-assets/mp-x86_64-unknown-linux-gnu
+          cp target/release/mps    release-assets/mps-x86_64-unknown-linux-gnu
+          cp target/release/mp-keygen release-assets/mp-keygen-x86_64-unknown-linux-gnu
+
+      - name: Upload release assets artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: release-assets/
+
+  # ── Create GitHub release ────────────────────────────────────────────────────
+  release:
+    name: 📝 Create GitHub Release 📝
+    needs: build
+    runs-on: ubuntu-latest
+    outputs:
+      tarball_sha256: ${{ steps.sha256.outputs.tarball_sha256 }}
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: release-assets/
+
+      - name: Download source tarball from GitHub
+        run: |
+          curl -sSL \
+            "https://github.com/${{ github.repository }}/archive/${{ github.ref_name }}.tar.gz" \
+            -o "moshpit-${{ needs.build.outputs.pkgver }}.tar.gz"
+
+      - name: Compute source tarball sha256
+        id: sha256
+        run: |
+          SHA=$(sha256sum "moshpit-${{ needs.build.outputs.pkgver }}.tar.gz" | awk '{print $1}')
+          echo "tarball_sha256=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            release-assets/*
+            moshpit-${{ needs.build.outputs.pkgver }}.tar.gz
+
+  # ── Update PKGBUILDs ─────────────────────────────────────────────────────────
+  update-pkgbuilds:
+    name: 📦 Update PKGBUILDs 📦
+    needs: [build, release]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Push back to master after updating
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update pkgver and sha256sums in all three PKGBUILDs
+        env:
+          PKGVER: ${{ needs.build.outputs.pkgver }}
+          SHA256: ${{ needs.release.outputs.tarball_sha256 }}
+        run: |
+          for pkg in moshpit-keygen moshpit moshpits; do
+            PKGBUILD="packaging/arch/${pkg}/PKGBUILD"
+            # Update pkgver
+            sed -i "s/^pkgver=.*/pkgver=${PKGVER}/" "$PKGBUILD"
+            # Reset pkgrel to 1
+            sed -i "s/^pkgrel=.*/pkgrel=1/" "$PKGBUILD"
+            # Update sha256sums — replace the first SKIP with the real hash,
+            # leaving subsequent SKIPs (e.g. for mps.service) unchanged.
+            sed -i "0,/'SKIP'/s/'SKIP'/'${SHA256}'/" "$PKGBUILD"
+          done
+
+      - name: Commit updated PKGBUILDs
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add packaging/arch/
+          git diff --cached --quiet || git commit \
+            -m "chore(packaging): update PKGBUILDs to v${{ needs.build.outputs.pkgver }}"
+          git push origin HEAD:master
+
+  # ── Push to AUR ──────────────────────────────────────────────────────────────
+  aur-publish:
+    name: 🏹 Publish to AUR 🏹
+    needs: [build, update-pkgbuilds]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        package: [moshpit-keygen, moshpit, moshpits]
+    steps:
+      - name: Checkout (after PKGBUILD update commit)
+        uses: actions/checkout@v4
+        with:
+          ref: master
+
+      - name: Publish ${{ matrix.package }} to AUR
+        uses: KSXGitHub/github-actions-deploy-aur@v3.0.1
+        with:
+          pkgname: ${{ matrix.package }}
+          pkgbuild: packaging/arch/${{ matrix.package }}/PKGBUILD
+          commit_username: "Jason Ozias"
+          commit_email: "jason.g.ozias@gmail.com"
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: "Update to v${{ needs.build.outputs.pkgver }}"
+          allow_empty_commits: false
