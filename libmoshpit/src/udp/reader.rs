@@ -29,7 +29,7 @@ use tokio::{
     net::UdpSocket,
     select,
     sync::mpsc::Sender,
-    time::{interval, sleep},
+    time::{Instant as TokioInstant, interval, sleep, sleep_until},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -73,9 +73,25 @@ pub struct UdpReader {
     /// Number of NAK retries per gap, used to give up on permanently lost packets
     #[builder(default)]
     gap_nak_count: HashMap<u64, u32>,
+    /// If no frame is received within this duration the server is assumed unreachable.
+    /// Triggers reconnect via [`reconnect_tx`] when set, otherwise calls
+    /// [`process::exit`].
+    silence_timeout: Option<Duration>,
+    /// Signals the caller that the server connection was lost and a reconnect should
+    /// be attempted.  When absent, connection loss falls back to [`process::exit`].
+    reconnect_tx: Option<Sender<()>>,
 }
 
 impl UdpReader {
+    /// Signal the reconnect channel if set; otherwise exit the process.
+    fn signal_reconnect_or_exit(&self, code: i32) {
+        if let Some(ref tx) = self.reconnect_tx {
+            let _ = tx.try_send(());
+        } else {
+            process::exit(code);
+        }
+    }
+
     /// Buffer an arrived `(frame, seq)` pair and return any frames now ready to deliver
     /// in order. Incoming `Nak` frames are routed to the local sender's retransmit channel
     /// rather than returned.
@@ -221,7 +237,7 @@ impl UdpReader {
                             EncryptedFrame::Resize((_id, columns, rows)) => {
                                 term_tx.send(TerminalMessage::Resize { rows, columns }).await?;
                             }
-                            EncryptedFrame::Nak(_) | EncryptedFrame::Shutdown => {}
+                            EncryptedFrame::Nak(_) | EncryptedFrame::Shutdown | EncryptedFrame::Keepalive => {}
                         }
                     }
                 },
@@ -236,7 +252,7 @@ impl UdpReader {
                                     EncryptedFrame::Resize((_id, columns, rows)) => {
                                         term_tx.send(TerminalMessage::Resize { rows, columns }).await?;
                                     }
-                                    EncryptedFrame::Nak(_) | EncryptedFrame::Shutdown => {}
+                                    EncryptedFrame::Nak(_) | EncryptedFrame::Shutdown | EncryptedFrame::Keepalive => {}
                                 }
                             }
                         }
@@ -266,8 +282,11 @@ impl UdpReader {
         let mut prev_bytes = BytesMut::with_capacity(1024);
         let mut osc_started = false;
         let mut nak_check = interval(NAK_CHECK_INTERVAL);
+        // Deadline after which silence is treated as a server disconnect.
+        let mut silence_deadline: Option<TokioInstant> =
+            self.silence_timeout.map(|d| TokioInstant::now() + d);
 
-        loop {
+        'session: loop {
             select! {
                 () = token.cancelled() => process::exit(0),
                 _ = nak_check.tick() => {
@@ -281,15 +300,31 @@ impl UdpReader {
                             EncryptedFrame::Resize(_) => {
                                 error!("Received Resize frame on client, which is unexpected");
                             }
-                            EncryptedFrame::Nak(_) => {}
+                            EncryptedFrame::Nak(_) | EncryptedFrame::Keepalive => {}
                             EncryptedFrame::Shutdown => {
-                                info!("Server is shutting down, exiting");
-                                process::exit(0);
+                                info!("Server is shutting down, reconnecting");
+                                self.signal_reconnect_or_exit(0);
+                                break 'session;
                             }
                         }
                     }
                 },
+                // Silence timeout: no frame received within `silence_timeout`.
+                () = async {
+                    match silence_deadline {
+                        Some(dl) => sleep_until(dl).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    info!("Server not responding, signalling reconnect");
+                    self.signal_reconnect_or_exit(1);
+                    break;
+                },
                 frame_res = self.read_encrypted_frame() => {
+                    // Reset silence deadline on every received frame.
+                    if let Some(timeout) = self.silence_timeout {
+                        silence_deadline = Some(TokioInstant::now() + timeout);
+                    }
                     match frame_res {
                         Ok(Some((frame, seq))) => {
                             for ready in self.handle_arrival(frame, seq) {
@@ -297,72 +332,92 @@ impl UdpReader {
                                     EncryptedFrame::Resize(_) => {
                                         error!("Received Resize frame on client, which is unexpected");
                                     }
-                                    EncryptedFrame::Nak(_) => {}
+                                    EncryptedFrame::Nak(_) | EncryptedFrame::Keepalive => {}
                                     EncryptedFrame::Shutdown => {
-                                        info!("Server is shutting down, exiting");
-                                        process::exit(0);
+                                        info!("Server is shutting down, reconnecting");
+                                        self.signal_reconnect_or_exit(0);
+                                        break 'session;
                                     }
                                     EncryptedFrame::Bytes((_id, message)) => {
-                                let message = if prev_bytes.is_empty() {
-                                    message
-                                } else {
-                                    let mut combined =
-                                        BytesMut::with_capacity(prev_bytes.len() + message.len());
-                                    combined.extend_from_slice(&prev_bytes);
-                                    combined.extend_from_slice(&message);
-                                    prev_bytes.clear();
-                                    combined.freeze().to_vec()
-                                };
-                                prev_bytes.clear();
-                                let mut valid_utf8 = String::new();
-                                for chunk in message.utf8_chunks() {
-                                    valid_utf8.push_str(chunk.valid());
-
-                                    if !chunk.invalid().is_empty() {
-                                        prev_bytes.extend_from_slice(chunk.invalid());
-                                    }
-                                }
-                                let result = TokenStream::from(&valid_utf8).collect::<Vec<Token<'_>>>();
-
-                                for part in &result {
-                                    match part {
-                                        Token::String(osc_cmd_string) => if osc_started && is_exit_title(osc_cmd_string, false) {
-                                            sleep(Duration::from_millis(500)).await;
-                                            token.cancel();
-                                        }
-                                        Token::ControlFunction(control_function) => {
-                                            if osc_started
-                                                && (*control_function == c1::ST
-                                                    || *control_function == c0::BEL)
-                                            {
-                                                osc_started = false;
-                                            } else if *control_function == c1::OSC && !osc_started {
-                                                osc_started = true;
-                                            }
-                                        }
-                                    }
-                                }
-                                if let Err(e) = stdout_tx.send(valid_utf8.into_bytes()).await {
-                                    error!("Error sending to stdout channel: {e}");
-                                }
+                                        process_bytes_message(
+                                            message,
+                                            &mut prev_bytes,
+                                            &mut osc_started,
+                                            &stdout_tx,
+                                            &token,
+                                        )
+                                        .await;
                                     }
                                 }
                             }
                         }
                         Ok(None) => {
                             info!("server closed UDP connection");
-                            process::exit(0);
+                            self.signal_reconnect_or_exit(0);
+                            break;
                         }
                         Err(e) => {
                             error!("udp read error, server likely disconnected: {e}");
-                            process::exit(1);
+                            self.signal_reconnect_or_exit(1);
+                            break;
                         }
                     }
                 }
             }
         }
     }
+}
 
+/// Decode a raw terminal bytes message, detect shell-exit via OSC title, and
+/// forward the valid UTF-8 portion to the stdout channel.
+async fn process_bytes_message(
+    raw: Vec<u8>,
+    prev_bytes: &mut BytesMut,
+    osc_started: &mut bool,
+    stdout_tx: &Sender<Vec<u8>>,
+    token: &CancellationToken,
+) {
+    let message = if prev_bytes.is_empty() {
+        raw
+    } else {
+        let mut combined = BytesMut::with_capacity(prev_bytes.len() + raw.len());
+        combined.extend_from_slice(prev_bytes);
+        combined.extend_from_slice(&raw);
+        prev_bytes.clear();
+        combined.freeze().to_vec()
+    };
+    prev_bytes.clear();
+    let mut valid_utf8 = String::new();
+    for chunk in message.utf8_chunks() {
+        valid_utf8.push_str(chunk.valid());
+        if !chunk.invalid().is_empty() {
+            prev_bytes.extend_from_slice(chunk.invalid());
+        }
+    }
+    let result = TokenStream::from(&valid_utf8).collect::<Vec<Token<'_>>>();
+    for part in &result {
+        match part {
+            Token::String(osc_cmd_string) => {
+                if *osc_started && is_exit_title(osc_cmd_string, false) {
+                    sleep(Duration::from_millis(500)).await;
+                    token.cancel();
+                }
+            }
+            Token::ControlFunction(control_function) => {
+                if *osc_started && (*control_function == c1::ST || *control_function == c0::BEL) {
+                    *osc_started = false;
+                } else if *control_function == c1::OSC && !*osc_started {
+                    *osc_started = true;
+                }
+            }
+        }
+    }
+    if let Err(e) = stdout_tx.send(valid_utf8.into_bytes()).await {
+        error!("Error sending to stdout channel: {e}");
+    }
+}
+
+impl UdpReader {
     /// Read a single `Frame` value from the underlying stream.
     ///
     /// The function waits until it has retrieved enough data to parse a frame.

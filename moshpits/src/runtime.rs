@@ -7,9 +7,9 @@
 // modified, or distributed except according to those terms.
 
 use std::{
-    collections::{BTreeSet, VecDeque},
+    collections::{BTreeSet, HashMap, VecDeque},
     ffi::OsString,
-    io::{Read as _, Write as _},
+    io::{IsTerminal as _, Read as _, Write as _},
     net::SocketAddr,
     sync::Arc,
     thread::{self, sleep},
@@ -25,6 +25,7 @@ use libmoshpit::{
     run_key_exchange,
 };
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+
 use tokio::{
     net::{TcpListener, TcpStream},
     select, spawn,
@@ -45,6 +46,139 @@ use crate::{
         new_full_registry,
     },
 };
+
+/// Info about a currently-connected moshpit client.
+struct ClientInfo {
+    peer_addr: SocketAddr,
+    user: String,
+    session_uuid: Uuid,
+}
+
+/// Shared mutable state for the server status banner.
+#[derive(Clone)]
+struct BannerState {
+    inner: Arc<Mutex<BannerInner>>,
+    /// `false` when stderr is not a TTY; banner operations become no-ops.
+    enabled: bool,
+}
+
+struct BannerInner {
+    clients: HashMap<Uuid, ClientInfo>,
+    /// Number of banner lines written on the last render, used to clear stale lines.
+    prev_lines: usize,
+}
+
+impl BannerState {
+    fn new(enabled: bool) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(BannerInner {
+                clients: HashMap::new(),
+                prev_lines: 0,
+            })),
+            enabled,
+        }
+    }
+
+    async fn insert(&self, kex_uuid: Uuid, info: ClientInfo) {
+        let mut inner = self.inner.lock().await;
+        drop(inner.clients.insert(kex_uuid, info));
+        if self.enabled {
+            Self::render_and_write(&mut inner);
+        }
+    }
+
+    /// Remove the entry for this connection.  Each connection has a unique kex UUID as
+    /// its key, so there is no risk of evicting a different connection's entry.
+    async fn remove(&self, kex_uuid: Uuid) {
+        let mut inner = self.inner.lock().await;
+        if inner.clients.remove(&kex_uuid).is_some() && self.enabled {
+            Self::render_and_write(&mut inner);
+        }
+    }
+
+    /// Redraw the banner without changing the client list.
+    ///
+    /// Called periodically to repair any damage caused by log output that
+    /// momentarily overwrote the banner rows.
+    async fn refresh(&self) {
+        if !self.enabled {
+            return;
+        }
+        let mut inner = self.inner.lock().await;
+        if !inner.clients.is_empty() {
+            Self::render_and_write(&mut inner);
+        }
+    }
+
+    fn render_and_write(inner: &mut BannerInner) {
+        let clients: Vec<&ClientInfo> = inner.clients.values().collect();
+        let bytes = render_banner(&clients, inner.prev_lines);
+        inner.prev_lines = if clients.is_empty() {
+            0
+        } else {
+            clients.len() + 1
+        };
+        drop(std::io::stderr().write_all(&bytes));
+        drop(std::io::stderr().flush());
+    }
+}
+
+/// Render the server status banner as a byte sequence of raw ANSI escape codes.
+///
+/// The banner is anchored to the **top** of the terminal, occupying rows 1 through
+/// `banner_lines` (header + one row per client).  Normal log output scrolls below
+/// and may temporarily overwrite the banner; the 5-second periodic refresh task in
+/// [`run`] repaints it.
+///
+/// Layout (2 clients):
+/// ```text
+/// row 1 : [moshpits] 2 client(s) connected
+/// row 2 : client 1 info
+/// row 3 : client 2 info
+/// row 4+: scrolling tracing output
+/// ```
+fn render_banner(clients: &[&ClientInfo], prev_lines: usize) -> Vec<u8> {
+    let mut out = Vec::<u8>::new();
+    out.extend_from_slice(b"\x1b[s"); // save cursor
+
+    if clients.is_empty() {
+        // Erase every line that was part of the previous banner.
+        for row in 1..=prev_lines {
+            out.extend_from_slice(format!("\x1b[{row};1H\x1b[0m\x1b[K").as_bytes());
+        }
+        out.extend_from_slice(b"\x1b[u"); // restore cursor
+    } else {
+        let n = clients.len();
+        let banner_lines = n + 1; // header + one row per client
+
+        // Header row (row 1).
+        out.extend_from_slice(
+            format!("\x1b[1;1H\x1b[44;97;1m [moshpits] {n} client(s) connected \x1b[K\x1b[0m")
+                .as_bytes(),
+        );
+        // One row per client.
+        for (i, c) in clients.iter().enumerate() {
+            let row = 2 + i;
+            let peer = c.peer_addr;
+            let user = &c.user;
+            let sid = c.session_uuid;
+            out.extend_from_slice(
+                format!("\x1b[{row};1H\x1b[44;97;1m  {peer:<25}  {user:<15}  {sid} \x1b[K\x1b[0m")
+                    .as_bytes(),
+            );
+        }
+
+        // When the banner shrank (fewer clients than last render), clear the rows
+        // that are no longer part of the banner.
+        for row in (banner_lines + 1)..=prev_lines {
+            out.extend_from_slice(format!("\x1b[{row};1H\x1b[0m\x1b[K").as_bytes());
+        }
+
+        out.extend_from_slice(b"\x1b[u"); // restore cursor
+    }
+
+    out
+}
 
 pub(crate) async fn run<I, T>(args: Option<I>) -> Result<()>
 where
@@ -90,12 +224,29 @@ where
     let session_registry = new_session_registry();
     let _ = config.set_session_registry(session_registry);
     let full_registry = new_full_registry();
+    let banner = BannerState::new(std::io::stderr().is_terminal());
 
     let server_token = CancellationToken::new();
+
+    // Periodically redraw the banner to repair any transient overwrite from log output.
+    let banner_refresh = banner.clone();
+    let refresh_token = server_token.clone();
+    let _banner_refresh = spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(5));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            select! {
+                () = refresh_token.cancelled() => break,
+                _ = ticker.tick() => banner_refresh.refresh().await,
+            }
+        }
+    });
+
     loop {
         let config_c = config.clone();
         let st = server_token.clone();
         let fr_c = full_registry.clone();
+        let banner_c = banner.clone();
         select! {
             _ = tokio::signal::ctrl_c() => {
                 info!("Received Ctrl-C, shutting down server");
@@ -108,7 +259,7 @@ where
                 match accept_res {
                     Ok((socket, _addr)) => {
                         let _conn = spawn(async move {
-                            if let Err(e) = handle_connection(config_c, socket, st, fr_c).await {
+                            if let Err(e) = handle_connection(config_c, socket, st, fr_c, banner_c).await {
                                 trace!("{e}");
                             }
                         });
@@ -121,34 +272,25 @@ where
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
-async fn handle_connection(
-    config: Config,
-    socket: TcpStream,
-    server_token: CancellationToken,
-    full_registry: FullSessionRegistry,
-) -> Result<()> {
-    let (sock_read, sock_write) = socket.into_split();
-    let port_pool = config.port_pool();
-    let session_registry = config.session_registry();
-    let (kex, udp_arc, skex_opt) =
-        run_key_exchange(config, sock_read, sock_write, || Ok(None)).await?;
-    info!("Key exchange completed with moshpit");
-
-    let skex = skex_opt.ok_or_else(|| anyhow::anyhow!("missing server kex info"))?;
+/// Resolve which session to use for this connection.
+///
+/// On resume, reconnects to the existing session and replays scrollback.
+/// On new or expired sessions, creates a fresh session via [`new_session`].
+async fn resolve_session(
+    kex: &libmoshpit::Kex,
+    skex: &libmoshpit::ServerKex,
+    conn_token: &CancellationToken,
+    udp_port: u16,
+    tx: Sender<EncryptedFrame>,
+    full_registry: &FullSessionRegistry,
+) -> Result<(
+    Sender<TerminalMessage>,
+    Option<Receiver<TerminalMessage>>,
+    Arc<Mutex<SessionOutputHandle>>,
+    Arc<Mutex<VecDeque<u8>>>,
+)> {
     let session_uuid = skex.session_uuid();
-    let is_resume = skex.is_resume();
-    let udp_port = udp_arc.local_addr()?.port();
-
-    let (tx, rx) = channel::<EncryptedFrame>(256);
-    let (retransmit_tx, retransmit_rx) = channel::<Vec<u64>>(64);
-    let udp_recv = udp_arc.clone();
-    let udp_send = udp_arc.clone();
-
-    let conn_token = CancellationToken::new();
-
-    // Resolve channels and decide whether to spawn a new PTY.
-    let (term_tx, maybe_term_rx, output_handle, scrollback) = if is_resume {
+    if skex.is_resume() {
         let reg = full_registry.lock().await;
         if let Some(record) = reg.get(&session_uuid) {
             let term_tx = record.term_tx.clone();
@@ -171,43 +313,102 @@ async fn handle_connection(
 
             // Replay scrollback so the client terminal catches up.
             let sb_data: Vec<u8> = scrollback.lock().await.iter().copied().collect();
+            let scrollback_bytes = sb_data.len();
             for chunk in sb_data.chunks(MAX_UDP_PAYLOAD) {
                 tx.send(EncryptedFrame::Bytes((kex.uuid_wrapper(), chunk.to_vec())))
                     .await?;
             }
-            info!("Resumed session {session_uuid}");
+            info!(
+                user = skex.user(),
+                session = %session_uuid,
+                scrollback_bytes,
+                "session resumed"
+            );
 
-            (
+            Ok((
                 term_tx,
                 None::<Receiver<TerminalMessage>>,
                 output_handle,
                 scrollback,
-            )
+            ))
         } else {
             // Session expired; start fresh.
             drop(reg);
-            info!("Session {session_uuid} not found (expired?); starting new session");
-            new_session(
-                &kex,
-                &conn_token,
-                udp_port,
-                session_uuid,
-                tx.clone(),
-                &full_registry,
-            )
-            .await?
+            info!(
+                user = skex.user(),
+                session = %session_uuid,
+                "previous session expired, starting new session"
+            );
+            new_session(kex, conn_token, udp_port, session_uuid, tx, full_registry).await
         }
     } else {
-        new_session(
-            &kex,
-            &conn_token,
-            udp_port,
-            session_uuid,
-            tx.clone(),
-            &full_registry,
+        let result =
+            new_session(kex, conn_token, udp_port, session_uuid, tx, full_registry).await?;
+        info!(
+            user = skex.user(),
+            session = %session_uuid,
+            "new session started"
+        );
+        Ok(result)
+    }
+}
+
+async fn handle_connection(
+    config: Config,
+    socket: TcpStream,
+    server_token: CancellationToken,
+    full_registry: FullSessionRegistry,
+    banner: BannerState,
+) -> Result<()> {
+    let peer_addr = socket.peer_addr()?;
+    let (sock_read, sock_write) = socket.into_split();
+    let port_pool = config.port_pool();
+    let session_registry = config.session_registry();
+    let (kex, udp_arc, skex_opt) =
+        run_key_exchange(config, sock_read, sock_write, || Ok(None)).await?;
+    info!("Key exchange completed with moshpit");
+
+    let skex = skex_opt.ok_or_else(|| anyhow::anyhow!("missing server kex info"))?;
+    let session_uuid = skex.session_uuid();
+
+    let udp_port = udp_arc.local_addr()?.port();
+
+    let (tx, rx) = channel::<EncryptedFrame>(256);
+    let (retransmit_tx, retransmit_rx) = channel::<Vec<u64>>(64);
+    let udp_recv = udp_arc.clone();
+    let udp_send = udp_arc.clone();
+
+    let conn_token = CancellationToken::new();
+
+    // Resolve channels and decide whether to spawn a new PTY.
+    let (term_tx, maybe_term_rx, output_handle, scrollback) = resolve_session(
+        &kex,
+        &skex,
+        &conn_token,
+        udp_port,
+        tx.clone(),
+        &full_registry,
+    )
+    .await?;
+
+    // Register this connection in the banner; schedule removal when the connection drops.
+    banner
+        .insert(
+            kex.uuid(),
+            ClientInfo {
+                peer_addr,
+                user: skex.user().to_owned(),
+                session_uuid,
+            },
         )
-        .await?
-    };
+        .await;
+    let banner_dc = banner.clone();
+    let dc_kex_uuid = kex.uuid();
+    let dc_conn_token = conn_token.clone();
+    let _banner_watcher = spawn(async move {
+        dc_conn_token.cancelled().await;
+        banner_dc.remove(dc_kex_uuid).await;
+    });
 
     let mut udp_reader = UdpReader::builder()
         .socket(udp_recv)
@@ -237,15 +438,7 @@ async fn handle_connection(
     let sender_token = conn_token.clone();
     let _udp_handle = spawn(async move { udp_sender.frame_loop(sender_token).await });
 
-    // Notify client on server shutdown, then cancel the connection token.
-    let watcher_tx = tx.clone();
-    let watcher_conn_token = conn_token.clone();
-    let _shutdown_watcher = spawn(async move {
-        server_token.cancelled().await;
-        drop(watcher_tx.send(EncryptedFrame::Shutdown).await);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        watcher_conn_token.cancel();
-    });
+    spawn_connection_watchdogs(tx.clone(), conn_token.clone(), server_token);
 
     // For new sessions, spawn the long-lived PTY thread.
     if let Some(term_rx) = maybe_term_rx {
@@ -261,6 +454,42 @@ async fn handle_connection(
     }
 
     Ok(())
+}
+
+/// Spawn the shutdown-watcher and keepalive tasks for one client connection.
+///
+/// - Shutdown watcher: on server cancellation, sends `Shutdown` to the client and
+///   cancels the per-connection token after a short drain delay.
+/// - Keepalive: sends `Keepalive` every 10 s so the client's 15 s silence timeout
+///   never fires during idle sessions.
+fn spawn_connection_watchdogs(
+    tx: Sender<EncryptedFrame>,
+    conn_token: CancellationToken,
+    server_token: CancellationToken,
+) {
+    let watcher_tx = tx.clone();
+    let watcher_conn_token = conn_token.clone();
+    let _shutdown_watcher = spawn(async move {
+        server_token.cancelled().await;
+        drop(watcher_tx.send(EncryptedFrame::Shutdown).await);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        watcher_conn_token.cancel();
+    });
+
+    let _keepalive = spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(10));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            select! {
+                () = conn_token.cancelled() => break,
+                _ = ticker.tick() => {
+                    if tx.send(EncryptedFrame::Keepalive).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// Create a new session record, register it in both registries, and return the live
@@ -392,6 +621,7 @@ fn spawn_pty_reader(
             let mut fr = full_registry.blocking_lock();
             drop(fr.remove(&session_uuid));
         }
+        info!(session = %session_uuid, "session ended, client exited cleanly");
     });
 }
 

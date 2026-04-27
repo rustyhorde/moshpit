@@ -37,6 +37,8 @@ pub enum EncryptedFrame {
     Nak(Vec<u64>),
     /// Server is shutting down; client should exit cleanly.
     Shutdown,
+    /// Server keepalive; client should reset its silence deadline and discard.
+    Keepalive,
 }
 
 impl EncryptedFrame {
@@ -48,6 +50,7 @@ impl EncryptedFrame {
             EncryptedFrame::Resize(_) => 1,
             EncryptedFrame::Nak(_) => 2,
             EncryptedFrame::Shutdown => 3,
+            EncryptedFrame::Keepalive => 4,
         }
     }
 

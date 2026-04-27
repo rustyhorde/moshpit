@@ -43,9 +43,18 @@ pub(crate) struct Config {
     #[serde(skip)]
     #[getset(get_copy = "pub(crate)", set = "pub(crate)")]
     resume_session_uuid: Option<Uuid>,
+    /// Maximum backoff interval between reconnect attempts, in seconds.
+    /// Clamped to [2, 86400] (24 hours).  Defaults to 3600 (1 hour).
+    #[serde(default = "Config::default_max_reconnect_backoff_secs")]
+    #[getset(get_copy = "pub(crate)")]
+    max_reconnect_backoff_secs: u64,
 }
 
 impl Config {
+    fn default_max_reconnect_backoff_secs() -> u64 {
+        3600
+    }
+
     fn load_key_paths(&self) -> Result<(PathBuf, PathBuf)> {
         let (default_private_key_path, default_pub_key_ext) =
             KeyPair::default_key_path_ext(self.mode)?;
@@ -74,6 +83,7 @@ impl Default for Config {
             private_key_path: None,
             public_key_path: None,
             resume_session_uuid: None,
+            max_reconnect_backoff_secs: Self::default_max_reconnect_backoff_secs(),
         }
     }
 }

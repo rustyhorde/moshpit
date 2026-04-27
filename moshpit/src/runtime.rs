@@ -10,8 +10,11 @@ use std::{
     ffi::OsString,
     fs::{DirBuilder, OpenOptions},
     io::{Read as _, Write as _, stdin, stdout},
+    net::SocketAddr,
     path::{Path, PathBuf},
+    sync::Arc,
     thread,
+    time::Duration,
 };
 
 #[cfg(target_family = "unix")]
@@ -29,10 +32,13 @@ use terminal_size::terminal_size;
 #[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::{
-    net::TcpStream,
-    spawn,
-    sync::mpsc::{Receiver, Sender, channel},
-    task::spawn_blocking,
+    net::{TcpStream, UdpSocket},
+    select, spawn,
+    sync::{
+        Mutex,
+        mpsc::{Receiver, Sender, channel},
+    },
+    time,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, trace};
@@ -45,52 +51,228 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
-    // Parse the command line
     let cli = if let Some(args) = args {
         Cli::try_parse_from(args)?
     } else {
         Cli::try_parse()?
     };
-
-    // Load the configuration
     let mut config =
         load::<Cli, Config, Cli>(&cli, &cli).with_context(|| MoshpitError::ConfigLoad)?;
-
-    // Initialize tracing
     init_tracing(&config, config.tracing().file(), &cli, None)
         .with_context(|| MoshpitError::TracingInit)?;
-
-    trace!("Configuration loaded");
-    trace!("Tracing initialized");
-
-    // Prompt to generate a keypair if one does not exist at the configured paths
     maybe_generate_keypair(&config)?;
 
-    // Check for an existing session to resume
     let (user, socket_addr) =
         parse_server_destination(config.server_destination(), config.server_port())?;
     let server_ip = socket_addr.ip().to_string();
     let server_port = config.server_port();
-    if let Some(uuid) = read_session_uuid(&server_ip, server_port) {
-        let _ = config.set_resume_session_uuid(Some(uuid));
-        trace!("Attempting to resume session {uuid}");
+    let _ = config.set_user(user);
+
+    run_session_loop(config, socket_addr, server_ip, server_port).await
+}
+
+/// Cached passphrase state, avoiding re-prompting across reconnects.
+#[derive(Debug)]
+enum PassCache {
+    /// Not yet prompted.
+    Uncached,
+    /// Prompted; key is unencrypted — no passphrase needed.
+    NoPassphrase,
+    /// Prompted; encrypted key passphrase.
+    Passphrase(String),
+}
+
+impl PassCache {
+    /// Returns `true` when a cached answer is available.
+    fn is_cached(&self) -> bool {
+        !matches!(self, Self::Uncached)
     }
 
-    // Setup the TCP connection to the server for key exchange
-    let _ = config.set_user(user);
-    trace!("Connecting to server at {socket_addr}");
+    /// Returns the cached passphrase.  `None` means the key is unencrypted.
+    ///
+    /// Panics if called while `Uncached`.
+    fn passphrase(&self) -> Option<String> {
+        match self {
+            Self::Uncached => unreachable!("passphrase() called before caching"),
+            Self::NoPassphrase => None,
+            Self::Passphrase(s) => Some(s.clone()),
+        }
+    }
+}
+
+/// Show a mosh-style reconnecting banner at the top of the terminal.
+///
+/// The banner is white-on-blue, occupies the entire first row, and is
+/// rendered by writing raw ANSI escape sequences through the same stdout
+/// channel used for normal terminal output.
+async fn show_reconnect_banner(stdout_tx: &Sender<Vec<u8>>) {
+    // ESC[s          – save cursor position
+    // ESC[1;1H       – move to row 1, col 1
+    // ESC[44;97;1m   – blue background, bright-white bold text
+    // ESC[K          – erase to end of line (fills line with blue)
+    // ESC[0m         – reset attributes
+    // ESC[u          – restore cursor position
+    let msg = b"\x1b[s\x1b[1;1H\x1b[44;97;1m [moshpit] server unreachable, reconnecting... \x1b[K\x1b[0m\x1b[u";
+    drop(stdout_tx.send(msg.to_vec()).await);
+}
+
+/// Clear the reconnecting banner and restore the first row to normal.
+async fn clear_reconnect_banner(stdout_tx: &Sender<Vec<u8>>) {
+    // Reset attributes first so the erase uses the default background.
+    let msg = b"\x1b[s\x1b[1;1H\x1b[0m\x1b[K\x1b[u";
+    drop(stdout_tx.send(msg.to_vec()).await);
+}
+
+/// Redraw the banner once per second, counting down from `total_secs` to 0.
+async fn countdown_reconnect_banner(
+    stdout_tx: &Sender<Vec<u8>>,
+    total_secs: u64,
+    attempt: u32,
+    max_backoff_secs: u64,
+) {
+    for remaining in (0..=total_secs).rev() {
+        let msg = format!(
+            "\x1b[s\x1b[1;1H\x1b[44;97;1m [moshpit] server unreachable, reconnecting \
+(attempt #{attempt}, {remaining}s, max {max_backoff_secs}s)... \x1b[K\x1b[0m\x1b[u"
+        );
+        drop(stdout_tx.send(msg.into_bytes()).await);
+        if remaining > 0 {
+            time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+}
+
+/// Persistent reconnect loop.  Runs until the shell exits (via `process::exit`).
+async fn run_session_loop(
+    config: Config,
+    socket_addr: SocketAddr,
+    server_ip: String,
+    server_port: u16,
+) -> Result<()> {
+    // Clamp to [2 s, 24 h].
+    let max_backoff = Duration::from_secs(config.max_reconnect_backoff_secs().clamp(2, 86_400));
+
+    // Persistent stdout writer — survives reconnects.
+    let (stdout_tx, mut stdout_rx) = channel::<Vec<u8>>(256);
+    let _stdout_thread = thread::spawn(move || {
+        let mut out = stdout();
+        while let Some(msg) = stdout_rx.blocking_recv() {
+            drop(out.write_all(&msg));
+            drop(out.flush());
+        }
+    });
+
+    // Passphrase cache: avoids re-prompting on reconnect.
+    let pass_cache: Arc<std::sync::Mutex<PassCache>> =
+        Arc::new(std::sync::Mutex::new(PassCache::Uncached));
+
+    let mut config = config;
+    let mut backoff = Duration::from_secs(2);
+    let mut reconnect_attempt: u32 = 0;
+    // Stdin reader is started once, after the first successful kex (so that raw
+    // mode is not active while dialoguer reads the passphrase).
+    let mut kb_rx_shared: Option<Arc<Mutex<Receiver<Vec<u8>>>>> = None;
+
+    loop {
+        match connect_and_kex(
+            &mut config,
+            socket_addr,
+            &server_ip,
+            server_port,
+            &pass_cache,
+        )
+        .await
+        {
+            Ok((kex, udp_arc)) => {
+                backoff = Duration::from_secs(2);
+
+                // Enable raw mode and start the stdin reader on the first
+                // successful kex.  By this point the passphrase has been
+                // collected and cached, so raw mode won't interfere with it
+                // on reconnects.
+                let kb_rx = if let Some(ref rx) = kb_rx_shared {
+                    // This is a reconnect — clear the banner before the session starts.
+                    clear_reconnect_banner(&stdout_tx).await;
+                    rx.clone()
+                } else {
+                    enable_raw_mode()?;
+                    let (kb_tx, kb_rx) = channel::<Vec<u8>>(64);
+                    let _stdin_thread = thread::spawn(move || {
+                        let mut buf = [0u8; 4096];
+                        loop {
+                            match stdin().read(&mut buf) {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => {
+                                    if kb_tx.blocking_send(buf[..n].to_vec()).is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    });
+                    let shared = Arc::new(Mutex::new(kb_rx));
+                    kb_rx_shared = Some(shared.clone());
+                    shared
+                };
+
+                run_udp_session(kex, udp_arc, kb_rx, stdout_tx.clone()).await?;
+                // Session dropped — show the reconnecting banner while we retry.
+                show_reconnect_banner(&stdout_tx).await;
+                time::sleep(Duration::from_millis(500)).await;
+            }
+            Err(e) => {
+                reconnect_attempt = reconnect_attempt.saturating_add(1);
+                error!("Failed to connect to {socket_addr}: {e}, retrying in {backoff:?}");
+                countdown_reconnect_banner(
+                    &stdout_tx,
+                    backoff.as_secs(),
+                    reconnect_attempt,
+                    max_backoff.as_secs(),
+                )
+                .await;
+                backoff = (backoff * 2).min(max_backoff);
+            }
+        }
+    }
+}
+
+/// Connect via TCP, run the key exchange, and persist the session UUID.
+async fn connect_and_kex(
+    config: &mut Config,
+    socket_addr: SocketAddr,
+    server_ip: &str,
+    server_port: u16,
+    pass_cache: &Arc<std::sync::Mutex<PassCache>>,
+) -> Result<(Kex, Arc<UdpSocket>)> {
+    // Refresh resume UUID from disk (may have been updated by previous connection).
+    let _ = config.set_resume_session_uuid(read_session_uuid(server_ip, server_port));
+
     let socket = TcpStream::connect(socket_addr).await?;
-    let remote_addr = socket.peer_addr()?;
-    info!("Connected to server at {remote_addr}");
+    info!("Connected to {}", socket.peer_addr()?);
+
+    let cache = pass_cache.clone();
+    let pass_fn = move || -> Result<Option<String>> {
+        let guard = cache.lock().unwrap();
+        if guard.is_cached() {
+            return Ok(guard.passphrase());
+        }
+        drop(guard);
+        let result = read_passpharase();
+        if let Ok(ref pass) = result {
+            *cache.lock().unwrap() = match pass {
+                Some(s) => PassCache::Passphrase(s.clone()),
+                None => PassCache::NoPassphrase,
+            };
+        }
+        result
+    };
+
     let (sock_read, sock_write) = socket.into_split();
+    let (kex, udp_arc, _) =
+        run_key_exchange(config.clone(), sock_read, sock_write, pass_fn).await?;
 
-    // Run the key exchange
-    let (kex, udp_arc, _skex_opt) =
-        run_key_exchange(config, sock_read, sock_write, read_passpharase).await?;
-
-    // Persist (or update) the session token for future reconnects
     if let Some(session_uuid) = kex.session_uuid() {
-        if let Err(e) = write_session_uuid(&server_ip, server_port, session_uuid) {
+        if let Err(e) = write_session_uuid(server_ip, server_port, session_uuid) {
             trace!("Failed to write session file: {e}");
         }
         if kex.is_resume() {
@@ -99,26 +281,34 @@ where
             info!("New session {session_uuid} started");
         }
     }
-    info!("Key exchange completed with moshpits");
+    Ok((kex, udp_arc))
+}
 
-    // Setup the cancellation token
+/// Set up UDP tasks for one session and wait until the server disconnects.
+async fn run_udp_session(
+    kex: Kex,
+    udp_arc: Arc<UdpSocket>,
+    kb_rx: Arc<Mutex<Receiver<Vec<u8>>>>,
+    stdout_tx: Sender<Vec<u8>>,
+) -> Result<()> {
+    let (reconnect_tx, mut reconnect_rx) = channel::<()>(1);
     let token = CancellationToken::new();
-
-    let udp_recv = udp_arc.clone();
-    let udp_send = udp_arc.clone();
     let (tx, rx) = channel::<EncryptedFrame>(256);
     let (retransmit_tx, retransmit_rx) = channel::<Vec<u64>>(64);
+
     let mut udp_reader = UdpReader::builder()
-        .socket(udp_recv)
+        .socket(udp_arc.clone())
         .id(kex.uuid())
         .hmac(kex.hmac_key())
-        .rnk(kex.key())
-        .unwrap()
+        .rnk(kex.key())?
         .nak_out_tx(tx.clone())
         .retransmit_tx(retransmit_tx)
+        .silence_timeout(Duration::from_secs(15))
+        .reconnect_tx(reconnect_tx)
         .build();
+
     let mut udp_sender = UdpSender::builder()
-        .socket(udp_send)
+        .socket(udp_arc)
         .rx(rx)
         .retransmit_rx(retransmit_rx)
         .id(kex.uuid())
@@ -127,26 +317,47 @@ where
         .build();
 
     let sender_token = token.clone();
-    let _udp_handle = spawn(async move { udp_sender.frame_loop(sender_token).await });
+    let _sender = spawn(async move { udp_sender.frame_loop(sender_token).await });
 
-    let (columns, rows) = terminal_size().map_or((80, 24), |(width, height)| (width.0, height.0));
-    tx.send(EncryptedFrame::Resize((kex.uuid_wrapper(), columns, rows)))
+    let (cols, rows) = terminal_size().map_or((80, 24), |(w, h)| (w.0, h.0));
+    tx.send(EncryptedFrame::Resize((kex.uuid_wrapper(), cols, rows)))
         .await?;
 
-    let (stdout_tx, stdout_rx) = channel::<Vec<u8>>(256);
-
-    let stdout_tx_c = stdout_tx.clone();
     let reader_token = token.clone();
-    let _udp_reader_handle = spawn(async move {
-        udp_reader
-            .client_frame_loop(reader_token, stdout_tx_c)
-            .await;
-    });
+    let _reader = spawn(async move { udp_reader.client_frame_loop(reader_token, stdout_tx).await });
 
     spawn_resize_handler(tx.clone(), kex.uuid_wrapper(), token.clone());
 
-    let kex_io = kex;
-    spawn_blocking(move || handle_io(stdout_rx, &tx, kex_io)).await??;
+    // Stdin forwarder: holds the shared kb_rx mutex for this session's lifetime.
+    let fwd_token = token.clone();
+    let session_tx = tx;
+    let uuid_wrapper = kex.uuid_wrapper();
+    let _forwarder = spawn(async move {
+        let mut rx = kb_rx.lock().await;
+        loop {
+            select! {
+                () = fwd_token.cancelled() => break,
+                data = rx.recv() => match data {
+                    Some(data) => {
+                        if session_tx
+                            .send(EncryptedFrame::Bytes((uuid_wrapper, data)))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    None => break,
+                },
+            }
+        }
+    });
+
+    // Wait for reconnect signal; `process::exit` handles all clean exits.
+    let _ = reconnect_rx.recv().await;
+    token.cancel();
+    // Allow the stdin forwarder to release the kb_rx mutex before the next session.
+    time::sleep(Duration::from_millis(150)).await;
     Ok(())
 }
 
@@ -208,41 +419,6 @@ fn spawn_resize_handler(
             }
         }
     });
-}
-
-fn handle_io(
-    mut stdout_rx: Receiver<Vec<u8>>,
-    tx: &Sender<EncryptedFrame>,
-    kex: Kex,
-) -> Result<()> {
-    enable_raw_mode()?;
-
-    let _stdout_handle = thread::spawn(move || {
-        let mut stdout = stdout();
-
-        while let Some(msg) = stdout_rx.blocking_recv() {
-            if let Err(e) = stdout.write_all(&msg) {
-                error!("Error writing to stdout: {e}");
-            }
-            if let Err(e) = stdout.flush() {
-                error!("Error flushing stdout: {e}");
-            }
-        }
-    });
-
-    let mut stdin = stdin();
-    loop {
-        let mut buf = [0u8; 4096];
-        let len = stdin.read(&mut buf)?;
-        if len > 0 {
-            let msg = &buf[..len];
-            if let Err(e) =
-                tx.blocking_send(EncryptedFrame::Bytes((kex.uuid_wrapper(), msg.to_vec())))
-            {
-                error!("{e}");
-            }
-        }
-    }
 }
 
 fn maybe_generate_keypair(config: &Config) -> Result<()> {
@@ -346,7 +522,105 @@ fn read_passpharase() -> Result<Option<String>> {
         .map_err(Into::into)
 }
 
-/// Returns the path `~/.mp/sessions/<host>_<port>` for session UUID persistence.
+/// Returns a sanitized string identifying the current terminal, used to give each
+/// terminal window its own independent session slot.
+///
+/// Resolves the stdin file descriptor to its TTY device path and sanitizes it for
+/// use as a filename component (e.g. `/dev/pts/3` → `dev_pts_3`).  Returns `None`
+/// when stdin is not a TTY (piped/scripted invocations).
+#[cfg(unix)]
+fn tty_id() -> Option<String> {
+    use std::io::IsTerminal as _;
+    if !stdin().is_terminal() {
+        return None;
+    }
+    // Linux exposes a symlink at /proc/self/fd/0 → the actual TTY device.
+    // Other Unix systems expose the same information at /dev/fd/0.
+    #[cfg(target_os = "linux")]
+    let link = std::fs::read_link("/proc/self/fd/0").ok()?;
+    #[cfg(not(target_os = "linux"))]
+    let link = std::fs::read_link("/dev/fd/0").ok()?;
+    let raw = link.to_string_lossy();
+    // Strip the leading slash and replace non-alphanumeric chars with '_'.
+    let sanitized: String = raw
+        .trim_start_matches('/')
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        None
+    } else {
+        Some(sanitized)
+    }
+}
+
+/// Windows equivalent: `GetConsoleWindow()` returns the HWND of the console
+/// window associated with the calling process.  Like the TTY device path on
+/// Unix, the HWND is:
+/// - unique per console window (cmd.exe window, Windows Terminal tab, etc.)
+/// - stable across process restarts within the same window
+/// - different between simultaneously open windows
+#[cfg(windows)]
+fn tty_id() -> Option<String> {
+    use std::io::IsTerminal as _;
+    if !stdin().is_terminal() {
+        return None;
+    }
+    // Call Win32 GetConsoleWindow() via raw FFI — no extra crate required.
+    extern "system" {
+        fn GetConsoleWindow() -> *mut std::ffi::c_void;
+    }
+    let hwnd = unsafe { GetConsoleWindow() };
+    if hwnd.is_null() {
+        None
+    } else {
+        Some(format!("{hwnd:x}"))
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn tty_id() -> Option<String> {
+    None
+}
+
+/// Returns (or creates) a stable random UUID that uniquely identifies this client
+/// installation.  Written once to `~/.mp/client_id` and reused on every subsequent
+/// run, so the session file for a given server can always be found regardless of the
+/// current process PID.
+fn client_id() -> Option<Uuid> {
+    let path = dirs2::home_dir()?.join(".mp").join("client_id");
+    if let Ok(mut f) = std::fs::File::open(&path) {
+        let mut buf = String::new();
+        drop(f.read_to_string(&mut buf));
+        if let Ok(uuid) = buf.trim().parse::<Uuid>() {
+            return Some(uuid);
+        }
+    }
+    // First run: generate a new client ID and persist it.
+    let id = Uuid::new_v4();
+    if let Some(parent) = path.parent() {
+        drop(std::fs::create_dir_all(parent));
+    }
+    if let Ok(mut f) = std::fs::File::create(&path) {
+        drop(write!(f, "{id}"));
+    }
+    Some(id)
+}
+
+/// Returns the path `~/.mp/sessions/<client_id>_<host>_<port>[_<tty_id>]` for
+/// session UUID persistence.
+///
+/// When stdin is a TTY the filename includes a sanitized TTY identifier (e.g.
+/// `dev_pts_3`), giving each terminal window its own independent session slot.
+/// Restarting after a crash in the same window reuses the same slot, enabling
+/// transparent resume.  When stdin is not a TTY the TTY suffix is omitted and
+/// the connection falls back to last-connect-wins semantics.
 fn session_file_path(host: &str, port: u16) -> Option<PathBuf> {
     let home = dirs2::home_dir()?;
     // Sanitize host so it is safe as a file-name component.
@@ -360,11 +634,12 @@ fn session_file_path(host: &str, port: u16) -> Option<PathBuf> {
             }
         })
         .collect();
-    Some(
-        home.join(".mp")
-            .join("sessions")
-            .join(format!("{safe_host}_{port}")),
-    )
+    let cid = client_id()?;
+    let name = match tty_id() {
+        Some(tty) => format!("{cid}_{safe_host}_{port}_{tty}"),
+        None => format!("{cid}_{safe_host}_{port}"),
+    };
+    Some(home.join(".mp").join("sessions").join(name))
 }
 
 /// Read a persisted session UUID from disk, if any.

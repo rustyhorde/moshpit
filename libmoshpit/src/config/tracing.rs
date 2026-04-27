@@ -49,7 +49,6 @@ pub struct Layer {
 }
 
 /// Tracing configuration
-#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, CopyGetters, Debug, Default, Deserialize, Eq, PartialEq, Serialize, Setters)]
 pub struct FileLayer {
     /// quiet level

@@ -13,6 +13,7 @@ use config::{Config, Environment, File, FileFormat, Source};
 use dirs2::config_dir;
 use serde::Deserialize;
 use tokio::sync::Mutex;
+use uuid::Uuid;
 
 use crate::{KexMode, error::Error, session::SessionRegistry, to_path_buf};
 
@@ -57,7 +58,7 @@ pub trait KexConfig {
     }
     /// The session UUID to attempt resuming, only relevant for client mode.
     /// Returns `None` by default; client implementations override this.
-    fn resume_session_uuid(&self) -> Option<uuid::Uuid> {
+    fn resume_session_uuid(&self) -> Option<Uuid> {
         None
     }
 }

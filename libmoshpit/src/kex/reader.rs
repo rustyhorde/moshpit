@@ -189,7 +189,9 @@ impl KexReader {
             return Err(MoshpitError::InvalidFrame.into());
         }
 
-        // Determine session UUID: reuse existing session if user matches, else create new
+        // Determine session UUID: reuse the requested session if user matches,
+        // else create new.  Any live connection on the same session will be
+        // displaced by `resolve_session` when it cancels the old conn_token.
         let (session_uuid, is_resume) = match (requested_session_uuid_opt, &session_registry) {
             (Some(req_uuid), Some(registry)) => {
                 let reg = registry.lock().await;
