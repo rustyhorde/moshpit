@@ -99,10 +99,8 @@ fn shell_name(shell: Shell) -> &'static str {
 fn generate_man_page(cmd: &Command, out_dir: &Path) -> Result<()> {
     let man = Man::new(cmd.clone());
     let file_name = format!("{}.1", cmd.get_name());
-    let mut file =
-        fs::File::create(out_dir.join(&file_name)).with_context(|| {
-            format!("failed to create man page file {file_name}")
-        })?;
+    let mut file = fs::File::create(out_dir.join(&file_name))
+        .with_context(|| format!("failed to create man page file {file_name}"))?;
     man.render(&mut file)
         .with_context(|| format!("failed to render man page {file_name}"))?;
     Ok(())
@@ -169,8 +167,7 @@ fn mp_keygen_command() -> Command {
         .arg(verbose_arg())
         .arg(quiet_arg())
         .subcommand(
-            Command::new("generate")
-                .about("Generate a new ed25519 public/private key pair"),
+            Command::new("generate").about("Generate a new ed25519 public/private key pair"),
         )
         .subcommand(
             Command::new("verify")
