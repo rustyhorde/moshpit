@@ -60,7 +60,7 @@ need_stdout = true
 [jobs.nextest]
 command = [
     "cargo", "nextest", "run", "-p", "libmoshpit",
-    "--hide-progress-bar", "--failure-output", "final"
+    "--show-progress", "none", "--failure-output", "final"
 ]
 need_stdout = true
 analyzer = "nextest"

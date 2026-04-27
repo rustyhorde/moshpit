@@ -294,7 +294,7 @@ async fn run_udp_session(
     let (reconnect_tx, mut reconnect_rx) = channel::<()>(1);
     let token = CancellationToken::new();
     let (tx, rx) = channel::<EncryptedFrame>(256);
-    let (retransmit_tx, retransmit_rx) = channel::<Vec<u64>>(64);
+    let (retransmit_tx, retransmit_rx) = channel::<Vec<u64>>(512);
 
     let mut udp_reader = UdpReader::builder()
         .socket(udp_arc.clone())

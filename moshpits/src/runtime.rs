@@ -374,7 +374,7 @@ async fn handle_connection(
     let udp_port = udp_arc.local_addr()?.port();
 
     let (tx, rx) = channel::<EncryptedFrame>(256);
-    let (retransmit_tx, retransmit_rx) = channel::<Vec<u64>>(64);
+    let (retransmit_tx, retransmit_rx) = channel::<Vec<u64>>(512);
     let udp_recv = udp_arc.clone();
     let udp_send = udp_arc.clone();
 

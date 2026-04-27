@@ -67,7 +67,25 @@ impl UdpSender {
         let mut retransmit_active = true;
         loop {
             select! {
+                // Biased ordering: always service retransmit requests before queuing new
+                // outgoing frames.  Without this, Tokio's random fairness means retransmit
+                // requests are starved when the outgoing-frame channel is continuously ready
+                // (heavy PTY output), causing the retransmit channel to back up and overflow.
+                biased;
                 () = token.cancelled() => break,
+                seqs = self.retransmit_rx.recv(), if retransmit_active => {
+                    match seqs {
+                        Some(seqs) => {
+                            for seq in seqs {
+                                if let Some(wire) = self.retransmit_buffer.get(&seq) {
+                                    let wire = wire.clone();
+                                    let _bytes_sent = self.socket.send(&wire).await?;
+                                }
+                            }
+                        }
+                        None => retransmit_active = false,
+                    }
+                },
                 frame_opt = self.rx.recv() => {
                     match frame_opt {
                         Some(frame) => {
@@ -83,19 +101,6 @@ impl UdpSender {
                         None => break,
                     }
                 },
-                seqs = self.retransmit_rx.recv(), if retransmit_active => {
-                    match seqs {
-                        Some(seqs) => {
-                            for seq in seqs {
-                                if let Some(wire) = self.retransmit_buffer.get(&seq) {
-                                    let wire = wire.clone();
-                                    let _bytes_sent = self.socket.send(&wire).await?;
-                                }
-                            }
-                        }
-                        None => retransmit_active = false,
-                    }
-                }
             }
         }
         Ok(())
