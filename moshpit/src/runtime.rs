@@ -6,172 +6,659 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-use std::{ffi::OsString, io::stdin, net::SocketAddr, sync::Arc};
+use std::{
+    ffi::OsString,
+    fs::{DirBuilder, OpenOptions},
+    io::{Read as _, Write as _, stdin, stdout},
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    sync::Arc,
+    thread,
+    time::Duration,
+};
+
+#[cfg(target_family = "unix")]
+use std::os::unix::fs::DirBuilderExt;
 
 use anyhow::{Context as _, Result};
-use aws_lc_rs::{
-    agreement::{EphemeralPrivateKey, X25519},
-    rand::SystemRandom,
-};
 use clap::Parser as _;
+use crossterm::terminal::enable_raw_mode;
+use dialoguer::{Confirm, Password};
 use libmoshpit::{
-    ConnectionReader, ConnectionWriter, Frame, MoshpitError, UdpState, init_tracing, load,
+    EncryptedFrame, Kex, KexConfig as _, KeyPair, MoshpitError, UdpReader, UdpSender, UuidWrapper,
+    init_tracing, load, parse_server_destination, run_key_exchange,
 };
+use terminal_size::terminal_size;
+#[cfg(unix)]
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::{
     net::{TcpStream, UdpSocket},
-    spawn,
-    sync::mpsc::unbounded_channel,
+    select, spawn,
+    sync::{
+        Mutex,
+        mpsc::{Receiver, Sender, channel},
+    },
+    time,
 };
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, trace};
 use uuid::Uuid;
 
-use crate::{
-    cli::Cli,
-    config::Config,
-    tcp::{reader::FrameReader, sender::FrameSender},
-    udp::{reader::UdpReader, sender::UdpSender},
-};
+use crate::{cli::Cli, config::Config};
 
 pub(crate) async fn run<I, T>(args: Option<I>) -> Result<()>
 where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
-    // Parse the command line
     let cli = if let Some(args) = args {
         Cli::try_parse_from(args)?
     } else {
         Cli::try_parse()?
     };
-
-    // Load the configuration
-    let config = load::<Cli, Config, Cli>(&cli, &cli).with_context(|| MoshpitError::ConfigLoad)?;
-
-    // Initialize tracing
+    let mut config =
+        load::<Cli, Config, Cli>(&cli, &cli).with_context(|| MoshpitError::ConfigLoad)?;
     init_tracing(&config, config.tracing().file(), &cli, None)
         .with_context(|| MoshpitError::TracingInit)?;
+    maybe_generate_keypair(&config)?;
 
-    trace!("Configuration loaded");
-    trace!("Tracing initialized");
+    let (user, socket_addr) =
+        parse_server_destination(config.server_destination(), config.server_port())?;
+    let server_ip = socket_addr.ip().to_string();
+    let server_port = config.server_port();
+    let _ = config.set_user(user);
 
-    // Setup the TCP connection to the server for key exchange
-    let socket_addr = config
-        .server_ip()
-        .parse::<SocketAddr>()
-        .with_context(|| MoshpitError::InvalidServerAddress)?;
+    run_session_loop(config, socket_addr, server_ip, server_port).await
+}
 
-    let (key_bytes, hmac_key_bytes, uuid) = run_key_exchange(&socket_addr).await?;
+/// Cached passphrase state, avoiding re-prompting across reconnects.
+#[derive(Debug)]
+enum PassCache {
+    /// Not yet prompted.
+    Uncached,
+    /// Prompted; key is unencrypted — no passphrase needed.
+    NoPassphrase,
+    /// Prompted; encrypted key passphrase.
+    Passphrase(String),
+}
 
-    let udp_listener = UdpSocket::bind("127.0.0.1:0").await?;
-    udp_listener.connect(socket_addr).await?;
-    let udp_recv = Arc::new(udp_listener);
-    let udp_send = udp_recv.clone();
-    let (tx, rx) = unbounded_channel::<Vec<u8>>();
-    let mut udp_reader = UdpReader::builder().socket(udp_recv).build();
-    let mut udp_sender = UdpSender::builder()
-        .socket(udp_send)
-        .rx(rx)
-        .id(uuid)
-        .hmac(hmac_key_bytes)
-        .rnk(key_bytes)?
-        .build();
+impl PassCache {
+    /// Returns `true` when a cached answer is available.
+    fn is_cached(&self) -> bool {
+        !matches!(self, Self::Uncached)
+    }
 
-    let _udp_handle = spawn(async move {
-        if let Err(e) = udp_sender.handle_send().await {
-            error!("udp sender error {e}");
+    /// Returns the cached passphrase.  `None` means the key is unencrypted.
+    ///
+    /// Panics if called while `Uncached`.
+    fn passphrase(&self) -> Option<String> {
+        match self {
+            Self::Uncached => unreachable!("passphrase() called before caching"),
+            Self::NoPassphrase => None,
+            Self::Passphrase(s) => Some(s.clone()),
+        }
+    }
+}
+
+/// Show a mosh-style reconnecting banner at the top of the terminal.
+///
+/// The banner is white-on-blue, occupies the entire first row, and is
+/// rendered by writing raw ANSI escape sequences through the same stdout
+/// channel used for normal terminal output.
+async fn show_reconnect_banner(stdout_tx: &Sender<Vec<u8>>) {
+    // ESC[s          – save cursor position
+    // ESC[1;1H       – move to row 1, col 1
+    // ESC[44;97;1m   – blue background, bright-white bold text
+    // ESC[K          – erase to end of line (fills line with blue)
+    // ESC[0m         – reset attributes
+    // ESC[u          – restore cursor position
+    let msg = b"\x1b[s\x1b[1;1H\x1b[44;97;1m [moshpit] server unreachable, reconnecting... \x1b[K\x1b[0m\x1b[u";
+    drop(stdout_tx.send(msg.to_vec()).await);
+}
+
+/// Clear the reconnecting banner and restore the first row to normal.
+async fn clear_reconnect_banner(stdout_tx: &Sender<Vec<u8>>) {
+    // Reset attributes first so the erase uses the default background.
+    let msg = b"\x1b[s\x1b[1;1H\x1b[0m\x1b[K\x1b[u";
+    drop(stdout_tx.send(msg.to_vec()).await);
+}
+
+/// Redraw the banner once per second, counting down from `total_secs` to 0.
+async fn countdown_reconnect_banner(
+    stdout_tx: &Sender<Vec<u8>>,
+    total_secs: u64,
+    attempt: u32,
+    max_backoff_secs: u64,
+) {
+    for remaining in (0..=total_secs).rev() {
+        let msg = format!(
+            "\x1b[s\x1b[1;1H\x1b[44;97;1m [moshpit] server unreachable, reconnecting \
+(attempt #{attempt}, {remaining}s, max {max_backoff_secs}s)... \x1b[K\x1b[0m\x1b[u"
+        );
+        drop(stdout_tx.send(msg.into_bytes()).await);
+        if remaining > 0 {
+            time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+}
+
+/// Persistent reconnect loop.  Runs until the shell exits (via `process::exit`).
+async fn run_session_loop(
+    config: Config,
+    socket_addr: SocketAddr,
+    server_ip: String,
+    server_port: u16,
+) -> Result<()> {
+    // Clamp to [2 s, 24 h].
+    let max_backoff = Duration::from_secs(config.max_reconnect_backoff_secs().clamp(2, 86_400));
+
+    // Persistent stdout writer — survives reconnects.
+    let (stdout_tx, mut stdout_rx) = channel::<Vec<u8>>(256);
+    let _stdout_thread = thread::spawn(move || {
+        let mut out = stdout();
+        while let Some(msg) = stdout_rx.blocking_recv() {
+            drop(out.write_all(&msg));
+            drop(out.flush());
         }
     });
 
-    let _udp_reader_handle = spawn(async move {
-        if let Err(e) = udp_reader.handle_read().await {
-            error!("udp reader error {e}");
-        }
-    });
+    // Passphrase cache: avoids re-prompting on reconnect.
+    let pass_cache: Arc<std::sync::Mutex<PassCache>> =
+        Arc::new(std::sync::Mutex::new(PassCache::Uncached));
 
-    tx.send(b"Hello, world!".to_vec())?;
+    let mut config = config;
+    let mut backoff = Duration::from_secs(2);
+    let mut reconnect_attempt: u32 = 0;
+    // Stdin reader is started once, after the first successful kex (so that raw
+    // mode is not active while dialoguer reads the passphrase).
+    let mut kb_rx_shared: Option<Arc<Mutex<Receiver<Vec<u8>>>>> = None;
 
     loop {
-        let mut input = String::new();
-        match stdin().read_line(&mut input) {
-            Ok(_n) => {
-                tx.send(input.into_bytes())?;
+        match connect_and_kex(
+            &mut config,
+            socket_addr,
+            &server_ip,
+            server_port,
+            &pass_cache,
+        )
+        .await
+        {
+            Ok((kex, udp_arc)) => {
+                backoff = Duration::from_secs(2);
+
+                // Enable raw mode and start the stdin reader on the first
+                // successful kex.  By this point the passphrase has been
+                // collected and cached, so raw mode won't interfere with it
+                // on reconnects.
+                let kb_rx = if let Some(ref rx) = kb_rx_shared {
+                    // This is a reconnect — clear the banner before the session starts.
+                    clear_reconnect_banner(&stdout_tx).await;
+                    rx.clone()
+                } else {
+                    enable_raw_mode()?;
+                    let (kb_tx, kb_rx) = channel::<Vec<u8>>(64);
+                    let _stdin_thread = thread::spawn(move || {
+                        let mut buf = [0u8; 4096];
+                        loop {
+                            match stdin().read(&mut buf) {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => {
+                                    if kb_tx.blocking_send(buf[..n].to_vec()).is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    });
+                    let shared = Arc::new(Mutex::new(kb_rx));
+                    kb_rx_shared = Some(shared.clone());
+                    shared
+                };
+
+                run_udp_session(kex, udp_arc, kb_rx, stdout_tx.clone()).await?;
+                // Session dropped — show the reconnecting banner while we retry.
+                show_reconnect_banner(&stdout_tx).await;
+                time::sleep(Duration::from_millis(500)).await;
             }
-            Err(error) => {
-                println!("error: {error}");
-                break;
+            Err(e) => {
+                reconnect_attempt = reconnect_attempt.saturating_add(1);
+                error!("Failed to connect to {socket_addr}: {e}, retrying in {backoff:?}");
+                countdown_reconnect_banner(
+                    &stdout_tx,
+                    backoff.as_secs(),
+                    reconnect_attempt,
+                    max_backoff.as_secs(),
+                )
+                .await;
+                backoff = (backoff * 2).min(max_backoff);
             }
         }
     }
+}
+
+/// Connect via TCP, run the key exchange, and persist the session UUID.
+async fn connect_and_kex(
+    config: &mut Config,
+    socket_addr: SocketAddr,
+    server_ip: &str,
+    server_port: u16,
+    pass_cache: &Arc<std::sync::Mutex<PassCache>>,
+) -> Result<(Kex, Arc<UdpSocket>)> {
+    // Refresh resume UUID from disk (may have been updated by previous connection).
+    let _ = config.set_resume_session_uuid(read_session_uuid(server_ip, server_port));
+
+    let socket = TcpStream::connect(socket_addr).await?;
+    info!("Connected to {}", socket.peer_addr()?);
+
+    let cache = pass_cache.clone();
+    let pass_fn = move || -> Result<Option<String>> {
+        let guard = cache.lock().unwrap();
+        if guard.is_cached() {
+            return Ok(guard.passphrase());
+        }
+        drop(guard);
+        let result = read_passpharase();
+        if let Ok(ref pass) = result {
+            *cache.lock().unwrap() = match pass {
+                Some(s) => PassCache::Passphrase(s.clone()),
+                None => PassCache::NoPassphrase,
+            };
+        }
+        result
+    };
+
+    let (sock_read, sock_write) = socket.into_split();
+    let (kex, udp_arc, _) =
+        run_key_exchange(config.clone(), sock_read, sock_write, pass_fn).await?;
+
+    if let Some(session_uuid) = kex.session_uuid() {
+        if let Err(e) = write_session_uuid(server_ip, server_port, session_uuid) {
+            trace!("Failed to write session file: {e}");
+        }
+        if kex.is_resume() {
+            info!("Session {session_uuid} resumed");
+        } else {
+            info!("New session {session_uuid} started");
+        }
+    }
+    Ok((kex, udp_arc))
+}
+
+/// Set up UDP tasks for one session and wait until the server disconnects.
+async fn run_udp_session(
+    kex: Kex,
+    udp_arc: Arc<UdpSocket>,
+    kb_rx: Arc<Mutex<Receiver<Vec<u8>>>>,
+    stdout_tx: Sender<Vec<u8>>,
+) -> Result<()> {
+    let (reconnect_tx, mut reconnect_rx) = channel::<()>(1);
+    let token = CancellationToken::new();
+    let (tx, rx) = channel::<EncryptedFrame>(256);
+    let (retransmit_tx, retransmit_rx) = channel::<Vec<u64>>(512);
+
+    let mut udp_reader = UdpReader::builder()
+        .socket(udp_arc.clone())
+        .id(kex.uuid())
+        .hmac(kex.hmac_key())
+        .rnk(kex.key())?
+        .nak_out_tx(tx.clone())
+        .retransmit_tx(retransmit_tx)
+        .silence_timeout(Duration::from_secs(15))
+        .reconnect_tx(reconnect_tx)
+        .build();
+
+    let mut udp_sender = UdpSender::builder()
+        .socket(udp_arc)
+        .rx(rx)
+        .retransmit_rx(retransmit_rx)
+        .id(kex.uuid())
+        .hmac(kex.hmac_key())
+        .rnk(kex.key())?
+        .build();
+
+    let sender_token = token.clone();
+    let _sender = spawn(async move { udp_sender.frame_loop(sender_token).await });
+
+    let (cols, rows) = terminal_size().map_or((80, 24), |(w, h)| (w.0, h.0));
+    tx.send(EncryptedFrame::Resize((kex.uuid_wrapper(), cols, rows)))
+        .await?;
+
+    let reader_token = token.clone();
+    let _reader = spawn(async move { udp_reader.client_frame_loop(reader_token, stdout_tx).await });
+
+    spawn_resize_handler(tx.clone(), kex.uuid_wrapper(), token.clone());
+
+    // Stdin forwarder: holds the shared kb_rx mutex for this session's lifetime.
+    let fwd_token = token.clone();
+    let session_tx = tx;
+    let uuid_wrapper = kex.uuid_wrapper();
+    let _forwarder = spawn(async move {
+        let mut rx = kb_rx.lock().await;
+        loop {
+            select! {
+                () = fwd_token.cancelled() => break,
+                data = rx.recv() => match data {
+                    Some(data) => {
+                        if session_tx
+                            .send(EncryptedFrame::Bytes((uuid_wrapper, data)))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    None => break,
+                },
+            }
+        }
+    });
+
+    // Wait for reconnect signal; `process::exit` handles all clean exits.
+    let _ = reconnect_rx.recv().await;
+    token.cancel();
+    // Allow the stdin forwarder to release the kb_rx mutex before the next session.
+    time::sleep(Duration::from_millis(150)).await;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn spawn_resize_handler(
+    resize_tx: Sender<EncryptedFrame>,
+    resize_uuid: UuidWrapper,
+    resize_token: CancellationToken,
+) {
+    let _resize_handle = spawn(async move {
+        match signal(SignalKind::window_change()) {
+            Ok(mut sigwinch) => loop {
+                tokio::select! {
+                    () = resize_token.cancelled() => break,
+                    _ = sigwinch.recv() => {
+                        let (columns, rows) = terminal_size()
+                            .map_or((80, 24), |(width, height)| (width.0, height.0));
+                        if let Err(e) =
+                            resize_tx.send(EncryptedFrame::Resize((resize_uuid, columns, rows))).await
+                        {
+                            error!("Failed to send resize frame: {e}");
+                            break;
+                        }
+                    }
+                }
+            },
+            Err(e) => error!("Failed to register SIGWINCH handler: {e}"),
+        }
+    });
+}
+
+// On Windows there is no SIGWINCH.  Instead, poll GetConsoleScreenBufferInfo
+// (via terminal_size) every 250 ms and send a Resize frame whenever the
+// dimensions change.  This avoids touching the console input buffer so it
+// does not conflict with the stdin reader below.
+#[cfg(windows)]
+fn spawn_resize_handler(
+    resize_tx: Sender<EncryptedFrame>,
+    resize_uuid: UuidWrapper,
+    resize_token: CancellationToken,
+) {
+    let _resize_handle = thread::spawn(move || {
+        let mut last_size = terminal_size().map_or((80, 24), |(w, h)| (w.0, h.0));
+        loop {
+            if resize_token.is_cancelled() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(250));
+            let current_size = terminal_size().map_or(last_size, |(w, h)| (w.0, h.0));
+            if current_size != last_size {
+                last_size = current_size;
+                let (columns, rows) = current_size;
+                if let Err(e) =
+                    resize_tx.blocking_send(EncryptedFrame::Resize((resize_uuid, columns, rows)))
+                {
+                    error!("Failed to send resize frame: {e}");
+                    break;
+                }
+            }
+        }
+    });
+}
+
+fn maybe_generate_keypair(config: &Config) -> Result<()> {
+    let (priv_key_path, pub_key_path) = config.key_pair_paths()?;
+    if priv_key_path.try_exists()? && pub_key_path.try_exists()? {
+        return Ok(());
+    }
+
+    println!("No keypair found at the configured location.");
+    println!("  Private key: {}", priv_key_path.display());
+    println!("  Public key:  {}", pub_key_path.display());
+
+    let generate = Confirm::new()
+        .with_prompt("Generate a new keypair now?")
+        .default(true)
+        .wait_for_newline(true)
+        .interact()?;
+
+    if !generate {
+        return Ok(());
+    }
+
+    // Create the parent directory for the private key if needed
+    if let Some(parent) = priv_key_path.parent() {
+        create_key_dir(parent)?;
+    }
+
+    // Optionally protect the private key with a passphrase
+    let passphrase: String = Password::new()
+        .with_prompt(format!(
+            "Enter passphrase for \"{}\" (empty for no passphrase)",
+            priv_key_path.display()
+        ))
+        .with_confirmation(
+            "Enter same passphrase again",
+            "Passphrases do not match. Try again.",
+        )
+        .allow_empty_password(true)
+        .report(false)
+        .interact()?;
+    let passphrase_opt = if passphrase.is_empty() {
+        None
+    } else {
+        Some(passphrase)
+    };
+
+    let keypair = KeyPair::generate_key_pair(passphrase_opt.as_ref())?;
+
+    let mut priv_key_file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&priv_key_path)?;
+    keypair.write_private_key(&mut priv_key_file)?;
+
+    let mut pub_key_file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&pub_key_path)?;
+    keypair.write_public_key(&mut pub_key_file)?;
+
+    println!(
+        "Your identification has been saved in {}",
+        priv_key_path.display()
+    );
+    println!(
+        "Your public key has been saved in {}",
+        pub_key_path.display()
+    );
+    println!("The key fingerprint is:");
+    println!("{}", keypair.fingerprint()?);
+    println!("The key's randomart image is:");
+    print!("{}", keypair.randomart());
 
     Ok(())
 }
 
-async fn run_key_exchange(socket_addr: &SocketAddr) -> Result<([u8; 32], [u8; 64], Uuid)> {
-    // Setup the TCP connection to the server for key exchange
-    let socket = TcpStream::connect(socket_addr).await?;
-    let (sock_read, sock_write) = socket.into_split();
-    let reader = ConnectionReader::builder().reader(sock_read).build();
-    let writer = ConnectionWriter::builder().writer(sock_write).build();
-    let (tx, rx) = unbounded_channel();
-    let (tx_udp_state, mut rx_udp_state) = unbounded_channel::<UdpState>();
-    info!("Connected to the server!");
+#[cfg(target_family = "unix")]
+fn create_key_dir(path: &Path) -> Result<()> {
+    DirBuilder::new().mode(0o700).recursive(true).create(path)?;
+    Ok(())
+}
 
-    // Generate ephemeral X25519 key pair
-    let rng = SystemRandom::new();
-    let pk = EphemeralPrivateKey::generate(&X25519, &rng)?;
-    let my_public_key = pk.compute_public_key()?;
-    trace!("Generated ephemeral X25519 key pair");
+#[cfg(not(target_family = "unix"))]
+fn create_key_dir(path: &Path) -> Result<()> {
+    DirBuilder::new().recursive(true).create(path)?;
+    Ok(())
+}
 
-    // Setup the TCP frame reader
-    let tx_c = tx.clone();
-    let tx_udp_state_c = tx_udp_state.clone();
-    let _read_handle = spawn(async move {
-        let mut frame_reader = FrameReader::builder()
-            .reader(reader)
-            .tx(tx_c)
-            .tx_udp(tx_udp_state_c)
-            .build();
-        if let Err(e) = frame_reader.handle_connection(pk).await {
-            error!("mps frame reader: {e}");
-        }
-    });
-    trace!("Spawned TCP frame reader task");
+fn read_passpharase() -> Result<Option<String>> {
+    Password::new()
+        .with_prompt("Please enter your private key passphrase")
+        .with_confirmation(
+            "Confirm the passphrase",
+            "The entered passphrases do not match",
+        )
+        .report(false)
+        .interact()
+        .map(Some)
+        .map_err(Into::into)
+}
 
-    // Setup the TCP frame sender
-    let _write_handle = spawn(async move {
-        let mut sender = FrameSender::builder().writer(writer).rx(rx).build();
-        if let Err(e) = sender.handle_tx().await {
-            error!("mp sender error {e}");
-        }
-    });
-    trace!("Spawned TCP frame sender task");
-
-    // Send the initialize frame with our public key
-    trace!("Sending initialize frame...");
-    let frame = Frame::Initialize(my_public_key.as_ref().to_vec());
-    tx.send(frame.clone())?;
-
-    // Wait for UDP state updates with the key and UUID
-    // once we have both, we can set up the UDP socket
-    let mut key_bytes = [0u8; 32];
-    let mut hmac_key_bytes = [0u8; 64];
-    let mut uuid = Uuid::nil();
-    while let Some(udp_state) = rx_udp_state.recv().await {
-        match udp_state {
-            UdpState::Key(key_b) => {
-                trace!("Received UDP key");
-                key_bytes = key_b;
+/// Returns a sanitized string identifying the current terminal, used to give each
+/// terminal window its own independent session slot.
+///
+/// Resolves the stdin file descriptor to its TTY device path and sanitizes it for
+/// use as a filename component (e.g. `/dev/pts/3` → `dev_pts_3`).  Returns `None`
+/// when stdin is not a TTY (piped/scripted invocations).
+#[cfg(unix)]
+fn tty_id() -> Option<String> {
+    use std::io::IsTerminal as _;
+    if !stdin().is_terminal() {
+        return None;
+    }
+    // Linux exposes a symlink at /proc/self/fd/0 → the actual TTY device.
+    // Other Unix systems expose the same information at /dev/fd/0.
+    #[cfg(target_os = "linux")]
+    let link = std::fs::read_link("/proc/self/fd/0").ok()?;
+    #[cfg(not(target_os = "linux"))]
+    let link = std::fs::read_link("/dev/fd/0").ok()?;
+    let raw = link.to_string_lossy();
+    // Strip the leading slash and replace non-alphanumeric chars with '_'.
+    let sanitized: String = raw
+        .trim_start_matches('/')
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
             }
-            UdpState::HmacKey(hmac_key_b) => {
-                trace!("Received UDP HMAC key");
-                hmac_key_bytes = hmac_key_b;
-            }
-            UdpState::Uuid(set_uuid) => {
-                trace!("Received UDP UUID: {}", set_uuid);
-                uuid = set_uuid;
-                break;
-            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        None
+    } else {
+        Some(sanitized)
+    }
+}
+
+/// Windows equivalent: `GetConsoleWindow()` returns the HWND of the console
+/// window associated with the calling process.  Like the TTY device path on
+/// Unix, the HWND is:
+/// - unique per console window (cmd.exe window, Windows Terminal tab, etc.)
+/// - stable across process restarts within the same window
+/// - different between simultaneously open windows
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn tty_id() -> Option<String> {
+    use std::io::IsTerminal as _;
+    // Call Win32 GetConsoleWindow() via raw FFI — no extra crate required.
+    unsafe extern "system" {
+        fn GetConsoleWindow() -> *mut std::ffi::c_void;
+    }
+    if !stdin().is_terminal() {
+        return None;
+    }
+    let hwnd = unsafe { GetConsoleWindow() };
+    if hwnd.is_null() {
+        None
+    } else {
+        Some(format!("{:x}", hwnd.addr()))
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn tty_id() -> Option<String> {
+    None
+}
+
+/// Returns (or creates) a stable random UUID that uniquely identifies this client
+/// installation.  Written once to `~/.mp/client_id` and reused on every subsequent
+/// run, so the session file for a given server can always be found regardless of the
+/// current process PID.
+fn client_id() -> Option<Uuid> {
+    let path = dirs2::home_dir()?.join(".mp").join("client_id");
+    if let Ok(mut f) = std::fs::File::open(&path) {
+        let mut buf = String::new();
+        drop(f.read_to_string(&mut buf));
+        if let Ok(uuid) = buf.trim().parse::<Uuid>() {
+            return Some(uuid);
         }
     }
-    Ok((key_bytes, hmac_key_bytes, uuid))
+    // First run: generate a new client ID and persist it.
+    let id = Uuid::new_v4();
+    if let Some(parent) = path.parent() {
+        drop(std::fs::create_dir_all(parent));
+    }
+    if let Ok(mut f) = std::fs::File::create(&path) {
+        drop(write!(f, "{id}"));
+    }
+    Some(id)
+}
+
+/// Returns the path `~/.mp/sessions/<client_id>_<host>_<port>[_<tty_id>]` for
+/// session UUID persistence.
+///
+/// When stdin is a TTY the filename includes a sanitized TTY identifier (e.g.
+/// `dev_pts_3`), giving each terminal window its own independent session slot.
+/// Restarting after a crash in the same window reuses the same slot, enabling
+/// transparent resume.  When stdin is not a TTY the TTY suffix is omitted and
+/// the connection falls back to last-connect-wins semantics.
+fn session_file_path(host: &str, port: u16) -> Option<PathBuf> {
+    let home = dirs2::home_dir()?;
+    // Sanitize host so it is safe as a file-name component.
+    let safe_host: String = host
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let cid = client_id()?;
+    let name = match tty_id() {
+        Some(tty) => format!("{cid}_{safe_host}_{port}_{tty}"),
+        None => format!("{cid}_{safe_host}_{port}"),
+    };
+    Some(home.join(".mp").join("sessions").join(name))
+}
+
+/// Read a persisted session UUID from disk, if any.
+fn read_session_uuid(host: &str, port: u16) -> Option<Uuid> {
+    let path = session_file_path(host, port)?;
+    let mut file = std::fs::File::open(&path).ok()?;
+    let mut buf = String::new();
+    let _ = file.read_to_string(&mut buf).ok();
+    buf.trim().parse::<Uuid>().ok()
+}
+
+/// Write (or overwrite) the session UUID to disk.
+fn write_session_uuid(host: &str, port: u16, session_uuid: Uuid) -> Result<()> {
+    let path = session_file_path(host, port).ok_or_else(|| anyhow::anyhow!("no home dir"))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::File::create(&path)?;
+    write!(file, "{session_uuid}")?;
+    Ok(())
 }

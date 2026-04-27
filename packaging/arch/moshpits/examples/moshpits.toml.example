@@ -1,0 +1,54 @@
+# ~/.config/moshpits/moshpits.toml  (or /etc/moshpits/moshpits.toml for system-wide installs)
+# moshpits server configuration file
+#
+# Configuration is loaded in this order (highest priority first):
+#   1. Environment variables with the MOSHPITS_ prefix (e.g. MOSHPITS_MPS_PORT=40404)
+#   2. Command-line flags
+#   3. This config file
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+# Each increment of verbose adds one level of detail, each increment of quiet
+# removes one level.  The effective log level for the tracing file is:
+#   0 quiet  + 0 verbose -> INFO
+#   0 quiet  + 1 verbose -> DEBUG
+#   0 quiet  + 2 verbose -> TRACE
+#   1 quiet  + 0 verbose -> WARN
+#   2 quiet  + 0 verbose -> ERROR
+verbose = 0
+quiet   = 0
+
+# ── Server listen address ─────────────────────────────────────────────────────
+[mps]
+ip   = "0.0.0.0"  # IP address to listen on for client connections
+port = 40404      # TCP port to listen on
+
+# ── Key files ─────────────────────────────────────────────────────────────────
+# Defaults to ~/.mp/mps_host_ed25519_key and ~/.mp/mps_host_ed25519_key.pub
+# when not set.
+# private_key_path = "/path/to/mps_host_ed25519_key"
+# public_key_path  = "/path/to/mps_host_ed25519_key.pub"
+
+# ── Tracing (log output) ──────────────────────────────────────────────────────
+# stdout layer — controls log line formatting when --enable-std-output is active.
+# NOTE: --enable-std-output should not be used when running as a daemon/service.
+[tracing.stdout]
+with_target       = false  # include the Rust module path in each log line
+with_thread_ids   = false  # include the thread ID
+with_thread_names = false  # include the thread name
+with_line_number  = false  # include the source file line number
+with_level        = true   # include the log level (ERROR, WARN, INFO, …)
+# directives = "moshpits=debug,libmoshpit=info"  # optional tracing filter override
+
+# file layer — controls the format and level written to the persistent log file.
+# Default log file: ~/.config/moshpits/logs/moshpits.log
+[tracing.file]
+quiet   = 0
+verbose = 0
+
+[tracing.file.layer]
+with_target       = false
+with_thread_ids   = false
+with_thread_names = false
+with_line_number  = false
+with_level        = true
+# directives = "moshpits=debug"

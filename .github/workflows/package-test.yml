@@ -1,0 +1,67 @@
+on:
+  push:
+    branches:
+      - master
+    tags-ignore:
+      - "*"
+  pull_request:
+    branches:
+      - "*"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+name: 📦 Package Build Verification 📦
+
+jobs:
+  tarball-build:
+    name: 🗜️ Tarball --locked build 🗜️
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.91.1"
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Install build dependencies (cmake + C compiler for aws-lc-rs)
+        run: sudo apt-get update && sudo apt-get install -y cmake gcc
+
+      - name: Create source tarball (simulating GitHub archive — no .git present)
+        run: |
+          git archive HEAD --format=tar.gz -o /tmp/moshpit-src.tar.gz
+          mkdir /tmp/moshpit-src
+          tar -xzf /tmp/moshpit-src.tar.gz -C /tmp/moshpit-src
+
+      - name: Verify --locked build for mp
+        working-directory: /tmp/moshpit-src
+        run: |
+          export VERGEN_IDEMPOTENT=1
+          cargo build --release --locked --bin mp
+
+      - name: Verify --locked build for mps
+        working-directory: /tmp/moshpit-src
+        run: |
+          export VERGEN_IDEMPOTENT=1
+          cargo build --release --locked --bin mps
+
+      - name: Verify --locked build for mp-keygen
+        working-directory: /tmp/moshpit-src
+        run: |
+          export VERGEN_IDEMPOTENT=1
+          cargo build --release --locked --bin mp-keygen
+
+      - name: Verify xtask dist artifacts
+        working-directory: /tmp/moshpit-src
+        run: |
+          cargo xtask dist mp
+          cargo xtask dist mps
+          cargo xtask dist mp-keygen
+
+      - name: List generated artifacts
+        working-directory: /tmp/moshpit-src
+        run: find dist/ -type f | sort

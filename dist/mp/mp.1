@@ -1,0 +1,42 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH mp 1  "mp 0.1.0" 
+.SH NAME
+mp \- Connect to a moshpits server
+.SH SYNOPSIS
+\fBmp\fR [\fB\-v\fR|\fB\-\-verbose\fR]... [\fB\-q\fR|\fB\-\-quiet\fR]... [\fB\-c\fR|\fB\-\-config\-absolute\-path\fR] [\fB\-t\fR|\fB\-\-tracing\-absolute\-path\fR] [\fB\-p\fR|\fB\-\-private\-key\-path\fR] [\fB\-k\fR|\fB\-\-public\-key\-path\fR] [\fB\-s\fR|\fB\-\-server\-port\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] <\fISERVER_DESTINATION\fR> 
+.SH DESCRIPTION
+Connect to a moshpits server
+.SH OPTIONS
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Turn up logging verbosity (multiple will turn it up more)
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+Turn down logging verbosity (multiple will turn it down more)
+.TP
+\fB\-c\fR, \fB\-\-config\-absolute\-path\fR \fI<PATH>\fR
+Specify the absolute path to the config file
+.TP
+\fB\-t\fR, \fB\-\-tracing\-absolute\-path\fR \fI<PATH>\fR
+Specify the absolute path to the tracing output file
+.TP
+\fB\-p\fR, \fB\-\-private\-key\-path\fR \fI<PATH>\fR
+Specify the absolute path to the private key file
+.TP
+\fB\-k\fR, \fB\-\-public\-key\-path\fR \fI<PATH>\fR
+Specify the absolute path to the public key file
+.TP
+\fB\-s\fR, \fB\-\-server\-port\fR \fI<PORT>\fR [default: 40404]
+The port number of the server to connect to (default: 40404)
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Print version
+.TP
+<\fISERVER_DESTINATION\fR>
+The IP address of the server to connect to (user@address or address)
+.SH VERSION
+v0.1.0

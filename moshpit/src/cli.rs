@@ -47,10 +47,6 @@ pub(crate) struct Cli {
     )]
     #[getset(get_copy = "pub(crate)")]
     quiet: u8,
-    /// Enable logging to stdout/stderr in additions to the tracing output file
-    /// * NOTE * - This should not be used when running as a daemon/service
-    #[clap(short, long, help = "Enable logging to stdout/stderr")]
-    enable_std_output: bool,
     /// The absolute path to a non-standard config file
     #[clap(short, long, help = "Specify the absolute path to the config file")]
     #[getset(get = "pub(crate)")]
@@ -63,10 +59,38 @@ pub(crate) struct Cli {
     )]
     #[getset(get = "pub(crate)")]
     tracing_absolute_path: Option<String>,
-    /// The IP address of the server you wish to connect to
+    /// An absolute path to a non-standard private key file
+    #[clap(
+        short,
+        long,
+        help = "Specify the absolute path to the private key file"
+    )]
+    #[getset(get = "pub(crate)")]
+    private_key_path: Option<String>,
+    /// An absolute path to a non-standard public key file
+    #[clap(
+        short = 'k',
+        long,
+        help = "Specify the absolute path to the public key file"
+    )]
+    #[getset(get = "pub(crate)")]
+    public_key_path: Option<String>,
+    /// An optional port number for the server to connect to
+    /// defaults to 40404
+    #[clap(
+        short,
+        long,
+        help = "The port number of the server to connect to (default: 40404)",
+        default_value_t = 40404
+    )]
+    #[getset(get_copy = "pub(crate)")]
+    server_port: u16,
+    /// The destination of the server to connect to
+    /// This takes the form of 'user@ip address' where the user is optional
+    /// and will default to the user executing the command.
     #[clap(help = "The IP address of the server to connect to")]
     #[getset(get = "pub(crate)")]
-    server_ip: Option<String>,
+    server_destination: String,
 }
 
 impl Source for Cli {
@@ -85,10 +109,6 @@ impl Source for Cli {
             "quiet".to_string(),
             Value::new(Some(&origin), ValueKind::U64(u8::into(self.quiet))),
         );
-        let _old = map.insert(
-            "enable_std_output".to_string(),
-            Value::new(Some(&origin), ValueKind::Boolean(self.enable_std_output)),
-        );
         if let Some(config_path) = &self.config_absolute_path {
             let _old = map.insert(
                 "config_path".to_string(),
@@ -101,11 +121,27 @@ impl Source for Cli {
                 Value::new(Some(&origin), ValueKind::String(tracing_path.clone())),
             );
         }
+        if let Some(private_key_path) = &self.private_key_path {
+            let _old = map.insert(
+                "private_key_path".to_string(),
+                Value::new(Some(&origin), ValueKind::String(private_key_path.clone())),
+            );
+        }
+        if let Some(public_key_path) = &self.public_key_path {
+            let _old = map.insert(
+                "public_key_path".to_string(),
+                Value::new(Some(&origin), ValueKind::String(public_key_path.clone())),
+            );
+        }
         let _old = map.insert(
-            "server_ip".to_string(),
+            "server_port".to_string(),
+            Value::new(Some(&origin), ValueKind::U64(u16::into(self.server_port))),
+        );
+        let _old = map.insert(
+            "server_destination".to_string(),
             Value::new(
                 Some(&origin),
-                ValueKind::String(self.server_ip.clone().unwrap_or_default()),
+                ValueKind::String(self.server_destination.clone()),
             ),
         );
         Ok(map)

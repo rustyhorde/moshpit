@@ -1,0 +1,37 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH mp-keygen 1  "mp-keygen 0.1.0" 
+.SH NAME
+mp\-keygen \- Manage ed25519 key pairs for moshpit
+.SH SYNOPSIS
+\fBmp\-keygen\fR [\fB\-v\fR|\fB\-\-verbose\fR]... [\fB\-q\fR|\fB\-\-quiet\fR]... [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] <\fIsubcommands\fR>
+.SH DESCRIPTION
+Manage ed25519 key pairs for moshpit
+.SH OPTIONS
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Turn up logging verbosity (multiple will turn it up more)
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+Turn down logging verbosity (multiple will turn it down more)
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Print version
+.SH SUBCOMMANDS
+.TP
+mp\-keygen\-generate(1)
+Generate a new ed25519 public/private key pair
+.TP
+mp\-keygen\-verify(1)
+Verify a public key fingerprint or randomart image
+.TP
+mp\-keygen\-fingerprint(1)
+Display the fingerprint of the given public key
+.TP
+mp\-keygen\-help(1)
+Print this message or the help of the given subcommand(s)
+.SH VERSION
+v0.1.0

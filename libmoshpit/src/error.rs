@@ -43,6 +43,33 @@ pub enum Error {
     /// Invalid IP address for server
     #[error("Invalid IP address for server")]
     InvalidServerAddress,
+    /// Invalid Moshpits address
+    #[error("Invalid Moshpits address")]
+    InvalidMoshpitsAddress,
+    /// Invalid key exchange state
+    #[error("key exchange failed")]
+    InvalidKexState,
+    /// UUID mismatch
+    #[error("UUID mismatch")]
+    UuidMismatch,
+    /// No valid home directory could be found
+    #[error("There is no valid home directory")]
+    HomeDir,
+    /// Invalid public key file format
+    #[error("Invalid public key file format")]
+    InvalidPublicKeyFormat,
+    /// An invalid key header was found
+    #[error("An invalid key header was found")]
+    InvalidKeyHeader,
+    /// A public key mismatch occurred
+    #[error("A public key mismatch occurred")]
+    PublicKeyMismatch,
+    /// An unsupported AEAD cipher was specified
+    #[error("An unsupported AEAD cipher was specified")]
+    UnsupportedAeadCipher,
+    /// An invalid server destination format was provided
+    #[error("An invalid server destination format was provided")]
+    InvalidServerDestination,
 }
 
 /// Converts an `anyhow::Error` into a suitable exit code or clap message for a CLI application.

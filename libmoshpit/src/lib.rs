@@ -15,9 +15,7 @@
         multiple_supertrait_upcastable,
         must_not_suspend,
         non_exhaustive_omitted_patterns_lint,
-        rustdoc_missing_doc_code_examples,
         strict_provenance_lints,
-        supertrait_item_shadowing,
         unqualified_local_imports,
     )
 )]
@@ -214,11 +212,11 @@
         multiple_supertrait_upcastable,
         must_not_suspend,
         non_exhaustive_omitted_patterns,
-        supertrait_item_shadowing_definition,
-        supertrait_item_shadowing_usage,
         unqualified_local_imports,
     )
 )]
+// Allow unsafe code on Windows (required for Windows Security API calls)
+#![cfg_attr(all(nightly, windows), allow(unsafe_code, unsafe_op_in_unsafe_fn))]
 // clippy lints
 #![cfg_attr(nightly, deny(clippy::all, clippy::pedantic))]
 // rustdoc lints
@@ -234,40 +232,65 @@
         rustdoc::private_intra_doc_links,
     )
 )]
-#![cfg_attr(
-    all(nightly, feature = "unstable"),
-    deny(rustdoc::missing_doc_code_examples)
-)]
 #![cfg_attr(all(docsrs), feature(doc_cfg))]
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
 mod config;
-mod connection;
 mod error;
 mod frames;
-mod reader;
+mod kex;
+mod keygen;
+mod session;
+mod tcp;
+mod term;
 mod tracing;
 mod udp;
 mod utils;
 mod uuid;
-mod writer;
 
+pub use self::config::KexConfig;
 pub use self::config::PathDefaults;
 pub use self::config::load;
 pub use self::config::mps::Mps;
 pub use self::config::tracing::FileLayer;
 pub use self::config::tracing::Layer;
 pub use self::config::tracing::Tracing;
-pub use self::connection::Connection;
 pub use self::error::Error as MoshpitError;
 pub use self::error::clap_or_error;
 pub use self::error::success;
 pub use self::frames::encframe::EncryptedFrame;
 pub use self::frames::frame::Frame;
-pub use self::reader::ConnectionReader;
+pub use self::kex::Kex;
+pub use self::kex::KexEvent;
+pub use self::kex::KexMode;
+pub use self::kex::KexState;
+pub use self::kex::KexStateMachine;
+pub use self::kex::ServerKex;
+pub use self::kex::reader::KexReader;
+pub use self::kex::run_key_exchange;
+pub use self::kex::sender::KexSender;
+pub use self::keygen::AEADCipher;
+pub use self::keygen::EncryptedKeyPair;
+pub use self::keygen::KeyPair;
+pub use self::keygen::UnencryptedKeyPair;
+pub use self::keygen::decrypt_private_key;
+pub use self::keygen::load_private_key;
+pub use self::keygen::load_public_key;
+pub use self::keygen::pk::extract_public_key_bytes;
+pub use self::keygen::pk::fingerprint;
+pub use self::keygen::pk::randomart;
+pub use self::keygen::pk::verify_fingerprint;
+pub use self::session::SessionRegistry;
+pub use self::session::new_session_registry;
+pub use self::tcp::reader::ConnectionReader;
+pub use self::tcp::writer::ConnectionWriter;
+pub use self::term::TerminalMessage;
 pub use self::tracing::{TracingConfigExt, init_tracing};
 pub use self::udp::UdpClient;
-pub use self::udp::UdpState;
+pub use self::udp::reader::UdpReader;
+pub use self::udp::sender::MAX_UDP_PAYLOAD;
+pub use self::udp::sender::UdpSender;
+pub use self::utils::is_exit_title;
+pub use self::utils::parse_server_destination;
 pub use self::utils::to_path_buf;
 pub use self::uuid::UuidWrapper;
-pub use self::writer::ConnectionWriter;

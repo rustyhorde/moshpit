@@ -6,12 +6,11 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-use std::{fmt::Display, io::Cursor};
+use std::{fmt::Display, io::Cursor, net::SocketAddr};
 
 use anyhow::Result;
-use bincode::{Decode, Encode, config::standard, decode_from_slice};
+use bincode_next::{Decode, Encode, config::standard, decode_from_slice};
 use bytes::Buf as _;
-use tracing::trace;
 
 use crate::{
     frames::{get_bytes, get_usize},
@@ -22,13 +21,25 @@ use crate::{
 #[derive(Clone, Debug, Decode, Encode, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Frame {
     /// An initialization frame from moshpit.
-    Initialize(Vec<u8>),
+    Initialize(Vec<u8>, Vec<u8>, Vec<u8>),
     /// A peer initialization frame from moshpits.
     PeerInitialize(Vec<u8>, Vec<u8>),
     /// A check message from moshpit.
     Check([u8; 12], Vec<u8>),
     /// A key agreement message from moshpits.
     KeyAgreement(UuidWrapper),
+    /// The address the moshpits listener is bound to.
+    MoshpitsAddr(SocketAddr),
+    /// The address the moshpit listener is bound to.
+    MoshpitAddr(SocketAddr),
+    /// Key exchange failure notification.
+    KexFailure,
+    /// A stable session token sent from moshpits to moshpit after key agreement.
+    /// The client stores this UUID and presents it on reconnect to resume the session.
+    SessionToken(UuidWrapper),
+    /// A request from moshpit to resume a previous session.
+    /// Contains (`session_uuid`, `user_bytes`, `ephemeral_public_key`, `full_public_key`).
+    ResumeRequest(UuidWrapper, Vec<u8>, Vec<u8>, Vec<u8>),
 }
 
 impl Frame {
@@ -36,10 +47,15 @@ impl Frame {
     #[must_use]
     pub fn id(&self) -> u8 {
         match self {
-            Frame::Initialize(_) => 0,
+            Frame::Initialize(_, _, _) => 0,
             Frame::PeerInitialize(_, _) => 1,
             Frame::Check(_, _) => 2,
             Frame::KeyAgreement(_) => 3,
+            Frame::MoshpitsAddr(_) => 4,
+            Frame::MoshpitAddr(_) => 5,
+            Frame::KexFailure => 6,
+            Frame::SessionToken(_) => 7,
+            Frame::ResumeRequest(_, _, _, _) => 8,
         }
     }
 
@@ -50,7 +66,7 @@ impl Frame {
     ///
     pub fn parse(src: &mut Cursor<&[u8]>) -> Result<Option<Self>> {
         match get_u8(src) {
-            Some(0..=3) => {
+            Some(0..=8) => {
                 if let Some(length_slice) = get_usize(src)? {
                     let length = usize::from_be_bytes(length_slice.try_into()?);
                     if let Some(data) = get_bytes(src, length)? {
@@ -60,14 +76,7 @@ impl Frame {
                 }
                 Ok(None)
             }
-            Some(_) => {
-                trace!("Unknown frame");
-                Ok(None)
-            }
-            None => {
-                trace!("Incomplete frame");
-                Ok(None)
-            }
+            Some(_) | None => Ok(None),
         }
     }
 }
@@ -83,7 +92,15 @@ fn get_u8(src: &mut Cursor<&[u8]>) -> Option<u8> {
 impl Display for Frame {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Frame::Initialize(data) => write!(f, "Initialize({} bytes)", data.len()),
+            Frame::Initialize(user, pk, full_pk) => {
+                write!(
+                    f,
+                    "Initialize({} bytes, {} bytes, {} bytes)",
+                    user.len(),
+                    pk.len(),
+                    full_pk.len()
+                )
+            }
             Frame::PeerInitialize(pk, salt) => write!(
                 f,
                 "PeerInitialize({} bytes, {} bytes)",
@@ -94,6 +111,17 @@ impl Display for Frame {
                 write!(f, "Check({} bytes, {} bytes)", nonce.len(), data.len())
             }
             Frame::KeyAgreement(uuid) => write!(f, "KeyAgreement({uuid})"),
+            Frame::MoshpitsAddr(addr) => write!(f, "MoshpitsAddr({addr})"),
+            Frame::MoshpitAddr(addr) => write!(f, "MoshpitAddr({addr})"),
+            Frame::KexFailure => write!(f, "KexFailure"),
+            Frame::SessionToken(uuid) => write!(f, "SessionToken({uuid})"),
+            Frame::ResumeRequest(uuid, user, epk, fpk) => write!(
+                f,
+                "ResumeRequest({uuid}, {} bytes, {} bytes, {} bytes)",
+                user.len(),
+                epk.len(),
+                fpk.len()
+            ),
         }
     }
 }
@@ -103,7 +131,7 @@ mod tests {
     use std::io::Cursor;
 
     use anyhow::Result;
-    use bincode::{config::standard, encode_to_vec};
+    use bincode_next::{config::standard, encode_to_vec};
 
     use crate::frames::USIZE_LENGTH;
 
@@ -249,10 +277,11 @@ mod tests {
 
     #[test]
     fn test_parse() -> Result<()> {
+        let user = b"user".to_vec();
         let data = b"hello world".to_vec();
-        let frame = Frame::Initialize(data.clone());
+        let full_data = b"full key data".to_vec();
+        let frame = Frame::Initialize(user.clone(), data.clone(), full_data.clone());
         let encoded_frame = encode_to_vec(&frame, standard())?;
-
         let length = encoded_frame.len();
         let length_bytes = length.to_be_bytes();
 

@@ -11,43 +11,53 @@ name = "libmoshpit"
 readme = "../README.md"
 repository = "https://github.com/rustyhorde/moshpit"
 version = "0.1.0"
-rust-version = "1.88.0"
+rust-version = "1.91.1"
 
 [features]
 unstable = []
 
 [dependencies]
+ansi-control-codes = { version = "1.0.1", features = ["parser", "explain"] }
 anyhow = { workspace = true }
+argon2 = { version = "0.6.0-rc.8", features = ["getrandom"] }
 aws-lc-rs = { workspace = true }
-bincode = "2.0.1"
+base64 = "0.22.1"
+bincode-next = "3.0.0-rc.13"
+bishop = "1.0.0"
 bon = { workspace = true }
 bytes = { workspace = true }
 clap = { workspace = true }
 config = { workspace = true }
 dirs2 = "3.0.1"
 getset = { workspace = true }
+local-ip-address = "0.6.11"
+regex = "1.12.3"
 serde = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["process","sync","time"] }
+tokio-util = { workspace = true }
 tracing = { workspace = true }
-tracing-appender = "0.2.3"
-tracing-subscriber = { version = "=0.3.19", features = [
+tracing-appender = "0.2.5"
+tracing-subscriber = { version = "0.3.23", features = [
     "env-filter",
     "fmt",
     "time",
 ] }
 tracing-subscriber-init = { workspace = true }
 uuid = { workspace = true }
+whoami = "2.1.1"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+] }
 
 [build-dependencies]
 anyhow = { workspace = true }
 rustversion = { workspace = true }
 vergen-gix = { workspace = true }
-
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = [
-    'cfg(coverage,coverage_nightly)',
-] }
 
 [dev-dependencies]
 tempfile = "3.23.0"

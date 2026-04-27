@@ -1,35 +1,36 @@
 [workspace]
 resolver = "3"
 
-members = ["libmoshpit", "moshpit", "moshpits"]
+members = ["keygen","libmoshpit", "moshpit", "moshpits", "xtask"]
 
 [workspace.dependencies]
-anyhow = "1.0.100"
-aws-lc-rs = "1.14.1"
-bon = "3.8.1"
-bytes = "1.10.1"
-clap = { version = "4.5.51", features = ["derive"] }
-config = { version = "0.15.18", features = ["toml"] }
+anyhow = "1.0.102"
+aws-lc-rs = "1.16.3"
+bon = "3.9.1"
+bytes = "1.11.1"
+clap = { version = "4.6.1", features = ["derive"] }
+config = { version = "0.15.22", features = ["toml"] }
 getset = "0.1.6"
 rustversion = "1.0.22"
 serde = { version = "1.0.228", features = ["derive"] }
-thiserror = "2.0.17"
-tokio = { version = "1.48.0", features = [
+thiserror = "2.0.18"
+tokio = { version = "1.52.1", features = [
   "io-util",
   "macros",
   "net",
   "rt-multi-thread",
 ] }
-tracing = { version = "0.1.41", features = [
+tokio-util = "0.7.18"
+tracing = { version = "0.1.44", features = [
   "max_level_trace",
   "release_max_level_trace",
 ] }
-tracing-subscriber-init = { version = "0.2.3", features = ["tstime"] }
-uuid = { version = "1.18.1", features = ["v4"] }
-vergen-gix = { version = "2.1.0-beta.6", features = [
+tracing-subscriber-init = { version = "0.2.6", features = ["tstime"] }
+uuid = { version = "1.23.0", features = ["v4"] }
+vergen-gix = { version = "10.0.0-beta.7", features = [
   "build",
   "cargo",
   "rustc",
   "si",
 ] }
-vergen-pretty = { version = "2.1.1", features = ["bincode", "serde"] }
+vergen-pretty = { version = "10.0.0-beta.7", features = ["color", "tracing", "rkyv", "serde"] }

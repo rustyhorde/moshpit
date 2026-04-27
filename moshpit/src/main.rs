@@ -15,9 +15,7 @@
         multiple_supertrait_upcastable,
         must_not_suspend,
         non_exhaustive_omitted_patterns_lint,
-        rustdoc_missing_doc_code_examples,
         strict_provenance_lints,
-        supertrait_item_shadowing,
         unqualified_local_imports,
     )
 )]
@@ -214,8 +212,6 @@
         multiple_supertrait_upcastable,
         must_not_suspend,
         non_exhaustive_omitted_patterns,
-        supertrait_item_shadowing_definition,
-        supertrait_item_shadowing_usage,
         unqualified_local_imports,
     )
 )]
@@ -234,10 +230,6 @@
         rustdoc::private_intra_doc_links,
     )
 )]
-#![cfg_attr(
-    all(nightly, feature = "unstable"),
-    deny(rustdoc::missing_doc_code_examples)
-)]
 #![cfg_attr(all(docsrs), feature(doc_cfg))]
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
@@ -251,8 +243,6 @@ use crate::runtime::run;
 mod cli;
 mod config;
 mod runtime;
-mod tcp;
-mod udp;
 
 #[tokio::main]
 async fn main() -> Result<()> {

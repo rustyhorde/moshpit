@@ -1,0 +1,38 @@
+[package]
+authors = ["Jason Ozias <jason.g.ozias@gmail.com>"]
+categories = ["command-line-interface", "network-programming", "cryptography"]
+description = "Perform various key tasks for moshpit"
+documentation = "https://docs.rs/libmoshpit"
+edition = "2024"
+homepage = "https://github.com/rustyhorde/moshpit"
+keywords = ["ssh", "mosh"]
+license = "MIT OR Apache-2.0"
+name = "keygen"
+readme = "../README.md"
+repository = "https://github.com/rustyhorde/moshpit"
+version = "0.1.0"
+rust-version = "1.91.1"
+
+[[bin]]
+name = "mp-keygen"
+path = "src/main.rs"
+
+[features]
+unstable = []
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+dialoguer = "0.12.0"
+getset = { workspace = true }
+libmoshpit = { version = "0.1.0", path = "../libmoshpit" }
+vergen-pretty = { workspace = true }
+
+[build-dependencies]
+anyhow = { workspace = true }
+rustversion = { workspace = true }
+vergen-gix = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

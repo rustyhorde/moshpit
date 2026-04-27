@@ -63,6 +63,22 @@ pub(crate) struct Cli {
     )]
     #[getset(get = "pub(crate)")]
     tracing_absolute_path: Option<String>,
+    /// An absolute path to a non-standard private key file
+    #[clap(
+        short,
+        long,
+        help = "Specify the absolute path to the private key file"
+    )]
+    #[getset(get = "pub(crate)")]
+    private_key_path: Option<String>,
+    /// An absolute path to a non-standard public key file
+    #[clap(
+        short = 'k',
+        long,
+        help = "Specify the absolute path to the public key file"
+    )]
+    #[getset(get = "pub(crate)")]
+    public_key_path: Option<String>,
 }
 
 impl Source for Cli {
@@ -95,6 +111,18 @@ impl Source for Cli {
             let _old = map.insert(
                 "tracing_path".to_string(),
                 Value::new(Some(&origin), ValueKind::String(tracing_path.clone())),
+            );
+        }
+        if let Some(private_key_path) = &self.private_key_path {
+            let _old = map.insert(
+                "private_key_path".to_string(),
+                Value::new(Some(&origin), ValueKind::String(private_key_path.clone())),
+            );
+        }
+        if let Some(public_key_path) = &self.public_key_path {
+            let _old = map.insert(
+                "public_key_path".to_string(),
+                Value::new(Some(&origin), ValueKind::String(public_key_path.clone())),
             );
         }
         Ok(map)

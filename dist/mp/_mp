@@ -1,0 +1,50 @@
+#compdef mp
+
+autoload -U is-at-least
+
+_mp() {
+    typeset -A opt_args
+    typeset -a _arguments_options
+    local ret=1
+
+    if is-at-least 5.2; then
+        _arguments_options=(-s -S -C)
+    else
+        _arguments_options=(-s -C)
+    fi
+
+    local context curcontext="$curcontext" state line
+    _arguments "${_arguments_options[@]}" : \
+'-c+[Specify the absolute path to the config file]:PATH:_default' \
+'--config-absolute-path=[Specify the absolute path to the config file]:PATH:_default' \
+'-t+[Specify the absolute path to the tracing output file]:PATH:_default' \
+'--tracing-absolute-path=[Specify the absolute path to the tracing output file]:PATH:_default' \
+'-p+[Specify the absolute path to the private key file]:PATH:_default' \
+'--private-key-path=[Specify the absolute path to the private key file]:PATH:_default' \
+'-k+[Specify the absolute path to the public key file]:PATH:_default' \
+'--public-key-path=[Specify the absolute path to the public key file]:PATH:_default' \
+'-s+[The port number of the server to connect to (default\: 40404)]:PORT:_default' \
+'--server-port=[The port number of the server to connect to (default\: 40404)]:PORT:_default' \
+'(-q --quiet)*-v[Turn up logging verbosity (multiple will turn it up more)]' \
+'(-q --quiet)*--verbose[Turn up logging verbosity (multiple will turn it up more)]' \
+'(-v --verbose)*-q[Turn down logging verbosity (multiple will turn it down more)]' \
+'(-v --verbose)*--quiet[Turn down logging verbosity (multiple will turn it down more)]' \
+'-h[Print help]' \
+'--help[Print help]' \
+'-V[Print version]' \
+'--version[Print version]' \
+':server-destination -- The IP address of the server to connect to (user@address or address):_default' \
+&& ret=0
+}
+
+(( $+functions[_mp_commands] )) ||
+_mp_commands() {
+    local commands; commands=()
+    _describe -t commands 'mp commands' commands "$@"
+}
+
+if [ "$funcstack[1]" = "_mp" ]; then
+    _mp "$@"
+else
+    compdef _mp mp
+fi

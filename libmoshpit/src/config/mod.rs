@@ -6,14 +6,16 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-use std::path::PathBuf;
+use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
 
 use anyhow::{Context as _, Result};
 use config::{Config, Environment, File, FileFormat, Source};
 use dirs2::config_dir;
 use serde::Deserialize;
+use tokio::sync::Mutex;
+use uuid::Uuid;
 
-use crate::{error::Error, to_path_buf};
+use crate::{KexMode, error::Error, session::SessionRegistry, to_path_buf};
 
 pub(crate) mod mps;
 pub(crate) mod tracing;
@@ -34,6 +36,31 @@ pub trait PathDefaults {
     fn default_tracing_path(&self) -> String;
     /// The default log file name to use
     fn default_tracing_file_name(&self) -> String;
+}
+
+/// Trait for key exchange configuration
+pub trait KexConfig {
+    /// The key exchange mode
+    fn mode(&self) -> KexMode;
+    /// An optional pool of ports to use for UDP connections, only relevant for server mode
+    fn port_pool(&self) -> Option<Arc<Mutex<BTreeSet<u16>>>>;
+    /// The paths to the public and private key files
+    ///
+    /// # Errors
+    ///
+    fn key_pair_paths(&self) -> Result<(PathBuf, PathBuf)>;
+    /// The username to use for the key exchange, only relevant for client mode
+    fn user(&self) -> Option<String>;
+    /// The session registry for tracking active sessions, only relevant for server mode.
+    /// Returns `None` by default; server implementations override this.
+    fn session_registry(&self) -> Option<SessionRegistry> {
+        None
+    }
+    /// The session UUID to attempt resuming, only relevant for client mode.
+    /// Returns `None` by default; client implementations override this.
+    fn resume_session_uuid(&self) -> Option<Uuid> {
+        None
+    }
 }
 
 /// Load the configuration

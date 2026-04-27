@@ -1,0 +1,154 @@
+#compdef mp-keygen
+
+autoload -U is-at-least
+
+_mp-keygen() {
+    typeset -A opt_args
+    typeset -a _arguments_options
+    local ret=1
+
+    if is-at-least 5.2; then
+        _arguments_options=(-s -S -C)
+    else
+        _arguments_options=(-s -C)
+    fi
+
+    local context curcontext="$curcontext" state line
+    _arguments "${_arguments_options[@]}" : \
+'(-q --quiet)*-v[Turn up logging verbosity (multiple will turn it up more)]' \
+'(-q --quiet)*--verbose[Turn up logging verbosity (multiple will turn it up more)]' \
+'(-v --verbose)*-q[Turn down logging verbosity (multiple will turn it down more)]' \
+'(-v --verbose)*--quiet[Turn down logging verbosity (multiple will turn it down more)]' \
+'-h[Print help]' \
+'--help[Print help]' \
+'-V[Print version]' \
+'--version[Print version]' \
+":: :_mp-keygen_commands" \
+"*::: :->mp-keygen" \
+&& ret=0
+    case $state in
+    (mp-keygen)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:mp-keygen-command-$line[1]:"
+        case $line[1] in
+            (generate)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(verify)
+_arguments "${_arguments_options[@]}" : \
+'-r[Verify a randomart image instead of a fingerprint]' \
+'--randomart[Verify a randomart image instead of a fingerprint]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':signature -- The fingerprint or randomart to verify:_default' \
+&& ret=0
+;;
+(fingerprint)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+':public-key -- Path to the public key file:_default' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_mp-keygen__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:mp-keygen-help-command-$line[1]:"
+        case $line[1] in
+            (generate)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(verify)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(fingerprint)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+}
+
+(( $+functions[_mp-keygen_commands] )) ||
+_mp-keygen_commands() {
+    local commands; commands=(
+'generate:Generate a new ed25519 public/private key pair' \
+'verify:Verify a public key fingerprint or randomart image' \
+'fingerprint:Display the fingerprint of the given public key' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'mp-keygen commands' commands "$@"
+}
+(( $+functions[_mp-keygen__subcmd__fingerprint_commands] )) ||
+_mp-keygen__subcmd__fingerprint_commands() {
+    local commands; commands=()
+    _describe -t commands 'mp-keygen fingerprint commands' commands "$@"
+}
+(( $+functions[_mp-keygen__subcmd__generate_commands] )) ||
+_mp-keygen__subcmd__generate_commands() {
+    local commands; commands=()
+    _describe -t commands 'mp-keygen generate commands' commands "$@"
+}
+(( $+functions[_mp-keygen__subcmd__help_commands] )) ||
+_mp-keygen__subcmd__help_commands() {
+    local commands; commands=(
+'generate:Generate a new ed25519 public/private key pair' \
+'verify:Verify a public key fingerprint or randomart image' \
+'fingerprint:Display the fingerprint of the given public key' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'mp-keygen help commands' commands "$@"
+}
+(( $+functions[_mp-keygen__subcmd__help__subcmd__fingerprint_commands] )) ||
+_mp-keygen__subcmd__help__subcmd__fingerprint_commands() {
+    local commands; commands=()
+    _describe -t commands 'mp-keygen help fingerprint commands' commands "$@"
+}
+(( $+functions[_mp-keygen__subcmd__help__subcmd__generate_commands] )) ||
+_mp-keygen__subcmd__help__subcmd__generate_commands() {
+    local commands; commands=()
+    _describe -t commands 'mp-keygen help generate commands' commands "$@"
+}
+(( $+functions[_mp-keygen__subcmd__help__subcmd__help_commands] )) ||
+_mp-keygen__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'mp-keygen help help commands' commands "$@"
+}
+(( $+functions[_mp-keygen__subcmd__help__subcmd__verify_commands] )) ||
+_mp-keygen__subcmd__help__subcmd__verify_commands() {
+    local commands; commands=()
+    _describe -t commands 'mp-keygen help verify commands' commands "$@"
+}
+(( $+functions[_mp-keygen__subcmd__verify_commands] )) ||
+_mp-keygen__subcmd__verify_commands() {
+    local commands; commands=()
+    _describe -t commands 'mp-keygen verify commands' commands "$@"
+}
+
+if [ "$funcstack[1]" = "_mp-keygen" ]; then
+    _mp-keygen "$@"
+else
+    compdef _mp-keygen mp-keygen
+fi

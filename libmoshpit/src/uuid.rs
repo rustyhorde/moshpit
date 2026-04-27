@@ -8,7 +8,7 @@
 
 use std::fmt::{Display, Formatter};
 
-use bincode::{
+use bincode_next::{
     BorrowDecode, Decode, Encode,
     de::{BorrowDecoder, Decoder},
     enc::Encoder,

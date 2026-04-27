@@ -1,2 +1,4 @@
 /target
 lcov.info
+test_key
+*.bin
