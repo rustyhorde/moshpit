@@ -2369,6 +2369,7 @@ dependencies = [
  "uuid",
  "vergen-gix",
  "vergen-pretty",
+ "vt100",
 ]
 
 [[package]]

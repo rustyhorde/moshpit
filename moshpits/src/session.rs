@@ -8,6 +8,7 @@
 
 use std::{
     collections::{HashMap, VecDeque},
+    fmt,
     sync::Arc,
 };
 
@@ -36,7 +37,6 @@ pub(crate) struct SessionOutputHandle {
 }
 
 /// Full state for one live PTY session.
-#[derive(Debug)]
 pub(crate) struct SessionRecord {
     /// Forward keyboard / resize events from the connected client into this channel.
     pub term_tx: Sender<TerminalMessage>,
@@ -44,6 +44,19 @@ pub(crate) struct SessionRecord {
     pub output_handle: Arc<Mutex<SessionOutputHandle>>,
     /// Ring buffer of raw PTY output bytes for scrollback replay on reconnect.
     pub scrollback: Arc<Mutex<VecDeque<u8>>>,
+    /// Server-side vt100 emulator tracking current PTY screen state.
+    /// Fed by the PTY reader thread; queried on reconnect and by the periodic
+    /// screen-state sync task to produce [`libmoshpit::EncryptedFrame::ScreenState`] frames.
+    pub server_emulator: Arc<Mutex<vt100::Parser>>,
+}
+
+impl fmt::Debug for SessionRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionRecord")
+            .field("output_handle", &self.output_handle)
+            .field("scrollback", &self.scrollback)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Full session registry: maps stable session UUID → [`SessionRecord`].

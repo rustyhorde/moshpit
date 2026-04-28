@@ -43,6 +43,9 @@ pub enum EncryptedFrame {
     ScrollbackStart,
     /// Signals the end of a scrollback replay block; client should repaint from emulator state.
     ScrollbackEnd,
+    /// Full screen state from the server-side vt100 emulator; client feeds bytes into a
+    /// temporary [`vt100::Parser`] and renders the result for an instant clean repaint.
+    ScreenState(Vec<u8>),
 }
 
 impl EncryptedFrame {
@@ -57,6 +60,7 @@ impl EncryptedFrame {
             EncryptedFrame::Keepalive => 4,
             EncryptedFrame::ScrollbackStart => 5,
             EncryptedFrame::ScrollbackEnd => 6,
+            EncryptedFrame::ScreenState(_) => 7,
         }
     }
 

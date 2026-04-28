@@ -113,10 +113,16 @@ where
         None => "info",
     };
 
+    // Suppress noisy debug-level log output from third-party crates that emit
+    // `log::debug!()` for unimplemented-but-harmless sequences:
+    //   vt100 – logs "unhandled <escape sequence>" for every CSI/OSC/DCS it
+    //            doesn't model; these are intentional no-ops, not errors.
+    let base = format!("{directives_base},vt100=warn");
+
     if let Some(directives) = config.directives() {
-        format!("{directives_base},{directives}")
+        format!("{base},{directives}")
     } else {
-        directives_base.to_string()
+        base
     }
 }
 

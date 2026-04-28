@@ -35,6 +35,7 @@ tracing = { workspace = true }
 tracing-subscriber-init = { workspace = true }
 uuid = { workspace = true }
 vergen-pretty = { workspace = true }
+vt100 = { workspace = true }
 
 [build-dependencies]
 anyhow = { workspace = true }

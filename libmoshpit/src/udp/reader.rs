@@ -481,7 +481,8 @@ impl UdpReader {
                                 term_tx.send(TerminalMessage::Resize { rows, columns }).await?;
                             }
                             EncryptedFrame::Nak(_) | EncryptedFrame::Shutdown | EncryptedFrame::Keepalive
-                            | EncryptedFrame::ScrollbackStart | EncryptedFrame::ScrollbackEnd => {}
+                            | EncryptedFrame::ScrollbackStart | EncryptedFrame::ScrollbackEnd
+                            | EncryptedFrame::ScreenState(_) => {}
                         }
                     }
                 },
@@ -497,7 +498,8 @@ impl UdpReader {
                                         term_tx.send(TerminalMessage::Resize { rows, columns }).await?;
                                     }
                                     EncryptedFrame::Nak(_) | EncryptedFrame::Shutdown | EncryptedFrame::Keepalive
-                                    | EncryptedFrame::ScrollbackStart | EncryptedFrame::ScrollbackEnd => {}
+                                    | EncryptedFrame::ScrollbackStart | EncryptedFrame::ScrollbackEnd
+                                    | EncryptedFrame::ScreenState(_) => {}
                                 }
                             }
                         }
@@ -596,6 +598,24 @@ impl UdpReader {
                                     error!("Error sending repaint to stdout channel: {e}");
                                 }
                             }
+                            EncryptedFrame::ScreenState(payload) => {
+                                let (rows, cols) = {
+                                    let emu = emulator.lock().unwrap();
+                                    emu.screen().size()
+                                };
+                                let mut tmp = vt100::Parser::new(rows, cols, 0);
+                                tmp.process(&payload);
+                                let repaint = {
+                                    let mut rend = renderer.lock().unwrap();
+                                    rend.invalidate();
+                                    rend.render(tmp.screen(), &[], None)
+                                };
+                                if !repaint.is_empty()
+                                    && let Err(e) = stdout_tx.send(repaint).await
+                                {
+                                    error!("Error sending ScreenState repaint to stdout channel: {e}");
+                                }
+                            }
                         }
                     }
                 },
@@ -643,6 +663,24 @@ impl UdpReader {
                                         if !repaint.is_empty()
                                             && let Err(e) = stdout_tx.send(repaint).await {
                                             error!("Error sending repaint to stdout channel: {e}");
+                                        }
+                                    }
+                                    EncryptedFrame::ScreenState(payload) => {
+                                        let (rows, cols) = {
+                                            let emu = emulator.lock().unwrap();
+                                            emu.screen().size()
+                                        };
+                                        let mut tmp = vt100::Parser::new(rows, cols, 0);
+                                        tmp.process(&payload);
+                                        let repaint = {
+                                            let mut rend = renderer.lock().unwrap();
+                                            rend.invalidate();
+                                            rend.render(tmp.screen(), &[], None)
+                                        };
+                                        if !repaint.is_empty()
+                                            && let Err(e) = stdout_tx.send(repaint).await
+                                        {
+                                            error!("Error sending ScreenState repaint to stdout channel: {e}");
                                         }
                                     }
                                     EncryptedFrame::Bytes((_id, message)) => {

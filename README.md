@@ -11,7 +11,7 @@ moshpit is a suite of tools for establishing encrypted, resilient remote termina
 | `mp` | moshpit | Client — connects to a running `mps` server |
 | `mp-keygen` | keygen | Key management — generates and inspects ed25519 key pairs |
 
-Sessions are authenticated with ed25519 key pairs and transported over an encrypted TCP control channel plus a UDP data channel (ports 50000–59999).
+Sessions are authenticated with ed25519 key pairs and transported over an encrypted TCP control channel plus a UDP data channel (ports 50000–59999).  The server tracks full terminal screen state with a server-side vt100 emulator; on reconnect the client receives a single clean screen snapshot and repaints instantly rather than replaying raw scrollback history.
 
 ---
 
@@ -25,6 +25,8 @@ moshpit draws its core motivation from [Mosh (Mobile Shell)](https://mosh.org/),
 - **Resilience to connectivity loss** — both tools keep the session alive across short network outages and IP address changes; the client reconnects automatically without user intervention.
 - **Authenticated encryption** — all data on the wire is encrypted and authenticated; neither tool relies on a plain-text transport at any layer.
 - **Client / server split** — a lightweight server component (`mps` / `mosh-server`) runs on the remote host and manages the PTY; a client (`mp` / `mosh`) runs locally and drives the terminal.
+- **Server-side screen state** — the server maintains a vt100 model of the current PTY screen; on reconnect the client receives a single screen snapshot for an instant, noise-free repaint.
+- **Client-side prediction** — keystrokes are echoed locally and cursor movement is predicted to hide round-trip latency; predicted characters are underlined until the server confirms them.
 
 ### Where moshpit differs
 
@@ -33,14 +35,72 @@ moshpit draws its core motivation from [Mosh (Mobile Shell)](https://mosh.org/),
 | **Language** | C++ | Rust |
 | **Authentication** | Delegated to SSH for the initial handshake; a one-time secret is passed back over SSH | Standalone ed25519 key-pair authentication — no SSH dependency |
 | **Transport model** | Pure UDP after setup; Mosh's *State Synchronization Protocol* (SSP) keeps a diff of the full terminal screen state and sends only the latest snapshot | Separate TCP control channel + UDP data channel; NAK-based selective retransmission ensures reliable, ordered delivery of the raw byte stream |
-| **Client-side prediction** | Mosh echoes keystrokes locally and predicts cursor movement to hide latency, underlining characters that have not yet been confirmed by the server | No client-side prediction — the server's output is authoritative and is displayed as received |
-| **Encryption** | AES-128-OCB authenticated encryption using a symmetric session key | Key exchange via an ed25519-based handshake; symmetric encryption on the UDP channel with per-packet HMAC authentication |
+| **Reconnect display sync** | SSP sends the latest screen snapshot; client repaints from the diff immediately | Server maintains a `vt100::Parser` tracking the live PTY screen; on reconnect a single `ScreenState` frame delivers `contents_formatted()` bytes for an instant clean repaint.  A 50 ms periodic task also sends `ScreenState` diffs during normal use so the client stays in sync even across network hiccups. |
+| **Client-side prediction** | Mosh echoes keystrokes locally and predicts cursor movement to hide latency, underlining characters that have not yet been confirmed by the server | Same — keystrokes are echoed locally, cursor movement is predicted, and unconfirmed characters are underlined until the server output arrives |
+| **Encryption** | AES-128-OCB authenticated encryption using a symmetric session key | Key exchange via an ed25519-based handshake; symmetric AES-256-GCM-SIV on the UDP channel with per-packet HMAC-SHA-512 authentication |
 | **Session multiplexing** | One Mosh session per `mosh-server` process | Same — one PTY per `mps` connection |
 | **Configuration** | Minimal; primarily driven by command-line options | TOML config files with environment-variable overrides |
 | **UDP port range** | 60001–61000 (by default) | 50000–59999 |
 | **License** | GPL v3 | Apache 2.0 / MIT (your choice) |
 
 > **Attribution**: the name *moshpit* is a deliberate nod to Mosh, whose design and published research were a direct inspiration for this project.  If you need production-grade, battle-tested remote terminal software, [use Mosh](https://mosh.org/).  moshpit is an independent reimagining with different goals and trade-offs.
+
+---
+
+## Installation (Arch Linux / AUR)
+
+All three binaries are available as separate AUR packages.  Install them with any AUR helper (e.g. `yay`, `paru`) or manually with `makepkg`.
+
+| AUR package | Installs | Notes |
+|-------------|----------|-------|
+| `moshpit-keygen` | `mp-keygen` | No dependencies; install this first if building manually |
+| `moshpit` | `mp` (client) | Depends on `moshpit-keygen` |
+| `moshpits` | `mps` (server) | Depends on `moshpit-keygen` |
+
+### Install with an AUR helper
+
+```bash
+# Install the server (pulls in moshpit-keygen automatically)
+yay -S moshpits
+
+# Install the client (pulls in moshpit-keygen automatically)
+yay -S moshpit
+
+# Or install both in one go
+yay -S moshpits moshpit
+```
+
+### Install manually with makepkg
+
+```bash
+# 1. Clone and build moshpit-keygen first (shared dependency)
+git clone https://aur.archlinux.org/moshpit-keygen.git
+cd moshpit-keygen
+makepkg -si
+cd ..
+
+# 2. Clone and build the server
+git clone https://aur.archlinux.org/moshpits.git
+cd moshpits
+makepkg -si
+cd ..
+
+# 3. Clone and build the client
+git clone https://aur.archlinux.org/moshpit.git
+cd moshpit
+makepkg -si
+cd ..
+```
+
+### Removing packages
+
+```bash
+# Remove server and client (keep keygen)
+sudo pacman -R moshpits moshpit
+
+# Remove everything including keygen
+sudo pacman -Rs moshpits moshpit moshpit-keygen
+```
 
 ---
 
