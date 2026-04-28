@@ -91,6 +91,15 @@ pub(crate) struct Cli {
     #[clap(help = "The IP address of the server to connect to")]
     #[getset(get = "pub(crate)")]
     server_destination: String,
+    /// Local-echo prediction preference: adaptive (default), always, or never.
+    #[clap(
+        long,
+        value_name = "MODE",
+        default_value = "adaptive",
+        help = "Local-echo prediction: adaptive (default), always, or never"
+    )]
+    #[getset(get = "pub(crate)")]
+    predict: String,
 }
 
 impl Source for Cli {
@@ -143,6 +152,10 @@ impl Source for Cli {
                 Some(&origin),
                 ValueKind::String(self.server_destination.clone()),
             ),
+        );
+        let _old = map.insert(
+            "predict".to_string(),
+            Value::new(Some(&origin), ValueKind::String(self.predict.clone())),
         );
         Ok(map)
     }

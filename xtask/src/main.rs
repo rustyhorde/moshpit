@@ -136,6 +136,14 @@ fn mp_command() -> Command {
                 .required(true)
                 .help("The IP address of the server to connect to (user@address or address)"),
         )
+        .arg(
+            Arg::new("predict")
+                .long("predict")
+                .value_name("MODE")
+                .value_parser(["adaptive", "always", "never"])
+                .default_value("adaptive")
+                .help("Local-echo prediction: adaptive (default), always, or never"),
+        )
 }
 
 /// `mps` — moshpits server

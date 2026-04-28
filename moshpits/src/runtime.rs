@@ -314,10 +314,12 @@ async fn resolve_session(
             // Replay scrollback so the client terminal catches up.
             let sb_data: Vec<u8> = scrollback.lock().await.iter().copied().collect();
             let scrollback_bytes = sb_data.len();
+            tx.send(EncryptedFrame::ScrollbackStart).await?;
             for chunk in sb_data.chunks(MAX_UDP_PAYLOAD) {
                 tx.send(EncryptedFrame::Bytes((kex.uuid_wrapper(), chunk.to_vec())))
                     .await?;
             }
+            tx.send(EncryptedFrame::ScrollbackEnd).await?;
             info!(
                 user = skex.user(),
                 session = %session_uuid,

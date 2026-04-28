@@ -10,7 +10,7 @@ use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use getset::{CopyGetters, Getters, Setters};
-use libmoshpit::{KexConfig, KexMode, KeyPair, Tracing, TracingConfigExt};
+use libmoshpit::{DisplayPreference, KexConfig, KexMode, KeyPair, Tracing, TracingConfigExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::Level;
@@ -48,6 +48,10 @@ pub(crate) struct Config {
     #[serde(default = "Config::default_max_reconnect_backoff_secs")]
     #[getset(get_copy = "pub(crate)")]
     max_reconnect_backoff_secs: u64,
+    /// Local-echo prediction display preference.
+    #[serde(default)]
+    #[getset(get_copy = "pub(crate)")]
+    predict: DisplayPreference,
 }
 
 impl Config {
@@ -84,6 +88,7 @@ impl Default for Config {
             public_key_path: None,
             resume_session_uuid: None,
             max_reconnect_backoff_secs: Self::default_max_reconnect_backoff_secs(),
+            predict: DisplayPreference::default(),
         }
     }
 }

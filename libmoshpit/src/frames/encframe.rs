@@ -39,6 +39,10 @@ pub enum EncryptedFrame {
     Shutdown,
     /// Server keepalive; client should reset its silence deadline and discard.
     Keepalive,
+    /// Signals the start of a scrollback replay block; client should enter silent-absorb mode.
+    ScrollbackStart,
+    /// Signals the end of a scrollback replay block; client should repaint from emulator state.
+    ScrollbackEnd,
 }
 
 impl EncryptedFrame {
@@ -51,6 +55,8 @@ impl EncryptedFrame {
             EncryptedFrame::Nak(_) => 2,
             EncryptedFrame::Shutdown => 3,
             EncryptedFrame::Keepalive => 4,
+            EncryptedFrame::ScrollbackStart => 5,
+            EncryptedFrame::ScrollbackEnd => 6,
         }
     }
 

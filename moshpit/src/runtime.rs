@@ -25,8 +25,9 @@ use clap::Parser as _;
 use crossterm::terminal::enable_raw_mode;
 use dialoguer::{Confirm, Password};
 use libmoshpit::{
-    EncryptedFrame, Kex, KexConfig as _, KeyPair, MoshpitError, UdpReader, UdpSender, UuidWrapper,
-    init_tracing, load, parse_server_destination, run_key_exchange,
+    DisplayPreference, Emulator, EncryptedFrame, Kex, KexConfig as _, KeyPair, MoshpitError,
+    PredictionEngine, Renderer, UdpReader, UdpSender, UuidWrapper, init_tracing, load,
+    paint_overlays_to_ansi, parse_server_destination, run_key_exchange,
 };
 use terminal_size::terminal_size;
 #[cfg(unix)]
@@ -215,7 +216,7 @@ async fn run_session_loop(
                     shared
                 };
 
-                run_udp_session(kex, udp_arc, kb_rx, stdout_tx.clone()).await?;
+                run_udp_session(kex, udp_arc, kb_rx, stdout_tx.clone(), config.predict()).await?;
                 // Session dropped — show the reconnecting banner while we retry.
                 show_reconnect_banner(&stdout_tx).await;
                 time::sleep(Duration::from_millis(500)).await;
@@ -285,11 +286,13 @@ async fn connect_and_kex(
 }
 
 /// Set up UDP tasks for one session and wait until the server disconnects.
+#[cfg_attr(nightly, allow(clippy::too_many_lines))]
 async fn run_udp_session(
     kex: Kex,
     udp_arc: Arc<UdpSocket>,
     kb_rx: Arc<Mutex<Receiver<Vec<u8>>>>,
     stdout_tx: Sender<Vec<u8>>,
+    display_preference: DisplayPreference,
 ) -> Result<()> {
     let (reconnect_tx, mut reconnect_rx) = channel::<()>(1);
     let token = CancellationToken::new();
@@ -305,6 +308,7 @@ async fn run_udp_session(
         .retransmit_tx(retransmit_tx)
         .silence_timeout(Duration::from_secs(15))
         .reconnect_tx(reconnect_tx)
+        .query_response_tx(tx.clone())
         .build();
 
     let mut udp_sender = UdpSender::builder()
@@ -323,15 +327,45 @@ async fn run_udp_session(
     tx.send(EncryptedFrame::Resize((kex.uuid_wrapper(), cols, rows)))
         .await?;
 
-    let reader_token = token.clone();
-    let _reader = spawn(async move { udp_reader.client_frame_loop(reader_token, stdout_tx).await });
+    // ── Prediction / emulator shared state ──────────────────────────────────
+    let emulator = Arc::new(std::sync::Mutex::new(Emulator::new(rows, cols)));
+    let prediction = Arc::new(std::sync::Mutex::new(PredictionEngine::new(
+        display_preference,
+    )));
+    let renderer = Arc::new(std::sync::Mutex::new(Renderer::new(rows, cols)));
 
-    spawn_resize_handler(tx.clone(), kex.uuid_wrapper(), token.clone());
+    let reader_token = token.clone();
+    let emu_reader = emulator.clone();
+    let pred_reader = prediction.clone();
+    let rend_reader = renderer.clone();
+    let stdout_tx_reader = stdout_tx.clone();
+    let _reader = spawn(async move {
+        udp_reader
+            .client_frame_loop(
+                reader_token,
+                stdout_tx_reader,
+                emu_reader,
+                pred_reader,
+                rend_reader,
+            )
+            .await;
+    });
+
+    spawn_resize_handler(
+        tx.clone(),
+        kex.uuid_wrapper(),
+        token.clone(),
+        emulator.clone(),
+        renderer.clone(),
+    );
 
     // Stdin forwarder: holds the shared kb_rx mutex for this session's lifetime.
     let fwd_token = token.clone();
     let session_tx = tx;
     let uuid_wrapper = kex.uuid_wrapper();
+    let emu_fwd = emulator.clone();
+    let pred_fwd = prediction.clone();
+    let stdout_tx_fwd = stdout_tx;
     let _forwarder = spawn(async move {
         let mut rx = kb_rx.lock().await;
         loop {
@@ -339,12 +373,27 @@ async fn run_udp_session(
                 () = fwd_token.cancelled() => break,
                 data = rx.recv() => match data {
                     Some(data) => {
+                        // Forward to server.
                         if session_tx
-                            .send(EncryptedFrame::Bytes((uuid_wrapper, data)))
+                            .send(EncryptedFrame::Bytes((uuid_wrapper, data.clone())))
                             .await
                             .is_err()
                         {
                             break;
+                        }
+                        // Local echo prediction: feed each byte to the engine.
+                        let (overlays, cursor) = {
+                            let emu = emu_fwd.lock().unwrap();
+                            let screen = emu.screen();
+                            let mut pred = pred_fwd.lock().unwrap();
+                            for byte in &data {
+                                pred.new_user_byte(*byte, screen);
+                            }
+                            pred.apply(screen)
+                        };
+                        let preview = paint_overlays_to_ansi(&overlays, cursor);
+                        if !preview.is_empty() {
+                            drop(stdout_tx_fwd.send(preview).await);
                         }
                     }
                     None => break,
@@ -366,6 +415,8 @@ fn spawn_resize_handler(
     resize_tx: Sender<EncryptedFrame>,
     resize_uuid: UuidWrapper,
     resize_token: CancellationToken,
+    emulator: Arc<std::sync::Mutex<Emulator>>,
+    renderer: Arc<std::sync::Mutex<Renderer>>,
 ) {
     let _resize_handle = spawn(async move {
         match signal(SignalKind::window_change()) {
@@ -375,6 +426,8 @@ fn spawn_resize_handler(
                     _ = sigwinch.recv() => {
                         let (columns, rows) = terminal_size()
                             .map_or((80, 24), |(width, height)| (width.0, height.0));
+                        emulator.lock().unwrap().set_size(rows, columns);
+                        renderer.lock().unwrap().set_size(rows, columns);
                         if let Err(e) =
                             resize_tx.send(EncryptedFrame::Resize((resize_uuid, columns, rows))).await
                         {
@@ -398,6 +451,8 @@ fn spawn_resize_handler(
     resize_tx: Sender<EncryptedFrame>,
     resize_uuid: UuidWrapper,
     resize_token: CancellationToken,
+    emulator: Arc<std::sync::Mutex<Emulator>>,
+    renderer: Arc<std::sync::Mutex<Renderer>>,
 ) {
     let _resize_handle = thread::spawn(move || {
         let mut last_size = terminal_size().map_or((80, 24), |(w, h)| (w.0, h.0));
@@ -410,6 +465,8 @@ fn spawn_resize_handler(
             if current_size != last_size {
                 last_size = current_size;
                 let (columns, rows) = current_size;
+                emulator.lock().unwrap().set_size(rows, columns);
+                renderer.lock().unwrap().set_size(rows, columns);
                 if let Err(e) =
                     resize_tx.blocking_send(EncryptedFrame::Resize((resize_uuid, columns, rows)))
                 {
