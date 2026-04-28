@@ -230,18 +230,18 @@ mod test {
         let config = TestConfig::default();
         let level_filter = LevelFilter::OFF;
         let dirs = directives(&config, level_filter);
-        assert_eq!(dirs, "info");
+        assert_eq!(dirs, "info,vt100=warn");
         let level_filter = LevelFilter::TRACE;
         let dirs = directives(&config, level_filter);
-        assert_eq!(dirs, "trace");
+        assert_eq!(dirs, "trace,vt100=warn");
         let level_filter = LevelFilter::DEBUG;
         let dirs = directives(&config, level_filter);
-        assert_eq!(dirs, "debug");
+        assert_eq!(dirs, "debug,vt100=warn");
         let level_filter = LevelFilter::WARN;
         let dirs = directives(&config, level_filter);
-        assert_eq!(dirs, "warn");
+        assert_eq!(dirs, "warn,vt100=warn");
         let level_filter = LevelFilter::ERROR;
         let dirs = directives(&config, level_filter);
-        assert_eq!(dirs, "error");
+        assert_eq!(dirs, "error,vt100=warn");
     }
 }
