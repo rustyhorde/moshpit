@@ -11,6 +11,10 @@ env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: write
+  pull-requests: write
+
 name: 🚀 Release 🚀
 
 jobs:
@@ -114,7 +118,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          # Push back to master after updating
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Update pkgver and sha256sums in all three PKGBUILDs
@@ -133,14 +136,30 @@ jobs:
             sed -i "0,/'SKIP'/s/'SKIP'/'${SHA256}'/" "$PKGBUILD"
           done
 
-      - name: Commit updated PKGBUILDs
+      - name: Upload updated PKGBUILDs as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkgbuilds
+          path: packaging/arch/
+
+      - name: Open PR to update PKGBUILDs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PKGVER: ${{ needs.build.outputs.pkgver }}
         run: |
+          BRANCH="chore/pkgbuild-v${PKGVER}"
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
           git add packaging/arch/
           git diff --cached --quiet || git commit \
-            -m "chore(packaging): update PKGBUILDs to v${{ needs.build.outputs.pkgver }}"
-          git push origin HEAD:master
+            -m "chore(packaging): update PKGBUILDs to v${PKGVER}"
+          git push origin "$BRANCH"
+          gh pr create \
+            --title "chore(packaging): update PKGBUILDs to v${PKGVER}" \
+            --body "Automated PKGBUILD update for release v${PKGVER}.\n\nAUR packages have already been published from this branch. Please review and merge to keep the in-tree PKGBUILDs in sync." \
+            --base master \
+            --head "$BRANCH"
 
   # ── Push to AUR ──────────────────────────────────────────────────────────────
   aur-publish:
@@ -151,10 +170,11 @@ jobs:
       matrix:
         package: [moshpit-keygen, moshpit, moshpits]
     steps:
-      - name: Checkout (after PKGBUILD update commit)
-        uses: actions/checkout@v4
+      - name: Download updated PKGBUILDs
+        uses: actions/download-artifact@v4
         with:
-          ref: master
+          name: pkgbuilds
+          path: packaging/arch/
 
       - name: Publish ${{ matrix.package }} to AUR
         uses: KSXGitHub/github-actions-deploy-aur@v3.0.1
