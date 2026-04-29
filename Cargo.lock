@@ -2152,20 +2152,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "keygen"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "dialoguer",
- "getset",
- "libmoshpit",
- "rustversion",
- "vergen-gix",
- "vergen-pretty",
-]
-
-[[package]]
 name = "kstring"
 version = "2.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2194,7 +2180,7 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "libmoshpit"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ansi-control-codes",
  "anyhow",
@@ -2327,7 +2313,7 @@ dependencies = [
 
 [[package]]
 name = "moshpit"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2350,8 +2336,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "moshpit-keygen"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "dialoguer",
+ "getset",
+ "libmoshpit",
+ "rustversion",
+ "vergen-gix",
+ "vergen-pretty",
+]
+
+[[package]]
 name = "moshpits"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -4117,7 +4117,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
