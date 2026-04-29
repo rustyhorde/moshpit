@@ -860,9 +860,39 @@ mod tests {
     #[tokio::test]
     #[should_panic(expected = "split_to out of bounds")]
     async fn test_connect_and_kex_kex_failure() {
-        let cli =
-            Cli::try_parse_from(["moshpit", "-p", "/dev/null", "-k", "/dev/null", "user@host"])
-                .unwrap();
+        let dir = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[tracing.stdout]\n\
+             with_target = false\n\
+             with_thread_ids = false\n\
+             with_thread_names = false\n\
+             with_line_number = false\n\
+             with_level = false\n\
+             [tracing.file]\n\
+             quiet = 0\n\
+             verbose = 0\n\
+             [tracing.file.layer]\n\
+             with_target = false\n\
+             with_thread_ids = false\n\
+             with_thread_names = false\n\
+             with_line_number = false\n\
+             with_level = false\n",
+        )
+        .unwrap();
+        let cli = Cli::try_parse_from([
+            "moshpit",
+            "-c",
+            config_path.to_str().unwrap(),
+            "-p",
+            "/dev/null",
+            "-k",
+            "/dev/null",
+            "user@host",
+        ])
+        .unwrap();
         let mut config = load::<Cli, Config, Cli>(&cli, &cli).unwrap();
 
         let pass_cache = Arc::new(std::sync::Mutex::new(PassCache::Uncached));
