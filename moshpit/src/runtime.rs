@@ -813,12 +813,34 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let priv_path = dir.join("id_ed25519");
         let pub_path = dir.join("id_ed25519.pub");
+        let config_path = dir.join("config.toml");
 
         std::fs::write(&priv_path, "fake private key").unwrap();
         std::fs::write(&pub_path, "fake public key").unwrap();
+        std::fs::write(
+            &config_path,
+            "[tracing.stdout]\n\
+             with_target = false\n\
+             with_thread_ids = false\n\
+             with_thread_names = false\n\
+             with_line_number = false\n\
+             with_level = false\n\
+             [tracing.file]\n\
+             quiet = 0\n\
+             verbose = 0\n\
+             [tracing.file.layer]\n\
+             with_target = false\n\
+             with_thread_ids = false\n\
+             with_thread_names = false\n\
+             with_line_number = false\n\
+             with_level = false\n",
+        )
+        .unwrap();
 
         let cli = Cli::try_parse_from([
             "moshpit",
+            "-c",
+            config_path.to_str().unwrap(),
             "-p",
             priv_path.to_str().unwrap(),
             "-k",
