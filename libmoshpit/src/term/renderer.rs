@@ -61,7 +61,7 @@ impl Renderer {
     /// Resize the renderer's view of the physical terminal.
     pub fn set_size(&mut self, rows: u16, cols: u16) {
         // Resizing forces a full refresh on the next render.
-        self.displayed.set_size(rows, cols);
+        self.displayed.screen_mut().set_size(rows, cols);
         self.initialized = false;
     }
 
@@ -197,4 +197,71 @@ pub fn paint_overlays_to_ansi(overlays: &[OverlayCell], cursor: Option<OverlayCu
 fn write_to_vec(buf: &mut Vec<u8>, args: fmt::Arguments<'_>) {
     use std::io::Write as _;
     drop(buf.write_fmt(args));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_size_resets_renderer_and_updates_dimensions() {
+        let mut renderer = Renderer::new(24, 80);
+        // Force initialized state by rendering once.
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        parser.process(b"hello");
+        drop(renderer.render(parser.screen(), &[], None));
+        assert!(renderer.initialized);
+
+        // set_size should clear initialized so next render is a full refresh.
+        renderer.set_size(30, 100);
+        assert!(!renderer.initialized);
+    }
+
+    #[test]
+    fn renderer_new_is_not_initialized() {
+        let r = Renderer::new(24, 80);
+        assert!(!r.initialized);
+    }
+
+    #[test]
+    fn renderer_first_render_sets_initialized() {
+        let mut r = Renderer::new(24, 80);
+        let parser = vt100::Parser::new(24, 80, 0);
+        let out = r.render(parser.screen(), &[], None);
+        assert!(r.initialized);
+        assert!(!out.is_empty());
+    }
+
+    #[test]
+    fn renderer_invalidate_clears_initialized() {
+        let mut r = Renderer::new(24, 80);
+        let parser = vt100::Parser::new(24, 80, 0);
+        drop(r.render(parser.screen(), &[], None));
+        assert!(r.initialized);
+        r.invalidate();
+        assert!(!r.initialized);
+    }
+
+    #[test]
+    fn paint_overlays_to_ansi_empty_returns_empty() {
+        let out = paint_overlays_to_ansi(&[], None);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn paint_overlays_to_ansi_with_cell_contains_escape_sequences() {
+        use super::super::prediction::OverlayCell;
+        let cells = vec![OverlayCell {
+            row: 0,
+            col: 0,
+            ch: 'a',
+            flagged: false,
+        }];
+        let out = paint_overlays_to_ansi(&cells, None);
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("\x1b[s"));
+        assert!(s.contains("\x1b[1;1H"));
+        assert!(s.contains('a'));
+        assert!(s.contains("\x1b[u"));
+    }
 }

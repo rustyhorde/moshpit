@@ -120,3 +120,116 @@ impl EncryptedFrame {
         Ok(None)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use aws_lc_rs::{
+        aead::{AES_256_GCM_SIV, Aad, RandomizedNonceKey},
+        hmac::{HMAC_SHA512, Key, sign},
+    };
+    use bincode_next::{config::standard, encode_to_vec};
+    use uuid::Uuid;
+
+    use crate::UuidWrapper;
+
+    use super::EncryptedFrame;
+
+    fn make_keys() -> (Uuid, RandomizedNonceKey, Key) {
+        let id = Uuid::new_v4();
+        let rnk = RandomizedNonceKey::new(&AES_256_GCM_SIV, &[1u8; 32]).unwrap();
+        let hmac = Key::new(HMAC_SHA512, &[2u8; 64]);
+        (id, rnk, hmac)
+    }
+
+    fn encrypt_frame(
+        frame: &EncryptedFrame,
+        seq: u64,
+        id: Uuid,
+        rnk: &RandomizedNonceKey,
+        hmac: &Key,
+    ) -> Vec<u8> {
+        let data = encode_to_vec(frame, standard()).unwrap();
+        let aad = Aad::from(seq.to_be_bytes());
+        let mut encrypted_part = id.as_bytes().to_vec();
+        encrypted_part.extend_from_slice(&data);
+        let nonce = rnk
+            .seal_in_place_append_tag(aad, &mut encrypted_part)
+            .unwrap();
+        let seq_bytes = seq.to_be_bytes();
+        let mut to_sign = seq_bytes.to_vec();
+        to_sign.extend_from_slice(&encrypted_part);
+        let tag = sign(hmac, &to_sign);
+        let tag_bytes: [u8; 64] = tag.as_ref().try_into().unwrap();
+        let len = encrypted_part.len().to_be_bytes();
+        let mut packet = nonce.as_ref().to_vec();
+        packet.extend_from_slice(&seq_bytes);
+        packet.extend_from_slice(&tag_bytes);
+        packet.extend_from_slice(&len);
+        packet.extend_from_slice(&encrypted_part);
+        packet
+    }
+
+    #[test]
+    fn frame_id_variants_are_correct() {
+        let uuid = Uuid::new_v4();
+        assert_eq!(
+            EncryptedFrame::Bytes((UuidWrapper::new(uuid), vec![])).id(),
+            0
+        );
+        assert_eq!(
+            EncryptedFrame::Resize((UuidWrapper::new(uuid), 0, 0)).id(),
+            1
+        );
+        assert_eq!(EncryptedFrame::Nak(vec![]).id(), 2);
+        assert_eq!(EncryptedFrame::Shutdown.id(), 3);
+        assert_eq!(EncryptedFrame::Keepalive.id(), 4);
+        assert_eq!(EncryptedFrame::ScrollbackStart.id(), 5);
+        assert_eq!(EncryptedFrame::ScrollbackEnd.id(), 6);
+        assert_eq!(EncryptedFrame::ScreenState(vec![]).id(), 7);
+    }
+
+    #[test]
+    fn parse_round_trip_keepalive() {
+        let (id, rnk, hmac) = make_keys();
+        let packet = encrypt_frame(&EncryptedFrame::Keepalive, 0, id, &rnk, &hmac);
+        let mut cursor = Cursor::new(packet.as_slice());
+        let (parsed_frame, seq) = EncryptedFrame::parse(&mut cursor, id, &hmac, &rnk)
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed_frame, EncryptedFrame::Keepalive);
+        assert_eq!(seq, 0);
+    }
+
+    #[test]
+    fn parse_round_trip_shutdown() {
+        let (id, rnk, hmac) = make_keys();
+        let packet = encrypt_frame(&EncryptedFrame::Shutdown, 42, id, &rnk, &hmac);
+        let mut cursor = Cursor::new(packet.as_slice());
+        let (parsed_frame, seq) = EncryptedFrame::parse(&mut cursor, id, &hmac, &rnk)
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed_frame, EncryptedFrame::Shutdown);
+        assert_eq!(seq, 42);
+    }
+
+    #[test]
+    fn parse_truncated_returns_none() {
+        let (id, rnk, hmac) = make_keys();
+        let packet = [0u8; 4];
+        let mut cursor = Cursor::new(packet.as_slice());
+        let result = EncryptedFrame::parse(&mut cursor, id, &hmac, &rnk).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn parse_wrong_uuid_returns_error() {
+        let (id, rnk, hmac) = make_keys();
+        let packet = encrypt_frame(&EncryptedFrame::Keepalive, 0, id, &rnk, &hmac);
+        let wrong_id = Uuid::new_v4();
+        let mut cursor = Cursor::new(packet.as_slice());
+        let result = EncryptedFrame::parse(&mut cursor, wrong_id, &hmac, &rnk);
+        assert!(result.is_err());
+    }
+}

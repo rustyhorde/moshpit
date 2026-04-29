@@ -158,3 +158,97 @@ impl PathDefaults for Cli {
         env!("CARGO_PKG_NAME").to_string()
     }
 }
+
+#[cfg(test)]
+mod test {
+    use config::Source as _;
+
+    use super::Cli;
+
+    fn parse(args: &[&str]) -> Cli {
+        <Cli as clap::Parser>::parse_from(args)
+    }
+
+    #[test]
+    fn cli_defaults() {
+        let cli = parse(&["mps"]);
+        assert_eq!(cli.verbose(), 0);
+        assert_eq!(cli.quiet(), 0);
+        assert!(!cli.enable_std_output);
+        assert!(cli.config_absolute_path().is_none());
+        assert!(cli.tracing_absolute_path().is_none());
+        assert!(cli.private_key_path().is_none());
+        assert!(cli.public_key_path().is_none());
+    }
+
+    #[test]
+    fn cli_verbose() {
+        let cli = parse(&["mps", "-vv"]);
+        assert_eq!(cli.verbose(), 2);
+    }
+
+    #[test]
+    fn cli_quiet() {
+        let cli = parse(&["mps", "-qq"]);
+        assert_eq!(cli.quiet(), 2);
+    }
+
+    #[test]
+    fn cli_private_key_path() {
+        let cli = parse(&["mps", "-p", "/tmp/key"]);
+        assert_eq!(cli.private_key_path().as_deref(), Some("/tmp/key"));
+    }
+
+    #[test]
+    fn cli_public_key_path() {
+        let cli = parse(&["mps", "-k", "/tmp/key.pub"]);
+        assert_eq!(cli.public_key_path().as_deref(), Some("/tmp/key.pub"));
+    }
+
+    #[test]
+    fn cli_source_collect() {
+        let cli = parse(&["mps"]);
+        let map = cli.collect().expect("collect should succeed");
+        assert!(map.contains_key("verbose"));
+        assert!(map.contains_key("quiet"));
+        assert!(map.contains_key("enable_std_output"));
+        // Optional keys absent when not provided
+        assert!(!map.contains_key("private_key_path"));
+        assert!(!map.contains_key("public_key_path"));
+        assert!(!map.contains_key("config_path"));
+        assert!(!map.contains_key("tracing_path"));
+    }
+
+    #[test]
+    fn cli_source_collect_with_paths() {
+        let cli = parse(&[
+            "mps",
+            "-p",
+            "/tmp/priv",
+            "-k",
+            "/tmp/pub",
+            "-c",
+            "/tmp/config.toml",
+            "-t",
+            "/tmp/trace.log",
+        ]);
+        let map = cli.collect().expect("collect should succeed");
+        assert!(map.contains_key("private_key_path"));
+        assert!(map.contains_key("public_key_path"));
+        assert!(map.contains_key("config_path"));
+        assert!(map.contains_key("tracing_path"));
+    }
+
+    #[test]
+    fn cli_path_defaults() {
+        use libmoshpit::PathDefaults as _;
+        let cli = parse(&["mps"]);
+        assert_eq!(cli.env_prefix(), "MOSHPITS");
+        assert_eq!(cli.default_file_path(), "moshpits");
+        assert_eq!(cli.default_file_name(), "moshpits");
+        assert_eq!(cli.default_tracing_path(), "moshpits/logs");
+        assert_eq!(cli.default_tracing_file_name(), "moshpits");
+        assert!(cli.config_absolute_path().is_none());
+        assert!(cli.tracing_absolute_path().is_none());
+    }
+}

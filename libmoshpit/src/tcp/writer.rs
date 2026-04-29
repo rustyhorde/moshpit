@@ -58,3 +58,38 @@ impl ConnectionWriter {
         self.writer.flush().await.map_err(Into::into)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use tokio::net::{TcpListener, TcpStream};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn write_frame_succeeds() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (server, client) = tokio::join!(
+            async { listener.accept().await.map(|(s, _)| s).unwrap() },
+            TcpStream::connect(addr),
+        );
+        let (_server_r, _server_w) = server.into_split();
+        let (_, client_w) = client.unwrap().into_split();
+        let mut writer = ConnectionWriter::builder().writer(client_w).build();
+        writer.write_frame(&Frame::KexFailure).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_bytes_succeeds() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (server, client) = tokio::join!(
+            async { listener.accept().await.map(|(s, _)| s).unwrap() },
+            TcpStream::connect(addr),
+        );
+        let (_server_r, _server_w) = server.into_split();
+        let (_, client_w) = client.unwrap().into_split();
+        let mut writer = ConnectionWriter::builder().writer(client_w).build();
+        writer.write_bytes(b"hello").await.unwrap();
+    }
+}

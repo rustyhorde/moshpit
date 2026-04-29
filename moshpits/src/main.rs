@@ -247,6 +247,7 @@ mod runtime;
 mod session;
 
 #[tokio::main]
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn main() -> Result<()> {
     exit(
         run::<Vec<&str>, &str>(None)

@@ -126,3 +126,75 @@ impl TracingConfigExt for Config {
         get_effective_level(self.quiet(), self.verbose())
     }
 }
+
+#[cfg(test)]
+mod test {
+    use std::{net::SocketAddr, path::PathBuf};
+
+    use libmoshpit::{KexConfig as _, KexMode, TracingConfigExt as _};
+
+    use super::Config;
+
+    fn server_mode() -> KexMode {
+        KexMode::Server("0.0.0.0:0".parse::<SocketAddr>().unwrap())
+    }
+
+    #[test]
+    fn config_default_is_sane() {
+        let config = Config::default();
+        assert_eq!(config.verbose(), 0);
+        assert_eq!(config.quiet(), 0);
+        assert!(!config.enable_stdout());
+    }
+
+    #[test]
+    fn config_tracing_config_delegates() {
+        let config = Config::default();
+        assert_eq!(config.quiet(), 0);
+        assert_eq!(config.verbose(), 0);
+    }
+
+    #[test]
+    fn config_tracing_config_ext() {
+        let config = Config::default();
+        assert!(!config.enable_stdout());
+        assert!(config.directives().is_none());
+    }
+
+    #[test]
+    fn config_load_key_paths_explicit() {
+        let priv_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../libmoshpit/tests/keys/id_ed25519_test"
+        );
+        let pub_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../libmoshpit/tests/keys/id_ed25519_test.pub"
+        );
+        let mut config = Config {
+            private_key_path: Some(priv_path.to_string()),
+            public_key_path: Some(pub_path.to_string()),
+            ..Config::default()
+        };
+        let _ = config.set_mode(server_mode());
+        let (got_priv, got_pub) = config.key_pair_paths().expect("key_pair_paths");
+        assert_eq!(got_priv, PathBuf::from(priv_path));
+        assert_eq!(got_pub, PathBuf::from(pub_path));
+    }
+
+    #[test]
+    fn config_load_key_paths_default_derives_pub() {
+        let priv_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../libmoshpit/tests/keys/id_ed25519_test"
+        );
+        let mut config = Config {
+            private_key_path: Some(priv_path.to_string()),
+            ..Config::default()
+        };
+        let _ = config.set_mode(server_mode());
+        let (got_priv, got_pub) = config.key_pair_paths().expect("key_pair_paths");
+        assert_eq!(got_priv, PathBuf::from(priv_path));
+        assert_eq!(got_pub, PathBuf::from(priv_path).with_extension("pub"));
+    }
+}

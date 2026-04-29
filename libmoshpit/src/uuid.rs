@@ -96,3 +96,34 @@ impl Encode for UuidWrapper {
         s.encode(encoder)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use bincode_next::{config::standard, decode_from_slice, encode_to_vec};
+    use uuid::Uuid;
+
+    use super::UuidWrapper;
+
+    #[test]
+    fn uuid_wrapper_bincode_round_trip() {
+        let uuid = Uuid::new_v4();
+        let wrapper = UuidWrapper::new(uuid);
+        let encoded = encode_to_vec(wrapper, standard()).unwrap();
+        let (decoded, _): (UuidWrapper, _) = decode_from_slice(&encoded, standard()).unwrap();
+        assert_eq!(decoded.as_uuid(), uuid);
+    }
+
+    #[test]
+    fn uuid_wrapper_display_matches_hyphenated() {
+        let uuid = Uuid::new_v4();
+        let wrapper = UuidWrapper::new(uuid);
+        assert_eq!(format!("{wrapper}"), uuid.to_string());
+    }
+
+    #[test]
+    fn uuid_wrapper_from_uuid() {
+        let uuid = Uuid::new_v4();
+        let wrapper = UuidWrapper::from(uuid);
+        assert_eq!(wrapper.as_uuid(), uuid);
+    }
+}

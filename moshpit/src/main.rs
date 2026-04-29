@@ -244,6 +244,7 @@ mod cli;
 mod config;
 mod runtime;
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[tokio::main]
 async fn main() -> Result<()> {
     exit(

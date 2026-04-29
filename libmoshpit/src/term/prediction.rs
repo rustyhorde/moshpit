@@ -385,7 +385,8 @@ impl PredictionEngine {
                 let original = screen
                     .cell(pred_row, pred_col)
                     .map(vt100::Cell::contents)
-                    .unwrap_or_default();
+                    .unwrap_or_default()
+                    .to_owned();
 
                 let row_entry = self.get_or_make_row(pred_row);
                 let cell = row_entry.cell_mut(pred_col, epoch);
@@ -419,7 +420,8 @@ impl PredictionEngine {
                 let original = screen
                     .cell(pred_row, new_col)
                     .map(vt100::Cell::contents)
-                    .unwrap_or_default();
+                    .unwrap_or_default()
+                    .to_owned();
                 let row_entry = self.get_or_make_row(pred_row);
                 let cell = row_entry.cell_mut(new_col, epoch);
                 cell.replacement = ' ';
@@ -639,5 +641,98 @@ impl PredictionEngine {
         self.glitch_trigger = 0;
         self.glitch_repair_count = 0;
         self.last_byte = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_screen(rows: u16, cols: u16, content: &[u8]) -> vt100::Parser {
+        let mut p = vt100::Parser::new(rows, cols, 0);
+        if !content.is_empty() {
+            p.process(content);
+        }
+        p
+    }
+
+    /// Printable ASCII branch: `Cell::contents()` result (`.to_owned()`) is stored in
+    /// `cell.original` and must be a valid `String`.
+    #[test]
+    fn new_user_byte_printable_stores_original_as_string() {
+        let mut engine = PredictionEngine::new(DisplayPreference::Always);
+        // Write 'X' at (0,0), then home the cursor back to (0,0) so the
+        // prediction lands on the cell that contains 'X'.
+        let parser = make_screen(24, 80, b"X\x1b[H");
+        let screen = parser.screen();
+        assert_eq!(screen.cursor_position(), (0, 0));
+
+        // Type 'a' — should predict 'a' at (0,0) and store original = "X".
+        engine.new_user_byte(b'a', screen);
+
+        let row = engine.overlay_rows.iter().find(|r| r.row == 0).unwrap();
+        let cell = row.cells.iter().find(|c| c.col == 0).unwrap();
+        assert_eq!(cell.replacement, 'a');
+        assert_eq!(cell.original, "X");
+    }
+
+    /// Backspace branch: `Cell::contents()` result (`.to_owned()`) is stored in
+    /// `cell.original` for the cell being blanked.
+    #[test]
+    fn new_user_byte_backspace_stores_original_as_string() {
+        let mut engine = PredictionEngine::new(DisplayPreference::Always);
+        // Write 'X' at (0,0) and home the cursor to (0,0).
+        let parser = make_screen(24, 80, b"X\x1b[H");
+        let screen = parser.screen();
+        assert_eq!(screen.cursor_position(), (0, 0));
+
+        // Type 'a': predicted cursor advances to (0,1).
+        engine.new_user_byte(b'a', screen);
+
+        // Backspace: predicted cursor is at (0,1), so new_col = 0.
+        // original = screen.cell(0, 0) = "X".
+        engine.new_user_byte(0x7f, screen);
+
+        let row = engine.overlay_rows.iter().find(|r| r.row == 0).unwrap();
+        let cell = row
+            .cells
+            .iter()
+            .find(|c| c.col == 0 && c.replacement == ' ')
+            .unwrap();
+        assert_eq!(cell.original, "X");
+    }
+
+    #[test]
+    fn display_preference_default_is_adaptive() {
+        assert_eq!(DisplayPreference::default(), DisplayPreference::Adaptive);
+    }
+
+    #[test]
+    fn is_active_always_returns_true() {
+        let engine = PredictionEngine::new(DisplayPreference::Always);
+        assert!(engine.is_active());
+    }
+
+    #[test]
+    fn is_active_never_returns_false() {
+        let engine = PredictionEngine::new(DisplayPreference::Never);
+        assert!(!engine.is_active());
+    }
+
+    #[test]
+    fn set_send_interval_above_high_threshold_activates_srtt_trigger() {
+        let mut engine = PredictionEngine::new(DisplayPreference::Adaptive);
+        assert!(!engine.is_active());
+        engine.set_send_interval(31); // > SRTT_TRIGGER_HIGH_MS=30
+        assert!(engine.is_active());
+    }
+
+    #[test]
+    fn apply_never_returns_empty() {
+        let engine = PredictionEngine::new(DisplayPreference::Never);
+        let parser = make_screen(24, 80, b"");
+        let (cells, cursor) = engine.apply(parser.screen());
+        assert!(cells.is_empty());
+        assert!(cursor.is_none());
     }
 }

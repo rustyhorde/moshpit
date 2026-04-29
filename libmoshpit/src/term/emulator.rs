@@ -43,7 +43,7 @@ impl Emulator {
 
     /// Resize the emulator's screen (call on SIGWINCH).
     pub fn set_size(&mut self, rows: u16, cols: u16) {
-        self.parser.set_size(rows, cols);
+        self.parser.screen_mut().set_size(rows, cols);
     }
 
     /// Returns the current screen state.
@@ -61,5 +61,38 @@ impl Emulator {
     /// Returns a mutable reference to the underlying parser.
     pub fn parser_mut(&mut self) -> &mut vt100::Parser {
         &mut self.parser
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_size_updates_screen_dimensions() {
+        let mut emu = Emulator::new(24, 80);
+        assert_eq!(emu.screen().size(), (24, 80));
+        emu.set_size(30, 100);
+        assert_eq!(emu.screen().size(), (30, 100));
+    }
+
+    #[test]
+    fn emulator_new_initial_size() {
+        let emu = Emulator::new(24, 80);
+        assert_eq!(emu.screen().size(), (24, 80));
+    }
+
+    #[test]
+    fn emulator_process_bytes_moves_cursor() {
+        let mut emu = Emulator::new(24, 80);
+        emu.process(b"hello");
+        assert_eq!(emu.screen().cursor_position(), (0, 5));
+    }
+
+    #[test]
+    fn emulator_debug_format_contains_struct_name() {
+        let emu = Emulator::new(24, 80);
+        let s = format!("{emu:?}");
+        assert!(s.contains("Emulator"));
     }
 }
