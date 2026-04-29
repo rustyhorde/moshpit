@@ -13,9 +13,13 @@ use bincode_next::{Decode, Encode, config::standard, decode_from_slice};
 use bytes::Buf as _;
 
 use crate::{
+    error::Error,
     frames::{get_bytes, get_usize},
     uuid::UuidWrapper,
 };
+
+/// The maximum size of a TCP frame payload in bytes (64KB).
+pub(crate) const MAX_FRAME_LENGTH: usize = 65536;
 
 /// A moshpit frame.
 #[derive(Clone, Debug, Decode, Encode, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -69,6 +73,9 @@ impl Frame {
             Some(0..=8) => {
                 if let Some(length_slice) = get_usize(src)? {
                     let length = usize::from_be_bytes(length_slice.try_into()?);
+                    if length > MAX_FRAME_LENGTH {
+                        return Err(Error::FrameTooLarge.into());
+                    }
                     if let Some(data) = get_bytes(src, length)? {
                         let (frame, _): (Frame, _) = decode_from_slice(data, standard())?;
                         return Ok(Some(frame));
@@ -315,5 +322,23 @@ mod tests {
         assert!(result.is_ok());
         let maybe_frame = result.unwrap();
         assert!(maybe_frame.is_none());
+    }
+
+    #[test]
+    fn test_parse_oversized() {
+        use crate::frames::frame::MAX_FRAME_LENGTH;
+        let oversized_len = MAX_FRAME_LENGTH + 1;
+        let length_bytes = oversized_len.to_be_bytes();
+        let mut all_data = vec![0u8];
+        all_data.extend_from_slice(&length_bytes);
+        all_data.extend_from_slice(&[0u8; 10]); // Mock data
+
+        let mut cursor = Cursor::new(&all_data[..]);
+        let result = Frame::parse(&mut cursor);
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            crate::error::Error::FrameTooLarge.to_string()
+        );
     }
 }

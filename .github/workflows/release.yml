@@ -11,9 +11,7 @@ env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   CARGO_TERM_COLOR: always
 
-permissions:
-  contents: write
-  pull-requests: write
+
 
 name: 🚀 Release 🚀
 
@@ -22,6 +20,8 @@ jobs:
   build:
     name: 🔨 Build Linux x86_64 🔨
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
       pkgver: ${{ steps.version.outputs.pkgver }}
     steps:
@@ -83,6 +83,8 @@ jobs:
     name: 📝 Create GitHub Release 📝
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     outputs:
       tarball_sha256: ${{ steps.sha256.outputs.tarball_sha256 }}
     steps:
@@ -120,6 +122,9 @@ jobs:
     name: 📦 Update PKGBUILDs 📦
     needs: [build, release]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
     steps:
       - name: Checkout
         # v6
@@ -174,6 +179,8 @@ jobs:
     name: 🏹 Publish to AUR 🏹
     needs: [build, update-pkgbuilds]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     strategy:
       matrix:
         package: [moshpit-keygen, moshpit, moshpits]

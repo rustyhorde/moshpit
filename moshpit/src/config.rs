@@ -113,6 +113,10 @@ impl KexConfig for Config {
     fn resume_session_uuid(&self) -> Option<Uuid> {
         self.resume_session_uuid
     }
+
+    fn server_id(&self) -> Option<String> {
+        Some(self.server_destination().clone())
+    }
 }
 
 impl TracingConfig for Config {

@@ -181,6 +181,7 @@ fn render_banner(clients: &[&ClientInfo], prev_lines: usize) -> Vec<u8> {
     out
 }
 
+#[allow(unsafe_code)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) async fn run<I, T>(args: Option<I>) -> Result<()>
 where
@@ -193,6 +194,11 @@ where
     } else {
         Cli::try_parse()?
     };
+
+    #[cfg(unix)]
+    if unsafe { libc::getuid() } == 0 {
+        return Err(anyhow::anyhow!("mps daemon should not be run as root"));
+    }
 
     // Load the configuration
     let mut config =
@@ -373,7 +379,7 @@ async fn handle_connection(
     let port_pool = config.port_pool();
     let session_registry = config.session_registry();
     let (kex, udp_arc, skex_opt) =
-        run_key_exchange(config, sock_read, sock_write, || Ok(None)).await?;
+        run_key_exchange(config, sock_read, sock_write, || Ok(None), None).await?;
     info!("Key exchange completed with moshpit");
 
     let skex = skex_opt.ok_or_else(|| anyhow::anyhow!("missing server kex info"))?;
@@ -485,6 +491,8 @@ async fn handle_connection(
     if let Some(term_rx) = maybe_term_rx {
         spawn_pty(
             session_uuid,
+            skex.user().to_owned(),
+            skex.shell().to_owned(),
             term_rx,
             output_handle,
             scrollback,
@@ -686,10 +694,13 @@ fn spawn_pty_reader(
 ///
 /// The thread owns the PTY master and keeps running until the shell exits, regardless of
 /// how many clients connect and disconnect.
+#[allow(unsafe_code)]
 #[cfg_attr(nightly, allow(clippy::too_many_arguments))]
 #[cfg_attr(coverage_nightly, coverage(off))]
 fn spawn_pty(
     session_uuid: Uuid,
+    user: String,
+    shell: String,
     mut term_rx: Receiver<TerminalMessage>,
     output_handle: Arc<Mutex<SessionOutputHandle>>,
     scrollback: Arc<Mutex<VecDeque<u8>>>,
@@ -701,12 +712,27 @@ fn spawn_pty(
     let _term_handle = thread::spawn(move || {
         #[cfg(unix)]
         let cmd = {
-            let mut c = CommandBuilder::new("/usr/bin/fish");
+            // Verify that the daemon user matches the requested user to prevent session confusion
+            let daemon_uid = unsafe { libc::getuid() };
+            let pwd = unsafe { libc::getpwuid(daemon_uid) };
+            if !pwd.is_null() {
+                let daemon_user = unsafe { std::ffi::CStr::from_ptr((*pwd).pw_name) };
+                if daemon_user.to_string_lossy() != user {
+                    error!(
+                        "Daemon user {} cannot spawn shell for user {}",
+                        daemon_user.to_string_lossy(),
+                        user
+                    );
+                    return;
+                }
+            }
+
+            let mut c = CommandBuilder::new(shell);
             c.arg("-li");
             c
         };
         #[cfg(windows)]
-        let cmd = CommandBuilder::new("cmd.exe");
+        let cmd = CommandBuilder::new(shell);
 
         let pty_system = native_pty_system();
         let pair = pty_system

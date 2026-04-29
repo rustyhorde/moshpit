@@ -27,7 +27,6 @@ dialoguer = "0.12.0"
 getset = { workspace = true }
 libmoshpit = { version = "0.2.0", path = "../libmoshpit" }
 vergen-pretty = { workspace = true }
-
 [build-dependencies]
 anyhow = { workspace = true }
 rustversion = { workspace = true }

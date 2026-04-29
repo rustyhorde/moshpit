@@ -61,11 +61,26 @@ fn generate_keypair() -> Result<()> {
     let keypair = KeyPair::generate_key_pair(passphrase_opt.as_ref())?;
 
     // Write the private key out to the private key file
-    let mut priv_key_file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&priv_key_path)?;
+    let mut priv_key_file = {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&priv_key_path)?
+        }
+        #[cfg(not(unix))]
+        {
+            OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&priv_key_path)?
+        }
+    };
     keypair.write_private_key(&mut priv_key_file)?;
 
     // Write the public key out to the public key file
@@ -139,26 +154,18 @@ fn check_paths(priv_key_path: &Path, pub_key_path: &Path) -> Result<bool> {
 }
 
 fn setup_passphrase(priv_key_path: &Path) -> Result<Option<String>> {
-    let mut passphrase_opt = None;
-    let passphrase_prompt = format!(
-        "Enter passphrase for \"{}\" (empty for no passphrase)",
-        priv_key_path.display()
-    );
+    let passphrase_prompt = format!("Enter passphrase for \"{}\"", priv_key_path.display());
     let passphrase: String = Password::new()
         .with_prompt(passphrase_prompt)
         .with_confirmation(
             "Enter same passphrase again",
             "Passphrases do not match.  Try again.",
         )
-        .allow_empty_password(true)
+        .allow_empty_password(false)
         .report(false)
         .interact()?;
 
-    if !passphrase.is_empty() {
-        passphrase_opt = Some(passphrase);
-    }
-
-    Ok(passphrase_opt)
+    Ok(Some(passphrase))
 }
 
 fn display_fingerprint(public_key_path: &str) -> Result<()> {

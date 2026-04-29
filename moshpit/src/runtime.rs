@@ -271,8 +271,29 @@ async fn connect_and_kex(
     };
 
     let (sock_read, sock_write) = socket.into_split();
-    let (kex, udp_arc, _) =
-        run_key_exchange(config.clone(), sock_read, sock_write, pass_fn).await?;
+
+    let tofu_fn: libmoshpit::TofuFn = Arc::new(|host: &str, fingerprint: &str| -> Result<bool> {
+        tokio::task::block_in_place(|| {
+            let prompt = format!(
+                "The authenticity of host '{host}' can't be established.\n\
+                 Fingerprint is SHA256:{fingerprint}.\n\
+                 Are you sure you want to continue connecting? (yes/no)"
+            );
+            let input: String = dialoguer::Input::new()
+                .with_prompt(prompt)
+                .interact_text()?;
+            Ok(input.eq_ignore_ascii_case("yes"))
+        })
+    });
+
+    let (kex, udp_arc, _) = run_key_exchange(
+        config.clone(),
+        sock_read,
+        sock_write,
+        pass_fn,
+        Some(tofu_fn),
+    )
+    .await?;
 
     if let Some(session_uuid) = kex.session_uuid() {
         if let Err(e) = write_session_uuid(server_ip, server_port, session_uuid) {
@@ -506,32 +527,42 @@ fn maybe_generate_keypair(config: &Config) -> Result<()> {
         create_key_dir(parent)?;
     }
 
-    // Optionally protect the private key with a passphrase
     let passphrase: String = Password::new()
         .with_prompt(format!(
-            "Enter passphrase for \"{}\" (empty for no passphrase)",
+            "Enter passphrase for \"{}\"",
             priv_key_path.display()
         ))
         .with_confirmation(
             "Enter same passphrase again",
             "Passphrases do not match. Try again.",
         )
-        .allow_empty_password(true)
+        .allow_empty_password(false)
         .report(false)
         .interact()?;
-    let passphrase_opt = if passphrase.is_empty() {
-        None
-    } else {
-        Some(passphrase)
-    };
+    let passphrase_opt = Some(passphrase);
 
     let keypair = KeyPair::generate_key_pair(passphrase_opt.as_ref())?;
 
-    let mut priv_key_file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&priv_key_path)?;
+    let mut priv_key_file = {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&priv_key_path)?
+        }
+        #[cfg(not(unix))]
+        {
+            OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&priv_key_path)?
+        }
+    };
     keypair.write_private_key(&mut priv_key_file)?;
 
     let mut pub_key_file = OpenOptions::new()
@@ -716,9 +747,34 @@ fn read_session_uuid(host: &str, port: u16) -> Option<Uuid> {
 fn write_session_uuid(host: &str, port: u16, session_uuid: Uuid) -> Result<()> {
     let path = session_file_path(host, port).ok_or_else(|| anyhow::anyhow!("no home dir"))?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        {
+            DirBuilder::new()
+                .mode(0o700)
+                .recursive(true)
+                .create(parent)?;
+        }
+        #[cfg(not(unix))]
+        {
+            DirBuilder::new().recursive(true).create(parent)?;
+        }
     }
-    let mut file = std::fs::File::create(&path)?;
+    let mut file = {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&path)?
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::File::create(&path)?
+        }
+    };
     write!(file, "{session_uuid}")?;
     Ok(())
 }
