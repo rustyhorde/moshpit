@@ -33,4 +33,4 @@ vergen-gix = { version = "10.0.0-beta.7", features = [
   "rustc",
   "si",
 ] }
-vergen-pretty = { version = "10.0.0-beta.7", features = ["color", "tracing", "rkyv", "serde"] }
+vergen-pretty = { version = "10.0.0-beta.8", features = ["color", "tracing", "rkyv", "serde"] }
