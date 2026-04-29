@@ -2152,20 +2152,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "keygen"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "clap",
- "dialoguer",
- "getset",
- "libmoshpit",
- "rustversion",
- "vergen-gix",
- "vergen-pretty",
-]
-
-[[package]]
 name = "kstring"
 version = "2.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2345,6 +2331,20 @@ dependencies = [
  "tracing",
  "tracing-subscriber-init",
  "uuid",
+ "vergen-gix",
+ "vergen-pretty",
+]
+
+[[package]]
+name = "moshpit-keygen"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "dialoguer",
+ "getset",
+ "libmoshpit",
+ "rustversion",
  "vergen-gix",
  "vergen-pretty",
 ]
