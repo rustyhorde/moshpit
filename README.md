@@ -11,7 +11,7 @@ moshpit is a suite of tools for establishing encrypted, resilient remote termina
 | `mp` | moshpit | Client — connects to a running `mps` server |
 | `mp-keygen` | keygen | Key management — generates and inspects ed25519 key pairs |
 
-Sessions are authenticated with ed25519 key pairs and transported over an encrypted TCP control channel plus a UDP data channel (ports 50000–59999).  The server tracks full terminal screen state with a server-side vt100 emulator; on reconnect the client receives a single clean screen snapshot and repaints instantly rather than replaying raw scrollback history.
+Sessions are authenticated with ed25519 key pairs.  TCP is used only for the initial key exchange; once the exchange completes the connection switches to UDP exclusively (ports 50000–59999) for all terminal I/O.  The server tracks full terminal screen state with a server-side vt100 emulator; on reconnect the client receives a single clean screen snapshot and repaints instantly rather than replaying raw scrollback history.
 
 ---
 
@@ -34,7 +34,7 @@ moshpit draws its core motivation from [Mosh (Mobile Shell)](https://mosh.org/),
 |---------|------|---------|
 | **Language** | C++ | Rust |
 | **Authentication** | Delegated to SSH for the initial handshake; a one-time secret is passed back over SSH | Standalone ed25519 key-pair authentication — no SSH dependency |
-| **Transport model** | Pure UDP after setup; Mosh's *State Synchronization Protocol* (SSP) keeps a diff of the full terminal screen state and sends only the latest snapshot | Separate TCP control channel + UDP data channel; NAK-based selective retransmission ensures reliable, ordered delivery of the raw byte stream |
+| **Transport model** | Pure UDP after setup; Mosh's *State Synchronization Protocol* (SSP) keeps a diff of the full terminal screen state and sends only the latest snapshot | TCP is used solely for the ed25519 key exchange; all terminal I/O runs over UDP after the exchange completes.  NAK-based selective retransmission ensures reliable, ordered delivery of the raw byte stream |
 | **Reconnect display sync** | SSP sends the latest screen snapshot; client repaints from the diff immediately | Server maintains a `vt100::Parser` tracking the live PTY screen; on reconnect a single `ScreenState` frame delivers `contents_formatted()` bytes for an instant clean repaint.  A 50 ms periodic task also sends `ScreenState` diffs during normal use so the client stays in sync even across network hiccups. |
 | **Client-side prediction** | Mosh echoes keystrokes locally and predicts cursor movement to hide latency, underlining characters that have not yet been confirmed by the server | Same — keystrokes are echoed locally, cursor movement is predicted, and unconfirmed characters are underlined until the server output arrives |
 | **Encryption** | AES-128-OCB authenticated encryption using a symmetric session key | Key exchange via an ed25519-based handshake; symmetric AES-256-GCM-SIV on the UDP channel with per-packet HMAC-SHA-512 authentication |
@@ -44,6 +44,30 @@ moshpit draws its core motivation from [Mosh (Mobile Shell)](https://mosh.org/),
 | **License** | GPL v3 | Apache 2.0 / MIT (your choice) |
 
 > **Attribution**: the name *moshpit* is a deliberate nod to Mosh, whose design and published research were a direct inspiration for this project.  If you need production-grade, battle-tested remote terminal software, [use Mosh](https://mosh.org/).  moshpit is an independent reimagining with different goals and trade-offs.
+
+---
+
+## Connection model
+
+### Phase 1 — TCP key exchange
+
+The client opens a TCP connection to the server's configured port (default 40404).  The two sides run a mutual ed25519 key-pair authentication and key-exchange protocol over this connection.  Once the handshake completes both halves of the TCP socket are released and the TCP connection is **closed immediately** — it is not kept alive, and is not used for anything after the key exchange.
+
+### Phase 2 — UDP session
+
+All subsequent communication happens exclusively over UDP (server-side port range 50000–59999).  Every frame is encrypted with AES-256-GCM-SIV and authenticated with a per-packet HMAC-SHA-512.
+
+Reliable, ordered delivery is provided at the application layer using **NAK-based selective retransmission**:
+
+- The **receiver** (`UdpReader`) tracks the highest sequence number seen and maintains a reorder buffer.  Any gap that persists beyond a 50 ms timeout triggers a `Nak` frame — a compact list of missing sequence numbers — sent back to the sender over the same UDP channel.
+- The **sender** (`UdpSender`) keeps a sliding retransmit buffer of the 512 most-recently transmitted wire-encoded packets.  When a `Nak` arrives the missing packets are looked up and resent immediately.
+- Each gap is retried up to 10 times (with the 50 ms floor doubling each attempt); after the limit is exceeded the gap is abandoned and the session proceeds.
+
+Because retransmission is handled entirely within the UDP layer there is no head-of-line blocking from TCP: a lost packet delays only the frames that depend on it, not the rest of the stream.
+
+### Reconnection
+
+If the UDP path is interrupted the client automatically reconnects — performing a new TCP key exchange for the same logical session — and the server delivers a single `ScreenState` frame containing the current terminal contents so the display repaints instantly without replaying scrollback history.
 
 ---
 
@@ -104,13 +128,22 @@ sudo pacman -Rs moshpits moshpit moshpit-keygen
 
 ---
 
-## Building
+## Installation (cargo)
+
+Requires a Rust toolchain (stable, 1.91.1 or later).  Install all three binaries directly from [crates.io](https://crates.io):
 
 ```bash
-cargo build --release
+# Key management tool (install first — the others depend on it)
+cargo install keygen
+
+# Client
+cargo install moshpit
+
+# Server
+cargo install moshpits
 ```
 
-The resulting binaries are in `target/release/`.
+To install a specific version, append `--version <x.y.z>` to any of the commands above.
 
 ---
 
@@ -420,7 +453,7 @@ with_level       = true
 
 | Port range | Protocol | Direction | Purpose |
 |-----------|----------|-----------|---------|
-| `mps.port` (e.g. 40404) | TCP | Inbound to server | Control channel / key exchange |
+| `mps.port` (e.g. 40404) | TCP | Inbound to server | Key exchange only — connection switches to UDP after handshake |
 | 50000–59999 | UDP | Inbound to server | Encrypted terminal data |
 
 ---
