@@ -98,6 +98,12 @@ If the UDP path is interrupted the client automatically reconnects — performin
 [![codecov](https://codecov.io/gh/rustyhorde/moshpit/branch/master/graph/badge.svg?token=cBXro7o2UN)](https://codecov.io/gh/rustyhorde/moshpit)
 [![CI](https://github.com/rustyhorde/moshpit/actions/workflows/moshpit.yml/badge.svg)](https://github.com/rustyhorde/moshpit/actions)
 
+## Security Notice (Pre-Hardening)
+
+This project has not yet completed a formal security hardening phase, external security review, or independent penetration testing.  It may contain security flaws that could lead to data loss, session compromise, privilege misuse, or other unintended behavior.
+
+Use this software at your own risk, especially in internet-facing, production, or high-trust environments.
+
 ---
 
 ## Installation (Arch Linux / AUR)
@@ -484,6 +490,16 @@ with_level       = true
 |-----------|----------|-----------|---------|
 | `mps.port` (e.g. 40404) | TCP | Inbound to server | Key exchange only — connection switches to UDP after handshake |
 | 50000–59999 | UDP | Inbound to server | Encrypted terminal data |
+
+---
+
+## Developer Liability Disclaimer
+
+To the fullest extent permitted by applicable law, this software is provided "AS IS" and "AS AVAILABLE", without warranties or conditions of any kind, express or implied.  By installing, running, or distributing this software, you assume all risks associated with its use.
+
+The project author and contributors are not liable for any direct, indirect, incidental, special, exemplary, or consequential damages, including but not limited to system damage, data loss, security incidents, service interruption, or loss of profits, arising from use of this project.
+
+If you do not agree with these terms, do not use this software.
 
 ---
 
