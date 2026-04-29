@@ -885,6 +885,11 @@ mod tests {
         let dir = std::env::temp_dir().join(Uuid::new_v4().to_string());
         std::fs::create_dir_all(&dir).unwrap();
         let config_path = dir.join("config.toml");
+        // Empty key files: /dev/null doesn't exist on Windows, so create real empty files.
+        let empty_priv_key_path = dir.join("empty_priv_key");
+        let empty_pub_key_path = dir.join("empty_pub_key");
+        std::fs::write(&empty_priv_key_path, b"").unwrap();
+        std::fs::write(&empty_pub_key_path, b"").unwrap();
         std::fs::write(
             &config_path,
             "[tracing.stdout]\n\
@@ -909,9 +914,9 @@ mod tests {
             "-c",
             config_path.to_str().unwrap(),
             "-p",
-            "/dev/null",
+            empty_priv_key_path.to_str().unwrap(),
             "-k",
-            "/dev/null",
+            empty_pub_key_path.to_str().unwrap(),
             "user@host",
         ])
         .unwrap();
