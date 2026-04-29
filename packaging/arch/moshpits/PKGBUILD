@@ -15,7 +15,7 @@ source=(
     "mps.service"
 )
 sha256sums=(
-    'SKIP'
+    '1453fdad76893f072b4c8754cbab60e51d5c6d98bddf55159a2ca0d72c610521'
     'SKIP'
 )
 
