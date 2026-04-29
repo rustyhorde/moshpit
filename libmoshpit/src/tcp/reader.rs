@@ -121,3 +121,42 @@ impl ConnectionReader {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use tokio::net::{TcpListener, TcpStream};
+
+    use super::*;
+    use crate::ConnectionWriter;
+
+    async fn make_loopback() -> (ConnectionReader, ConnectionWriter) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (server, client) = tokio::join!(
+            async { listener.accept().await.map(|(s, _)| s).unwrap() },
+            TcpStream::connect(addr),
+        );
+        let (server_r, _) = server.into_split();
+        let (_, client_w) = client.unwrap().into_split();
+        let reader = ConnectionReader::builder().reader(server_r).build();
+        let writer = ConnectionWriter::builder().writer(client_w).build();
+        (reader, writer)
+    }
+
+    #[tokio::test]
+    async fn read_frame_round_trip() {
+        let (mut reader, mut writer) = make_loopback().await;
+        writer.write_frame(&Frame::KexFailure).await.unwrap();
+        drop(writer);
+        let frame = reader.read_frame().await.unwrap();
+        assert_eq!(frame, Some(Frame::KexFailure));
+    }
+
+    #[tokio::test]
+    async fn read_frame_eof_returns_none() {
+        let (mut reader, writer) = make_loopback().await;
+        drop(writer);
+        let frame = reader.read_frame().await.unwrap();
+        assert_eq!(frame, None);
+    }
+}

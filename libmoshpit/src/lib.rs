@@ -285,6 +285,10 @@ pub use self::session::new_session_registry;
 pub use self::tcp::reader::ConnectionReader;
 pub use self::tcp::writer::ConnectionWriter;
 pub use self::term::TerminalMessage;
+pub use self::term::{
+    DisplayPreference, Emulator, OverlayCell, OverlayCursor, PredictionEngine, Renderer,
+    paint_overlays_to_ansi,
+};
 pub use self::tracing::{TracingConfigExt, init_tracing};
 pub use self::udp::UdpClient;
 pub use self::udp::reader::UdpReader;

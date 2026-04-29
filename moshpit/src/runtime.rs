@@ -25,8 +25,9 @@ use clap::Parser as _;
 use crossterm::terminal::enable_raw_mode;
 use dialoguer::{Confirm, Password};
 use libmoshpit::{
-    EncryptedFrame, Kex, KexConfig as _, KeyPair, MoshpitError, UdpReader, UdpSender, UuidWrapper,
-    init_tracing, load, parse_server_destination, run_key_exchange,
+    DisplayPreference, Emulator, EncryptedFrame, Kex, KexConfig as _, KeyPair, MoshpitError,
+    PredictionEngine, Renderer, UdpReader, UdpSender, UuidWrapper, init_tracing, load,
+    paint_overlays_to_ansi, parse_server_destination, run_key_exchange,
 };
 use terminal_size::terminal_size;
 #[cfg(unix)]
@@ -46,6 +47,7 @@ use uuid::Uuid;
 
 use crate::{cli::Cli, config::Config};
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) async fn run<I, T>(args: Option<I>) -> Result<()>
 where
     I: IntoIterator<Item = T>,
@@ -143,6 +145,7 @@ async fn countdown_reconnect_banner(
 }
 
 /// Persistent reconnect loop.  Runs until the shell exits (via `process::exit`).
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn run_session_loop(
     config: Config,
     socket_addr: SocketAddr,
@@ -215,7 +218,7 @@ async fn run_session_loop(
                     shared
                 };
 
-                run_udp_session(kex, udp_arc, kb_rx, stdout_tx.clone()).await?;
+                run_udp_session(kex, udp_arc, kb_rx, stdout_tx.clone(), config.predict()).await?;
                 // Session dropped — show the reconnecting banner while we retry.
                 show_reconnect_banner(&stdout_tx).await;
                 time::sleep(Duration::from_millis(500)).await;
@@ -285,11 +288,14 @@ async fn connect_and_kex(
 }
 
 /// Set up UDP tasks for one session and wait until the server disconnects.
+#[cfg_attr(nightly, allow(clippy::too_many_lines))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn run_udp_session(
     kex: Kex,
     udp_arc: Arc<UdpSocket>,
     kb_rx: Arc<Mutex<Receiver<Vec<u8>>>>,
     stdout_tx: Sender<Vec<u8>>,
+    display_preference: DisplayPreference,
 ) -> Result<()> {
     let (reconnect_tx, mut reconnect_rx) = channel::<()>(1);
     let token = CancellationToken::new();
@@ -305,6 +311,7 @@ async fn run_udp_session(
         .retransmit_tx(retransmit_tx)
         .silence_timeout(Duration::from_secs(15))
         .reconnect_tx(reconnect_tx)
+        .query_response_tx(tx.clone())
         .build();
 
     let mut udp_sender = UdpSender::builder()
@@ -323,15 +330,45 @@ async fn run_udp_session(
     tx.send(EncryptedFrame::Resize((kex.uuid_wrapper(), cols, rows)))
         .await?;
 
-    let reader_token = token.clone();
-    let _reader = spawn(async move { udp_reader.client_frame_loop(reader_token, stdout_tx).await });
+    // ── Prediction / emulator shared state ──────────────────────────────────
+    let emulator = Arc::new(std::sync::Mutex::new(Emulator::new(rows, cols)));
+    let prediction = Arc::new(std::sync::Mutex::new(PredictionEngine::new(
+        display_preference,
+    )));
+    let renderer = Arc::new(std::sync::Mutex::new(Renderer::new(rows, cols)));
 
-    spawn_resize_handler(tx.clone(), kex.uuid_wrapper(), token.clone());
+    let reader_token = token.clone();
+    let emu_reader = emulator.clone();
+    let pred_reader = prediction.clone();
+    let rend_reader = renderer.clone();
+    let stdout_tx_reader = stdout_tx.clone();
+    let _reader = spawn(async move {
+        udp_reader
+            .client_frame_loop(
+                reader_token,
+                stdout_tx_reader,
+                emu_reader,
+                pred_reader,
+                rend_reader,
+            )
+            .await;
+    });
+
+    spawn_resize_handler(
+        tx.clone(),
+        kex.uuid_wrapper(),
+        token.clone(),
+        emulator.clone(),
+        renderer.clone(),
+    );
 
     // Stdin forwarder: holds the shared kb_rx mutex for this session's lifetime.
     let fwd_token = token.clone();
     let session_tx = tx;
     let uuid_wrapper = kex.uuid_wrapper();
+    let emu_fwd = emulator.clone();
+    let pred_fwd = prediction.clone();
+    let stdout_tx_fwd = stdout_tx;
     let _forwarder = spawn(async move {
         let mut rx = kb_rx.lock().await;
         loop {
@@ -339,12 +376,27 @@ async fn run_udp_session(
                 () = fwd_token.cancelled() => break,
                 data = rx.recv() => match data {
                     Some(data) => {
+                        // Forward to server.
                         if session_tx
-                            .send(EncryptedFrame::Bytes((uuid_wrapper, data)))
+                            .send(EncryptedFrame::Bytes((uuid_wrapper, data.clone())))
                             .await
                             .is_err()
                         {
                             break;
+                        }
+                        // Local echo prediction: feed each byte to the engine.
+                        let (overlays, cursor) = {
+                            let emu = emu_fwd.lock().unwrap();
+                            let screen = emu.screen();
+                            let mut pred = pred_fwd.lock().unwrap();
+                            for byte in &data {
+                                pred.new_user_byte(*byte, screen);
+                            }
+                            pred.apply(screen)
+                        };
+                        let preview = paint_overlays_to_ansi(&overlays, cursor);
+                        if !preview.is_empty() {
+                            drop(stdout_tx_fwd.send(preview).await);
                         }
                     }
                     None => break,
@@ -366,6 +418,8 @@ fn spawn_resize_handler(
     resize_tx: Sender<EncryptedFrame>,
     resize_uuid: UuidWrapper,
     resize_token: CancellationToken,
+    emulator: Arc<std::sync::Mutex<Emulator>>,
+    renderer: Arc<std::sync::Mutex<Renderer>>,
 ) {
     let _resize_handle = spawn(async move {
         match signal(SignalKind::window_change()) {
@@ -375,6 +429,8 @@ fn spawn_resize_handler(
                     _ = sigwinch.recv() => {
                         let (columns, rows) = terminal_size()
                             .map_or((80, 24), |(width, height)| (width.0, height.0));
+                        emulator.lock().unwrap().set_size(rows, columns);
+                        renderer.lock().unwrap().set_size(rows, columns);
                         if let Err(e) =
                             resize_tx.send(EncryptedFrame::Resize((resize_uuid, columns, rows))).await
                         {
@@ -398,6 +454,8 @@ fn spawn_resize_handler(
     resize_tx: Sender<EncryptedFrame>,
     resize_uuid: UuidWrapper,
     resize_token: CancellationToken,
+    emulator: Arc<std::sync::Mutex<Emulator>>,
+    renderer: Arc<std::sync::Mutex<Renderer>>,
 ) {
     let _resize_handle = thread::spawn(move || {
         let mut last_size = terminal_size().map_or((80, 24), |(w, h)| (w.0, h.0));
@@ -410,6 +468,8 @@ fn spawn_resize_handler(
             if current_size != last_size {
                 last_size = current_size;
                 let (columns, rows) = current_size;
+                emulator.lock().unwrap().set_size(rows, columns);
+                renderer.lock().unwrap().set_size(rows, columns);
                 if let Err(e) =
                     resize_tx.blocking_send(EncryptedFrame::Resize((resize_uuid, columns, rows)))
                 {
@@ -661,4 +721,225 @@ fn write_session_uuid(host: &str, port: u16, session_uuid: Uuid) -> Result<()> {
     let mut file = std::fs::File::create(&path)?;
     write!(file, "{session_uuid}")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn test_pass_cache() {
+        let mut cache = PassCache::Uncached;
+        assert!(!cache.is_cached());
+
+        cache = PassCache::NoPassphrase;
+        assert!(cache.is_cached());
+        assert_eq!(cache.passphrase(), None);
+
+        cache = PassCache::Passphrase("secret".to_string());
+        assert!(cache.is_cached());
+        assert_eq!(cache.passphrase(), Some("secret".to_string()));
+    }
+
+    #[test]
+    #[should_panic(expected = "passphrase() called before caching")]
+    fn test_pass_cache_panic() {
+        let cache = PassCache::Uncached;
+        drop(cache.passphrase());
+    }
+
+    #[tokio::test]
+    async fn test_banners() {
+        let (tx, mut rx) = channel(10);
+        show_reconnect_banner(&tx).await;
+        let msg = rx.recv().await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&msg).contains("[moshpit] server unreachable, reconnecting...")
+        );
+
+        clear_reconnect_banner(&tx).await;
+        let msg = rx.recv().await.unwrap();
+        assert!(String::from_utf8_lossy(&msg).ends_with("\x1b[0m\x1b[K\x1b[u"));
+
+        countdown_reconnect_banner(&tx, 0, 1, 10).await;
+        let msg = rx.recv().await.unwrap();
+        assert!(String::from_utf8_lossy(&msg).contains("attempt #1"));
+    }
+
+    #[test]
+    fn test_client_id() {
+        let id1 = client_id();
+        assert!(id1.is_some());
+        let id2 = client_id();
+        assert_eq!(id1, id2); // Should read the same from disk
+    }
+
+    #[test]
+    fn test_session_uuid_persistence() {
+        let host = "test.host";
+        let port = 12345;
+        let uuid = Uuid::new_v4();
+
+        // Write it
+        write_session_uuid(host, port, uuid).unwrap();
+
+        // Read it back
+        let read_uuid = read_session_uuid(host, port).unwrap();
+        assert_eq!(uuid, read_uuid);
+    }
+
+    #[test]
+    fn test_session_file_path() {
+        let host = "some_host.com";
+        let port = 2222;
+        let path = session_file_path(host, port).unwrap();
+        assert!(path.to_string_lossy().contains("some_host.com"));
+        assert!(path.to_string_lossy().contains("2222"));
+    }
+
+    #[test]
+    fn test_create_key_dir() {
+        let dir = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        let key_dir = dir.join("keys");
+        create_key_dir(&key_dir).unwrap();
+        assert!(key_dir.exists());
+        assert!(key_dir.is_dir());
+    }
+
+    #[test]
+    fn test_maybe_generate_keypair_existing() {
+        let dir = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let priv_path = dir.join("id_ed25519");
+        let pub_path = dir.join("id_ed25519.pub");
+        let config_path = dir.join("config.toml");
+
+        std::fs::write(&priv_path, "fake private key").unwrap();
+        std::fs::write(&pub_path, "fake public key").unwrap();
+        std::fs::write(
+            &config_path,
+            "[tracing.stdout]\n\
+             with_target = false\n\
+             with_thread_ids = false\n\
+             with_thread_names = false\n\
+             with_line_number = false\n\
+             with_level = false\n\
+             [tracing.file]\n\
+             quiet = 0\n\
+             verbose = 0\n\
+             [tracing.file.layer]\n\
+             with_target = false\n\
+             with_thread_ids = false\n\
+             with_thread_names = false\n\
+             with_line_number = false\n\
+             with_level = false\n",
+        )
+        .unwrap();
+
+        let cli = Cli::try_parse_from([
+            "moshpit",
+            "-c",
+            config_path.to_str().unwrap(),
+            "-p",
+            priv_path.to_str().unwrap(),
+            "-k",
+            pub_path.to_str().unwrap(),
+            "user@host",
+        ])
+        .unwrap();
+        let config = load::<Cli, Config, Cli>(&cli, &cli).unwrap();
+
+        // Should return Ok(()) immediately without prompting
+        let result = maybe_generate_keypair(&config);
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_connect_and_kex_tcp_failure() {
+        let mut config = Config::default();
+        let pass_cache = Arc::new(std::sync::Mutex::new(PassCache::Uncached));
+
+        // Bind to a random port and immediately close it
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let addr = format!("127.0.0.1:{port}").parse().unwrap();
+
+        // This should fail with ConnectionRefused
+        let result = connect_and_kex(&mut config, addr, "127.0.0.1", port, &pass_cache).await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .to_lowercase()
+                .contains("refused")
+        );
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "split_to out of bounds")]
+    async fn test_connect_and_kex_kex_failure() {
+        let dir = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("config.toml");
+        // Empty key files: /dev/null doesn't exist on Windows, so create real empty files.
+        let empty_priv_key_path = dir.join("empty_priv_key");
+        let empty_pub_key_path = dir.join("empty_pub_key");
+        std::fs::write(&empty_priv_key_path, b"").unwrap();
+        std::fs::write(&empty_pub_key_path, b"").unwrap();
+        std::fs::write(
+            &config_path,
+            "[tracing.stdout]\n\
+             with_target = false\n\
+             with_thread_ids = false\n\
+             with_thread_names = false\n\
+             with_line_number = false\n\
+             with_level = false\n\
+             [tracing.file]\n\
+             quiet = 0\n\
+             verbose = 0\n\
+             [tracing.file.layer]\n\
+             with_target = false\n\
+             with_thread_ids = false\n\
+             with_thread_names = false\n\
+             with_line_number = false\n\
+             with_level = false\n",
+        )
+        .unwrap();
+        let cli = Cli::try_parse_from([
+            "moshpit",
+            "-c",
+            config_path.to_str().unwrap(),
+            "-p",
+            empty_priv_key_path.to_str().unwrap(),
+            "-k",
+            empty_pub_key_path.to_str().unwrap(),
+            "user@host",
+        ])
+        .unwrap();
+        let mut config = load::<Cli, Config, Cli>(&cli, &cli).unwrap();
+
+        let pass_cache = Arc::new(std::sync::Mutex::new(PassCache::Uncached));
+
+        // Bind a real listener
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // Spawn a task to accept the connection and send the greeting, then drop
+        drop(spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            if let Ok((mut socket, _)) = listener.accept().await {
+                drop(socket.write_all(b"SSH-2.0-Moshpit\r\n").await);
+            }
+        }));
+
+        let addr = format!("127.0.0.1:{port}").parse().unwrap();
+
+        // TcpStream::connect will succeed, but run_key_exchange will fail
+        let result = connect_and_kex(&mut config, addr, "127.0.0.1", port, &pass_cache).await;
+        assert!(result.is_err());
+    }
 }

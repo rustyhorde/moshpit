@@ -106,3 +106,54 @@ impl TracingConfigExt for FileLayer {
         get_effective_level(self.quiet(), self.verbose())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use tracing::Level;
+    use tracing_subscriber_init::TracingConfig;
+
+    use crate::TracingConfigExt;
+
+    use super::{FileLayer, Tracing};
+
+    #[test]
+    fn layer_defaults_all_false() {
+        let t = Tracing::default();
+        let l = t.stdout();
+        assert!(!l.with_target());
+        assert!(!l.with_thread_ids());
+        assert!(!l.with_thread_names());
+        assert!(!l.with_line_number());
+        assert!(!l.with_level());
+        assert!(l.directives().is_none());
+    }
+
+    #[test]
+    fn file_layer_tracing_config_defaults() {
+        let f = FileLayer::default();
+        assert_eq!(f.quiet(), 0);
+        assert_eq!(f.verbose(), 0);
+        assert!(!f.with_ansi());
+    }
+
+    #[test]
+    fn file_layer_tracing_config_ext_defaults() {
+        let f = FileLayer::default();
+        assert!(!f.enable_stdout());
+        assert!(f.directives().is_none());
+    }
+
+    #[test]
+    fn file_layer_level_default_is_info() {
+        let f = FileLayer::default();
+        assert_eq!(f.level(), Level::INFO);
+    }
+
+    #[test]
+    fn file_layer_is_distinct_from_stdout_layer() {
+        let t = Tracing::default();
+        // file layer wraps its own Layer
+        let _ = t.file();
+        let _ = t.stdout();
+    }
+}

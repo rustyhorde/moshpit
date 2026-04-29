@@ -7,8 +7,9 @@
 // modified, or distributed except according to those terms.
 
 use std::{
-    collections::{BTreeSet, HashMap, VecDeque},
+    collections::{BTreeSet, HashMap, VecDeque, hash_map::DefaultHasher},
     ffi::OsString,
+    hash::{Hash, Hasher},
     io::{IsTerminal as _, Read as _, Write as _},
     net::SocketAddr,
     sync::Arc,
@@ -180,6 +181,7 @@ fn render_banner(clients: &[&ClientInfo], prev_lines: usize) -> Vec<u8> {
     out
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) async fn run<I, T>(args: Option<I>) -> Result<()>
 where
     I: IntoIterator<Item = T>,
@@ -274,8 +276,9 @@ where
 
 /// Resolve which session to use for this connection.
 ///
-/// On resume, reconnects to the existing session and replays scrollback.
-/// On new or expired sessions, creates a fresh session via [`new_session`].
+/// On resume, reconnects to the existing session and sends a `ScreenState` frame
+/// for an instant clean repaint.  On new or expired sessions, creates a fresh
+/// session via [`new_session`].
 async fn resolve_session(
     kex: &libmoshpit::Kex,
     skex: &libmoshpit::ServerKex,
@@ -288,6 +291,7 @@ async fn resolve_session(
     Option<Receiver<TerminalMessage>>,
     Arc<Mutex<SessionOutputHandle>>,
     Arc<Mutex<VecDeque<u8>>>,
+    Arc<Mutex<vt100::Parser>>,
 )> {
     let session_uuid = skex.session_uuid();
     if skex.is_resume() {
@@ -296,6 +300,7 @@ async fn resolve_session(
             let term_tx = record.term_tx.clone();
             let output_handle = record.output_handle.clone();
             let scrollback = record.scrollback.clone();
+            let server_emulator = record.server_emulator.clone();
             drop(reg);
 
             // Replace the output handle with the new connection's channels.
@@ -311,17 +316,17 @@ async fn resolve_session(
                 h.udp_port = Some(udp_port);
             }
 
-            // Replay scrollback so the client terminal catches up.
-            let sb_data: Vec<u8> = scrollback.lock().await.iter().copied().collect();
-            let scrollback_bytes = sb_data.len();
-            for chunk in sb_data.chunks(MAX_UDP_PAYLOAD) {
-                tx.send(EncryptedFrame::Bytes((kex.uuid_wrapper(), chunk.to_vec())))
-                    .await?;
-            }
+            // Send current screen state for an instant clean repaint on reconnect.
+            let screen_state = {
+                let emu = server_emulator.lock().await;
+                emu.screen().contents_formatted()
+            };
+            let screen_state_bytes = screen_state.len();
+            tx.send(EncryptedFrame::ScreenState(screen_state)).await?;
             info!(
                 user = skex.user(),
                 session = %session_uuid,
-                scrollback_bytes,
+                screen_state_bytes,
                 "session resumed"
             );
 
@@ -330,6 +335,7 @@ async fn resolve_session(
                 None::<Receiver<TerminalMessage>>,
                 output_handle,
                 scrollback,
+                server_emulator,
             ))
         } else {
             // Session expired; start fresh.
@@ -353,6 +359,8 @@ async fn resolve_session(
     }
 }
 
+#[cfg_attr(nightly, allow(clippy::too_many_lines))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn handle_connection(
     config: Config,
     socket: TcpStream,
@@ -381,7 +389,7 @@ async fn handle_connection(
     let conn_token = CancellationToken::new();
 
     // Resolve channels and decide whether to spawn a new PTY.
-    let (term_tx, maybe_term_rx, output_handle, scrollback) = resolve_session(
+    let (term_tx, maybe_term_rx, output_handle, scrollback, server_emulator) = resolve_session(
         &kex,
         &skex,
         &conn_token,
@@ -440,6 +448,39 @@ async fn handle_connection(
 
     spawn_connection_watchdogs(tx.clone(), conn_token.clone(), server_token);
 
+    // Periodic screen-state sync: every 50 ms send ScreenState to the client when the
+    // screen has changed (guarded by a content hash to skip unchanged frames).
+    let sync_emu = server_emulator.clone();
+    let sync_tx = tx.clone();
+    let sync_token = conn_token.clone();
+    let _screen_sync = spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(50));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_hash: u64 = 0;
+        loop {
+            select! {
+                () = sync_token.cancelled() => break,
+                _ = ticker.tick() => {
+                    let contents = {
+                        let emu = sync_emu.lock().await;
+                        emu.screen().contents_formatted()
+                    };
+                    let hash = {
+                        let mut h = DefaultHasher::new();
+                        contents.hash(&mut h);
+                        h.finish()
+                    };
+                    if hash != last_hash {
+                        last_hash = hash;
+                        if sync_tx.send(EncryptedFrame::ScreenState(contents)).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+
     // For new sessions, spawn the long-lived PTY thread.
     if let Some(term_rx) = maybe_term_rx {
         spawn_pty(
@@ -447,6 +488,7 @@ async fn handle_connection(
             term_rx,
             output_handle,
             scrollback,
+            server_emulator,
             port_pool,
             session_registry,
             full_registry,
@@ -506,6 +548,7 @@ async fn new_session(
     Option<Receiver<TerminalMessage>>,
     Arc<Mutex<SessionOutputHandle>>,
     Arc<Mutex<VecDeque<u8>>>,
+    Arc<Mutex<vt100::Parser>>,
 )> {
     let (term_tx, term_rx) = channel::<TerminalMessage>(256);
     let output_handle = Arc::new(Mutex::new(SessionOutputHandle {
@@ -515,6 +558,7 @@ async fn new_session(
         udp_port: Some(udp_port),
     }));
     let scrollback = Arc::new(Mutex::new(VecDeque::with_capacity(SCROLLBACK_CAPACITY)));
+    let server_emulator = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
 
     {
         let mut fr = full_registry.lock().await;
@@ -524,20 +568,30 @@ async fn new_session(
                 term_tx: term_tx.clone(),
                 output_handle: output_handle.clone(),
                 scrollback: scrollback.clone(),
+                server_emulator: server_emulator.clone(),
             },
         ));
     }
 
-    Ok((term_tx, Some(term_rx), output_handle, scrollback))
+    Ok((
+        term_tx,
+        Some(term_rx),
+        output_handle,
+        scrollback,
+        server_emulator,
+    ))
 }
 
 /// Spawn the background thread that reads PTY output, writes scrollback, and forwards
 /// frames to the currently connected client.  Cleans up session state when the shell exits.
+#[cfg_attr(nightly, allow(clippy::too_many_arguments))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn spawn_pty_reader(
     session_uuid: Uuid,
     mut term_out: Box<dyn std::io::Read + Send>,
     output_handle: Arc<Mutex<SessionOutputHandle>>,
     scrollback: Arc<Mutex<VecDeque<u8>>>,
+    server_emulator: Arc<Mutex<vt100::Parser>>,
     port_pool: Arc<Mutex<BTreeSet<u16>>>,
     session_registry: SessionRegistry,
     full_registry: FullSessionRegistry,
@@ -567,6 +621,9 @@ fn spawn_pty_reader(
                             }
                             sb.extend(chunk.iter().copied());
                         }
+
+                        // Feed into the server-side emulator for screen-state tracking.
+                        server_emulator.blocking_lock().process(chunk);
 
                         // Send to the currently connected client (if any).
                         let send_ok = {
@@ -629,11 +686,14 @@ fn spawn_pty_reader(
 ///
 /// The thread owns the PTY master and keeps running until the shell exits, regardless of
 /// how many clients connect and disconnect.
+#[cfg_attr(nightly, allow(clippy::too_many_arguments))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn spawn_pty(
     session_uuid: Uuid,
     mut term_rx: Receiver<TerminalMessage>,
     output_handle: Arc<Mutex<SessionOutputHandle>>,
     scrollback: Arc<Mutex<VecDeque<u8>>>,
+    server_emulator: Arc<Mutex<vt100::Parser>>,
     port_pool: Arc<Mutex<BTreeSet<u16>>>,
     session_registry: SessionRegistry,
     full_registry: FullSessionRegistry,
@@ -668,6 +728,7 @@ fn spawn_pty(
             term_out,
             output_handle,
             scrollback,
+            server_emulator.clone(),
             port_pool,
             session_registry,
             full_registry,
@@ -684,6 +745,11 @@ fn spawn_pty(
                     }) {
                         error!("error resizing terminal: {e}");
                     }
+                    // Keep the server-side emulator in sync with the PTY dimensions.
+                    server_emulator
+                        .blocking_lock()
+                        .screen_mut()
+                        .set_size(rows, columns);
                 }
                 TerminalMessage::Input(data) => {
                     if let Err(e) = term_in.write_all(&data) {
@@ -694,4 +760,398 @@ fn spawn_pty(
             }
         }
     });
+}
+
+#[cfg(test)]
+#[allow(dead_code, clippy::all)]
+mod test {
+    use std::net::SocketAddr;
+
+    use libmoshpit::{EncryptedFrame, Kex, ServerKex};
+    use tokio::sync::mpsc::channel;
+    use tokio_util::sync::CancellationToken;
+    use uuid::Uuid;
+
+    use super::{
+        BannerState, ClientInfo, new_full_registry, new_session, render_banner, resolve_session,
+        spawn_connection_watchdogs,
+    };
+
+    // ── helpers ────────────────────────────────────────────────────────────────
+
+    fn client(addr: &str, user: &str) -> ClientInfo {
+        ClientInfo {
+            peer_addr: addr.parse::<SocketAddr>().unwrap(),
+            user: user.to_string(),
+            session_uuid: Uuid::nil(),
+        }
+    }
+
+    // ── Phase 5: render_banner ─────────────────────────────────────────────────
+
+    #[test]
+    fn render_banner_empty_no_prev() {
+        let out = render_banner(&[], 0);
+        assert_eq!(out, b"\x1b[s\x1b[u");
+    }
+
+    #[test]
+    fn render_banner_empty_clears_prev_lines() {
+        let out = render_banner(&[], 2);
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("\x1b[1;1H"));
+        assert!(s.contains("\x1b[2;1H"));
+        assert!(s.ends_with("\x1b[u"));
+    }
+
+    #[test]
+    fn render_banner_single_client() {
+        let c = client("127.0.0.1:1234", "alice");
+        let out = render_banner(&[&c], 0);
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.starts_with("\x1b[s"));
+        // Header on row 1
+        assert!(s.contains("\x1b[1;1H"));
+        // Client row on row 2
+        assert!(s.contains("\x1b[2;1H"));
+        assert!(s.ends_with("\x1b[u"));
+    }
+
+    #[test]
+    fn render_banner_two_clients() {
+        let c1 = client("127.0.0.1:1234", "alice");
+        let c2 = client("127.0.0.1:5678", "bob");
+        let out = render_banner(&[&c1, &c2], 0);
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("\x1b[1;1H"));
+        assert!(s.contains("\x1b[2;1H"));
+        assert!(s.contains("\x1b[3;1H"));
+        assert!(s.ends_with("\x1b[u"));
+    }
+
+    #[test]
+    fn render_banner_shrink_clears_stale_rows() {
+        let c1 = client("127.0.0.1:1234", "alice");
+        // prev_lines=3 (was header + 2 clients), now only 1 client → row 3 must be cleared
+        let out = render_banner(&[&c1], 3);
+        let s = String::from_utf8_lossy(&out);
+        // New banner rows 1 and 2 should be present
+        assert!(s.contains("\x1b[1;1H"));
+        assert!(s.contains("\x1b[2;1H"));
+        // Stale row 3 cleared
+        assert!(s.contains("\x1b[3;1H\x1b[0m\x1b[K"));
+    }
+
+    #[test]
+    fn render_banner_contains_user_and_addr() {
+        let c = client("10.0.0.1:9999", "charlie");
+        let out = render_banner(&[&c], 0);
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("10.0.0.1:9999"));
+        assert!(s.contains("charlie"));
+    }
+
+    // ── Phase 6: BannerState ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn banner_state_disabled_new() {
+        let banner = BannerState::new(false);
+        assert!(!banner.enabled);
+        assert!(banner.inner.lock().await.clients.is_empty());
+    }
+
+    #[tokio::test]
+    async fn banner_state_insert_increments_count() {
+        let banner = BannerState::new(false);
+        let uuid = Uuid::new_v4();
+        banner.insert(uuid, client("127.0.0.1:1", "u1")).await;
+        assert_eq!(banner.inner.lock().await.clients.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn banner_state_remove_decrements_count() {
+        let banner = BannerState::new(false);
+        let uuid = Uuid::new_v4();
+        banner.insert(uuid, client("127.0.0.1:1", "u1")).await;
+        banner.remove(uuid).await;
+        assert!(banner.inner.lock().await.clients.is_empty());
+    }
+
+    #[tokio::test]
+    async fn banner_state_remove_nonexistent_noop() {
+        let banner = BannerState::new(false);
+        // Should not panic or change state
+        banner.remove(Uuid::new_v4()).await;
+        assert!(banner.inner.lock().await.clients.is_empty());
+    }
+
+    #[tokio::test]
+    async fn banner_state_refresh_noop_when_disabled() {
+        let banner = BannerState::new(false);
+        banner
+            .insert(Uuid::new_v4(), client("127.0.0.1:1", "u"))
+            .await;
+        // No panic — refresh is a no-op when disabled
+        banner.refresh().await;
+    }
+
+    #[tokio::test]
+    async fn banner_state_enabled_refresh_when_empty() {
+        let banner = BannerState::new(true);
+        // No clients → refresh skips the render call entirely
+        banner.refresh().await;
+    }
+
+    // ── Phase 7: new_session ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn new_session_registers_in_full_registry() {
+        let kex = Kex::default();
+        let conn_token = CancellationToken::new();
+        let (tx, _rx) = channel::<EncryptedFrame>(4);
+        let session_uuid = Uuid::new_v4();
+        let registry = new_full_registry();
+
+        let _reg_result = new_session(&kex, &conn_token, 50_000, session_uuid, tx, &registry)
+            .await
+            .unwrap();
+
+        assert!(registry.lock().await.contains_key(&session_uuid));
+    }
+
+    #[tokio::test]
+    async fn new_session_returns_some_term_rx() {
+        let kex = Kex::default();
+        let conn_token = CancellationToken::new();
+        let (tx, _rx) = channel::<EncryptedFrame>(4);
+        let session_uuid = Uuid::new_v4();
+        let registry = new_full_registry();
+
+        let (_, maybe_rx, _, _, _) =
+            new_session(&kex, &conn_token, 50_000, session_uuid, tx, &registry)
+                .await
+                .unwrap();
+        assert!(maybe_rx.is_some());
+    }
+
+    #[tokio::test]
+    async fn new_session_output_handle_has_correct_kex_uuid() {
+        let kex = Kex::default();
+        let conn_token = CancellationToken::new();
+        let (tx, _rx) = channel::<EncryptedFrame>(4);
+        let session_uuid = Uuid::new_v4();
+        let registry = new_full_registry();
+
+        let (_, _, output_handle, _, _) =
+            new_session(&kex, &conn_token, 50_000, session_uuid, tx, &registry)
+                .await
+                .unwrap();
+        assert_eq!(output_handle.lock().await.kex_uuid, kex.uuid());
+    }
+
+    #[tokio::test]
+    async fn new_session_scrollback_initially_empty() {
+        let kex = Kex::default();
+        let conn_token = CancellationToken::new();
+        let (tx, _rx) = channel::<EncryptedFrame>(4);
+        let session_uuid = Uuid::new_v4();
+        let registry = new_full_registry();
+
+        let (_, _, _, scrollback, _) =
+            new_session(&kex, &conn_token, 50_000, session_uuid, tx, &registry)
+                .await
+                .unwrap();
+        assert!(scrollback.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn new_session_emulator_default_size() {
+        let kex = Kex::default();
+        let conn_token = CancellationToken::new();
+        let (tx, _rx) = channel::<EncryptedFrame>(4);
+        let session_uuid = Uuid::new_v4();
+        let registry = new_full_registry();
+
+        let (_, _, _, _, emulator) =
+            new_session(&kex, &conn_token, 50_000, session_uuid, tx, &registry)
+                .await
+                .unwrap();
+        let emu = emulator.lock().await;
+        let screen = emu.screen();
+        assert_eq!(screen.size(), (24, 80));
+    }
+
+    // ── Phase 9: spawn_connection_watchdogs ────────────────────────────────────
+
+    #[tokio::test]
+    async fn watchdogs_keepalive_sends_frame() {
+        let (tx, mut rx) = channel::<EncryptedFrame>(4);
+        let conn_token = CancellationToken::new();
+        let server_token = CancellationToken::new();
+        spawn_connection_watchdogs(tx, conn_token.clone(), server_token);
+
+        // The keepalive fires every 10 s — wait for the first tick (immediate on start)
+        // or drain until we see a Keepalive within a short timeout.
+        let frame = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await;
+        // Either we got a frame or the channel is still open; cancel to clean up
+        conn_token.cancel();
+        // We just verify the channel was not closed (tasks are alive)
+        // A Keepalive arrives on the first tick; the tick interval starts with an
+        // immediate first tick so we expect it promptly.
+        let frame = frame
+            .expect("timeout waiting for keepalive")
+            .expect("channel closed");
+        assert!(matches!(frame, EncryptedFrame::Keepalive));
+    }
+
+    #[tokio::test]
+    async fn watchdogs_server_cancel_sends_shutdown_then_cancels_conn() {
+        let (tx, mut rx) = channel::<EncryptedFrame>(4);
+        let conn_token = CancellationToken::new();
+        let server_token = CancellationToken::new();
+        spawn_connection_watchdogs(tx, conn_token.clone(), server_token.clone());
+
+        server_token.cancel();
+
+        // Allow the watcher task to run
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Drain frames looking for Shutdown
+        let mut saw_shutdown = false;
+        while let Ok(frame) = rx.try_recv() {
+            if matches!(frame, EncryptedFrame::Shutdown) {
+                saw_shutdown = true;
+                break;
+            }
+        }
+        assert!(
+            saw_shutdown,
+            "expected Shutdown frame after server_token cancel"
+        );
+        // After another short wait, conn_token should be cancelled
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(conn_token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn watchdogs_conn_cancel_stops_keepalive() {
+        let (tx, mut rx) = channel::<EncryptedFrame>(4);
+        let conn_token = CancellationToken::new();
+        let server_token = CancellationToken::new();
+        spawn_connection_watchdogs(tx, conn_token.clone(), server_token);
+
+        // Cancel immediately — keepalive loop should stop
+        conn_token.cancel();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Drain any already-queued frames
+        while rx.try_recv().is_ok() {}
+        // No further Keepalive frames should arrive
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
+        // Either timeout (no frame) or channel closed — both are acceptable
+        assert!(result.is_err() || result.unwrap().is_none());
+    }
+
+    // ── Phase 10: resolve_session ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn resolve_session_new_session_path() {
+        let kex = Kex::default();
+        let session_uuid = Uuid::new_v4();
+        let skex = ServerKex::builder()
+            .user("alice".to_string())
+            .shell("/usr/bin/fish".to_string())
+            .session_uuid(session_uuid)
+            .build();
+        let conn_token = CancellationToken::new();
+        let (tx, _rx) = channel::<EncryptedFrame>(4);
+        let registry = new_full_registry();
+
+        let (_, maybe_rx, _, _, _) =
+            resolve_session(&kex, &skex, &conn_token, 50_000, tx, &registry)
+                .await
+                .unwrap();
+        // New session → PTY needs to be spawned → Some(term_rx)
+        assert!(maybe_rx.is_some());
+    }
+
+    #[tokio::test]
+    async fn resolve_session_resume_existing() {
+        let kex = Kex::default();
+        let session_uuid = Uuid::new_v4();
+        let conn_token = CancellationToken::new();
+        let (tx, _rx) = channel::<EncryptedFrame>(16);
+        let registry = new_full_registry();
+
+        // First connection: create a session
+        let _first_session = new_session(
+            &kex,
+            &conn_token,
+            50_000,
+            session_uuid,
+            tx.clone(),
+            &registry,
+        )
+        .await
+        .unwrap();
+
+        // Second connection: resume
+        let new_kex = Kex::default();
+        let skex_resume = ServerKex::builder()
+            .user("alice".to_string())
+            .shell("/usr/bin/fish".to_string())
+            .session_uuid(session_uuid)
+            .is_resume(true)
+            .build();
+        let new_conn_token = CancellationToken::new();
+        let (tx2, mut rx2) = channel::<EncryptedFrame>(16);
+
+        let (_, maybe_rx, output_handle, _, _) = resolve_session(
+            &new_kex,
+            &skex_resume,
+            &new_conn_token,
+            50_001,
+            tx2,
+            &registry,
+        )
+        .await
+        .unwrap();
+
+        // Resume → no new PTY → None
+        assert!(maybe_rx.is_none());
+        // Output handle should be updated with the new kex uuid
+        assert_eq!(output_handle.lock().await.kex_uuid, new_kex.uuid());
+        // A ScreenState frame should have been sent on the *new* connection's tx
+        let mut saw_screen_state = false;
+        while let Ok(frame) = rx2.try_recv() {
+            if matches!(frame, EncryptedFrame::ScreenState(_)) {
+                saw_screen_state = true;
+                break;
+            }
+        }
+        assert!(saw_screen_state, "expected ScreenState frame on resume");
+    }
+
+    #[tokio::test]
+    async fn resolve_session_resume_expired() {
+        let kex = Kex::default();
+        let session_uuid = Uuid::new_v4();
+        // Registry is empty — no existing session with this UUID
+        let skex = ServerKex::builder()
+            .user("alice".to_string())
+            .shell("/usr/bin/fish".to_string())
+            .session_uuid(session_uuid)
+            .is_resume(true)
+            .build();
+        let conn_token = CancellationToken::new();
+        let (tx, _rx) = channel::<EncryptedFrame>(4);
+        let registry = new_full_registry();
+
+        let (_, maybe_rx, _, _, _) =
+            resolve_session(&kex, &skex, &conn_token, 50_000, tx, &registry)
+                .await
+                .unwrap();
+        // Falls back to new session → Some(term_rx)
+        assert!(maybe_rx.is_some());
+    }
 }

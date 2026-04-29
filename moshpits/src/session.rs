@@ -8,6 +8,7 @@
 
 use std::{
     collections::{HashMap, VecDeque},
+    fmt,
     sync::Arc,
 };
 
@@ -36,7 +37,6 @@ pub(crate) struct SessionOutputHandle {
 }
 
 /// Full state for one live PTY session.
-#[derive(Debug)]
 pub(crate) struct SessionRecord {
     /// Forward keyboard / resize events from the connected client into this channel.
     pub term_tx: Sender<TerminalMessage>,
@@ -44,6 +44,19 @@ pub(crate) struct SessionRecord {
     pub output_handle: Arc<Mutex<SessionOutputHandle>>,
     /// Ring buffer of raw PTY output bytes for scrollback replay on reconnect.
     pub scrollback: Arc<Mutex<VecDeque<u8>>>,
+    /// Server-side vt100 emulator tracking current PTY screen state.
+    /// Fed by the PTY reader thread; queried on reconnect and by the periodic
+    /// screen-state sync task to produce [`libmoshpit::EncryptedFrame::ScreenState`] frames.
+    pub server_emulator: Arc<Mutex<vt100::Parser>>,
+}
+
+impl fmt::Debug for SessionRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionRecord")
+            .field("output_handle", &self.output_handle)
+            .field("scrollback", &self.scrollback)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Full session registry: maps stable session UUID → [`SessionRecord`].
@@ -52,4 +65,62 @@ pub(crate) type FullSessionRegistry = Arc<Mutex<HashMap<Uuid, SessionRecord>>>;
 /// Create a new, empty [`FullSessionRegistry`].
 pub(crate) fn new_full_registry() -> FullSessionRegistry {
     Arc::new(Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+mod test {
+    use std::{collections::VecDeque, sync::Arc};
+
+    use libmoshpit::{EncryptedFrame, TerminalMessage};
+    use tokio::sync::{Mutex, mpsc::channel};
+    use uuid::Uuid;
+
+    use super::{SCROLLBACK_CAPACITY, SessionOutputHandle, SessionRecord, new_full_registry};
+
+    #[test]
+    fn scrollback_capacity_is_64kib() {
+        assert_eq!(SCROLLBACK_CAPACITY, 65_536);
+    }
+
+    #[tokio::test]
+    async fn new_full_registry_is_empty() {
+        let registry = new_full_registry();
+        assert!(registry.lock().await.is_empty());
+    }
+
+    #[test]
+    fn session_output_handle_debug() {
+        let handle = SessionOutputHandle {
+            kex_uuid: Uuid::nil(),
+            tx: None::<tokio::sync::mpsc::Sender<EncryptedFrame>>,
+            conn_token: None,
+            udp_port: None,
+        };
+        let s = format!("{handle:?}");
+        assert!(s.contains("SessionOutputHandle"));
+        assert!(s.contains("kex_uuid"));
+    }
+
+    #[tokio::test]
+    async fn session_record_debug() {
+        let (term_tx, _term_rx) = channel::<TerminalMessage>(1);
+        let (frame_tx, _frame_rx) = channel::<EncryptedFrame>(1);
+        let output_handle = Arc::new(Mutex::new(SessionOutputHandle {
+            kex_uuid: Uuid::nil(),
+            tx: Some(frame_tx),
+            conn_token: None,
+            udp_port: None,
+        }));
+        let scrollback = Arc::new(Mutex::new(VecDeque::<u8>::new()));
+        let server_emulator = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
+        let record = SessionRecord {
+            term_tx,
+            output_handle,
+            scrollback,
+            server_emulator,
+        };
+        let s = format!("{record:?}");
+        assert!(s.contains("SessionRecord"));
+        assert!(s.contains("output_handle"));
+    }
 }

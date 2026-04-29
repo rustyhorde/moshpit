@@ -91,6 +91,15 @@ pub(crate) struct Cli {
     #[clap(help = "The IP address of the server to connect to")]
     #[getset(get = "pub(crate)")]
     server_destination: String,
+    /// Local-echo prediction preference: adaptive (default), always, or never.
+    #[clap(
+        long,
+        value_name = "MODE",
+        default_value = "adaptive",
+        help = "Local-echo prediction: adaptive (default), always, or never"
+    )]
+    #[getset(get = "pub(crate)")]
+    predict: String,
 }
 
 impl Source for Cli {
@@ -144,6 +153,10 @@ impl Source for Cli {
                 ValueKind::String(self.server_destination.clone()),
             ),
         );
+        let _old = map.insert(
+            "predict".to_string(),
+            Value::new(Some(&origin), ValueKind::String(self.predict.clone())),
+        );
         Ok(map)
     }
 }
@@ -175,5 +188,145 @@ impl PathDefaults for Cli {
 
     fn default_tracing_file_name(&self) -> String {
         env!("CARGO_PKG_NAME").to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cli_defaults() {
+        let cli = Cli::try_parse_from(["moshpit", "user@host"]).unwrap();
+        assert_eq!(cli.verbose(), 0);
+        assert_eq!(cli.quiet(), 0);
+        assert_eq!(cli.config_absolute_path(), &None);
+        assert_eq!(cli.tracing_absolute_path(), &None);
+        assert_eq!(cli.private_key_path(), &None);
+        assert_eq!(cli.public_key_path(), &None);
+        assert_eq!(cli.server_port(), 40404);
+        assert_eq!(cli.server_destination(), "user@host");
+        assert_eq!(cli.predict(), "adaptive");
+    }
+
+    #[test]
+    fn test_cli_parsing() {
+        let cli = Cli::try_parse_from([
+            "moshpit",
+            "-vv",
+            "-c",
+            "/tmp/config",
+            "-t",
+            "/tmp/trace",
+            "-p",
+            "/tmp/priv",
+            "-k",
+            "/tmp/pub",
+            "-s",
+            "1234",
+            "--predict",
+            "always",
+            "admin@10.0.0.1",
+        ])
+        .unwrap();
+        assert_eq!(cli.verbose(), 2);
+        assert_eq!(cli.quiet(), 0);
+        assert_eq!(cli.config_absolute_path().as_deref(), Some("/tmp/config"));
+        assert_eq!(cli.tracing_absolute_path().as_deref(), Some("/tmp/trace"));
+        assert_eq!(cli.private_key_path().as_deref(), Some("/tmp/priv"));
+        assert_eq!(cli.public_key_path().as_deref(), Some("/tmp/pub"));
+        assert_eq!(cli.server_port(), 1234);
+        assert_eq!(cli.server_destination(), "admin@10.0.0.1");
+        assert_eq!(cli.predict(), "always");
+    }
+
+    #[test]
+    fn test_cli_quiet() {
+        let cli = Cli::try_parse_from(["moshpit", "-qqq", "host"]).unwrap();
+        assert_eq!(cli.quiet(), 3);
+        assert_eq!(cli.verbose(), 0);
+    }
+
+    #[test]
+    fn test_source_impl() {
+        let cli = Cli::try_parse_from(["moshpit", "host"]).unwrap();
+        let map = cli.collect().unwrap();
+
+        assert!(matches!(
+            map.get("verbose").unwrap().kind,
+            ValueKind::U64(0)
+        ));
+        assert!(matches!(map.get("quiet").unwrap().kind, ValueKind::U64(0)));
+        assert!(matches!(
+            map.get("server_port").unwrap().kind,
+            ValueKind::U64(40404)
+        ));
+
+        if let ValueKind::String(ref s) = map.get("server_destination").unwrap().kind {
+            assert_eq!(s, "host");
+        } else {
+            panic!("Expected String");
+        }
+
+        if let ValueKind::String(ref s) = map.get("predict").unwrap().kind {
+            assert_eq!(s, "adaptive");
+        } else {
+            panic!("Expected String");
+        }
+
+        assert!(!map.contains_key("config_path"));
+
+        let boxed = cli.clone_into_box();
+        let map2 = boxed.collect().unwrap();
+        if let ValueKind::String(ref s) = map2.get("server_destination").unwrap().kind {
+            assert_eq!(s, "host");
+        } else {
+            panic!("Expected String");
+        }
+    }
+
+    #[test]
+    fn test_source_impl_with_options() {
+        let cli = Cli::try_parse_from([
+            "moshpit", "-c", "cfg", "-t", "trc", "-p", "prv", "-k", "pub", "host",
+        ])
+        .unwrap();
+        let map = cli.collect().unwrap();
+
+        if let ValueKind::String(ref s) = map.get("config_path").unwrap().kind {
+            assert_eq!(s, "cfg");
+        } else {
+            panic!("Expected String");
+        }
+
+        if let ValueKind::String(ref s) = map.get("tracing_path").unwrap().kind {
+            assert_eq!(s, "trc");
+        } else {
+            panic!("Expected String");
+        }
+
+        if let ValueKind::String(ref s) = map.get("private_key_path").unwrap().kind {
+            assert_eq!(s, "prv");
+        } else {
+            panic!("Expected String");
+        }
+
+        if let ValueKind::String(ref s) = map.get("public_key_path").unwrap().kind {
+            assert_eq!(s, "pub");
+        } else {
+            panic!("Expected String");
+        }
+    }
+
+    #[test]
+    fn test_path_defaults() {
+        let cli = Cli::try_parse_from(["moshpit", "-c", "cfg", "-t", "trc", "host"]).unwrap();
+        assert_eq!(cli.env_prefix(), "MOSHPIT");
+        assert_eq!(cli.config_absolute_path().as_deref(), Some("cfg"));
+        assert_eq!(cli.default_file_path(), "moshpit");
+        assert_eq!(cli.default_file_name(), "moshpit");
+        assert_eq!(cli.tracing_absolute_path().as_deref(), Some("trc"));
+        assert_eq!(cli.default_tracing_path(), "moshpit/logs");
+        assert_eq!(cli.default_tracing_file_name(), "moshpit");
     }
 }

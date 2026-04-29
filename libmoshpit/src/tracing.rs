@@ -113,10 +113,12 @@ where
         None => "info",
     };
 
+    let base = directives_base.to_owned();
+
     if let Some(directives) = config.directives() {
-        format!("{directives_base},{directives}")
+        format!("{base},{directives}")
     } else {
-        directives_base.to_string()
+        base
     }
 }
 

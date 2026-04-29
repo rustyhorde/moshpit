@@ -6,7 +6,10 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use anyhow::Result;
 use aws_lc_rs::{
@@ -16,14 +19,18 @@ use aws_lc_rs::{
 use bincode_next::{config::standard, encode_to_vec};
 use bon::Builder;
 use getset::MutGetters;
-use tokio::{net::UdpSocket, select, sync::mpsc::Receiver};
+use std::time::Duration;
+use tokio::{net::UdpSocket, select, sync::mpsc::Receiver, time::interval};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::EncryptedFrame;
 
 /// Number of sent packets kept in the retransmit buffer.
-const RETRANSMIT_WINDOW: u64 = 512;
+/// Exported so the receiver can immediately give up on gaps that fall outside
+/// this window — the sender has already evicted those packets and retransmit
+/// requests for them will silently fail.
+pub(crate) const RETRANSMIT_WINDOW: u64 = 512;
 
 /// Maximum payload size for UDP frames to avoid IP fragmentation.
 /// Accounts for ~140 bytes of wire overhead (nonce, seq, HMAC, length, UUID, AEAD tag, bincode)
@@ -54,6 +61,10 @@ pub struct UdpSender {
     /// Buffer of sent wire bytes keyed by sequence number for potential retransmission
     #[builder(default)]
     retransmit_buffer: HashMap<u64, Vec<u8>>,
+    /// Deduplicated set of sequence numbers waiting to be retransmitted.
+    /// Populated from `retransmit_rx`; drained on every retransmit tick.
+    #[builder(default)]
+    pending_retransmit: HashSet<u64>,
 }
 
 impl UdpSender {
@@ -65,25 +76,28 @@ impl UdpSender {
     ///
     pub async fn frame_loop(&mut self, token: CancellationToken) -> Result<()> {
         let mut retransmit_active = true;
+        // Drain pending_retransmit at the same cadence as NAK_CHECK_INTERVAL on the
+        // reader side, so retransmits are coalesced across multiple NAK messages that
+        // arrived for the same sequence number before it could be re-sent.
+        let mut retransmit_tick = interval(Duration::from_millis(20));
         loop {
             select! {
-                // Biased ordering: always service retransmit requests before queuing new
-                // outgoing frames.  Without this, Tokio's random fairness means retransmit
-                // requests are starved when the outgoing-frame channel is continuously ready
-                // (heavy PTY output), causing the retransmit channel to back up and overflow.
-                biased;
                 () = token.cancelled() => break,
+                // Collect incoming retransmit requests into a HashSet, deduplicating
+                // repeated NAKs for the same sequence number before we actually send.
                 seqs = self.retransmit_rx.recv(), if retransmit_active => {
                     match seqs {
-                        Some(seqs) => {
-                            for seq in seqs {
-                                if let Some(wire) = self.retransmit_buffer.get(&seq) {
-                                    let wire = wire.clone();
-                                    let _bytes_sent = self.socket.send(&wire).await?;
-                                }
-                            }
-                        }
+                        Some(seqs) => self.pending_retransmit.extend(seqs),
                         None => retransmit_active = false,
+                    }
+                },
+                // Drain the deduplicated pending set once per tick.
+                _ = retransmit_tick.tick(), if !self.pending_retransmit.is_empty() => {
+                    for seq in self.pending_retransmit.drain() {
+                        if let Some(wire) = self.retransmit_buffer.get(&seq) {
+                            let wire = wire.clone();
+                            let _bytes_sent = self.socket.send(&wire).await?;
+                        }
                     }
                 },
                 frame_opt = self.rx.recv() => {

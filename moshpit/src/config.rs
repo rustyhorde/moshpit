@@ -10,7 +10,7 @@ use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use getset::{CopyGetters, Getters, Setters};
-use libmoshpit::{KexConfig, KexMode, KeyPair, Tracing, TracingConfigExt};
+use libmoshpit::{DisplayPreference, KexConfig, KexMode, KeyPair, Tracing, TracingConfigExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::Level;
@@ -48,6 +48,10 @@ pub(crate) struct Config {
     #[serde(default = "Config::default_max_reconnect_backoff_secs")]
     #[getset(get_copy = "pub(crate)")]
     max_reconnect_backoff_secs: u64,
+    /// Local-echo prediction display preference.
+    #[serde(default)]
+    #[getset(get_copy = "pub(crate)")]
+    predict: DisplayPreference,
 }
 
 impl Config {
@@ -84,6 +88,7 @@ impl Default for Config {
             public_key_path: None,
             resume_session_uuid: None,
             max_reconnect_backoff_secs: Self::default_max_reconnect_backoff_secs(),
+            predict: DisplayPreference::default(),
         }
     }
 }
@@ -151,5 +156,92 @@ impl TracingConfigExt for Config {
 
     fn level(&self) -> Level {
         get_effective_level(self.quiet(), self.verbose())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_config() {
+        let config = Config::default();
+        assert_eq!(config.mode(), KexMode::Client);
+        assert_eq!(config.verbose(), 0);
+        assert_eq!(config.quiet(), 0);
+        assert_eq!(config.server_port(), 60001);
+        assert_eq!(config.server_destination(), "");
+        assert_eq!(config.private_key_path(), &None);
+        assert_eq!(config.public_key_path(), &None);
+        assert_eq!(config.resume_session_uuid(), None);
+        assert_eq!(config.max_reconnect_backoff_secs(), 3600);
+        assert_eq!(config.predict(), DisplayPreference::default());
+    }
+
+    #[test]
+    fn test_kex_config_impl() {
+        let mut config = Config::default();
+        let _ = config.set_user("testuser".to_string());
+
+        let uuid = Uuid::new_v4();
+        let _ = config.set_resume_session_uuid(Some(uuid));
+
+        assert_eq!(KexConfig::mode(&config), KexMode::Client);
+        assert!(KexConfig::port_pool(&config).is_none());
+        assert_eq!(KexConfig::user(&config).unwrap(), "testuser");
+        assert_eq!(KexConfig::resume_session_uuid(&config), Some(uuid));
+    }
+
+    #[test]
+    fn test_load_key_paths() {
+        // Without explicit paths, it should fall back to default
+        let config = Config::default();
+        let (priv_path, pub_path) = config.load_key_paths().unwrap();
+        assert!(priv_path.to_string_lossy().contains("id_ed25519"));
+        assert!(pub_path.to_string_lossy().contains("id_ed25519.pub"));
+
+        // With explicit paths
+        let config = Config {
+            private_key_path: Some("/tmp/my_priv".to_string()),
+            public_key_path: Some("/tmp/my_pub".to_string()),
+            ..Config::default()
+        };
+        let (priv_path, pub_path) = config.load_key_paths().unwrap();
+        assert_eq!(priv_path, PathBuf::from("/tmp/my_priv"));
+        assert_eq!(pub_path, PathBuf::from("/tmp/my_pub"));
+    }
+
+    #[test]
+    fn test_tracing_config_impl() {
+        let config = Config {
+            verbose: 2,
+            quiet: 1,
+            ..Config::default()
+        };
+
+        assert_eq!(TracingConfig::verbose(&config), 2);
+        assert_eq!(TracingConfig::quiet(&config), 1);
+
+        // These will be false/default based on the default `Tracing` object inside Config
+        assert!(!TracingConfig::with_target(&config));
+        assert!(!TracingConfig::with_thread_ids(&config));
+        assert!(!TracingConfig::with_thread_names(&config));
+        assert!(!TracingConfig::with_line_number(&config));
+        assert!(!TracingConfig::with_level(&config));
+    }
+
+    #[test]
+    fn test_tracing_config_ext_impl() {
+        let config = Config {
+            verbose: 3,
+            quiet: 0,
+            ..Config::default()
+        };
+
+        assert!(!TracingConfigExt::enable_stdout(&config));
+        assert!(TracingConfigExt::directives(&config).is_none());
+
+        // Check effective level
+        assert_eq!(TracingConfigExt::level(&config), Level::TRACE);
     }
 }

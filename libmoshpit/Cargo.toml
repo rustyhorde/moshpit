@@ -45,6 +45,7 @@ tracing-subscriber = { version = "0.3.23", features = [
 ] }
 tracing-subscriber-init = { workspace = true }
 uuid = { workspace = true }
+vt100 = { workspace = true }
 whoami = "2.1.1"
 
 [target.'cfg(windows)'.dependencies]
@@ -61,6 +62,7 @@ vergen-gix = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3.23.0"
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
 
 [package.metadata.docs.rs]
 all-features = true
