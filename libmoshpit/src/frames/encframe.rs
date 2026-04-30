@@ -123,7 +123,8 @@ impl EncryptedFrame {
                     message_with_tag.reverse();
                     let mut message = message_with_tag.split_off(AES_256_GCM_SIV.tag_len());
                     message.reverse();
-                    let frame_data: (EncryptedFrame, _) = decode_from_slice(&message, standard())?;
+                    let config = standard().with_limit::<65536>();
+                    let frame_data: (EncryptedFrame, _) = decode_from_slice(&message, config)?;
                     return Ok(Some((frame_data.0, seq)));
                 }
                 error!("HMAC verification failed");

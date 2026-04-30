@@ -1,4 +1,4 @@
-/target
+target/
 lcov.info
 test_key
 .github/prompts

@@ -77,7 +77,8 @@ impl Frame {
                         return Err(Error::FrameTooLarge.into());
                     }
                     if let Some(data) = get_bytes(src, length)? {
-                        let (frame, _): (Frame, _) = decode_from_slice(data, standard())?;
+                        let config = standard().with_limit::<65536>();
+                        let (frame, _): (Frame, _) = decode_from_slice(data, config)?;
                         return Ok(Some(frame));
                     }
                 }
