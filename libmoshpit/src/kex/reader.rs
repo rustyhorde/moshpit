@@ -700,6 +700,7 @@ fn check_known_hosts(host: &str, pk: &[u8], tofu_fn: Option<&TofuFn>) -> Result<
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 #[allow(unsafe_code)]
 mod tests {
     use std::{

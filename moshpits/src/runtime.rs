@@ -695,11 +695,15 @@ fn spawn_pty_reader(
 /// The thread owns the PTY master and keeps running until the shell exits, regardless of
 /// how many clients connect and disconnect.
 #[allow(unsafe_code)]
-#[cfg_attr(nightly, allow(clippy::too_many_arguments))]
+#[cfg_attr(
+    nightly,
+    allow(clippy::too_many_arguments, clippy::needless_pass_by_value)
+)]
+#[cfg_attr(not(nightly), allow(clippy::needless_pass_by_value))]
 #[cfg_attr(coverage_nightly, coverage(off))]
 fn spawn_pty(
     session_uuid: Uuid,
-    user: String,
+    #[cfg_attr(not(unix), allow(unused_variables))] user: String,
     shell: String,
     mut term_rx: Receiver<TerminalMessage>,
     output_handle: Arc<Mutex<SessionOutputHandle>>,
@@ -717,7 +721,7 @@ fn spawn_pty(
             let pwd = unsafe { libc::getpwuid(daemon_uid) };
             if !pwd.is_null() {
                 let daemon_user = unsafe { std::ffi::CStr::from_ptr((*pwd).pw_name) };
-                if daemon_user.to_string_lossy() != user {
+                if daemon_user.to_string_lossy() != user.as_str() {
                     error!(
                         "Daemon user {} cannot spawn shell for user {}",
                         daemon_user.to_string_lossy(),
