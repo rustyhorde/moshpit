@@ -143,9 +143,10 @@ jobs:
             sed -i "s/^pkgver=.*/pkgver=${PKGVER}/" "$PKGBUILD"
             # Reset pkgrel to 1
             sed -i "s/^pkgrel=.*/pkgrel=1/" "$PKGBUILD"
-            # Update sha256sums — replace the first SKIP with the real hash,
-            # leaving subsequent SKIPs (e.g. for mps.service) unchanged.
-            sed -i "0,/'SKIP'/s/'SKIP'/'${SHA256}'/" "$PKGBUILD"
+            # Update sha256sums — replace the first source checksum entry
+            # (whether it is SKIP or an existing hash) and leave remaining
+            # entries unchanged (e.g. mps.service checksum).
+            sed -i "/^sha256sums=/,/^)/ s/'[^']*'/'${SHA256}'/1" "$PKGBUILD"
           done
 
       - name: Upload updated PKGBUILDs as artifact
