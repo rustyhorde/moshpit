@@ -38,7 +38,8 @@ vergen-pretty = { workspace = true }
 vt100 = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc = "0.2.186"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 
