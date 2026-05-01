@@ -48,6 +48,8 @@ const NAK_TIMEOUT: Duration = Duration::from_millis(50);
 const NAK_BACKOFF_MAX_SHIFT: u32 = 4;
 /// Maximum number of NAK retries before giving up on a permanently lost packet.
 const MAX_NAK_RETRIES: u32 = 10;
+/// Maximum sequence jump allowed before dropping the frame to prevent `DoS`.
+const MAX_SEQ_JUMP: u64 = 1024;
 
 /// UDP reader for encrypted frames
 #[derive(Builder, Debug)]
@@ -85,7 +87,7 @@ pub struct UdpReader {
     #[builder(default)]
     highest_seq_seen: u64,
     /// If no frame is received within this duration the server is assumed unreachable.
-    /// Triggers reconnect via [`reconnect_tx`] when set, otherwise calls
+    /// Triggers reconnect via [`reconnect_tx`](Self::reconnect_tx) when set, otherwise calls
     /// [`process::exit`].
     silence_timeout: Option<Duration>,
     /// Signals the caller that the server connection was lost and a reconnect should
@@ -267,6 +269,15 @@ impl UdpReader {
     fn handle_arrival(&mut self, frame: EncryptedFrame, seq: u64) -> Vec<EncryptedFrame> {
         // Duplicate or replay
         if seq < self.next_seq {
+            return vec![];
+        }
+
+        // Prevent DoS memory exhaustion from an adversarial massive sequence jump.
+        if seq > self.next_seq + MAX_SEQ_JUMP {
+            warn!(
+                "Dropping frame with sequence {seq} jumping too far ahead of {}",
+                self.next_seq
+            );
             return vec![];
         }
 
@@ -880,6 +891,163 @@ impl UdpReader {
             }
             Ok(None) => Ok(None),
             Err(err) => Err(err),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_handle_arrival_seq_jump() {
+        // Build a minimal UdpReader
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+
+        let mut reader = UdpReader::builder()
+            .socket(socket)
+            .id(Uuid::new_v4())
+            .rnk([0u8; 32])
+            .unwrap()
+            .hmac([0u8; 64])
+            .build();
+
+        // First packet arrives normally
+        let frame1 = EncryptedFrame::Keepalive;
+        let ready1 = reader.handle_arrival(frame1, 0);
+        assert_eq!(ready1.len(), 1);
+        assert_eq!(reader.next_seq, 1);
+        assert!(reader.gap_first_seen.is_empty());
+
+        // Massive sequence jump
+        let oversized_jump_seq = 1 + MAX_SEQ_JUMP + 10;
+        let frame2 = EncryptedFrame::Keepalive;
+        let ready2 = reader.handle_arrival(frame2, oversized_jump_seq);
+
+        // Should drop the frame
+        assert!(ready2.is_empty());
+        assert_eq!(reader.next_seq, 1); // Unchanged
+        assert!(reader.gap_first_seen.is_empty()); // No gaps recorded!
+
+        // Small sequence jump (within limits)
+        let frame3 = EncryptedFrame::Keepalive;
+        let ready3 = reader.handle_arrival(frame3, 3);
+
+        // Should buffer the frame and record gaps for 1 and 2
+        assert!(ready3.is_empty());
+        assert_eq!(reader.next_seq, 1);
+        assert_eq!(reader.gap_first_seen.len(), 2);
+        assert!(reader.gap_first_seen.contains_key(&1));
+        assert!(reader.gap_first_seen.contains_key(&2));
+    }
+
+    // -----------------------------------------------------------------------
+    // Property tests (proptest)
+    // -----------------------------------------------------------------------
+
+    use proptest::prelude::*;
+
+    fn make_reader_sync() -> UdpReader {
+        // Build a UdpReader synchronously using a blocking socket creation.
+        // proptest strategy closures cannot be async, so we use a blocking handle.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let socket = rt.block_on(async { UdpSocket::bind("127.0.0.1:0").await.unwrap() });
+        UdpReader::builder()
+            .socket(Arc::new(socket))
+            .id(Uuid::new_v4())
+            .rnk([0u8; 32])
+            .unwrap()
+            .hmac([0u8; 64])
+            .build()
+    }
+
+    proptest! {
+        /// For any sequence of in-order frames `[0..N]`, every frame is delivered
+        /// exactly once and in order.
+        #[test]
+        fn prop_in_order_delivery(n in 1u64..64u64) {
+            let mut reader = make_reader_sync();
+            let mut delivered = Vec::new();
+            for seq in 0..n {
+                let ready = reader.handle_arrival(EncryptedFrame::Keepalive, seq);
+                delivered.extend(ready);
+            }
+            // All N frames should have been delivered immediately.
+            prop_assert_eq!(delivered.len() as u64, n);
+            prop_assert_eq!(reader.next_seq, n);
+        }
+
+        /// A single out-of-order pair (seq+1 arrives before seq) is reordered
+        /// correctly: after the gap is filled both frames are delivered.
+        #[test]
+        fn prop_single_gap_reorder(base in 0u64..1000u64) {
+            let mut reader = make_reader_sync();
+
+            // Deliver base first so next_seq = base+1 is established.
+            if base > 0 {
+                for s in 0..base {
+                    drop(reader.handle_arrival(EncryptedFrame::Keepalive, s));
+                }
+            }
+
+            // Deliver base+1 (out of order — gap at `base` if base==0 else at base).
+            // Simplified: just send seq=1 before seq=0 from a fresh reader.
+            let mut reader2 = make_reader_sync();
+            let late = reader2.handle_arrival(EncryptedFrame::Keepalive, 1);
+            // seq=1 arrives before seq=0 — buffered, none delivered yet.
+            prop_assert!(late.is_empty(), "frame buffered, not delivered yet");
+            prop_assert_eq!(reader2.next_seq, 0);
+
+            // Now deliver the missing seq=0.
+            let flushed = reader2.handle_arrival(EncryptedFrame::Keepalive, 0);
+            // Both seq=0 and the buffered seq=1 should now be delivered.
+            prop_assert_eq!(flushed.len(), 2);
+            prop_assert_eq!(reader2.next_seq, 2);
+        }
+
+        /// Any frame whose seq exceeds next_seq + MAX_SEQ_JUMP is dropped.
+        /// `next_seq` and gap tracking must be unchanged.
+        #[test]
+        fn prop_seq_jump_rejected(jump in (MAX_SEQ_JUMP + 1)..(MAX_SEQ_JUMP * 4)) {
+            let mut reader = make_reader_sync();
+            let seq = reader.next_seq + jump;
+            let ready = reader.handle_arrival(EncryptedFrame::Keepalive, seq);
+            prop_assert!(ready.is_empty(), "oversized seq-jump frame must be dropped");
+            prop_assert_eq!(reader.next_seq, 0, "next_seq must be unchanged");
+            prop_assert!(reader.gap_first_seen.is_empty(), "no gap state must be recorded");
+            prop_assert!(reader.recv_buffer.is_empty(), "no buffer entry must be created");
+        }
+
+        /// A frame with a seq < next_seq is a replay/duplicate — must be discarded.
+        #[test]
+        fn prop_replay_rejected(n in 2u64..32u64) {
+            let mut reader = make_reader_sync();
+            // Deliver n frames in order to advance next_seq to n.
+            for seq in 0..n {
+                drop(reader.handle_arrival(EncryptedFrame::Keepalive, seq));
+            }
+            prop_assert_eq!(reader.next_seq, n);
+
+            // Now re-deliver any already-seen sequence number.
+            for old_seq in 0..n {
+                let ready = reader.handle_arrival(EncryptedFrame::Keepalive, old_seq);
+                prop_assert!(ready.is_empty(), "replayed frame {old_seq} must be discarded");
+            }
+            prop_assert_eq!(reader.next_seq, n, "next_seq must be unchanged after replays");
+        }
+
+        /// Under arbitrary reordering within the allowed window, recv_buffer
+        /// never grows beyond MAX_SEQ_JUMP entries.
+        #[test]
+        fn prop_recv_buffer_bounded(seqs in proptest::collection::vec(0u64..MAX_SEQ_JUMP, 0..128)) {
+            let mut reader = make_reader_sync();
+            for seq in seqs {
+                drop(reader.handle_arrival(EncryptedFrame::Keepalive, seq));
+                prop_assert!(
+                    reader.recv_buffer.len() as u64 <= MAX_SEQ_JUMP,
+                    "recv_buffer must stay bounded: len={}", reader.recv_buffer.len()
+                );
+            }
         }
     }
 }

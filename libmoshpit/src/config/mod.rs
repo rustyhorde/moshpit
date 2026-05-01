@@ -61,6 +61,11 @@ pub trait KexConfig {
     fn resume_session_uuid(&self) -> Option<Uuid> {
         None
     }
+    /// The server identifier (hostname or IP) used for `known_hosts` validation.
+    /// Returns `None` by default.
+    fn server_id(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Load the configuration

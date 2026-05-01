@@ -70,6 +70,9 @@ pub enum Error {
     /// An invalid server destination format was provided
     #[error("An invalid server destination format was provided")]
     InvalidServerDestination,
+    /// A frame was received that exceeds the maximum allowed length
+    #[error("Frame too large")]
+    FrameTooLarge,
 }
 
 /// Converts an `anyhow::Error` into a suitable exit code or clap message for a CLI application.

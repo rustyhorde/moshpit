@@ -236,6 +236,11 @@ impl KeyPair {
     /// If key generation or encryption fails, an error is returned.
     ///
     pub fn generate_key_pair(passphrase_opt: Option<&String>) -> Result<Self> {
+        if passphrase_opt.is_none_or(String::is_empty) {
+            return Err(anyhow::anyhow!(
+                "A non-empty passphrase is required to protect the private key"
+            ));
+        }
         // Generate the ECDH using Curve25519 key pair
         let priv_key = PrivateKey::generate(&X25519)?;
         let public_key = priv_key.compute_public_key()?;
@@ -401,6 +406,7 @@ fn encrypt_private_key(
     private_key: &mut Vec<u8>,
     passphrase: &str,
 ) -> Result<()> {
+    use zeroize::Zeroize;
     // Encrypt the private key bytes with the passphrase
     let key_bytes = passphrase.as_bytes();
 
@@ -410,11 +416,12 @@ fn encrypt_private_key(
     let salt = Salt::new(HKDF_SHA512, &salt_bytes);
     let pseudo_random_key = salt.extract(key_bytes);
     let okm_aes = pseudo_random_key.expand(HKDF_INFO, &AES_256_GCM_SIV)?;
-    let mut key_bytes = [0u8; AES_256_KEY_LEN];
-    okm_aes.fill(&mut key_bytes)?;
+    let mut derived_key = [0u8; AES_256_KEY_LEN];
+    okm_aes.fill(&mut derived_key)?;
 
     // Encrypt the private key in place with an empty tag
-    let rnk = RandomizedNonceKey::new(&AES_256_GCM_SIV, &key_bytes)?;
+    let rnk = RandomizedNonceKey::new(&AES_256_GCM_SIV, &derived_key)?;
+    derived_key.zeroize();
     let nonce = rnk.seal_in_place_append_tag(Aad::empty(), private_key)?;
     let nonce_bytes = nonce.as_ref();
 
@@ -440,6 +447,7 @@ pub fn decrypt_private_key(
     nonce_bytes: &[u8],
     encrypted_private_key_bytes: &mut [u8],
 ) -> Result<()> {
+    use zeroize::Zeroize;
     // Encrypt the private key bytes with the passphrase
     let key_bytes = passphrase.as_bytes();
 
@@ -447,11 +455,12 @@ pub fn decrypt_private_key(
     let salt = Salt::new(HKDF_SHA512, salt_bytes);
     let pseudo_random_key = salt.extract(key_bytes);
     let okm_aes = pseudo_random_key.expand(HKDF_INFO, &AES_256_GCM_SIV)?;
-    let mut key_bytes = [0u8; AES_256_KEY_LEN];
-    okm_aes.fill(&mut key_bytes)?;
+    let mut derived_key = [0u8; AES_256_KEY_LEN];
+    okm_aes.fill(&mut derived_key)?;
 
     // Decrypt the private key in place with an empty tag
-    let rnk = RandomizedNonceKey::new(&AES_256_GCM_SIV, &key_bytes)?;
+    let rnk = RandomizedNonceKey::new(&AES_256_GCM_SIV, &derived_key)?;
+    derived_key.zeroize();
     let nonce = Nonce::try_assume_unique_for_key(nonce_bytes)?;
     let _ = rnk.open_in_place(nonce, Aad::empty(), encrypted_private_key_bytes)?;
     Ok(())

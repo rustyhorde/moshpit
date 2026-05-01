@@ -21,10 +21,20 @@ use uuid::Uuid;
 
 use crate::{
     MoshpitError, UuidWrapper,
+    error::Error,
     frames::{get_bytes, get_nonce, get_usize},
 };
 
 const UUID_LEN: usize = 16;
+/// The maximum size of a UDP encrypted frame ciphertext in bytes (64 KB).
+///
+/// The ciphertext includes the 16-byte UUID prefix, the encrypted payload, and
+/// the 16-byte AES-256-GCM-SIV AEAD tag.  `ScreenState` frames carry
+/// `vt100::Screen::contents_formatted()` output which can be 4–15 KB for a
+/// typical terminal, and larger terminals or high-density output may exceed
+/// that.  64 KB comfortably accommodates all realistic terminal sizes while
+/// still bounding the memory allocated per received UDP packet.
+pub(crate) const MAX_ENCFRAME_LENGTH: usize = 65536;
 
 /// A moshpit frame.
 #[derive(Clone, Debug, Decode, Encode, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -91,6 +101,9 @@ impl EncryptedFrame {
             && let Some(length_slice) = get_usize(src)?
         {
             let length = usize::from_be_bytes(length_slice.try_into()?);
+            if length > MAX_ENCFRAME_LENGTH {
+                return Err(Error::FrameTooLarge.into());
+            }
             if let Some(data) = get_bytes(src, length)? {
                 // Verify HMAC over seq_bytes || ciphertext to authenticate the sequence number
                 let mut to_verify = seq_bytes.to_vec();
@@ -110,7 +123,8 @@ impl EncryptedFrame {
                     message_with_tag.reverse();
                     let mut message = message_with_tag.split_off(AES_256_GCM_SIV.tag_len());
                     message.reverse();
-                    let frame_data: (EncryptedFrame, _) = decode_from_slice(&message, standard())?;
+                    let config = standard().with_limit::<65536>();
+                    let frame_data: (EncryptedFrame, _) = decode_from_slice(&message, config)?;
                     return Ok(Some((frame_data.0, seq)));
                 }
                 error!("HMAC verification failed");
@@ -231,5 +245,44 @@ mod tests {
         let mut cursor = Cursor::new(packet.as_slice());
         let result = EncryptedFrame::parse(&mut cursor, wrong_id, &hmac, &rnk);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_oversized_encframe() {
+        use crate::frames::encframe::MAX_ENCFRAME_LENGTH;
+        let (id, rnk, hmac) = make_keys();
+        // Construct a packet with oversized length
+        let oversized_len = MAX_ENCFRAME_LENGTH + 1;
+
+        let seq = 0u64;
+        let aad = Aad::from(seq.to_be_bytes());
+        let mut encrypted_part = id.as_bytes().to_vec();
+        // Add fake payload to match length
+        encrypted_part.extend_from_slice(&[0u8; 10]);
+        let nonce = rnk
+            .seal_in_place_append_tag(aad, &mut encrypted_part)
+            .unwrap();
+
+        let seq_bytes = seq.to_be_bytes();
+        let mut to_sign = seq_bytes.to_vec();
+        to_sign.extend_from_slice(&encrypted_part);
+        let tag = sign(&hmac, &to_sign);
+        let tag_bytes: [u8; 64] = tag.as_ref().try_into().unwrap();
+
+        let len = oversized_len.to_be_bytes(); // Oversized!
+
+        let mut packet = nonce.as_ref().to_vec();
+        packet.extend_from_slice(&seq_bytes);
+        packet.extend_from_slice(&tag_bytes);
+        packet.extend_from_slice(&len);
+        packet.extend_from_slice(&encrypted_part);
+
+        let mut cursor = Cursor::new(packet.as_slice());
+        let result = EncryptedFrame::parse(&mut cursor, id, &hmac, &rnk);
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            crate::error::Error::FrameTooLarge.to_string()
+        );
     }
 }

@@ -67,3 +67,64 @@ pub(crate) enum Commands {
         public_key: String,
     },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verify_cli() {
+        use clap::CommandFactory;
+        <Cli as CommandFactory>::command().debug_assert();
+    }
+
+    #[test]
+    fn verify_generate_command() {
+        let args = vec!["moshpit-keygen", "generate"];
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert!(matches!(cli.command(), Commands::Generate));
+        assert_eq!(cli.verbose(), 0);
+        assert_eq!(cli.quiet(), 0);
+    }
+
+    #[test]
+    fn verify_verify_command() {
+        let args = vec!["moshpit-keygen", "verify", "--randomart", "dummy_sig"];
+        let cli = Cli::try_parse_from(args).unwrap();
+        match cli.command() {
+            Commands::Verify {
+                randomart,
+                signature,
+            } => {
+                assert!(randomart);
+                assert_eq!(signature, "dummy_sig");
+            }
+            _ => panic!("Expected Verify command"),
+        }
+    }
+
+    #[test]
+    fn verify_fingerprint_command() {
+        let args = vec!["moshpit-keygen", "fingerprint", "dummy_path"];
+        let cli = Cli::try_parse_from(args).unwrap();
+        match cli.command() {
+            Commands::Fingerprint { public_key } => {
+                assert_eq!(public_key, "dummy_path");
+            }
+            _ => panic!("Expected Fingerprint command"),
+        }
+    }
+
+    #[test]
+    fn verify_verbose_quiet_flags() {
+        let args = vec!["moshpit-keygen", "-vv", "generate"];
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert_eq!(cli.verbose(), 2);
+        assert_eq!(cli.quiet(), 0);
+
+        let args2 = vec!["moshpit-keygen", "-q", "generate"];
+        let cli2 = Cli::try_parse_from(args2).unwrap();
+        assert_eq!(cli2.verbose(), 0);
+        assert_eq!(cli2.quiet(), 1);
+    }
+}

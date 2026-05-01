@@ -1,0 +1,38 @@
+[package]
+name = "libmoshpit-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+libmoshpit = { path = ".." }
+aws-lc-rs = { version = "1", features = ["bindgen"] }
+uuid = "1"
+
+# Prevent the workspace from treating this crate as a member.
+[workspace]
+
+[[bin]]
+name = "fuzz_frame"
+path = "fuzz_targets/fuzz_frame.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_encframe"
+path = "fuzz_targets/fuzz_encframe.rs"
+test = false
+doc = false
+
+[[test]]
+name = "regression_encframe"
+path = "fuzz_targets/regression_encframe.rs"
+
+[[test]]
+name = "regression_frame"
+path = "fuzz_targets/regression_frame.rs"

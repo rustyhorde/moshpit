@@ -10,7 +10,7 @@ license = "MIT OR Apache-2.0"
 name = "libmoshpit"
 readme = "../README.md"
 repository = "https://github.com/rustyhorde/moshpit"
-version = "0.2.0"
+version = "0.3.0"
 rust-version = "1.91.1"
 
 [features]
@@ -47,7 +47,7 @@ tracing-subscriber-init = { workspace = true }
 uuid = { workspace = true }
 vt100 = { workspace = true }
 whoami = "2.1.2"
-
+zeroize = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
@@ -61,6 +61,7 @@ rustversion = { workspace = true }
 vergen-gix = { workspace = true }
 
 [dev-dependencies]
+proptest = "1.11.0"
 tempfile = "3.27.0"
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
 

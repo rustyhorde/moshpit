@@ -38,6 +38,9 @@ use crate::{
     UuidWrapper, decrypt_private_key, load_private_key, load_public_key,
 };
 
+/// The callback type for TOFU (Trust-On-First-Use) interactive host key validation.
+pub type TofuFn = Arc<dyn Fn(&str, &str) -> Result<bool> + Send + Sync>;
+
 pub(crate) mod reader;
 pub(crate) mod sender;
 
@@ -233,6 +236,7 @@ pub async fn run_key_exchange<T: KexConfig>(
     sock_read: OwnedReadHalf,
     sock_write: OwnedWriteHalf,
     passphrase_fn: impl Fn() -> Result<Option<String>>,
+    tofu_fn: Option<TofuFn>,
 ) -> Result<(Kex, Arc<UdpSocket>, Option<ServerKex>)> {
     // Setup the TCP connection to the server for key exchange
     let mode = config.mode();
@@ -253,7 +257,16 @@ pub async fn run_key_exchange<T: KexConfig>(
 
     Ok(match mode {
         KexMode::Client => {
-            run_client_kex(config, tx, tx_event, reader, kex_handle, passphrase_fn).await?
+            run_client_kex(
+                config,
+                tx,
+                tx_event,
+                reader,
+                kex_handle,
+                passphrase_fn,
+                tofu_fn,
+            )
+            .await?
         }
         KexMode::Server(socket_addr) => {
             let tx_c = tx.clone();
@@ -275,6 +288,7 @@ async fn run_client_kex<T: KexConfig>(
     reader: ConnectionReader,
     kex_handle: JoinHandle<Result<Kex>>,
     passphrase_fn: impl Fn() -> Result<Option<String>>,
+    tofu_fn: Option<TofuFn>,
 ) -> Result<(Kex, Arc<UdpSocket>, Option<ServerKex>)> {
     let (private_key_path, public_key_path) = config.key_pair_paths()?;
     trace!("Loading private key from {}", private_key_path.display());
@@ -321,12 +335,16 @@ async fn run_client_kex<T: KexConfig>(
     let tx_c = tx.clone();
     let tx_event_c = tx_event.clone();
     let requested = config.resume_session_uuid();
+    let server_id = config.server_id();
+
     let _read_handle = spawn(async move {
         let mut frame_reader = KexReader::builder()
             .reader(reader)
             .tx(tx_c)
             .tx_event(tx_event_c)
             .maybe_requested_session_uuid(requested)
+            .maybe_server_destination(server_id)
+            .maybe_tofu_fn(tofu_fn)
             .build();
         if let Err(e) = frame_reader.client_kex(&pk).await {
             trace!("{e}");

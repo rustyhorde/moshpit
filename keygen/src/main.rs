@@ -242,6 +242,7 @@ use crate::runtime::run;
 mod cli;
 mod runtime;
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn main() {
     exit(run::<Vec<&str>, &str>(None).map_or_else(clap_or_error, success))
 }
