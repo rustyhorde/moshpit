@@ -66,8 +66,32 @@ fn dist(binary: &str) -> Result<()> {
 
     generate_completions(binary, &mut cmd, &out_dir)?;
     generate_man_page(&cmd, &out_dir)?;
+    copy_licenses(&out_dir)?;
+    copy_example_config(binary, &out_dir)?;
 
     println!("Artifacts written to {}", out_dir.display());
+    Ok(())
+}
+
+fn copy_licenses(out_dir: &Path) -> Result<()> {
+    for name in ["LICENSE-MIT", "LICENSE-APACHE"] {
+        fs::copy(name, out_dir.join(name))
+            .with_context(|| format!("failed to copy {name} to {}", out_dir.display()))?;
+    }
+    Ok(())
+}
+
+fn copy_example_config(binary: &str, out_dir: &Path) -> Result<()> {
+    let (pkg, cfg) = match binary {
+        "mp" => ("moshpit", "moshpit.toml.example"),
+        "mps" => ("moshpits", "moshpits.toml.example"),
+        _ => return Ok(()),
+    };
+    let src = PathBuf::from(format!("packaging/arch/{pkg}/examples/{cfg}"));
+    if src.exists() {
+        fs::copy(&src, out_dir.join(cfg))
+            .with_context(|| format!("failed to copy {}", src.display()))?;
+    }
     Ok(())
 }
 

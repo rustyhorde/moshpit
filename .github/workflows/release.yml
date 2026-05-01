@@ -10,15 +10,14 @@ concurrency:
 env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   CARGO_TERM_COLOR: always
-
-
+  CARGO_INCREMENTAL: "0"
 
 name: 🚀 Release 🚀
 
 jobs:
   # ── Build release binaries ───────────────────────────────────────────────────
   build:
-    name: 🔨 Build Linux x86_64 🔨
+    name: 🔨 Build Linux Binaries 🔨
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -38,10 +37,18 @@ jobs:
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
           toolchain: "1.91.1"
-          targets: x86_64-unknown-linux-gnu
 
-      - name: Install build dependencies (cmake + C compiler for aws-lc-rs)
-        run: sudo apt-get update && sudo apt-get install -y cmake gcc
+      - name: Cache cross binary
+        id: cache-cross
+        # v5
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
+        with:
+          path: ~/.cargo/bin/cross
+          key: cross-v0.2.5
+
+      - name: Install cross
+        if: steps.cache-cross.outputs.cache-hit != 'true'
+        run: cargo install cross --version 0.2.5 --locked
 
       - name: Cache cargo registry
         # v5
@@ -50,13 +57,23 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
           key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build release binaries
+      - name: Build x86_64-unknown-linux-musl
+        env:
+          VERGEN_IDEMPOTENT: "1"
         run: |
-          export VERGEN_IDEMPOTENT=1
-          cargo build --release --locked --bin mp --bin mps --bin mp-keygen
+          cross build --release --locked \
+            --target x86_64-unknown-linux-musl \
+            --bin mp --bin mps --bin mp-keygen
+
+      - name: Build aarch64-unknown-linux-musl
+        env:
+          VERGEN_IDEMPOTENT: "1"
+        run: |
+          cross build --release --locked \
+            --target aarch64-unknown-linux-musl \
+            --bin mp --bin mps --bin mp-keygen
 
       - name: Generate xtask dist artifacts
         run: |
@@ -64,12 +81,36 @@ jobs:
           cargo xtask dist mps
           cargo xtask dist mp-keygen
 
+      - name: Create dist tarballs
+        run: |
+          tar -czf dist-mp.tar.gz        -C dist mp
+          tar -czf dist-mps.tar.gz       -C dist mps
+          tar -czf dist-mp-keygen.tar.gz -C dist mp-keygen
+
       - name: Stage release assets
         run: |
           mkdir -p release-assets
-          cp target/release/mp     release-assets/mp-x86_64-unknown-linux-gnu
-          cp target/release/mps    release-assets/mps-x86_64-unknown-linux-gnu
-          cp target/release/mp-keygen release-assets/mp-keygen-x86_64-unknown-linux-gnu
+
+          # x86_64 static MUSL binaries
+          cp target/x86_64-unknown-linux-musl/release/mp \
+             release-assets/mp-x86_64-unknown-linux-musl
+          cp target/x86_64-unknown-linux-musl/release/mps \
+             release-assets/mps-x86_64-unknown-linux-musl
+          cp target/x86_64-unknown-linux-musl/release/mp-keygen \
+             release-assets/mp-keygen-x86_64-unknown-linux-musl
+
+          # aarch64 static MUSL binaries
+          cp target/aarch64-unknown-linux-musl/release/mp \
+             release-assets/mp-aarch64-unknown-linux-musl
+          cp target/aarch64-unknown-linux-musl/release/mps \
+             release-assets/mps-aarch64-unknown-linux-musl
+          cp target/aarch64-unknown-linux-musl/release/mp-keygen \
+             release-assets/mp-keygen-aarch64-unknown-linux-musl
+
+          # dist tarballs (man pages + shell completions + licenses + example configs)
+          cp dist-mp.tar.gz        release-assets/
+          cp dist-mps.tar.gz       release-assets/
+          cp dist-mp-keygen.tar.gz release-assets/
 
       - name: Upload release assets artifact
         # v7
@@ -132,22 +173,83 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Update pkgver and sha256sums in all three PKGBUILDs
+      - name: Download release assets
+        # v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: release-assets
+          path: release-assets/
+
+      - name: Compute checksums for binary PKGBUILDs
+        id: binsums
+        run: |
+          echo "x86_64_mp=$(sha256sum release-assets/mp-x86_64-unknown-linux-musl | awk '{print $1}')" \
+            >> "$GITHUB_OUTPUT"
+          echo "x86_64_mps=$(sha256sum release-assets/mps-x86_64-unknown-linux-musl | awk '{print $1}')" \
+            >> "$GITHUB_OUTPUT"
+          echo "x86_64_mpkeygen=$(sha256sum release-assets/mp-keygen-x86_64-unknown-linux-musl | awk '{print $1}')" \
+            >> "$GITHUB_OUTPUT"
+          echo "aarch64_mp=$(sha256sum release-assets/mp-aarch64-unknown-linux-musl | awk '{print $1}')" \
+            >> "$GITHUB_OUTPUT"
+          echo "aarch64_mps=$(sha256sum release-assets/mps-aarch64-unknown-linux-musl | awk '{print $1}')" \
+            >> "$GITHUB_OUTPUT"
+          echo "aarch64_mpkeygen=$(sha256sum release-assets/mp-keygen-aarch64-unknown-linux-musl | awk '{print $1}')" \
+            >> "$GITHUB_OUTPUT"
+          echo "dist_mp=$(sha256sum release-assets/dist-mp.tar.gz | awk '{print $1}')" \
+            >> "$GITHUB_OUTPUT"
+          echo "dist_mps=$(sha256sum release-assets/dist-mps.tar.gz | awk '{print $1}')" \
+            >> "$GITHUB_OUTPUT"
+          echo "dist_mpkeygen=$(sha256sum release-assets/dist-mp-keygen.tar.gz | awk '{print $1}')" \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Update source PKGBUILDs
         env:
           PKGVER: ${{ needs.build.outputs.pkgver }}
           SHA256: ${{ needs.release.outputs.tarball_sha256 }}
         run: |
           for pkg in moshpit-keygen moshpit moshpits; do
             PKGBUILD="packaging/arch/${pkg}/PKGBUILD"
-            # Update pkgver
             sed -i "s/^pkgver=.*/pkgver=${PKGVER}/" "$PKGBUILD"
-            # Reset pkgrel to 1
             sed -i "s/^pkgrel=.*/pkgrel=1/" "$PKGBUILD"
-            # Update sha256sums — replace the first source checksum entry
-            # (whether it is SKIP or an existing hash) and leave remaining
-            # entries unchanged (e.g. mps.service checksum).
             sed -i "/^sha256sums=/,/^)/ s/'[^']*'/'${SHA256}'/1" "$PKGBUILD"
           done
+
+      - name: Update binary PKGBUILDs
+        env:
+          PKGVER:           ${{ needs.build.outputs.pkgver }}
+          X86_64_MP:        ${{ steps.binsums.outputs.x86_64_mp }}
+          X86_64_MPS:       ${{ steps.binsums.outputs.x86_64_mps }}
+          X86_64_MPKEYGEN:  ${{ steps.binsums.outputs.x86_64_mpkeygen }}
+          AARCH64_MP:       ${{ steps.binsums.outputs.aarch64_mp }}
+          AARCH64_MPS:      ${{ steps.binsums.outputs.aarch64_mps }}
+          AARCH64_MPKEYGEN: ${{ steps.binsums.outputs.aarch64_mpkeygen }}
+          DIST_MP:          ${{ steps.binsums.outputs.dist_mp }}
+          DIST_MPS:         ${{ steps.binsums.outputs.dist_mps }}
+          DIST_MPKEYGEN:    ${{ steps.binsums.outputs.dist_mpkeygen }}
+        run: |
+          # Replaces pkgver, pkgrel, and all three sha256sums arrays in a binary PKGBUILD.
+          # The sed patterns match the first single-quoted value on each sha256sums line,
+          # preserving any additional entries on the same line (e.g. mps.service hash).
+          update_bin_pkgbuild() {
+            local pb="$1" dist_hash="$2" x86_64_hash="$3" aarch64_hash="$4"
+            sed -i "s/^pkgver=.*/pkgver=${PKGVER}/"                                    "$pb"
+            sed -i "s/^pkgrel=.*/pkgrel=1/"                                            "$pb"
+            sed -i "s/^sha256sums=('[^']*'/sha256sums=('${dist_hash}'/"                "$pb"
+            sed -i "s/^sha256sums_x86_64=('[^']*'/sha256sums_x86_64=('${x86_64_hash}'/" "$pb"
+            sed -i "s/^sha256sums_aarch64=('[^']*'/sha256sums_aarch64=('${aarch64_hash}'/" "$pb"
+          }
+
+          update_bin_pkgbuild \
+            packaging/arch/moshpit-keygen-bin/PKGBUILD \
+            "$DIST_MPKEYGEN" "$X86_64_MPKEYGEN" "$AARCH64_MPKEYGEN"
+
+          update_bin_pkgbuild \
+            packaging/arch/moshpit-bin/PKGBUILD \
+            "$DIST_MP" "$X86_64_MP" "$AARCH64_MP"
+
+          update_bin_pkgbuild \
+            packaging/arch/moshpits-bin/PKGBUILD \
+            "$DIST_MPS" "$X86_64_MPS" "$AARCH64_MPS"
 
       - name: Upload updated PKGBUILDs as artifact
         # v7
@@ -184,7 +286,13 @@ jobs:
       contents: read
     strategy:
       matrix:
-        package: [moshpit-keygen, moshpit, moshpits]
+        package:
+          - moshpit-keygen
+          - moshpit
+          - moshpits
+          - moshpit-keygen-bin
+          - moshpit-bin
+          - moshpits-bin
     steps:
       - name: Download updated PKGBUILDs
         # v8

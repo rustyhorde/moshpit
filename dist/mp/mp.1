@@ -1,10 +1,10 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH mp 1  "mp 0.2.0" 
+.TH mp 1  "mp 0.3.0" 
 .SH NAME
 mp \- Connect to a moshpits server
 .SH SYNOPSIS
-\fBmp\fR [\fB\-v\fR|\fB\-\-verbose\fR]... [\fB\-q\fR|\fB\-\-quiet\fR]... [\fB\-c\fR|\fB\-\-config\-absolute\-path\fR] [\fB\-t\fR|\fB\-\-tracing\-absolute\-path\fR] [\fB\-p\fR|\fB\-\-private\-key\-path\fR] [\fB\-k\fR|\fB\-\-public\-key\-path\fR] [\fB\-s\fR|\fB\-\-server\-port\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] <\fISERVER_DESTINATION\fR> 
+\fBmp\fR [\fB\-v\fR|\fB\-\-verbose\fR]... [\fB\-q\fR|\fB\-\-quiet\fR]... [\fB\-c\fR|\fB\-\-config\-absolute\-path\fR] [\fB\-t\fR|\fB\-\-tracing\-absolute\-path\fR] [\fB\-p\fR|\fB\-\-private\-key\-path\fR] [\fB\-k\fR|\fB\-\-public\-key\-path\fR] [\fB\-s\fR|\fB\-\-server\-port\fR] [\fB\-\-predict\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] <\fISERVER_DESTINATION\fR> 
 .SH DESCRIPTION
 Connect to a moshpits server
 .SH OPTIONS
@@ -30,6 +30,21 @@ Specify the absolute path to the public key file
 \fB\-s\fR, \fB\-\-server\-port\fR \fI<PORT>\fR [default: 40404]
 The port number of the server to connect to (default: 40404)
 .TP
+\fB\-\-predict\fR \fI<MODE>\fR [default: adaptive]
+Local\-echo prediction: adaptive (default), always, or never
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+adaptive
+.IP \(bu 2
+always
+.IP \(bu 2
+never
+.RE
+.TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help
 .TP
@@ -39,4 +54,4 @@ Print version
 <\fISERVER_DESTINATION\fR>
 The IP address of the server to connect to (user@address or address)
 .SH VERSION
-v0.2.0
+v0.3.0
