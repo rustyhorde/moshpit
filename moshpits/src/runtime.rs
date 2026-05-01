@@ -7,12 +7,14 @@
 // modified, or distributed except according to those terms.
 
 use std::{
-    collections::{BTreeSet, HashMap, VecDeque, hash_map::DefaultHasher},
+    collections::{BTreeSet, HashMap, VecDeque},
     ffi::OsString,
-    hash::{Hash, Hasher},
     io::{IsTerminal as _, Read as _, Write as _},
     net::SocketAddr,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     thread::{self, sleep},
     time::Duration,
 };
@@ -298,6 +300,7 @@ async fn resolve_session(
     Arc<Mutex<SessionOutputHandle>>,
     Arc<Mutex<VecDeque<u8>>>,
     Arc<Mutex<vt100::Parser>>,
+    Arc<AtomicU64>,
 )> {
     let session_uuid = skex.session_uuid();
     if skex.is_resume() {
@@ -307,6 +310,7 @@ async fn resolve_session(
             let output_handle = record.output_handle.clone();
             let scrollback = record.scrollback.clone();
             let server_emulator = record.server_emulator.clone();
+            let dirty_counter = record.dirty_counter.clone();
             drop(reg);
 
             // Replace the output handle with the new connection's channels.
@@ -342,6 +346,7 @@ async fn resolve_session(
                 output_handle,
                 scrollback,
                 server_emulator,
+                dirty_counter,
             ))
         } else {
             // Session expired; start fresh.
@@ -395,15 +400,16 @@ async fn handle_connection(
     let conn_token = CancellationToken::new();
 
     // Resolve channels and decide whether to spawn a new PTY.
-    let (term_tx, maybe_term_rx, output_handle, scrollback, server_emulator) = resolve_session(
-        &kex,
-        &skex,
-        &conn_token,
-        udp_port,
-        tx.clone(),
-        &full_registry,
-    )
-    .await?;
+    let (term_tx, maybe_term_rx, output_handle, scrollback, server_emulator, dirty_counter) =
+        resolve_session(
+            &kex,
+            &skex,
+            &conn_token,
+            udp_port,
+            tx.clone(),
+            &full_registry,
+        )
+        .await?;
 
     // Register this connection in the banner; schedule removal when the connection drops.
     banner
@@ -455,32 +461,33 @@ async fn handle_connection(
     spawn_connection_watchdogs(tx.clone(), conn_token.clone(), server_token);
 
     // Periodic screen-state sync: every 50 ms send ScreenState to the client when the
-    // screen has changed (guarded by a content hash to skip unchanged frames).
+    // screen has changed.  The dirty_counter is incremented by spawn_pty_reader on every
+    // PTY output chunk and by spawn_pty on every Resize event, so this tick is a pure
+    // atomic load — essentially free — when the terminal is idle.
     let sync_emu = server_emulator.clone();
     let sync_tx = tx.clone();
     let sync_token = conn_token.clone();
+    let sync_dirty = dirty_counter.clone();
     let _screen_sync = spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_millis(50));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut last_hash: u64 = 0;
+        let mut last_dirty: u64 = 0;
         loop {
             select! {
                 () = sync_token.cancelled() => break,
                 _ = ticker.tick() => {
+                    let current = sync_dirty.load(Ordering::Relaxed);
+                    if current == last_dirty {
+                        // Screen has not changed since last tick — skip expensive formatting.
+                        continue;
+                    }
+                    last_dirty = current;
                     let contents = {
                         let emu = sync_emu.lock().await;
                         emu.screen().contents_formatted()
                     };
-                    let hash = {
-                        let mut h = DefaultHasher::new();
-                        contents.hash(&mut h);
-                        h.finish()
-                    };
-                    if hash != last_hash {
-                        last_hash = hash;
-                        if sync_tx.send(EncryptedFrame::ScreenState(contents)).await.is_err() {
-                            break;
-                        }
+                    if sync_tx.send(EncryptedFrame::ScreenState(contents)).await.is_err() {
+                        break;
                     }
                 }
             }
@@ -497,6 +504,7 @@ async fn handle_connection(
             output_handle,
             scrollback,
             server_emulator,
+            dirty_counter,
             port_pool,
             session_registry,
             full_registry,
@@ -557,6 +565,7 @@ async fn new_session(
     Arc<Mutex<SessionOutputHandle>>,
     Arc<Mutex<VecDeque<u8>>>,
     Arc<Mutex<vt100::Parser>>,
+    Arc<AtomicU64>,
 )> {
     let (term_tx, term_rx) = channel::<TerminalMessage>(256);
     let output_handle = Arc::new(Mutex::new(SessionOutputHandle {
@@ -567,6 +576,8 @@ async fn new_session(
     }));
     let scrollback = Arc::new(Mutex::new(VecDeque::with_capacity(SCROLLBACK_CAPACITY)));
     let server_emulator = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
+    // Start at 1 so the first sync tick always sends an initial screen state.
+    let dirty_counter = Arc::new(AtomicU64::new(1));
 
     {
         let mut fr = full_registry.lock().await;
@@ -577,6 +588,7 @@ async fn new_session(
                 output_handle: output_handle.clone(),
                 scrollback: scrollback.clone(),
                 server_emulator: server_emulator.clone(),
+                dirty_counter: dirty_counter.clone(),
             },
         ));
     }
@@ -587,6 +599,7 @@ async fn new_session(
         output_handle,
         scrollback,
         server_emulator,
+        dirty_counter,
     ))
 }
 
@@ -600,6 +613,7 @@ fn spawn_pty_reader(
     output_handle: Arc<Mutex<SessionOutputHandle>>,
     scrollback: Arc<Mutex<VecDeque<u8>>>,
     server_emulator: Arc<Mutex<vt100::Parser>>,
+    dirty_counter: Arc<AtomicU64>,
     port_pool: Arc<Mutex<BTreeSet<u16>>>,
     session_registry: SessionRegistry,
     full_registry: FullSessionRegistry,
@@ -632,6 +646,9 @@ fn spawn_pty_reader(
 
                         // Feed into the server-side emulator for screen-state tracking.
                         server_emulator.blocking_lock().process(chunk);
+
+                        // Signal to the screen-sync task that new content is available.
+                        let _ = dirty_counter.fetch_add(1, Ordering::Relaxed);
 
                         // Send to the currently connected client (if any).
                         let send_ok = {
@@ -709,6 +726,7 @@ fn spawn_pty(
     output_handle: Arc<Mutex<SessionOutputHandle>>,
     scrollback: Arc<Mutex<VecDeque<u8>>>,
     server_emulator: Arc<Mutex<vt100::Parser>>,
+    dirty_counter: Arc<AtomicU64>,
     port_pool: Arc<Mutex<BTreeSet<u16>>>,
     session_registry: SessionRegistry,
     full_registry: FullSessionRegistry,
@@ -759,6 +777,7 @@ fn spawn_pty(
             output_handle,
             scrollback,
             server_emulator.clone(),
+            dirty_counter.clone(),
             port_pool,
             session_registry,
             full_registry,
@@ -780,6 +799,8 @@ fn spawn_pty(
                         .blocking_lock()
                         .screen_mut()
                         .set_size(rows, columns);
+                    // Resize changes the rendered screen layout — mark dirty.
+                    let _ = dirty_counter.fetch_add(1, Ordering::Relaxed);
                 }
                 TerminalMessage::Input(data) => {
                     if let Err(e) = term_in.write_all(&data) {
@@ -957,7 +978,7 @@ mod test {
         let session_uuid = Uuid::new_v4();
         let registry = new_full_registry();
 
-        let (_, maybe_rx, _, _, _) =
+        let (_, maybe_rx, _, _, _, _) =
             new_session(&kex, &conn_token, 50_000, session_uuid, tx, &registry)
                 .await
                 .unwrap();
@@ -972,7 +993,7 @@ mod test {
         let session_uuid = Uuid::new_v4();
         let registry = new_full_registry();
 
-        let (_, _, output_handle, _, _) =
+        let (_, _, output_handle, _, _, _) =
             new_session(&kex, &conn_token, 50_000, session_uuid, tx, &registry)
                 .await
                 .unwrap();
@@ -987,7 +1008,7 @@ mod test {
         let session_uuid = Uuid::new_v4();
         let registry = new_full_registry();
 
-        let (_, _, _, scrollback, _) =
+        let (_, _, _, scrollback, _, _) =
             new_session(&kex, &conn_token, 50_000, session_uuid, tx, &registry)
                 .await
                 .unwrap();
@@ -1002,7 +1023,7 @@ mod test {
         let session_uuid = Uuid::new_v4();
         let registry = new_full_registry();
 
-        let (_, _, _, _, emulator) =
+        let (_, _, _, _, emulator, _) =
             new_session(&kex, &conn_token, 50_000, session_uuid, tx, &registry)
                 .await
                 .unwrap();
@@ -1097,7 +1118,7 @@ mod test {
         let (tx, _rx) = channel::<EncryptedFrame>(4);
         let registry = new_full_registry();
 
-        let (_, maybe_rx, _, _, _) =
+        let (_, maybe_rx, _, _, _, _) =
             resolve_session(&kex, &skex, &conn_token, 50_000, tx, &registry)
                 .await
                 .unwrap();
@@ -1136,7 +1157,7 @@ mod test {
         let new_conn_token = CancellationToken::new();
         let (tx2, mut rx2) = channel::<EncryptedFrame>(16);
 
-        let (_, maybe_rx, output_handle, _, _) = resolve_session(
+        let (_, maybe_rx, output_handle, _, _, _) = resolve_session(
             &new_kex,
             &skex_resume,
             &new_conn_token,
@@ -1177,7 +1198,7 @@ mod test {
         let (tx, _rx) = channel::<EncryptedFrame>(4);
         let registry = new_full_registry();
 
-        let (_, maybe_rx, _, _, _) =
+        let (_, maybe_rx, _, _, _, _) =
             resolve_session(&kex, &skex, &conn_token, 50_000, tx, &registry)
                 .await
                 .unwrap();
