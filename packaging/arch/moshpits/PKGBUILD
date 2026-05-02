@@ -15,8 +15,8 @@ source=(
     "mps.service"
 )
 sha256sums=(
-    '626179d404b83999dbc5ada72cc1fed83851d51f34c08198e206b269ab470615'
-    '626179d404b83999dbc5ada72cc1fed83851d51f34c08198e206b269ab470615'
+    'a364daf9c4ecc82d9fa05bd0cce2c0693aecb343fbb5dfd616c790440588cf32'
+    'a364daf9c4ecc82d9fa05bd0cce2c0693aecb343fbb5dfd616c790440588cf32'
 )
 
 prepare() {
