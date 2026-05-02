@@ -281,6 +281,8 @@ jobs:
         with:
           pkgname: ${{ matrix.package }}
           pkgbuild: packaging/arch/${{ matrix.package }}/PKGBUILD
+          assets: |
+            packaging/arch/${{ matrix.package }}/*
           commit_username: "Jason Ozias"
           commit_email: "jason.g.ozias@gmail.com"
           ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
