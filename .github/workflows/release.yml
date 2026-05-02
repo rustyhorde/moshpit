@@ -179,14 +179,16 @@ jobs:
             >> "$GITHUB_OUTPUT"
           echo "dist_mpkeygen=$(sha256sum release-assets/dist-mp-keygen.tar.gz | awk '{print $1}')" \
             >> "$GITHUB_OUTPUT"
-          echo "mps_service=$(sha256sum packaging/arch/moshpits/mps.service | awk '{print $1}')" \
+          echo "mps_service_src=$(sha256sum packaging/arch/moshpits/mps.service | awk '{print $1}')" \
+            >> "$GITHUB_OUTPUT"
+          echo "mps_service_bin=$(sha256sum packaging/arch/moshpits-bin/mps.service | awk '{print $1}')" \
             >> "$GITHUB_OUTPUT"
 
       - name: Update source PKGBUILDs
         env:
           PKGVER: ${{ needs.build.outputs.pkgver }}
           SHA256: ${{ needs.release.outputs.tarball_sha256 }}
-          MPS_SERVICE: ${{ steps.binsums.outputs.mps_service }}
+          MPS_SERVICE_SRC: ${{ steps.binsums.outputs.mps_service_src }}
         run: |
           for pkg in moshpit-keygen moshpit moshpits; do
             PKGBUILD="packaging/arch/${pkg}/PKGBUILD"
@@ -195,7 +197,7 @@ jobs:
             sed -i "/^sha256sums=/,/^)/ s/'[^']*'/'${SHA256}'/1" "$PKGBUILD"
 
             if [[ "$pkg" == "moshpits" ]]; then
-              sed -i "/^sha256sums=/,/^)/ s/'[^']*'/'${MPS_SERVICE}'/2" "$PKGBUILD"
+              sed -i "/^sha256sums=/,/^)/ s/'[^']*'/'${MPS_SERVICE_SRC}'/2" "$PKGBUILD"
             fi
           done
 
@@ -208,7 +210,7 @@ jobs:
           DIST_MP:          ${{ steps.binsums.outputs.dist_mp }}
           DIST_MPS:         ${{ steps.binsums.outputs.dist_mps }}
           DIST_MPKEYGEN:    ${{ steps.binsums.outputs.dist_mpkeygen }}
-          MPS_SERVICE:      ${{ steps.binsums.outputs.mps_service }}
+          MPS_SERVICE_BIN:  ${{ steps.binsums.outputs.mps_service_bin }}
         run: |
           # Replaces pkgver, pkgrel, and both sha256sums arrays in a binary PKGBUILD.
           # The sed patterns match the first single-quoted value on each sha256sums line,
@@ -233,7 +235,7 @@ jobs:
             packaging/arch/moshpits-bin/PKGBUILD \
             "$DIST_MPS" "$X86_64_MPS"
 
-          sed -i "s/^sha256sums=('${DIST_MPS}' '[^']*')/sha256sums=('${DIST_MPS}' '${MPS_SERVICE}')/" \
+          sed -i "s/^sha256sums=('${DIST_MPS}' '[^']*')/sha256sums=('${DIST_MPS}' '${MPS_SERVICE_BIN}')/" \
             packaging/arch/moshpits-bin/PKGBUILD
 
       - name: Verify local source checksums
