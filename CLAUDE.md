@@ -105,9 +105,9 @@ The `package-test.yml` workflow simulates a release tarball build by running `--
 ## Release Process
 
 Tagging `v<semver>` triggers `release.yml`, which:
-1. Builds static MUSL binaries for `x86_64` and `aarch64` via `cross` (cross-rs/cross v0.2.5 in Docker)
+1. Builds static MUSL binaries for `x86_64` via `cross` (cross-rs/cross v0.2.5 in Docker)
 2. Runs `cargo xtask dist` natively to generate man pages, completions, licenses, and example configs, then tars them per binary (`dist-mp.tar.gz`, `dist-mps.tar.gz`, `dist-mp-keygen.tar.gz`)
-3. Creates a GitHub release with all 6 binaries + 3 dist tarballs + the source tarball
+3. Creates a GitHub release with all 3 binaries + 3 dist tarballs + the source tarball
 4. Computes SHA256 of every release asset and updates both source and binary PKGBUILDs, opens a PR
 5. Publishes to 6 AUR packages: `moshpit-keygen`, `moshpit`, `moshpits` (source/compile) and `moshpit-keygen-bin`, `moshpit-bin`, `moshpits-bin` (binary/pre-compiled)
 
