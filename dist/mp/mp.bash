@@ -23,7 +23,7 @@ _mp() {
 
     case "${cmd}" in
         mp)
-            opts="-v -q -c -t -p -k -s -h -V --verbose --quiet --config-absolute-path --tracing-absolute-path --private-key-path --public-key-path --server-port --help --version <SERVER_DESTINATION>"
+            opts="-v -q -c -t -p -k -s -h -V --verbose --quiet --config-absolute-path --tracing-absolute-path --private-key-path --public-key-path --server-port --predict --help --version <SERVER_DESTINATION>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -67,6 +67,10 @@ _mp() {
                     ;;
                 -s)
                     COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --predict)
+                    COMPREPLY=($(compgen -W "adaptive always never" -- "${cur}"))
                     return 0
                     ;;
                 *)

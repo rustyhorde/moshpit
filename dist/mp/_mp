@@ -25,6 +25,7 @@ _mp() {
 '--public-key-path=[Specify the absolute path to the public key file]:PATH:_default' \
 '-s+[The port number of the server to connect to (default\: 40404)]:PORT:_default' \
 '--server-port=[The port number of the server to connect to (default\: 40404)]:PORT:_default' \
+'--predict=[Local-echo prediction\: adaptive (default), always, or never]:MODE:(adaptive always never)' \
 '(-q --quiet)*-v[Turn up logging verbosity (multiple will turn it up more)]' \
 '(-q --quiet)*--verbose[Turn up logging verbosity (multiple will turn it up more)]' \
 '(-v --verbose)*-q[Turn down logging verbosity (multiple will turn it down more)]' \
