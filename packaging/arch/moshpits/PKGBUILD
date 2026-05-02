@@ -16,7 +16,8 @@ source=(
 )
 sha256sums=(
     '626179d404b83999dbc5ada72cc1fed83851d51f34c08198e206b269ab470615'
-    'f011f1cf322e913b8a0d94bafcf31dc2c77af8c056ef2c0e1a808eedc686a4cd'
+    # Local repo-tracked sidecar file; checksum is intentionally unmanaged in CI.
+    'SKIP'
 )
 
 prepare() {

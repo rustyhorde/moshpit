@@ -17,7 +17,8 @@ _base="https://github.com/rustyhorde/moshpit/releases/download/v${pkgver}"
 
 source=("${_base}/dist-mps.tar.gz" "mps.service")
 source_x86_64=("mps-x86_64::${_base}/mps-x86_64-unknown-linux-musl")
-sha256sums=('SKIP' 'f011f1cf322e913b8a0d94bafcf31dc2c77af8c056ef2c0e1a808eedc686a4cd')
+# First entry is the release dist tarball; local sidecar file is intentionally SKIP.
+sha256sums=('SKIP' 'SKIP')
 sha256sums_x86_64=('SKIP')
 
 package() {

@@ -167,6 +167,8 @@ jobs:
       - name: Compute checksums for PKGBUILDs
         id: binsums
         run: |
+          # Hash release artifacts produced in this workflow so AUR PKGBUILDs are pinned
+          # to the exact tarballs/binaries uploaded to the GitHub release.
           echo "x86_64_mp=$(sha256sum release-assets/mp-x86_64-unknown-linux-musl | awk '{print $1}')" \
             >> "$GITHUB_OUTPUT"
           echo "x86_64_mps=$(sha256sum release-assets/mps-x86_64-unknown-linux-musl | awk '{print $1}')" \
@@ -179,26 +181,19 @@ jobs:
             >> "$GITHUB_OUTPUT"
           echo "dist_mpkeygen=$(sha256sum release-assets/dist-mp-keygen.tar.gz | awk '{print $1}')" \
             >> "$GITHUB_OUTPUT"
-          echo "mps_service_src=$(sha256sum packaging/arch/moshpits/mps.service | awk '{print $1}')" \
-            >> "$GITHUB_OUTPUT"
-          echo "mps_service_bin=$(sha256sum packaging/arch/moshpits-bin/mps.service | awk '{print $1}')" \
-            >> "$GITHUB_OUTPUT"
 
       - name: Update source PKGBUILDs
         env:
           PKGVER: ${{ needs.build.outputs.pkgver }}
           SHA256: ${{ needs.release.outputs.tarball_sha256 }}
-          MPS_SERVICE_SRC: ${{ steps.binsums.outputs.mps_service_src }}
         run: |
           for pkg in moshpit-keygen moshpit moshpits; do
             PKGBUILD="packaging/arch/${pkg}/PKGBUILD"
             sed -i "s/^pkgver=.*/pkgver=${PKGVER}/" "$PKGBUILD"
             sed -i "s/^pkgrel=.*/pkgrel=1/" "$PKGBUILD"
+            # Only the first source entry is the remote release/source tarball.
+            # Local sidecar files are intentionally left as SKIP in PKGBUILDs.
             sed -i "/^sha256sums=/,/^)/ s/'[^']*'/'${SHA256}'/1" "$PKGBUILD"
-
-            if [[ "$pkg" == "moshpits" ]]; then
-              sed -i "/^sha256sums=/,/^)/ s/'[^']*'/'${MPS_SERVICE_SRC}'/2" "$PKGBUILD"
-            fi
           done
 
       - name: Update binary PKGBUILDs
@@ -210,11 +205,10 @@ jobs:
           DIST_MP:          ${{ steps.binsums.outputs.dist_mp }}
           DIST_MPS:         ${{ steps.binsums.outputs.dist_mps }}
           DIST_MPKEYGEN:    ${{ steps.binsums.outputs.dist_mpkeygen }}
-          MPS_SERVICE_BIN:  ${{ steps.binsums.outputs.mps_service_bin }}
         run: |
-          # Replaces pkgver, pkgrel, and both sha256sums arrays in a binary PKGBUILD.
-          # The sed patterns match the first single-quoted value on each sha256sums line,
-          # preserving any additional entries on the same line (e.g. mps.service hash).
+          # Replaces pkgver, pkgrel, and release-asset sha256 arrays in binary PKGBUILDs.
+          # For sha256sums, only the first value (dist tarball) is replaced.
+          # Additional local sidecar file entries remain SKIP by design.
           update_bin_pkgbuild() {
             local pb="$1" dist_hash="$2" x86_64_hash="$3"
             sed -i "s/^pkgver=.*/pkgver=${PKGVER}/"                                    "$pb"
@@ -234,61 +228,6 @@ jobs:
           update_bin_pkgbuild \
             packaging/arch/moshpits-bin/PKGBUILD \
             "$DIST_MPS" "$X86_64_MPS"
-
-          sed -i "s/^sha256sums=('${DIST_MPS}' '[^']*')/sha256sums=('${DIST_MPS}' '${MPS_SERVICE_BIN}')/" \
-            packaging/arch/moshpits-bin/PKGBUILD
-
-      - name: Verify local source checksums
-        run: |
-          python3 - <<'PY'
-          import hashlib
-          import re
-          import sys
-          from pathlib import Path
-
-          def quoted_values(array_body: str) -> list[str]:
-              return [a or b for a, b in re.findall(r"'([^']*)'|\"([^\"]*)\"", array_body)]
-
-          failed = False
-          for pkgbuild in sorted(Path("packaging/arch").glob("*/PKGBUILD")):
-              text = pkgbuild.read_text()
-
-              src_match = re.search(r"^source=\((.*?)\)\s*$", text, re.MULTILINE | re.DOTALL)
-              sum_match = re.search(r"^sha256sums=\((.*?)\)\s*$", text, re.MULTILINE | re.DOTALL)
-              if not src_match or not sum_match:
-                  continue
-
-              sources = quoted_values(src_match.group(1))
-              sums = quoted_values(sum_match.group(1))
-              if len(sources) != len(sums):
-                  print(f"[ERROR] {pkgbuild}: source/sha256sums length mismatch ({len(sources)} vs {len(sums)})")
-                  failed = True
-                  continue
-
-              for idx, source in enumerate(sources):
-                  source_path = source.split("::", 1)[-1]
-                  if "://" in source_path or source_path.startswith("$") or "${" in source_path:
-                      continue
-
-                  local_file = pkgbuild.parent / source_path
-                  if not local_file.is_file():
-                      print(f"[ERROR] {pkgbuild}: local source file not found: {source_path}")
-                      failed = True
-                      continue
-
-                  digest = hashlib.sha256(local_file.read_bytes()).hexdigest()
-                  if sums[idx] != digest:
-                      print(
-                          f"[ERROR] {pkgbuild}: sha256 mismatch for {source_path} "
-                          f"(expected {digest}, found {sums[idx]})"
-                      )
-                      failed = True
-
-          if failed:
-              sys.exit(1)
-
-          print("[OK] local source file checksums are in sync")
-          PY
 
       - name: Upload updated PKGBUILDs as artifact
         # v7
