@@ -67,14 +67,6 @@ jobs:
             --target x86_64-unknown-linux-musl \
             --bin mp --bin mps --bin mp-keygen
 
-      - name: Build aarch64-unknown-linux-musl
-        env:
-          VERGEN_IDEMPOTENT: "1"
-        run: |
-          cross build --release --locked \
-            --target aarch64-unknown-linux-musl \
-            --bin mp --bin mps --bin mp-keygen
-
       - name: Generate xtask dist artifacts
         run: |
           cargo xtask dist mp
@@ -98,14 +90,6 @@ jobs:
              release-assets/mps-x86_64-unknown-linux-musl
           cp target/x86_64-unknown-linux-musl/release/mp-keygen \
              release-assets/mp-keygen-x86_64-unknown-linux-musl
-
-          # aarch64 static MUSL binaries
-          cp target/aarch64-unknown-linux-musl/release/mp \
-             release-assets/mp-aarch64-unknown-linux-musl
-          cp target/aarch64-unknown-linux-musl/release/mps \
-             release-assets/mps-aarch64-unknown-linux-musl
-          cp target/aarch64-unknown-linux-musl/release/mp-keygen \
-             release-assets/mp-keygen-aarch64-unknown-linux-musl
 
           # dist tarballs (man pages + shell completions + licenses + example configs)
           cp dist-mp.tar.gz        release-assets/
@@ -189,12 +173,6 @@ jobs:
             >> "$GITHUB_OUTPUT"
           echo "x86_64_mpkeygen=$(sha256sum release-assets/mp-keygen-x86_64-unknown-linux-musl | awk '{print $1}')" \
             >> "$GITHUB_OUTPUT"
-          echo "aarch64_mp=$(sha256sum release-assets/mp-aarch64-unknown-linux-musl | awk '{print $1}')" \
-            >> "$GITHUB_OUTPUT"
-          echo "aarch64_mps=$(sha256sum release-assets/mps-aarch64-unknown-linux-musl | awk '{print $1}')" \
-            >> "$GITHUB_OUTPUT"
-          echo "aarch64_mpkeygen=$(sha256sum release-assets/mp-keygen-aarch64-unknown-linux-musl | awk '{print $1}')" \
-            >> "$GITHUB_OUTPUT"
           echo "dist_mp=$(sha256sum release-assets/dist-mp.tar.gz | awk '{print $1}')" \
             >> "$GITHUB_OUTPUT"
           echo "dist_mps=$(sha256sum release-assets/dist-mps.tar.gz | awk '{print $1}')" \
@@ -220,36 +198,32 @@ jobs:
           X86_64_MP:        ${{ steps.binsums.outputs.x86_64_mp }}
           X86_64_MPS:       ${{ steps.binsums.outputs.x86_64_mps }}
           X86_64_MPKEYGEN:  ${{ steps.binsums.outputs.x86_64_mpkeygen }}
-          AARCH64_MP:       ${{ steps.binsums.outputs.aarch64_mp }}
-          AARCH64_MPS:      ${{ steps.binsums.outputs.aarch64_mps }}
-          AARCH64_MPKEYGEN: ${{ steps.binsums.outputs.aarch64_mpkeygen }}
           DIST_MP:          ${{ steps.binsums.outputs.dist_mp }}
           DIST_MPS:         ${{ steps.binsums.outputs.dist_mps }}
           DIST_MPKEYGEN:    ${{ steps.binsums.outputs.dist_mpkeygen }}
         run: |
-          # Replaces pkgver, pkgrel, and all three sha256sums arrays in a binary PKGBUILD.
+          # Replaces pkgver, pkgrel, and both sha256sums arrays in a binary PKGBUILD.
           # The sed patterns match the first single-quoted value on each sha256sums line,
           # preserving any additional entries on the same line (e.g. mps.service hash).
           update_bin_pkgbuild() {
-            local pb="$1" dist_hash="$2" x86_64_hash="$3" aarch64_hash="$4"
+            local pb="$1" dist_hash="$2" x86_64_hash="$3"
             sed -i "s/^pkgver=.*/pkgver=${PKGVER}/"                                    "$pb"
             sed -i "s/^pkgrel=.*/pkgrel=1/"                                            "$pb"
             sed -i "s/^sha256sums=('[^']*'/sha256sums=('${dist_hash}'/"                "$pb"
             sed -i "s/^sha256sums_x86_64=('[^']*'/sha256sums_x86_64=('${x86_64_hash}'/" "$pb"
-            sed -i "s/^sha256sums_aarch64=('[^']*'/sha256sums_aarch64=('${aarch64_hash}'/" "$pb"
           }
 
           update_bin_pkgbuild \
             packaging/arch/moshpit-keygen-bin/PKGBUILD \
-            "$DIST_MPKEYGEN" "$X86_64_MPKEYGEN" "$AARCH64_MPKEYGEN"
+            "$DIST_MPKEYGEN" "$X86_64_MPKEYGEN"
 
           update_bin_pkgbuild \
             packaging/arch/moshpit-bin/PKGBUILD \
-            "$DIST_MP" "$X86_64_MP" "$AARCH64_MP"
+            "$DIST_MP" "$X86_64_MP"
 
           update_bin_pkgbuild \
             packaging/arch/moshpits-bin/PKGBUILD \
-            "$DIST_MPS" "$X86_64_MPS" "$AARCH64_MPS"
+            "$DIST_MPS" "$X86_64_MPS"
 
       - name: Upload updated PKGBUILDs as artifact
         # v7

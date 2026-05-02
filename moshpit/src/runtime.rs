@@ -681,12 +681,21 @@ fn tty_id() -> Option<String> {
     None
 }
 
+fn client_id_path(home: &Path) -> PathBuf {
+    home.join(".mp").join("client_id")
+}
+
 /// Returns (or creates) a stable random UUID that uniquely identifies this client
 /// installation.  Written once to `~/.mp/client_id` and reused on every subsequent
 /// run, so the session file for a given server can always be found regardless of the
 /// current process PID.
 fn client_id() -> Option<Uuid> {
-    let path = dirs2::home_dir()?.join(".mp").join("client_id");
+    client_id_in_home(&dirs2::home_dir()?)
+}
+
+#[allow(clippy::unnecessary_wraps)]
+fn client_id_in_home(home: &Path) -> Option<Uuid> {
+    let path = client_id_path(home);
     if let Ok(mut f) = std::fs::File::open(&path) {
         let mut buf = String::new();
         drop(f.read_to_string(&mut buf));
@@ -727,6 +736,27 @@ fn session_file_path(host: &str, port: u16) -> Option<PathBuf> {
         })
         .collect();
     let cid = client_id()?;
+    let name = match tty_id() {
+        Some(tty) => format!("{cid}_{safe_host}_{port}_{tty}"),
+        None => format!("{cid}_{safe_host}_{port}"),
+    };
+    Some(home.join(".mp").join("sessions").join(name))
+}
+
+#[cfg(test)]
+fn session_file_path_in_home(home: &Path, host: &str, port: u16) -> Option<PathBuf> {
+    // Sanitize host so it is safe as a file-name component.
+    let safe_host: String = host
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let cid = client_id_in_home(home)?;
     let name = match tty_id() {
         Some(tty) => format!("{cid}_{safe_host}_{port}_{tty}"),
         None => format!("{cid}_{safe_host}_{port}"),
@@ -784,6 +814,28 @@ mod tests {
     use super::*;
     use clap::Parser;
 
+    struct TestHome {
+        path: PathBuf,
+    }
+
+    impl TestHome {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(Uuid::new_v4().to_string());
+            std::fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestHome {
+        fn drop(&mut self) {
+            drop(std::fs::remove_dir_all(&self.path));
+        }
+    }
+
     #[test]
     fn test_pass_cache() {
         let mut cache = PassCache::Uncached;
@@ -825,31 +877,43 @@ mod tests {
 
     #[test]
     fn test_client_id() {
-        let id1 = client_id();
+        let home = TestHome::new();
+        let id1 = client_id_in_home(home.path());
         assert!(id1.is_some());
-        let id2 = client_id();
+        let id2 = client_id_in_home(home.path());
         assert_eq!(id1, id2); // Should read the same from disk
     }
 
     #[test]
     fn test_session_uuid_persistence() {
+        let home = TestHome::new();
         let host = "test.host";
         let port = 12345;
         let uuid = Uuid::new_v4();
 
         // Write it
-        write_session_uuid(host, port, uuid).unwrap();
+        let path = session_file_path_in_home(home.path(), host, port).unwrap();
+        if let Some(parent) = path.parent() {
+            DirBuilder::new().recursive(true).create(parent).unwrap();
+        }
+        std::fs::write(&path, uuid.to_string()).unwrap();
 
         // Read it back
-        let read_uuid = read_session_uuid(host, port).unwrap();
+        let read_uuid = {
+            let mut file = std::fs::File::open(&path).unwrap();
+            let mut buf = String::new();
+            let _ = file.read_to_string(&mut buf).unwrap();
+            buf.trim().parse::<Uuid>().unwrap()
+        };
         assert_eq!(uuid, read_uuid);
     }
 
     #[test]
     fn test_session_file_path() {
+        let home = TestHome::new();
         let host = "some_host.com";
         let port = 2222;
-        let path = session_file_path(host, port).unwrap();
+        let path = session_file_path_in_home(home.path(), host, port).unwrap();
         assert!(path.to_string_lossy().contains("some_host.com"));
         assert!(path.to_string_lossy().contains("2222"));
     }

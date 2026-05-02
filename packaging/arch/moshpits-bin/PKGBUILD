@@ -4,7 +4,7 @@ pkgname=moshpits-bin
 pkgver=0.3.0
 pkgrel=1
 pkgdesc="moshpits server — SSH and Mosh inspired remote terminal server (pre-compiled binary)"
-arch=('x86_64' 'aarch64')
+arch=('x86_64')
 url="https://github.com/rustyhorde/moshpit"
 license=('MIT' 'Apache-2.0')
 provides=('moshpits')
@@ -17,17 +17,11 @@ _base="https://github.com/rustyhorde/moshpit/releases/download/v${pkgver}"
 
 source=("${_base}/dist-mps.tar.gz" "mps.service")
 source_x86_64=("mps-x86_64::${_base}/mps-x86_64-unknown-linux-musl")
-source_aarch64=("mps-aarch64::${_base}/mps-aarch64-unknown-linux-musl")
 sha256sums=('SKIP' 'd08b5d53d639190be89f39c248d9d8262b58f59ab8a4ce16eab8260ec049e9e3')
 sha256sums_x86_64=('SKIP')
-sha256sums_aarch64=('SKIP')
 
 package() {
-    if [[ $CARCH == x86_64 ]]; then
-        install -Dm755 mps-x86_64 "$pkgdir/usr/bin/mps"
-    else
-        install -Dm755 mps-aarch64 "$pkgdir/usr/bin/mps"
-    fi
+    install -Dm755 mps-x86_64 "$pkgdir/usr/bin/mps"
 
     # Man page
     install -Dm644 mps/mps.1 "$pkgdir/usr/share/man/man1/mps.1"
