@@ -275,14 +275,27 @@ jobs:
           name: pkgbuilds
           path: packaging/arch/
 
+      - name: Collect flat package assets
+        id: assets
+        run: |
+          pkg_dir="packaging/arch/${{ matrix.package }}"
+          {
+            # Include only regular files in package root (no subdirectories).
+            find "$pkg_dir" -maxdepth 1 -type f ! -name 'PKGBUILD' | sort
+          } > assets.txt
+          {
+            echo "assets<<EOF"
+            cat assets.txt
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Publish ${{ matrix.package }} to AUR
         # v4.1.3
         uses: KSXGitHub/github-actions-deploy-aur@da03e160361ce01bf087e790b6ffd196d7dccff7
         with:
           pkgname: ${{ matrix.package }}
           pkgbuild: packaging/arch/${{ matrix.package }}/PKGBUILD
-          assets: |
-            packaging/arch/${{ matrix.package }}/*
+          assets: ${{ steps.assets.outputs.assets }}
           commit_username: "Jason Ozias"
           commit_email: "jason.g.ozias@gmail.com"
           ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
