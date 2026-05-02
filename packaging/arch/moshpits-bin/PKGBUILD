@@ -17,8 +17,8 @@ _base="https://github.com/rustyhorde/moshpit/releases/download/v${pkgver}"
 
 source=("${_base}/dist-mps.tar.gz" "mps.service")
 source_x86_64=("mps-x86_64::${_base}/mps-x86_64-unknown-linux-musl")
-sha256sums=('SKIP' 'd08b5d53d639190be89f39c248d9d8262b58f59ab8a4ce16eab8260ec049e9e3')
-sha256sums_x86_64=('SKIP')
+sha256sums=('7f637248f62885256a01739ccf9c0da4a2dc90d39e39d6d0b5f08e0962a7e70d' 'd08b5d53d639190be89f39c248d9d8262b58f59ab8a4ce16eab8260ec049e9e3')
+sha256sums_x86_64=('f7ea25a6769e16c8a7ce76b9db3d2087122180733d943127e131b4204c21b30a')
 
 package() {
     install -Dm755 mps-x86_64 "$pkgdir/usr/bin/mps"
