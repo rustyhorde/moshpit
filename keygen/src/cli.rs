@@ -63,6 +63,23 @@ pub(crate) enum Commands {
             default_value_t = false
         )]
         no_passphrase: bool,
+        /// Write the private key to this path instead of prompting.
+        /// The public key is written alongside it with a `.pub` extension.
+        /// Required when running non-interactively (no TTY).
+        #[clap(
+            short = 'o',
+            long,
+            help = "Write keys to this path (skips the interactive path prompt)"
+        )]
+        output_path: Option<String>,
+        /// Overwrite existing key files without prompting for confirmation.
+        #[clap(
+            short = 'f',
+            long,
+            help = "Overwrite existing key files without confirmation",
+            default_value_t = false
+        )]
+        force: bool,
     },
     #[clap(about = "Verify a public key fingerprint or randomart image")]
     Verify {
