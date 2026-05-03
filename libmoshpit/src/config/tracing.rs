@@ -52,8 +52,10 @@ pub struct Layer {
 #[derive(Clone, CopyGetters, Debug, Default, Deserialize, Eq, PartialEq, Serialize, Setters)]
 pub struct FileLayer {
     /// quiet level
+    #[getset(set = "pub")]
     quiet: u8,
     /// verbose level
+    #[getset(set = "pub")]
     verbose: u8,
     /// layer configuration
     layer: Layer,
