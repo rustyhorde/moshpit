@@ -36,7 +36,11 @@ where
     };
 
     match cli.command() {
-        Commands::Generate { no_passphrase } => generate_keypair(*no_passphrase),
+        Commands::Generate {
+            no_passphrase,
+            output_path,
+            force,
+        } => generate_keypair(*no_passphrase, output_path.as_deref(), *force),
         Commands::Verify {
             randomart: _,
             signature: _,
@@ -83,21 +87,30 @@ fn prompt_for_passphrase(priv_key_path: &Path) -> Result<Option<String>> {
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
-fn generate_keypair(no_passphrase: bool) -> Result<()> {
+fn generate_keypair(no_passphrase: bool, output_path: Option<&str>, force: bool) -> Result<()> {
     // Output header
     println!("Generating public/private ed25519 key pair.");
 
     let (default_priv_key_path, default_pub_key_ext) =
         KeyPair::default_key_path_ext(KexMode::Client)?;
 
-    let priv_key_path_input = prompt_for_path(&default_priv_key_path)?;
+    let priv_key_path_input = if let Some(path) = output_path {
+        path.to_string()
+    } else {
+        prompt_for_path(&default_priv_key_path)?
+    };
+
     let (priv_key_path, pub_key_path) = setup_paths_inner(
         priv_key_path_input,
         &default_priv_key_path,
         default_pub_key_ext,
     )?;
 
-    if !check_paths_inner(&priv_key_path, &pub_key_path, prompt_for_overwrite)? {
+    if force {
+        if !check_paths_inner(&priv_key_path, &pub_key_path, || Ok(true))? {
+            return Ok(());
+        }
+    } else if !check_paths_inner(&priv_key_path, &pub_key_path, prompt_for_overwrite)? {
         return Ok(());
     }
 
