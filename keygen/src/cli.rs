@@ -80,6 +80,14 @@ pub(crate) enum Commands {
             default_value_t = false
         )]
         force: bool,
+        /// Generate a server host key (allows unencrypted keys).
+        #[clap(
+            short = 's',
+            long,
+            help = "Generate a server host key (allows unencrypted keys)",
+            default_value_t = false
+        )]
+        server: bool,
     },
     #[clap(about = "Verify a public key fingerprint or randomart image")]
     Verify {
@@ -164,6 +172,18 @@ mod tests {
         match cli.command() {
             Commands::Generate { force, .. } => {
                 assert!(force);
+            }
+            _ => panic!("Expected Generate command"),
+        }
+    }
+
+    #[test]
+    fn verify_generate_server_flag() {
+        let args = vec!["moshpit-keygen", "generate", "--server"];
+        let cli = Cli::try_parse_from(args).unwrap();
+        match cli.command() {
+            Commands::Generate { server, .. } => {
+                assert!(server);
             }
             _ => panic!("Expected Generate command"),
         }

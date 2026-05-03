@@ -235,8 +235,8 @@ impl KeyPair {
     /// # Errors
     /// If key generation or encryption fails, an error is returned.
     ///
-    pub fn generate_key_pair(passphrase_opt: Option<&String>) -> Result<Self> {
-        if passphrase_opt.is_none_or(String::is_empty) {
+    pub fn generate_key_pair(passphrase_opt: Option<&String>, mode: KexMode) -> Result<Self> {
+        if matches!(mode, KexMode::Client) && passphrase_opt.is_none_or(String::is_empty) {
             return Err(anyhow::anyhow!(
                 "A non-empty passphrase is required to protect the private key"
             ));
@@ -577,6 +577,7 @@ mod tests {
 
     use anyhow::Result;
     use argon2::{Argon2, PasswordHash, PasswordVerifier as _};
+    use base64::Engine;
 
     use super::{decrypt_private_key, load_private_key};
 
@@ -656,6 +657,29 @@ mod tests {
             decrypt_private_key("test", salt_bytes, nonce_bytes, &mut decrypted_bytes);
         assert!(decrypt_res.is_ok());
         assert!(encrypted_private_key_bytes != decrypted_bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn test_generate_key_pair_unencrypted() -> Result<()> {
+        let key_pair = super::KeyPair::generate_key_pair(
+            None,
+            super::KexMode::Server("0.0.0.0:0".parse().unwrap()),
+        )?;
+        let mut priv_key_bytes = vec![];
+        key_pair.write_private_key(&mut priv_key_bytes)?;
+
+        // Verify it can be loaded as unencrypted
+        let decoded = base64::engine::general_purpose::STANDARD.decode(&priv_key_bytes)?;
+        let mut buf = bytes::BytesMut::from(&decoded[..]);
+        let header = buf.split_to(super::KEY_HEADER.len());
+        assert_eq!(&header[..], super::KEY_HEADER);
+
+        let cipher = super::get_val_by_len(&mut buf)?;
+        let kdf = super::get_val_by_len(&mut buf)?;
+        assert_eq!(&cipher[..], super::NONE_CIPHER.as_bytes());
+        assert_eq!(&kdf[..], super::NONE_KDF.as_bytes());
+
         Ok(())
     }
 }

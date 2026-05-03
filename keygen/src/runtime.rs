@@ -40,7 +40,8 @@ where
             no_passphrase,
             output_path,
             force,
-        } => generate_keypair(*no_passphrase, output_path.as_deref(), *force),
+            server,
+        } => generate_keypair(*no_passphrase, output_path.as_deref(), *force, *server),
         Commands::Verify {
             randomart: _,
             signature: _,
@@ -87,12 +88,22 @@ fn prompt_for_passphrase(priv_key_path: &Path) -> Result<Option<String>> {
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
-fn generate_keypair(no_passphrase: bool, output_path: Option<&str>, force: bool) -> Result<()> {
+fn generate_keypair(
+    no_passphrase: bool,
+    output_path: Option<&str>,
+    force: bool,
+    server: bool,
+) -> Result<()> {
     // Output header
     println!("Generating public/private ed25519 key pair.");
 
-    let (default_priv_key_path, default_pub_key_ext) =
-        KeyPair::default_key_path_ext(KexMode::Client)?;
+    let mode = if server {
+        KexMode::Server("0.0.0.0:0".parse().unwrap())
+    } else {
+        KexMode::Client
+    };
+
+    let (default_priv_key_path, default_pub_key_ext) = KeyPair::default_key_path_ext(mode)?;
 
     let priv_key_path_input = if let Some(path) = output_path {
         path.to_string()
@@ -119,7 +130,8 @@ fn generate_keypair(no_passphrase: bool, output_path: Option<&str>, force: bool)
     } else {
         prompt_for_passphrase(&priv_key_path)?
     };
-    generate_and_write_keys(&priv_key_path, &pub_key_path, passphrase_opt.as_ref())?;
+    let keypair = KeyPair::generate_key_pair(passphrase_opt.as_ref(), mode)?;
+    generate_and_write_keys_inner(&priv_key_path, &pub_key_path, &keypair)?;
     Ok(())
 }
 
@@ -163,14 +175,11 @@ where
     }
 }
 
-fn generate_and_write_keys(
+fn generate_and_write_keys_inner(
     priv_key_path: &Path,
     pub_key_path: &Path,
-    passphrase_opt: Option<&String>,
+    keypair: &KeyPair,
 ) -> Result<()> {
-    // Generate the key pair
-    let keypair = KeyPair::generate_key_pair(passphrase_opt)?;
-
     // Write the private key out to the private key file
     let mut priv_key_file = {
         #[cfg(unix)]
@@ -308,7 +317,8 @@ mod tests {
         let pub_path = dir.join("key.pub");
 
         let secret = "secret".to_string();
-        generate_and_write_keys(&priv_path, &pub_path, Some(&secret)).unwrap();
+        let keypair = KeyPair::generate_key_pair(Some(&secret), KexMode::Client).unwrap();
+        generate_and_write_keys_inner(&priv_path, &pub_path, &keypair).unwrap();
 
         assert!(priv_path.exists());
         assert!(pub_path.exists());
