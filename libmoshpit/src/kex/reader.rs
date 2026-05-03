@@ -25,6 +25,7 @@ use aws_lc_rs::{
     hkdf::{HKDF_SHA256, HKDF_SHA512, Salt},
     rand::fill,
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bon::Builder;
 use local_ip_address::local_ip;
 use tokio::{
@@ -35,6 +36,7 @@ use tokio::{
 use tracing::{error, trace};
 use uuid::Uuid;
 
+use crate::kex::HostKeyMismatchFn;
 use crate::{
     ConnectionReader, Frame, KexEvent, MoshpitError, ServerKex, UuidWrapper, kex::TofuFn,
     load_private_key, load_public_key, session::SessionRegistry,
@@ -58,6 +60,8 @@ pub struct KexReader {
     server_destination: Option<String>,
     /// The callback for TOFU interactive prompt
     tofu_fn: Option<TofuFn>,
+    /// Callback for known-host key mismatch replacement prompt.
+    host_key_mismatch_fn: Option<HostKeyMismatchFn>,
 }
 
 impl std::fmt::Debug for KexReader {
@@ -76,6 +80,14 @@ impl std::fmt::Debug for KexReader {
                     "None"
                 },
             )
+            .field(
+                "host_key_mismatch_fn",
+                &if self.host_key_mismatch_fn.is_some() {
+                    "Some(<fn>)"
+                } else {
+                    "None"
+                },
+            )
             .finish()
     }
 }
@@ -89,7 +101,12 @@ impl KexReader {
         if let Some(frame) = self.reader.read_frame().await? {
             if let Frame::PeerInitialize(pk, salt_bytes) = frame {
                 if let Some(host) = &self.server_destination
-                    && !check_known_hosts(host, &pk, self.tofu_fn.as_ref())?
+                    && !check_known_hosts(
+                        host,
+                        &pk,
+                        self.tofu_fn.as_ref(),
+                        self.host_key_mismatch_fn.as_ref(),
+                    )?
                 {
                     self.tx_event
                         .send(KexEvent::Failure)
@@ -651,9 +668,13 @@ fn windows_only_owner_has_access(path: &Path) -> bool {
     result
 }
 
-fn check_known_hosts(host: &str, pk: &[u8], tofu_fn: Option<&TofuFn>) -> Result<bool> {
+fn check_known_hosts(
+    host: &str,
+    pk: &[u8],
+    tofu_fn: Option<&TofuFn>,
+    mismatch_fn: Option<&HostKeyMismatchFn>,
+) -> Result<bool> {
     use aws_lc_rs::digest::{SHA256, digest};
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
 
     let home = dirs2::home_dir().ok_or_else(|| anyhow::anyhow!("No home directory found"))?;
     let known_hosts_path = home.join(".mp").join("known_hosts");
@@ -669,7 +690,15 @@ fn check_known_hosts(host: &str, pk: &[u8], tofu_fn: Option<&TofuFn>) -> Result<
                 if k == pk_b64 {
                     return Ok(true);
                 }
+                let old_fingerprint = key_fingerprint_from_b64(k);
+                let new_fingerprint = STANDARD.encode(digest(&SHA256, pk));
                 error!("HOST KEY VERIFICATION FAILED for {host}!");
+                if let Some(prompt_replace) = mismatch_fn
+                    && prompt_replace(host, &old_fingerprint, &new_fingerprint)?
+                {
+                    replace_known_host_key(host, &pk_b64)?;
+                    return Ok(true);
+                }
                 return Ok(false);
             }
         }
@@ -699,6 +728,59 @@ fn check_known_hosts(host: &str, pk: &[u8], tofu_fn: Option<&TofuFn>) -> Result<
     }
 }
 
+fn key_fingerprint_from_b64(key_b64: &str) -> String {
+    use aws_lc_rs::digest::{SHA256, digest};
+
+    let key_bytes = STANDARD
+        .decode(key_b64.as_bytes())
+        .unwrap_or_else(|_| key_b64.as_bytes().to_vec());
+    STANDARD.encode(digest(&SHA256, &key_bytes))
+}
+
+fn replace_known_host_key(host: &str, new_pk_b64: &str) -> Result<()> {
+    let home = dirs2::home_dir().ok_or_else(|| anyhow::anyhow!("No home directory found"))?;
+    let known_hosts_path = home.join(".mp").join("known_hosts");
+    if let Some(parent) = known_hosts_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let mut replaced = false;
+    let mut out_lines: Vec<String> = Vec::new();
+
+    if known_hosts_path.exists() {
+        let content = std::fs::read_to_string(&known_hosts_path)?;
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                out_lines.push(line.to_string());
+                continue;
+            }
+            let mut parts = line.split_whitespace();
+            if let Some(existing_host) = parts.next()
+                && existing_host == host
+            {
+                if !replaced {
+                    out_lines.push(format!("{host} {new_pk_b64}"));
+                    replaced = true;
+                }
+                continue;
+            }
+            out_lines.push(line.to_string());
+        }
+    }
+
+    if !replaced {
+        out_lines.push(format!("{host} {new_pk_b64}"));
+    }
+
+    let mut updated = out_lines.join("\n");
+    if !updated.is_empty() {
+        updated.push('\n');
+    }
+    std::fs::write(known_hosts_path, updated)?;
+    Ok(())
+}
+
 #[cfg(test)]
 #[cfg(unix)]
 #[allow(unsafe_code)]
@@ -713,7 +795,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{check_authorized_keys, check_known_hosts};
-    use crate::kex::TofuFn;
+    use crate::kex::{HostKeyMismatchFn, TofuFn};
 
     /// Tests that mutate the `HOME` environment variable must hold this lock
     /// to prevent races with concurrently-running tests in the same process.
@@ -765,7 +847,7 @@ mod tests {
         // Point HOME at the temp dir so check_known_hosts finds our file.
         // SAFETY: test-only; serialized via home_lock.
         unsafe { std::env::set_var("HOME", dir.path()) };
-        let result = check_known_hosts(host, pk, None).unwrap();
+        let result = check_known_hosts(host, pk, None, None).unwrap();
         assert!(result, "matching key should be accepted");
     }
 
@@ -780,8 +862,30 @@ mod tests {
         write_known_hosts(&dir, host, pinned_pk);
         // SAFETY: test-only; serialized via home_lock.
         unsafe { std::env::set_var("HOME", dir.path()) };
-        let result = check_known_hosts(host, attacker_pk, None).unwrap();
+        let result = check_known_hosts(host, attacker_pk, None, None).unwrap();
         assert!(!result, "mismatched host key must be rejected");
+    }
+
+    /// A mismatched key can be explicitly accepted and replaced by callback.
+    #[test]
+    fn check_known_hosts_mismatch_replace_accept() {
+        let _guard = home_lock().lock().unwrap();
+        let dir = TempDir::new().unwrap();
+        let old_pk = b"old-server-key";
+        let new_pk = b"new-server-key";
+        let host = "192.0.2.20";
+        write_known_hosts(&dir, host, old_pk);
+        // SAFETY: test-only; serialized via home_lock.
+        unsafe { std::env::set_var("HOME", dir.path()) };
+
+        let mismatch_fn: HostKeyMismatchFn = Arc::new(|_h, _old_fp, _new_fp| Ok(true));
+        let result = check_known_hosts(host, new_pk, None, Some(&mismatch_fn)).unwrap();
+        assert!(result, "accepted replacement should return true");
+
+        let content = std::fs::read_to_string(dir.path().join(".mp").join("known_hosts")).unwrap();
+        assert!(content.contains(host));
+        assert!(content.contains(&STANDARD.encode(new_pk)));
+        assert!(!content.contains(&STANDARD.encode(old_pk)));
     }
 
     /// Unknown host + TOFU callback that returns `true` → accepted and saved.
@@ -796,7 +900,7 @@ mod tests {
         // SAFETY: test-only; serialized via home_lock.
         unsafe { std::env::set_var("HOME", dir.path()) };
         let tofu_fn: TofuFn = Arc::new(|_host, _fp| Ok(true));
-        let result = check_known_hosts(host, pk, Some(&tofu_fn)).unwrap();
+        let result = check_known_hosts(host, pk, Some(&tofu_fn), None).unwrap();
         assert!(result, "TOFU accept should return true");
         // Key should now be persisted.
         let kh_content =
@@ -818,7 +922,7 @@ mod tests {
         // SAFETY: test-only; serialized via home_lock.
         unsafe { std::env::set_var("HOME", dir.path()) };
         let tofu_fn: TofuFn = Arc::new(|_host, _fp| Ok(false));
-        let result = check_known_hosts(host, pk, Some(&tofu_fn)).unwrap();
+        let result = check_known_hosts(host, pk, Some(&tofu_fn), None).unwrap();
         assert!(!result, "TOFU reject should return false");
     }
 
@@ -832,7 +936,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join(".mp")).unwrap();
         // SAFETY: test-only; serialized via home_lock.
         unsafe { std::env::set_var("HOME", dir.path()) };
-        let result = check_known_hosts(host, pk, None).unwrap();
+        let result = check_known_hosts(host, pk, None, None).unwrap();
         assert!(!result, "no TOFU callback must fail closed");
     }
 
