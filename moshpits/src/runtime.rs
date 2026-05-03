@@ -1023,6 +1023,8 @@ mod test {
         BannerState, ClientInfo, new_full_registry, new_session, render_banner, resolve_session,
         spawn_connection_watchdogs,
     };
+    #[cfg(unix)]
+    use super::{current_daemon_user, resolve_user_account};
 
     // ── helpers ────────────────────────────────────────────────────────────────
 
@@ -1032,6 +1034,35 @@ mod test {
             user: user.to_string(),
             session_uuid: Uuid::nil(),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_daemon_user_returns_some() {
+        let user = current_daemon_user();
+        assert!(user.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_user_account_unknown_user_errors() {
+        let result = resolve_user_account("__moshpit_no_such_user__", "/bin/sh");
+        assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_user_account_current_user_roundtrip() {
+        let Some(username) = current_daemon_user() else {
+            panic!("expected current daemon user on unix")
+        };
+
+        let account =
+            resolve_user_account(&username, "/bin/sh").expect("current daemon user should resolve");
+
+        assert_eq!(account.username, username);
+        assert!(!account.home.is_empty());
+        assert!(!account.shell.is_empty());
     }
 
     // ── Phase 5: render_banner ─────────────────────────────────────────────────

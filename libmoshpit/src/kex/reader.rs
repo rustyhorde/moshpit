@@ -888,6 +888,35 @@ mod tests {
         assert!(!content.contains(&STANDARD.encode(old_pk)));
     }
 
+    /// A mismatched key rejected by callback must keep existing `known_hosts` entry.
+    #[test]
+    fn check_known_hosts_mismatch_replace_reject_keeps_old_key() {
+        let _guard = home_lock().lock().unwrap();
+        let dir = TempDir::new().unwrap();
+        let old_pk = b"old-server-key";
+        let new_pk = b"new-server-key";
+        let host = "192.0.2.21";
+        write_known_hosts(&dir, host, old_pk);
+        // SAFETY: test-only; serialized via home_lock.
+        unsafe { std::env::set_var("HOME", dir.path()) };
+
+        let mismatch_fn: HostKeyMismatchFn = Arc::new(|_h, _old_fp, _new_fp| Ok(false));
+        let result = check_known_hosts(host, new_pk, None, Some(&mismatch_fn)).unwrap();
+        assert!(!result, "rejected replacement should return false");
+
+        let content = std::fs::read_to_string(dir.path().join(".mp").join("known_hosts")).unwrap();
+        assert!(content.contains(host));
+        assert!(content.contains(&STANDARD.encode(old_pk)));
+        assert!(!content.contains(&STANDARD.encode(new_pk)));
+    }
+
+    /// Invalid base64 `known_hosts` values still produce a deterministic fingerprint.
+    #[test]
+    fn key_fingerprint_from_b64_handles_invalid_input() {
+        let fp = super::key_fingerprint_from_b64("not-base64-@@@");
+        assert!(!fp.is_empty());
+    }
+
     /// Unknown host + TOFU callback that returns `true` → accepted and saved.
     #[test]
     fn check_known_hosts_tofu_accept() {
