@@ -9,9 +9,13 @@ Type=simple
 User=moshpits
 Group=moshpits
 
-# Pass -c to read from /etc/moshpits/moshpits.toml instead of the default user
-# config at ~/.config/moshpits/moshpits.toml.  Remove the flag to use the default.
-ExecStart=/usr/bin/mps -c /etc/moshpits/moshpits.toml
+# Read config from /etc/moshpits/moshpits.toml (system-wide default).
+# Override the host key and tracing log paths to the locations set up on install.
+ExecStart=/usr/bin/mps \
+    --config-absolute-path /etc/moshpits/moshpits.toml \
+    --private-key-path /etc/moshpits/keys/mps_host_ed25519_key \
+    --public-key-path /etc/moshpits/keys/mps_host_ed25519_key.pub \
+    --tracing-absolute-path /var/log/moshpits/mps.log
 Restart=on-failure
 RestartSec=5s
 
@@ -20,7 +24,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home /var/log/moshpits
+ReadWritePaths=/var/log/moshpits
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true

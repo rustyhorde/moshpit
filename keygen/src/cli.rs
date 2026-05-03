@@ -53,7 +53,17 @@ pub(crate) struct Cli {
 #[derive(Clone, Debug, Subcommand)]
 pub(crate) enum Commands {
     #[clap(about = "Generate a new ed25519 public/private key pair")]
-    Generate,
+    Generate {
+        /// Skip the passphrase prompt and create an unencrypted (passwordless) key.
+        /// Required when running non-interactively, e.g. as part of a service install.
+        #[clap(
+            short = 'n',
+            long,
+            help = "Skip the passphrase prompt and create an unencrypted key",
+            default_value_t = false
+        )]
+        no_passphrase: bool,
+    },
     #[clap(about = "Verify a public key fingerprint or randomart image")]
     Verify {
         #[clap(short, long, help = "Verify randomart", default_value_t = false)]
@@ -82,9 +92,38 @@ mod tests {
     fn verify_generate_command() {
         let args = vec!["moshpit-keygen", "generate"];
         let cli = Cli::try_parse_from(args).unwrap();
-        assert!(matches!(cli.command(), Commands::Generate));
+        assert!(matches!(
+            cli.command(),
+            Commands::Generate {
+                no_passphrase: false
+            }
+        ));
         assert_eq!(cli.verbose(), 0);
         assert_eq!(cli.quiet(), 0);
+    }
+
+    #[test]
+    fn verify_generate_no_passphrase_flag() {
+        let args = vec!["moshpit-keygen", "generate", "--no-passphrase"];
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert!(matches!(
+            cli.command(),
+            Commands::Generate {
+                no_passphrase: true
+            }
+        ));
+    }
+
+    #[test]
+    fn verify_generate_no_passphrase_short_flag() {
+        let args = vec!["moshpit-keygen", "generate", "-n"];
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert!(matches!(
+            cli.command(),
+            Commands::Generate {
+                no_passphrase: true
+            }
+        ));
     }
 
     #[test]
