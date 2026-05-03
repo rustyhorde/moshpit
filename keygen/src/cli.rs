@@ -112,7 +112,8 @@ mod tests {
         assert!(matches!(
             cli.command(),
             Commands::Generate {
-                no_passphrase: false
+                no_passphrase: false,
+                ..
             }
         ));
         assert_eq!(cli.verbose(), 0);
@@ -126,7 +127,8 @@ mod tests {
         assert!(matches!(
             cli.command(),
             Commands::Generate {
-                no_passphrase: true
+                no_passphrase: true,
+                ..
             }
         ));
     }
@@ -138,9 +140,33 @@ mod tests {
         assert!(matches!(
             cli.command(),
             Commands::Generate {
-                no_passphrase: true
+                no_passphrase: true,
+                ..
             }
         ));
+    }
+    #[test]
+    fn verify_generate_output_path_flag() {
+        let args = vec!["moshpit-keygen", "generate", "--output-path", "/tmp/key"];
+        let cli = Cli::try_parse_from(args).unwrap();
+        match cli.command() {
+            Commands::Generate { output_path, .. } => {
+                assert_eq!(output_path.as_deref(), Some("/tmp/key"));
+            }
+            _ => panic!("Expected Generate command"),
+        }
+    }
+
+    #[test]
+    fn verify_generate_force_flag() {
+        let args = vec!["moshpit-keygen", "generate", "--force"];
+        let cli = Cli::try_parse_from(args).unwrap();
+        match cli.command() {
+            Commands::Generate { force, .. } => {
+                assert!(force);
+            }
+            _ => panic!("Expected Generate command"),
+        }
     }
 
     #[test]
