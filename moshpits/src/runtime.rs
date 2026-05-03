@@ -843,15 +843,34 @@ fn spawn_pty(
 
             let _ = unsafe {
                 cmd.pre_exec(move || {
+                    #[cfg(target_os = "macos")]
+                    let tiocsctty_request: libc::c_ulong = u64::from(libc::TIOCSCTTY);
+                    #[cfg(not(target_os = "macos"))]
+                    let tiocsctty_request: libc::c_ulong = libc::TIOCSCTTY;
+
                     if libc::setsid() < 0 {
                         return Err(std::io::Error::last_os_error());
                     }
-                    if libc::ioctl(0, libc::TIOCSCTTY, 0) < 0 {
+                    if libc::ioctl(0, tiocsctty_request, 0) < 0 {
                         return Err(std::io::Error::last_os_error());
                     }
 
                     if let Some((username_c, login_uid, primary_group_id)) = drop_creds.as_ref() {
-                        if libc::initgroups(username_c.as_ptr(), *primary_group_id) < 0 {
+                        #[cfg(target_os = "macos")]
+                        let initgroups_basegroup: libc::c_int = match (*primary_group_id).try_into()
+                        {
+                            Ok(v) => v,
+                            Err(_) => {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidInput,
+                                    "gid does not fit into c_int for initgroups",
+                                ));
+                            }
+                        };
+                        #[cfg(not(target_os = "macos"))]
+                        let initgroups_basegroup = *primary_group_id;
+
+                        if libc::initgroups(username_c.as_ptr(), initgroups_basegroup) < 0 {
                             return Err(std::io::Error::last_os_error());
                         }
                         if libc::setgid(*primary_group_id) < 0 {
