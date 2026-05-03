@@ -19,6 +19,13 @@ use std::{
     time::Duration,
 };
 
+#[cfg(unix)]
+use std::{
+    ffi::{CStr, CString},
+    os::unix::process::CommandExt,
+    process::Stdio,
+};
+
 use anyhow::{Context as _, Result};
 use bytes::{Buf as _, BytesMut};
 use clap::Parser as _;
@@ -27,7 +34,9 @@ use libmoshpit::{
     UdpReader, UdpSender, UuidWrapper, init_tracing, is_exit_title, load, new_session_registry,
     run_key_exchange,
 };
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+#[cfg(windows)]
+use portable_pty::CommandBuilder;
+use portable_pty::{PtySize, native_pty_system};
 
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -387,7 +396,7 @@ async fn handle_connection(
     let port_pool = config.port_pool();
     let session_registry = config.session_registry();
     let (kex, udp_arc, skex_opt) =
-        run_key_exchange(config, sock_read, sock_write, || Ok(None), None).await?;
+        run_key_exchange(config, sock_read, sock_write, || Ok(None), None, None).await?;
     info!("Key exchange completed with moshpit");
 
     let skex = skex_opt.ok_or_else(|| anyhow::anyhow!("missing server kex info"))?;
@@ -717,7 +726,11 @@ fn spawn_pty_reader(
 #[allow(unsafe_code)]
 #[cfg_attr(
     nightly,
-    allow(clippy::too_many_arguments, clippy::needless_pass_by_value)
+    allow(
+        clippy::too_many_arguments,
+        clippy::needless_pass_by_value,
+        clippy::too_many_lines
+    )
 )]
 #[cfg_attr(not(nightly), allow(clippy::needless_pass_by_value))]
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -735,32 +748,6 @@ fn spawn_pty(
     full_registry: FullSessionRegistry,
 ) {
     let _term_handle = thread::spawn(move || {
-        #[cfg(unix)]
-        let cmd = {
-            // If not running as root, verify that the daemon user matches the requested user
-            let daemon_uid = unsafe { libc::getuid() };
-            if daemon_uid != 0 {
-                let pwd = unsafe { libc::getpwuid(daemon_uid) };
-                if !pwd.is_null() {
-                    let daemon_user = unsafe { std::ffi::CStr::from_ptr((*pwd).pw_name) };
-                    if daemon_user.to_string_lossy() != user.as_str() {
-                        error!(
-                            "Daemon user {} cannot spawn shell for user {}",
-                            daemon_user.to_string_lossy(),
-                            user
-                        );
-                        return;
-                    }
-                }
-            }
-
-            let mut c = CommandBuilder::new(shell);
-            c.arg("-li");
-            c
-        };
-        #[cfg(windows)]
-        let cmd = CommandBuilder::new(shell);
-
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -770,7 +757,157 @@ fn spawn_pty(
                 pixel_height: 0,
             })
             .unwrap();
-        let _child = pair.slave.spawn_command(cmd).unwrap();
+
+        #[cfg(unix)]
+        {
+            let daemon_uid = unsafe { libc::getuid() };
+            if daemon_uid != 0 {
+                let daemon_user = current_daemon_user();
+                if daemon_user.as_deref() != Some(user.as_str()) {
+                    error!(
+                        "Daemon user {} cannot spawn shell for user {}",
+                        daemon_user.unwrap_or_else(|| String::from("<unknown>")),
+                        user
+                    );
+                    return;
+                }
+            }
+
+            let Some(tty_path) = pair.master.tty_name() else {
+                error!("Unable to determine PTY slave tty path");
+                return;
+            };
+            let slave = match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&tty_path)
+            {
+                Ok(file) => file,
+                Err(e) => {
+                    error!("Failed to open PTY slave {}: {e}", tty_path.display());
+                    return;
+                }
+            };
+
+            let stdin_file = match slave.try_clone() {
+                Ok(file) => file,
+                Err(e) => {
+                    error!("Failed to clone PTY slave for stdin: {e}");
+                    return;
+                }
+            };
+            let stdout_file = match slave.try_clone() {
+                Ok(file) => file,
+                Err(e) => {
+                    error!("Failed to clone PTY slave for stdout: {e}");
+                    return;
+                }
+            };
+            let stderr_file = match slave.try_clone() {
+                Ok(file) => file,
+                Err(e) => {
+                    error!("Failed to clone PTY slave for stderr: {e}");
+                    return;
+                }
+            };
+
+            let mut cmd = std::process::Command::new(&shell);
+            let _ = cmd.arg("-li");
+
+            let mut drop_creds: Option<(CString, libc::uid_t, libc::gid_t)> = None;
+
+            if daemon_uid == 0 {
+                let account = match resolve_user_account(&user, &shell) {
+                    Ok(account) => account,
+                    Err(e) => {
+                        error!("Failed to resolve target account for {user}: {e}");
+                        return;
+                    }
+                };
+
+                let Ok(username_c) = CString::new(account.username.clone()) else {
+                    error!("Target username contains invalid NUL byte");
+                    return;
+                };
+                let login_uid = account.uid;
+                let primary_group_id = account.gid;
+
+                let _ = cmd.current_dir(&account.home);
+                let _ = cmd.env("HOME", &account.home);
+                let _ = cmd.env("USER", &account.username);
+                let _ = cmd.env("LOGNAME", &account.username);
+                let _ = cmd.env("SHELL", &account.shell);
+
+                drop_creds = Some((username_c, login_uid, primary_group_id));
+            }
+
+            let _ = unsafe {
+                cmd.pre_exec(move || {
+                    #[cfg(target_os = "macos")]
+                    let tiocsctty_request: libc::c_ulong = u64::from(libc::TIOCSCTTY);
+                    #[cfg(not(target_os = "macos"))]
+                    let tiocsctty_request: libc::c_ulong = libc::TIOCSCTTY;
+
+                    if libc::setsid() < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::ioctl(0, tiocsctty_request, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+
+                    if let Some((username_c, login_uid, primary_group_id)) = drop_creds.as_ref() {
+                        #[cfg(target_os = "macos")]
+                        let initgroups_basegroup: libc::c_int = match (*primary_group_id).try_into()
+                        {
+                            Ok(v) => v,
+                            Err(_) => {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidInput,
+                                    "gid does not fit into c_int for initgroups",
+                                ));
+                            }
+                        };
+                        #[cfg(not(target_os = "macos"))]
+                        let initgroups_basegroup = *primary_group_id;
+
+                        if libc::initgroups(username_c.as_ptr(), initgroups_basegroup) < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        if libc::setgid(*primary_group_id) < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        if libc::setuid(*login_uid) < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+
+                    Ok(())
+                })
+            };
+
+            let _ = cmd
+                .stdin(Stdio::from(stdin_file))
+                .stdout(Stdio::from(stdout_file))
+                .stderr(Stdio::from(stderr_file));
+
+            if let Err(e) = cmd.spawn() {
+                error!("Failed to spawn shell for user {user}: {e}");
+                return;
+            }
+
+            drop(pair.slave);
+            drop(slave);
+        }
+
+        #[cfg(windows)]
+        {
+            let cmd = CommandBuilder::new(shell);
+            if let Err(e) = pair.slave.spawn_command(cmd) {
+                error!("Failed to spawn shell: {e}");
+                return;
+            }
+        }
+
         let master = pair.master;
 
         let term_out = master.try_clone_reader().unwrap();
@@ -818,6 +955,60 @@ fn spawn_pty(
     });
 }
 
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn current_daemon_user() -> Option<String> {
+    let daemon_uid = unsafe { libc::getuid() };
+    let pwd = unsafe { libc::getpwuid(daemon_uid) };
+    if pwd.is_null() {
+        return None;
+    }
+    Some(
+        unsafe { CStr::from_ptr((*pwd).pw_name) }
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+#[cfg(unix)]
+struct ResolvedUserAccount {
+    username: String,
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+    home: String,
+    shell: String,
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn resolve_user_account(username: &str, fallback_shell: &str) -> Result<ResolvedUserAccount> {
+    let username_c = CString::new(username)?;
+    let pwd = unsafe { libc::getpwnam(username_c.as_ptr()) };
+    if pwd.is_null() {
+        return Err(anyhow::anyhow!("user '{username}' not found"));
+    }
+    let pw = unsafe { *pwd };
+
+    let home = unsafe { CStr::from_ptr(pw.pw_dir) }
+        .to_string_lossy()
+        .to_string();
+    let shell_from_db = unsafe { CStr::from_ptr(pw.pw_shell) }
+        .to_string_lossy()
+        .to_string();
+
+    Ok(ResolvedUserAccount {
+        username: username.to_string(),
+        uid: pw.pw_uid,
+        gid: pw.pw_gid,
+        home,
+        shell: if shell_from_db.is_empty() {
+            fallback_shell.to_string()
+        } else {
+            shell_from_db
+        },
+    })
+}
+
 #[cfg(test)]
 #[allow(dead_code, clippy::all)]
 mod test {
@@ -832,6 +1023,8 @@ mod test {
         BannerState, ClientInfo, new_full_registry, new_session, render_banner, resolve_session,
         spawn_connection_watchdogs,
     };
+    #[cfg(unix)]
+    use super::{current_daemon_user, resolve_user_account};
 
     // ── helpers ────────────────────────────────────────────────────────────────
 
@@ -841,6 +1034,35 @@ mod test {
             user: user.to_string(),
             session_uuid: Uuid::nil(),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_daemon_user_returns_some() {
+        let user = current_daemon_user();
+        assert!(user.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_user_account_unknown_user_errors() {
+        let result = resolve_user_account("__moshpit_no_such_user__", "/bin/sh");
+        assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_user_account_current_user_roundtrip() {
+        let Some(username) = current_daemon_user() else {
+            panic!("expected current daemon user on unix")
+        };
+
+        let account =
+            resolve_user_account(&username, "/bin/sh").expect("current daemon user should resolve");
+
+        assert_eq!(account.username, username);
+        assert!(!account.home.is_empty());
+        assert!(!account.shell.is_empty());
     }
 
     // ── Phase 5: render_banner ─────────────────────────────────────────────────

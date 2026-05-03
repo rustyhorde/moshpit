@@ -260,6 +260,7 @@ pub use self::error::clap_or_error;
 pub use self::error::success;
 pub use self::frames::encframe::EncryptedFrame;
 pub use self::frames::frame::Frame;
+pub use self::kex::HostKeyMismatchFn;
 pub use self::kex::Kex;
 pub use self::kex::KexEvent;
 pub use self::kex::KexMode;

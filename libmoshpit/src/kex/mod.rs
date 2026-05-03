@@ -41,6 +41,18 @@ use crate::{
 /// The callback type for TOFU (Trust-On-First-Use) interactive host key validation.
 pub type TofuFn = Arc<dyn Fn(&str, &str) -> Result<bool> + Send + Sync>;
 
+/// Callback invoked when a known host presents a different key than pinned.
+///
+/// Args are `(host, old_fingerprint, new_fingerprint)` where fingerprints are
+/// base64-encoded SHA256 digests (displayed as `SHA256:<fingerprint>`).
+pub type HostKeyMismatchFn = Arc<dyn Fn(&str, &str, &str) -> Result<bool> + Send + Sync>;
+
+#[derive(Clone)]
+struct HostKeyCallbacks {
+    tofu_fn: Option<TofuFn>,
+    host_key_mismatch_fn: Option<HostKeyMismatchFn>,
+}
+
 pub(crate) mod reader;
 pub(crate) mod sender;
 
@@ -237,6 +249,7 @@ pub async fn run_key_exchange<T: KexConfig>(
     sock_write: OwnedWriteHalf,
     passphrase_fn: impl Fn() -> Result<Option<String>>,
     tofu_fn: Option<TofuFn>,
+    host_key_mismatch_fn: Option<HostKeyMismatchFn>,
 ) -> Result<(Kex, Arc<UdpSocket>, Option<ServerKex>)> {
     // Setup the TCP connection to the server for key exchange
     let mode = config.mode();
@@ -264,7 +277,10 @@ pub async fn run_key_exchange<T: KexConfig>(
                 reader,
                 kex_handle,
                 passphrase_fn,
-                tofu_fn,
+                HostKeyCallbacks {
+                    tofu_fn,
+                    host_key_mismatch_fn,
+                },
             )
             .await?
         }
@@ -288,7 +304,7 @@ async fn run_client_kex<T: KexConfig>(
     reader: ConnectionReader,
     kex_handle: JoinHandle<Result<Kex>>,
     passphrase_fn: impl Fn() -> Result<Option<String>>,
-    tofu_fn: Option<TofuFn>,
+    callbacks: HostKeyCallbacks,
 ) -> Result<(Kex, Arc<UdpSocket>, Option<ServerKex>)> {
     let (private_key_path, public_key_path) = config.key_pair_paths()?;
     trace!("Loading private key from {}", private_key_path.display());
@@ -336,6 +352,10 @@ async fn run_client_kex<T: KexConfig>(
     let tx_event_c = tx_event.clone();
     let requested = config.resume_session_uuid();
     let server_id = config.server_id();
+    let HostKeyCallbacks {
+        tofu_fn,
+        host_key_mismatch_fn,
+    } = callbacks;
 
     let _read_handle = spawn(async move {
         let mut frame_reader = KexReader::builder()
@@ -345,6 +365,7 @@ async fn run_client_kex<T: KexConfig>(
             .maybe_requested_session_uuid(requested)
             .maybe_server_destination(server_id)
             .maybe_tofu_fn(tofu_fn)
+            .maybe_host_key_mismatch_fn(host_key_mismatch_fn)
             .build();
         if let Err(e) = frame_reader.client_kex(&pk).await {
             trace!("{e}");

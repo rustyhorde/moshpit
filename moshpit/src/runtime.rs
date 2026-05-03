@@ -286,12 +286,36 @@ async fn connect_and_kex(
         })
     });
 
+    let mismatch_fn: libmoshpit::HostKeyMismatchFn = Arc::new(
+        |host: &str, old_fingerprint: &str, new_fingerprint: &str| -> Result<bool> {
+            tokio::task::block_in_place(|| {
+                eprintln!("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@");
+                eprintln!("@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @");
+                eprintln!("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@");
+                eprintln!("Potential DNS spoofing or machine-in-the-middle detected.");
+                eprintln!("Host: {host}");
+                eprintln!("Offending key fingerprint: SHA256:{old_fingerprint}");
+                eprintln!("Presented key fingerprint: SHA256:{new_fingerprint}");
+
+                Confirm::new()
+                    .with_prompt(
+                        "Update ~/.mp/known_hosts with the newly presented key for this host?",
+                    )
+                    .default(false)
+                    .wait_for_newline(true)
+                    .interact()
+                    .map_err(Into::into)
+            })
+        },
+    );
+
     let (kex, udp_arc, _) = run_key_exchange(
         config.clone(),
         sock_read,
         sock_write,
         pass_fn,
         Some(tofu_fn),
+        Some(mismatch_fn),
     )
     .await?;
 
