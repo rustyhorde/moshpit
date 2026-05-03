@@ -199,7 +199,7 @@ where
 
     #[cfg(unix)]
     if unsafe { libc::getuid() } == 0 {
-        return Err(anyhow::anyhow!("mps daemon should not be run as root"));
+        info!("Running as root (multi-user mode enabled)");
     }
 
     // Load the configuration
@@ -207,11 +207,14 @@ where
         load::<Cli, Config, Cli>(&cli, &cli).with_context(|| MoshpitError::ConfigLoad)?;
 
     // Initialize tracing
-    init_tracing(&config, config.tracing().file(), &cli, None)
-        .with_context(|| MoshpitError::TracingInit)?;
+    let mut file_tracing = config.tracing().file().clone();
+    let _ = file_tracing.set_verbose(cli.verbose());
+    let _ = file_tracing.set_quiet(cli.quiet());
 
-    trace!("Configuration loaded");
-    trace!("Tracing initialized");
+    init_tracing(&config, &file_tracing, &cli, None).with_context(|| MoshpitError::TracingInit)?;
+
+    info!("Configuration loaded");
+    info!("Tracing initialized");
 
     let socket_addr = SocketAddr::new(
         config
@@ -270,7 +273,7 @@ where
                     Ok((socket, _addr)) => {
                         let _conn = spawn(async move {
                             if let Err(e) = handle_connection(config_c, socket, st, fr_c, banner_c).await {
-                                trace!("{e}");
+                                error!("{e}");
                             }
                         });
                     }
@@ -734,18 +737,20 @@ fn spawn_pty(
     let _term_handle = thread::spawn(move || {
         #[cfg(unix)]
         let cmd = {
-            // Verify that the daemon user matches the requested user to prevent session confusion
+            // If not running as root, verify that the daemon user matches the requested user
             let daemon_uid = unsafe { libc::getuid() };
-            let pwd = unsafe { libc::getpwuid(daemon_uid) };
-            if !pwd.is_null() {
-                let daemon_user = unsafe { std::ffi::CStr::from_ptr((*pwd).pw_name) };
-                if daemon_user.to_string_lossy() != user.as_str() {
-                    error!(
-                        "Daemon user {} cannot spawn shell for user {}",
-                        daemon_user.to_string_lossy(),
-                        user
-                    );
-                    return;
+            if daemon_uid != 0 {
+                let pwd = unsafe { libc::getpwuid(daemon_uid) };
+                if !pwd.is_null() {
+                    let daemon_user = unsafe { std::ffi::CStr::from_ptr((*pwd).pw_name) };
+                    if daemon_user.to_string_lossy() != user.as_str() {
+                        error!(
+                            "Daemon user {} cannot spawn shell for user {}",
+                            daemon_user.to_string_lossy(),
+                            user
+                        );
+                        return;
+                    }
                 }
             }
 
