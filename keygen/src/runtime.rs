@@ -36,7 +36,7 @@ where
     };
 
     match cli.command() {
-        Commands::Generate => generate_keypair(),
+        Commands::Generate { no_passphrase } => generate_keypair(*no_passphrase),
         Commands::Verify {
             randomart: _,
             signature: _,
@@ -83,7 +83,7 @@ fn prompt_for_passphrase(priv_key_path: &Path) -> Result<Option<String>> {
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
-fn generate_keypair() -> Result<()> {
+fn generate_keypair(no_passphrase: bool) -> Result<()> {
     // Output header
     println!("Generating public/private ed25519 key pair.");
 
@@ -101,7 +101,11 @@ fn generate_keypair() -> Result<()> {
         return Ok(());
     }
 
-    let passphrase_opt = prompt_for_passphrase(&priv_key_path)?;
+    let passphrase_opt = if no_passphrase {
+        None
+    } else {
+        prompt_for_passphrase(&priv_key_path)?
+    };
     generate_and_write_keys(&priv_key_path, &pub_key_path, passphrase_opt.as_ref())?;
     Ok(())
 }
