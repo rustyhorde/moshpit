@@ -1,0 +1,50 @@
+# nfpm package configuration for moshpit (client)
+# Build with: VERSION=<ver> nfpm package --config packaging/debian/moshpit.yaml --packager deb --target release-assets/
+name: moshpit
+arch: amd64
+version: ${VERSION}
+version_schema: semver
+section: net
+maintainer: Jason Ozias <jason.g.ozias@gmail.com>
+description: |
+  SSH and Mosh inspired remote terminal client.
+  Connects to a moshpits server over an encrypted channel using ed25519
+  mutual authentication and AES-256-GCM-SIV UDP transport.
+homepage: https://github.com/rustyhorde/moshpit
+license: MIT OR Apache-2.0
+
+overrides:
+  deb:
+    compression: xz
+
+contents:
+  # Binary
+  - src: target/x86_64-unknown-linux-musl/release/mp
+    dst: /usr/bin/mp
+    file_info:
+      mode: 0755
+
+  # Man page
+  - src: dist/mp/mp.1
+    dst: /usr/share/man/man1/mp.1
+
+  # Shell completions
+  - src: dist/mp/mp.bash
+    dst: /usr/share/bash-completion/completions/mp
+
+  - src: dist/mp/_mp
+    dst: /usr/share/zsh/vendor-completions/_mp
+
+  - src: dist/mp/mp.fish
+    dst: /usr/share/fish/vendor_completions.d/mp.fish
+
+  # Example configuration
+  - src: dist/mp/moshpit.toml.example
+    dst: /usr/share/doc/moshpit/examples/moshpit.toml.example
+
+  # Licenses
+  - src: dist/mp/LICENSE-MIT
+    dst: /usr/share/doc/moshpit/LICENSE-MIT
+
+  - src: dist/mp/LICENSE-APACHE
+    dst: /usr/share/doc/moshpit/LICENSE-APACHE

@@ -96,6 +96,31 @@ jobs:
           cp dist-mps.tar.gz       release-assets/
           cp dist-mp-keygen.tar.gz release-assets/
 
+      - name: Install nfpm
+        run: |
+          NFPM_VERSION="2.43.0"
+          curl -sSL \
+            "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" \
+            | tar -xz -C /usr/local/bin nfpm
+          nfpm --version
+
+      - name: Build Debian packages
+        env:
+          VERSION: ${{ steps.version.outputs.pkgver }}
+        run: |
+          nfpm package \
+            --config packaging/debian/moshpit-keygen.yaml \
+            --packager deb \
+            --target release-assets/
+          nfpm package \
+            --config packaging/debian/moshpit.yaml \
+            --packager deb \
+            --target release-assets/
+          nfpm package \
+            --config packaging/debian/moshpits.yaml \
+            --packager deb \
+            --target release-assets/
+
       - name: Upload release assets artifact
         # v7
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a

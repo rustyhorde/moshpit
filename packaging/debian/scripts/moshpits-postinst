@@ -1,0 +1,51 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        # Create the log directory
+        install -d -m 755 -o root -g root /var/log/moshpits
+
+        # Create the key directory with restricted permissions
+        install -d -m 700 -o root -g root /etc/moshpits/keys
+
+        # Install a starter config if none is present
+        if [ ! -f /etc/moshpits/moshpits.toml ]; then
+            install -m 644 -o root -g root \
+                /usr/share/doc/moshpits/examples/moshpits.toml.example \
+                /etc/moshpits/moshpits.toml
+        fi
+
+        # Generate a passwordless host key pair on first install
+        _key=/etc/moshpits/keys/mps_host_ed25519_key
+        if [ ! -f "$_key" ]; then
+            mp-keygen generate \
+                --server \
+                --no-passphrase \
+                --output-path "$_key" \
+                --force
+        fi
+
+        systemctl daemon-reload || true
+
+        echo ""
+        echo "  ── moshpits post-install notes ──────────────────────────────────────────"
+        echo ""
+        echo "  A passwordless host key pair has been generated at:"
+        echo "    /etc/moshpits/keys/mps_host_ed25519_key"
+        echo "    /etc/moshpits/keys/mps_host_ed25519_key.pub"
+        echo ""
+        echo "  Review (and customise) the config file at:"
+        echo "    /etc/moshpits/moshpits.toml"
+        echo ""
+        echo "  Open the required ports in your firewall:"
+        echo "    TCP inbound:  40404          (control / key-exchange channel)"
+        echo "    UDP inbound:  50000-59999    (encrypted terminal data)"
+        echo ""
+        echo "  Enable and start the service:"
+        echo "    systemctl enable --now mps"
+        echo ""
+        echo "  ─────────────────────────────────────────────────────────────────────────"
+        echo ""
+        ;;
+esac

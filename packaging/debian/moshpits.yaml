@@ -1,0 +1,76 @@
+# nfpm package configuration for moshpits (server)
+# Build with: VERSION=<ver> nfpm package --config packaging/debian/moshpits.yaml --packager deb --target release-assets/
+name: moshpits
+arch: amd64
+version: ${VERSION}
+version_schema: semver
+section: net
+maintainer: Jason Ozias <jason.g.ozias@gmail.com>
+description: |
+  SSH and Mosh inspired remote terminal server.
+  Listens for moshpit client connections, manages PTYs, and streams
+  encrypted terminal state over UDP using AES-256-GCM-SIV.
+homepage: https://github.com/rustyhorde/moshpit
+license: MIT OR Apache-2.0
+
+depends:
+  - moshpit-keygen
+
+overrides:
+  deb:
+    compression: xz
+    scripts:
+      postinstall: packaging/debian/scripts/moshpits-postinst
+      preremove: packaging/debian/scripts/moshpits-prerm
+
+contents:
+  # Binary
+  - src: target/x86_64-unknown-linux-musl/release/mps
+    dst: /usr/bin/mps
+    file_info:
+      mode: 0755
+
+  # Man page
+  - src: dist/mps/mps.1
+    dst: /usr/share/man/man1/mps.1
+
+  # Shell completions
+  - src: dist/mps/mps.bash
+    dst: /usr/share/bash-completion/completions/mps
+
+  - src: dist/mps/_mps
+    dst: /usr/share/zsh/vendor-completions/_mps
+
+  - src: dist/mps/mps.fish
+    dst: /usr/share/fish/vendor_completions.d/mps.fish
+
+  # systemd service unit (reused from Arch binary package)
+  - src: packaging/arch/moshpits-bin/mps.service
+    dst: /usr/lib/systemd/system/mps.service
+
+  # Example configuration
+  - src: dist/mps/moshpits.toml.example
+    dst: /usr/share/doc/moshpits/examples/moshpits.toml.example
+
+  # Licenses
+  - src: dist/mps/LICENSE-MIT
+    dst: /usr/share/doc/moshpits/LICENSE-MIT
+
+  - src: dist/mps/LICENSE-APACHE
+    dst: /usr/share/doc/moshpits/LICENSE-APACHE
+
+  # Managed directories (created by postinst, listed here so dpkg tracks them)
+  - dst: /etc/moshpits
+    type: dir
+    file_info:
+      mode: 0755
+
+  - dst: /etc/moshpits/keys
+    type: dir
+    file_info:
+      mode: 0700
+
+  - dst: /var/log/moshpits
+    type: dir
+    file_info:
+      mode: 0755
