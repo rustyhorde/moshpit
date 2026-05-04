@@ -627,10 +627,6 @@ fn create_key_dir(path: &Path) -> Result<()> {
 fn read_passpharase() -> Result<Option<String>> {
     Password::new()
         .with_prompt("Please enter your private key passphrase")
-        .with_confirmation(
-            "Confirm the passphrase",
-            "The entered passphrases do not match",
-        )
         .report(false)
         .interact()
         .map(Some)

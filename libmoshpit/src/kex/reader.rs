@@ -10,7 +10,7 @@ use std::{
     collections::BTreeSet,
     fs::OpenOptions,
     io::{BufRead, BufReader},
-    net::SocketAddr,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -27,7 +27,6 @@ use aws_lc_rs::{
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bon::Builder;
-use local_ip_address::local_ip;
 use tokio::{
     net::UdpSocket,
     process::Command,
@@ -384,17 +383,28 @@ impl KexReader {
 
     async fn handle_udp_setup(
         &mut self,
-        mut socket_addr: SocketAddr,
+        socket_addr: SocketAddr,
         port_pool: Arc<Mutex<BTreeSet<u16>>>,
     ) -> Result<Arc<UdpSocket>> {
         let mut port_p = port_pool.lock().await;
         let next_port = port_p.pop_first().unwrap_or(49999);
-        socket_addr.set_port(next_port);
-        let my_local_ip = local_ip()?;
-        let udp_socket_addr = SocketAddr::new(my_local_ip, socket_addr.port());
-        trace!("binding moshpits socket at {udp_socket_addr}");
-        self.tx.send(Frame::MoshpitsAddr(udp_socket_addr))?;
-        let udp_listener = UdpSocket::bind(udp_socket_addr).await?;
+
+        // Advertise the IP that the client used to reach us (the TCP connection's
+        // local address).  This is the IP the client can actually route UDP packets
+        // to, regardless of which bind address the listener was configured with.
+        let udp_addr_for_client = SocketAddr::new(socket_addr.ip(), next_port);
+        trace!("advertising moshpits UDP socket at {udp_addr_for_client}");
+        self.tx.send(Frame::MoshpitsAddr(udp_addr_for_client))?;
+
+        // Bind to all interfaces so we can receive from the client regardless of
+        // NAT, multi-homing, or routing asymmetry.
+        let unspecified = match socket_addr {
+            SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        };
+        let udp_bind_addr = SocketAddr::new(unspecified, next_port);
+        trace!("binding moshpits socket at {udp_bind_addr}");
+        let udp_listener = UdpSocket::bind(udp_bind_addr).await?;
         Ok(Arc::new(udp_listener))
     }
 

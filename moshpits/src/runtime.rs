@@ -280,8 +280,19 @@ where
             accept_res = listener.accept() => {
                 match accept_res {
                     Ok((socket, _addr)) => {
+                        // Use the TCP connection's actual local address (the interface the
+                        // client connected to) so that the UDP advertisement in
+                        // handle_udp_setup sends an IP the client can actually reach,
+                        // rather than the bind address (0.0.0.0) or whatever local_ip()
+                        // happens to return.
+                        let tcp_local_addr = match socket.local_addr() {
+                            Ok(a) => a,
+                            Err(e) => { error!("local_addr: {e}"); continue; }
+                        };
+                        let mut config_conn = config_c;
+                        let _ = config_conn.set_mode(KexMode::Server(tcp_local_addr));
                         let _conn = spawn(async move {
-                            if let Err(e) = handle_connection(config_c, socket, st, fr_c, banner_c).await {
+                            if let Err(e) = handle_connection(config_conn, socket, st, fr_c, banner_c).await {
                                 error!("{e}");
                             }
                         });
