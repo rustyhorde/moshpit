@@ -271,7 +271,7 @@ async fn connect_and_kex(
         }
         drop(guard);
         info!("passphrase: prompting user");
-        let result = read_passpharase();
+        let result = tokio::task::block_in_place(read_passpharase);
         match &result {
             Ok(Some(_)) => info!("passphrase: prompt returned a passphrase"),
             Ok(None) => info!("passphrase: prompt returned None (key may be unencrypted)"),
