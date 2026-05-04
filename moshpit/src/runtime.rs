@@ -102,6 +102,21 @@ impl PassCache {
     }
 }
 
+/// An unrecoverable key-exchange error that should not trigger the retry loop.
+#[derive(Debug)]
+struct FatalKexError {
+    inner: MoshpitError,
+    key_path: PathBuf,
+}
+
+impl std::fmt::Display for FatalKexError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} (key: {})", self.inner, self.key_path.display())
+    }
+}
+
+impl std::error::Error for FatalKexError {}
+
 /// Show a mosh-style reconnecting banner at the top of the terminal.
 ///
 /// The banner is white-on-blue, occupies the entire first row, and is
@@ -224,6 +239,14 @@ async fn run_session_loop(
                 time::sleep(Duration::from_millis(500)).await;
             }
             Err(e) => {
+                if let Some(fatal) = e.downcast_ref::<FatalKexError>() {
+                    eprintln!("mp: fatal key error: {fatal}");
+                    eprintln!(
+                        "mp: run `mp-keygen` to regenerate your keypair at {}",
+                        fatal.key_path.display()
+                    );
+                    return Err(e);
+                }
                 reconnect_attempt = reconnect_attempt.saturating_add(1);
                 error!("Failed to connect to {socket_addr}: {e}, retrying in {backoff:?}");
                 // If raw mode is not yet active (first connection attempt), the
@@ -246,6 +269,7 @@ async fn run_session_loop(
 }
 
 /// Connect via TCP, run the key exchange, and persist the session UUID.
+#[cfg_attr(nightly, allow(clippy::too_many_lines))]
 async fn connect_and_kex(
     config: &mut Config,
     socket_addr: SocketAddr,
@@ -333,7 +357,31 @@ async fn connect_and_kex(
         Some(tofu_fn),
         Some(mismatch_fn),
     )
-    .await?;
+    .await
+    .map_err(|e| {
+        if let Some(&moshpit_err) = e.downcast_ref::<MoshpitError>() {
+            match moshpit_err {
+                MoshpitError::KeyFileMissing
+                | MoshpitError::KeyCorrupt
+                | MoshpitError::KeyPairMismatch
+                | MoshpitError::DecryptionFailed
+                | MoshpitError::InvalidPublicKeyFormat
+                | MoshpitError::InvalidKeyHeader => {
+                    let key_path = config
+                        .key_pair_paths()
+                        .ok()
+                        .map(|(p, _)| p)
+                        .unwrap_or_default();
+                    return anyhow::anyhow!(FatalKexError {
+                        inner: moshpit_err,
+                        key_path,
+                    });
+                }
+                _ => {}
+            }
+        }
+        e
+    })?;
 
     if let Some(session_uuid) = kex.session_uuid() {
         if let Err(e) = write_session_uuid(server_ip, server_port, session_uuid) {

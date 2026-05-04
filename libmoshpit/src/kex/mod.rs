@@ -311,22 +311,22 @@ async fn run_client_kex<T: KexConfig>(
     info!("Loading public key from {}", public_key_path.display());
 
     // Load the moshpit public and private key
-    let (unenc_key_pair_opt, enc_key_pair_opt) =
-        load_private_key(&private_key_path).map_err(|e| {
+    let (unenc_key_pair_opt, enc_key_pair_opt) = load_private_key(&private_key_path)
+        .inspect_err(|e| {
             error!(
                 "Failed to load private key from {}: {e}",
                 private_key_path.display()
             );
-            e
-        })?;
-    let (full_public_key_bytes, public_key_bytes) =
-        load_public_key(&public_key_path).map_err(|e| {
+        })
+        .map_err(|_| MoshpitError::KeyFileMissing)?;
+    let (full_public_key_bytes, public_key_bytes) = load_public_key(&public_key_path)
+        .inspect_err(|e| {
             error!(
                 "Failed to load public key from {}: {e}",
                 public_key_path.display()
             );
-            e
-        })?;
+        })
+        .map_err(|_| MoshpitError::KeyFileMissing)?;
 
     let (pk, my_public_key) = if let Some(enc_key_pair) = enc_key_pair_opt {
         info!("Private key is encrypted — invoking passphrase prompt");
@@ -346,10 +346,10 @@ async fn run_client_kex<T: KexConfig>(
                 nonce_bytes,
                 &mut encrypted_private_key_bytes,
             )
-            .map_err(|e| {
+            .inspect_err(|e| {
                 error!("Private key decryption failed: {e}");
-                e
-            })?;
+            })
+            .map_err(|_| MoshpitError::KeyCorrupt)?;
 
             let private_key = PrivateKey::from_private_key(
                 &X25519,
@@ -357,32 +357,34 @@ async fn run_client_kex<T: KexConfig>(
             )
             .inspect_err(|e| {
                 error!("Failed to parse decrypted private key bytes: {e}");
-            })?;
-            let public_key = private_key.compute_public_key().inspect_err(|e| {
-                error!("Failed to compute public key from decrypted private key: {e}");
-            })?;
+            })
+            .map_err(|_| MoshpitError::KeyCorrupt)?;
+            let public_key = private_key
+                .compute_public_key()
+                .inspect_err(|e| {
+                    error!("Failed to compute public key from decrypted private key: {e}");
+                })
+                .map_err(|_| MoshpitError::KeyCorrupt)?;
 
             if public_key.as_ref() != public_key_bytes.as_slice() {
                 error!(
                     "Computed public key does not match stored public key at {}",
                     public_key_path.display()
                 );
-                return Err(anyhow::anyhow!("Public key does not match the private key"));
+                return Err(MoshpitError::KeyPairMismatch.into());
             }
             info!("Private key decrypted and verified successfully");
             (private_key, public_key)
         } else {
             error!("Passphrase prompt returned no input — cannot decrypt key");
-            return Err(anyhow::anyhow!(
-                "Encrypted key requires a passphrase but none was provided"
-            ));
+            return Err(MoshpitError::KeyCorrupt.into());
         }
     } else if let Some(unenc_key_pair) = unenc_key_pair_opt {
         info!("Private key is unencrypted — no passphrase needed");
         unenc_key_pair.take()
     } else {
         error!("No valid key pair found in {}", private_key_path.display());
-        return Err(anyhow::anyhow!("No valid private key found"));
+        return Err(MoshpitError::KeyFileMissing.into());
     };
 
     // Setup the TCP frame reader
