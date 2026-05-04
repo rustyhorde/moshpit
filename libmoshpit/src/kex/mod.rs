@@ -29,7 +29,7 @@ use tokio::{
     sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
     task::JoinHandle,
 };
-use tracing::{error, trace};
+use tracing::{error, info, trace};
 use uuid::Uuid;
 
 use crate::{
@@ -296,6 +296,7 @@ pub async fn run_key_exchange<T: KexConfig>(
     })
 }
 
+#[cfg_attr(nightly, allow(clippy::too_many_lines))]
 async fn run_client_kex<T: KexConfig>(
     config: T,
     tx: UnboundedSender<Frame>,
@@ -306,16 +307,35 @@ async fn run_client_kex<T: KexConfig>(
     callbacks: HostKeyCallbacks,
 ) -> Result<(Kex, Arc<UdpSocket>, Option<ServerKex>)> {
     let (private_key_path, public_key_path) = config.key_pair_paths()?;
-    trace!("Loading private key from {}", private_key_path.display());
-    trace!("Loading public key from {}", public_key_path.display());
+    info!("Loading private key from {}", private_key_path.display());
+    info!("Loading public key from {}", public_key_path.display());
 
     // Load the moshpit public and private key
-    let (unenc_key_pair_opt, enc_key_pair_opt) = load_private_key(&private_key_path)?;
-    let (full_public_key_bytes, public_key_bytes) = load_public_key(&public_key_path)?;
+    let (unenc_key_pair_opt, enc_key_pair_opt) =
+        load_private_key(&private_key_path).map_err(|e| {
+            error!(
+                "Failed to load private key from {}: {e}",
+                private_key_path.display()
+            );
+            e
+        })?;
+    let (full_public_key_bytes, public_key_bytes) =
+        load_public_key(&public_key_path).map_err(|e| {
+            error!(
+                "Failed to load public key from {}: {e}",
+                public_key_path.display()
+            );
+            e
+        })?;
 
     let (pk, my_public_key) = if let Some(enc_key_pair) = enc_key_pair_opt {
+        info!("Private key is encrypted — invoking passphrase prompt");
         // Get the passphrase
-        if let Some(passphrase) = passphrase_fn()? {
+        if let Some(passphrase) = passphrase_fn().map_err(|e| {
+            error!("Passphrase prompt failed: {e}");
+            e
+        })? {
+            info!("Passphrase received, decrypting private key");
             let salt_bytes = enc_key_pair.salt_bytes();
             let nonce_bytes = enc_key_pair.nonce_bytes();
             let mut encrypted_private_key_bytes =
@@ -325,24 +345,43 @@ async fn run_client_kex<T: KexConfig>(
                 salt_bytes,
                 nonce_bytes,
                 &mut encrypted_private_key_bytes,
-            )?;
+            )
+            .map_err(|e| {
+                error!("Private key decryption failed: {e}");
+                e
+            })?;
 
             let private_key = PrivateKey::from_private_key(
                 &X25519,
                 &encrypted_private_key_bytes[..AES_256_KEY_LEN],
-            )?;
-            let public_key = private_key.compute_public_key()?;
+            )
+            .inspect_err(|e| {
+                error!("Failed to parse decrypted private key bytes: {e}");
+            })?;
+            let public_key = private_key.compute_public_key().inspect_err(|e| {
+                error!("Failed to compute public key from decrypted private key: {e}");
+            })?;
 
             if public_key.as_ref() != public_key_bytes.as_slice() {
+                error!(
+                    "Computed public key does not match stored public key at {}",
+                    public_key_path.display()
+                );
                 return Err(anyhow::anyhow!("Public key does not match the private key"));
             }
+            info!("Private key decrypted and verified successfully");
             (private_key, public_key)
         } else {
-            return Err(anyhow::anyhow!("No valid private key found"));
+            error!("Passphrase prompt returned no input — cannot decrypt key");
+            return Err(anyhow::anyhow!(
+                "Encrypted key requires a passphrase but none was provided"
+            ));
         }
     } else if let Some(unenc_key_pair) = unenc_key_pair_opt {
+        info!("Private key is unencrypted — no passphrase needed");
         unenc_key_pair.take()
     } else {
+        error!("No valid key pair found in {}", private_key_path.display());
         return Err(anyhow::anyhow!("No valid private key found"));
     };
 
@@ -373,6 +412,10 @@ async fn run_client_kex<T: KexConfig>(
 
     // Send the initialize or resume-request frame with our public key
     let frame = if let Some(session_uuid) = config.resume_session_uuid() {
+        info!(
+            "Sending ResumeRequest for session {session_uuid} (user='{}')",
+            config.user().unwrap_or_default()
+        );
         Frame::ResumeRequest(
             UuidWrapper::new(session_uuid),
             config.user().unwrap_or_default().as_bytes().to_vec(),
@@ -380,6 +423,10 @@ async fn run_client_kex<T: KexConfig>(
             full_public_key_bytes,
         )
     } else {
+        info!(
+            "Sending Initialize for user='{}'",
+            config.user().unwrap_or_default()
+        );
         Frame::Initialize(
             config.user().unwrap_or_default().as_bytes().to_vec(),
             my_public_key.as_ref().to_vec(),

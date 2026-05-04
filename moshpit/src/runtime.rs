@@ -263,10 +263,20 @@ async fn connect_and_kex(
     let pass_fn = move || -> Result<Option<String>> {
         let guard = cache.lock().unwrap();
         if guard.is_cached() {
+            info!(
+                "passphrase: returning cached value (has_passphrase={})",
+                guard.passphrase().is_some()
+            );
             return Ok(guard.passphrase());
         }
         drop(guard);
+        info!("passphrase: prompting user");
         let result = read_passpharase();
+        match &result {
+            Ok(Some(_)) => info!("passphrase: prompt returned a passphrase"),
+            Ok(None) => info!("passphrase: prompt returned None (key may be unencrypted)"),
+            Err(e) => error!("passphrase: prompt failed: {e}"),
+        }
         if let Ok(ref pass) = result {
             *cache.lock().unwrap() = match pass {
                 Some(s) => PassCache::Passphrase(s.clone()),
