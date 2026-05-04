@@ -735,4 +735,110 @@ mod tests {
         assert!(cells.is_empty());
         assert!(cursor.is_none());
     }
+
+    // ── Phase 2: extended PredictionEngine branch tests ────────────────────────
+
+    #[test]
+    fn apply_always_with_prediction_returns_overlay() {
+        let mut engine = PredictionEngine::new(DisplayPreference::Always);
+        let parser_blank = make_screen(24, 80, b"");
+        // Prime the engine so cull knows the terminal dimensions
+        // (last_rows/last_cols default to 0; without priming the first cull resets everything).
+        engine.cull(parser_blank.screen());
+        // Cursor starts at (0,0); after typing 'z' the predicted cursor is at (0,1)
+        engine.new_user_byte(b'z', parser_blank.screen());
+        // Confirm the prediction by culling with a same-size screen whose cursor is at (0,1).
+        // ESC[1;2H positions cursor at row 0, col 1 (0-based)
+        let parser_cursor_at_1 = make_screen(24, 80, b"\x1b[1;2H");
+        engine.cull(parser_cursor_at_1.screen());
+        // Now apply against the blank screen — 'z' cell must appear in the overlay
+        let (cells, _cursor) = engine.apply(parser_blank.screen());
+        assert!(
+            !cells.is_empty(),
+            "expected at least one overlay cell after typing 'z'"
+        );
+        let z_cell = cells.iter().find(|c| c.ch == 'z');
+        assert!(z_cell.is_some(), "expected 'z' overlay cell");
+    }
+
+    #[test]
+    fn apply_always_cursor_overlay_present() {
+        let mut engine = PredictionEngine::new(DisplayPreference::Always);
+        let parser_blank = make_screen(24, 80, b"");
+        // Prime dimensions
+        engine.cull(parser_blank.screen());
+        engine.new_user_byte(b'a', parser_blank.screen());
+        // Confirm prediction: cursor at predicted position (0,1)
+        let parser_cursor_at_1 = make_screen(24, 80, b"\x1b[1;2H");
+        engine.cull(parser_cursor_at_1.screen());
+        let (_cells, cursor) = engine.apply(parser_blank.screen());
+        assert!(
+            cursor.is_some(),
+            "expected cursor overlay after typing a key"
+        );
+    }
+
+    #[test]
+    fn reset_clears_all_overlays() {
+        let mut engine = PredictionEngine::new(DisplayPreference::Always);
+        let parser = make_screen(24, 80, b"");
+        engine.new_user_byte(b'a', parser.screen());
+        engine.new_user_byte(b'b', parser.screen());
+        engine.reset();
+        let (cells, cursor) = engine.apply(parser.screen());
+        assert!(cells.is_empty(), "reset must clear all cell overlays");
+        assert!(cursor.is_none(), "reset must clear cursor overlay");
+    }
+
+    #[test]
+    fn cull_confirmed_prediction_removed() {
+        let mut engine = PredictionEngine::new(DisplayPreference::Always);
+        let parser_before = make_screen(24, 80, b"");
+        // Prime engine dimensions first (avoids spurious resize-reset on first cull)
+        engine.cull(parser_before.screen());
+        // Screen is blank; predict 'a' at (0,0). After typing, cursor will be at (0,1).
+        engine.new_user_byte(b'a', parser_before.screen());
+        // Cull with a screen that shows 'a' at (0,0) and cursor at (0,1).
+        // vt100: after processing b"a" cursor is at (0,1).
+        let parser_after = make_screen(24, 80, b"a");
+        engine.cull(parser_after.screen());
+        // Confirmed 'a' cell must be removed from the overlay
+        let (cells, _) = engine.apply(parser_after.screen());
+        let a_cell = cells.iter().find(|c| c.ch == 'a');
+        assert!(
+            a_cell.is_none(),
+            "confirmed prediction for 'a' must be culled"
+        );
+    }
+
+    #[test]
+    fn new_user_byte_esc_marks_unknown() {
+        let mut engine = PredictionEngine::new(DisplayPreference::Always);
+        let parser = make_screen(24, 80, b"");
+        // ESC should trigger the unknown/escape branch in new_user_byte
+        engine.new_user_byte(0x1b, parser.screen());
+        // After ESC the engine resets (no active predictions visible)
+        let (cells, _cursor) = engine.apply(parser.screen());
+        assert!(cells.is_empty(), "ESC should clear/reset predictions");
+    }
+
+    #[test]
+    fn set_send_interval_below_low_threshold_deactivates_adaptive() {
+        let mut engine = PredictionEngine::new(DisplayPreference::Adaptive);
+        // Activate first
+        engine.set_send_interval(31);
+        assert!(engine.is_active());
+        // Then drop below low threshold
+        engine.set_send_interval(10); // < SRTT_TRIGGER_LOW_MS=20
+        assert!(!engine.is_active());
+    }
+
+    #[test]
+    fn is_active_adaptive_starts_inactive() {
+        let engine = PredictionEngine::new(DisplayPreference::Adaptive);
+        assert!(
+            !engine.is_active(),
+            "adaptive must start inactive (no RTT data)"
+        );
+    }
 }

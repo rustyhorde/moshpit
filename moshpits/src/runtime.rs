@@ -1452,4 +1452,25 @@ mod test {
         // Falls back to new session → Some(term_rx)
         assert!(maybe_rx.is_some());
     }
+
+    // ── Phase 5: platform helper functions ────────────────────────────────────
+
+    #[cfg(all(unix, target_os = "linux"))]
+    use super::{initgroups_base_group, tiocsctty_ioctl_request};
+
+    #[cfg(all(unix, target_os = "linux"))]
+    #[test]
+    fn tiocsctty_ioctl_request_is_nonzero() {
+        // libc::TIOCSCTTY is 0x540E on Linux — must never be zero
+        assert_ne!(tiocsctty_ioctl_request(), 0);
+    }
+
+    #[cfg(all(unix, target_os = "linux"))]
+    #[test]
+    fn initgroups_base_group_roundtrip() {
+        // On Linux this is a trivial pass-through of gid_t
+        assert_eq!(initgroups_base_group(42), 42);
+        assert_eq!(initgroups_base_group(0), 0);
+        assert_eq!(initgroups_base_group(u32::MAX), u32::MAX);
+    }
 }

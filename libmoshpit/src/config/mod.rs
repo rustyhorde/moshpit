@@ -119,3 +119,98 @@ where
     let _ = config_file_path.set_extension("toml");
     Ok(config_file_path)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
+
+    use tokio::sync::Mutex;
+    use uuid::Uuid;
+
+    use super::{KexConfig, KexMode, PathDefaults, SessionRegistry, default_config_file_path};
+
+    // ── minimal KexConfig implementor ─────────────────────────────────────────
+
+    struct TestKexConfig;
+
+    impl KexConfig for TestKexConfig {
+        fn mode(&self) -> KexMode {
+            KexMode::Client
+        }
+        fn port_pool(&self) -> Option<Arc<Mutex<BTreeSet<u16>>>> {
+            None
+        }
+        fn key_pair_paths(&self) -> anyhow::Result<(PathBuf, PathBuf)> {
+            Ok((PathBuf::from("/tmp/pub"), PathBuf::from("/tmp/priv")))
+        }
+        fn user(&self) -> Option<String> {
+            Some("testuser".to_string())
+        }
+    }
+
+    // ── default method impls ──────────────────────────────────────────────────
+
+    #[test]
+    fn kex_config_session_registry_default_is_none() {
+        let cfg = TestKexConfig;
+        let reg: Option<SessionRegistry> = cfg.session_registry();
+        assert!(reg.is_none());
+    }
+
+    #[test]
+    fn kex_config_resume_session_uuid_default_is_none() {
+        let cfg = TestKexConfig;
+        let uuid: Option<Uuid> = cfg.resume_session_uuid();
+        assert!(uuid.is_none());
+    }
+
+    #[test]
+    fn kex_config_server_id_default_is_none() {
+        let cfg = TestKexConfig;
+        let sid: Option<String> = cfg.server_id();
+        assert!(sid.is_none());
+    }
+
+    // ── PathDefaults implementor ───────────────────────────────────────────────
+
+    struct TestPathDefaults;
+
+    impl PathDefaults for TestPathDefaults {
+        fn env_prefix(&self) -> String {
+            "TEST".to_string()
+        }
+        fn config_absolute_path(&self) -> Option<String> {
+            None
+        }
+        fn default_file_path(&self) -> String {
+            "moshpit-test".to_string()
+        }
+        fn default_file_name(&self) -> String {
+            "config".to_string()
+        }
+        fn tracing_absolute_path(&self) -> Option<String> {
+            None
+        }
+        fn default_tracing_path(&self) -> String {
+            "moshpit-test".to_string()
+        }
+        fn default_tracing_file_name(&self) -> String {
+            "moshpits".to_string()
+        }
+    }
+
+    #[test]
+    fn default_config_file_path_ends_with_toml() {
+        let defaults = TestPathDefaults;
+        // This may fail with ConfigDir if no home is set in the test environment,
+        // but on CI with a real user home it should succeed.
+        if let Ok(path) = default_config_file_path(&defaults) {
+            assert_eq!(path.extension().and_then(|e| e.to_str()), Some("toml"));
+            let path_str = path.to_string_lossy();
+            assert!(
+                path_str.contains("moshpit-test"),
+                "path must contain the default file path component"
+            );
+        }
+    }
+}
