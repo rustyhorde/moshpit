@@ -367,7 +367,7 @@ async fn run_client_kex<T: KexConfig>(
             .maybe_host_key_mismatch_fn(host_key_mismatch_fn)
             .build();
         if let Err(e) = frame_reader.client_kex(&pk).await {
-            trace!("{e}");
+            error!("client_kex failed: {e}");
         }
     });
 

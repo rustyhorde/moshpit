@@ -96,26 +96,54 @@ impl KexReader {
     ///
     /// # Errors
     ///
+    #[cfg_attr(nightly, allow(clippy::too_many_lines))]
     pub async fn client_kex(&mut self, epk: &PrivateKey) -> Result<()> {
-        if let Some(frame) = self.reader.read_frame().await? {
-            if let Frame::PeerInitialize(pk, salt_bytes) = frame {
-                if let Some(host) = &self.server_destination
-                    && !check_known_hosts(
+        trace!("client_kex: waiting for PeerInitialize");
+        match self.reader.read_frame().await? {
+            None => {
+                error!("client_kex: server closed connection before sending PeerInitialize");
+                return Err(anyhow::anyhow!(
+                    "Server closed connection during key exchange"
+                ));
+            }
+            Some(Frame::PeerInitialize(pk, salt_bytes)) => {
+                trace!(
+                    "client_kex: received PeerInitialize ({} byte pubkey)",
+                    pk.len()
+                );
+
+                if let Some(host) = &self.server_destination {
+                    trace!("client_kex: checking known_hosts for host '{host}'");
+                    match check_known_hosts(
                         host,
                         &pk,
                         self.tofu_fn.as_ref(),
                         self.host_key_mismatch_fn.as_ref(),
-                    )?
-                {
-                    self.tx_event
-                        .send(KexEvent::Failure)
-                        .map_err(|_| Unspecified)?;
-                    return Err(anyhow::anyhow!("Host key verification failed"));
+                    ) {
+                        Err(e) => {
+                            error!("client_kex: known_hosts check error for '{host}': {e}");
+                            let _ = self.tx_event.send(KexEvent::Failure);
+                            return Err(e);
+                        }
+                        Ok(false) => {
+                            error!("client_kex: host key verification rejected for '{host}'");
+                            let _ = self.tx_event.send(KexEvent::Failure);
+                            return Err(anyhow::anyhow!(
+                                "Host key verification failed for '{host}'"
+                            ));
+                        }
+                        Ok(true) => {
+                            trace!("client_kex: host key verified for '{host}'");
+                        }
+                    }
+                } else {
+                    trace!("client_kex: no server_destination set, skipping host-key check");
                 }
 
                 let peer_public_key = UnparsedPublicKey::new(&X25519, &pk);
                 let salt = Salt::new(HKDF_SHA256, &salt_bytes);
 
+                trace!("client_kex: running ECDH agree()");
                 agree(epk, peer_public_key, Unspecified, |key_material| {
                     let pseudo_random_key = salt.extract(key_material);
                     let mut check = b"Yoda".to_vec();
@@ -143,41 +171,98 @@ impl KexReader {
                         .send(Frame::Check(*nonce.as_ref(), check))
                         .map_err(|_| Unspecified)?;
                     Ok(())
+                })
+                .inspect(|()| trace!("client_kex: agree() succeeded, Check frame sent"))
+                .inspect_err(|_| {
+                    error!(
+                        "client_kex: agree() failed — channel closed or crypto error \
+                         (wrong passphrase?)"
+                    );
                 })?;
-            } else {
-                self.tx_event
-                    .send(KexEvent::Failure)
-                    .map_err(|_| Unspecified)?;
+            }
+            Some(other) => {
+                error!(
+                    "client_kex: expected PeerInitialize but got frame id={}",
+                    other.id()
+                );
+                let _ = self.tx_event.send(KexEvent::Failure);
                 return Err(MoshpitError::KeyNotEstablished.into());
             }
         }
 
-        if let Some(frame) = self.reader.read_frame().await?
-            && let Frame::KeyAgreement(uuid) = frame
-        {
-            self.tx_event
-                .send(KexEvent::Uuid(*uuid.as_ref()))
-                .map_err(|_| Unspecified)?;
+        trace!("client_kex: waiting for KeyAgreement");
+        match self.reader.read_frame().await? {
+            Some(Frame::KeyAgreement(uuid)) => {
+                trace!("client_kex: received KeyAgreement uuid={}", uuid);
+                self.tx_event
+                    .send(KexEvent::Uuid(*uuid.as_ref()))
+                    .map_err(|_| Unspecified)?;
+            }
+            Some(other) => {
+                error!(
+                    "client_kex: expected KeyAgreement but got frame id={}",
+                    other.id()
+                );
+                return Err(MoshpitError::KeyNotEstablished.into());
+            }
+            None => {
+                error!("client_kex: server closed connection before sending KeyAgreement");
+                return Err(anyhow::anyhow!(
+                    "Server closed connection before KeyAgreement"
+                ));
+            }
         }
 
         // Receive stable session token (sent by server after KeyAgreement)
-        if let Some(frame) = self.reader.read_frame().await?
-            && let Frame::SessionToken(session_uuid_wrapper) = frame
-        {
-            let session_uuid = *session_uuid_wrapper.as_ref();
-            let is_resume = self.requested_session_uuid == Some(session_uuid);
-            self.tx_event
-                .send(KexEvent::SessionInfo(session_uuid, is_resume))
-                .map_err(|_| Unspecified)?;
+        trace!("client_kex: waiting for SessionToken");
+        match self.reader.read_frame().await? {
+            Some(Frame::SessionToken(session_uuid_wrapper)) => {
+                let session_uuid = *session_uuid_wrapper.as_ref();
+                let is_resume = self.requested_session_uuid == Some(session_uuid);
+                trace!("client_kex: received SessionToken {session_uuid} (resume={is_resume})");
+                self.tx_event
+                    .send(KexEvent::SessionInfo(session_uuid, is_resume))
+                    .map_err(|_| Unspecified)?;
+            }
+            Some(other) => {
+                error!(
+                    "client_kex: expected SessionToken but got frame id={}",
+                    other.id()
+                );
+                return Err(MoshpitError::KeyNotEstablished.into());
+            }
+            None => {
+                error!("client_kex: server closed connection before sending SessionToken");
+                return Err(anyhow::anyhow!(
+                    "Server closed connection before SessionToken"
+                ));
+            }
         }
 
-        if let Some(frame) = self.reader.read_frame().await?
-            && let Frame::MoshpitsAddr(addr) = frame
-        {
-            self.tx_event
-                .send(KexEvent::MoshpitsAddr(addr))
-                .map_err(|_| Unspecified)?;
+        trace!("client_kex: waiting for MoshpitsAddr");
+        match self.reader.read_frame().await? {
+            Some(Frame::MoshpitsAddr(addr)) => {
+                trace!("client_kex: received MoshpitsAddr {addr}");
+                self.tx_event
+                    .send(KexEvent::MoshpitsAddr(addr))
+                    .map_err(|_| Unspecified)?;
+            }
+            Some(other) => {
+                error!(
+                    "client_kex: expected MoshpitsAddr but got frame id={}",
+                    other.id()
+                );
+                return Err(MoshpitError::KeyNotEstablished.into());
+            }
+            None => {
+                error!("client_kex: server closed connection before sending MoshpitsAddr");
+                return Err(anyhow::anyhow!(
+                    "Server closed connection before MoshpitsAddr"
+                ));
+            }
         }
+
+        trace!("client_kex: complete");
         Ok(())
     }
 
@@ -185,6 +270,7 @@ impl KexReader {
     ///
     /// # Errors
     ///
+    #[cfg_attr(nightly, allow(clippy::too_many_lines))]
     pub async fn server_kex(
         &mut self,
         socket_addr: SocketAddr,
@@ -193,49 +279,87 @@ impl KexReader {
         public_key_path: &PathBuf,
         session_registry: Option<SessionRegistry>,
     ) -> Result<(ServerKex, Arc<UdpSocket>)> {
+        trace!("server_kex: waiting for Initialize/ResumeRequest from client");
         let (rnk, user_str, shell, requested_session_uuid_opt) =
-            if let Some(frame) = self.reader.read_frame().await? {
-                let (user, pk, fpk, req_uuid) = match frame {
-                    Frame::Initialize(user, pk, fpk) => (user, pk, fpk, None),
-                    Frame::ResumeRequest(session_uuid_wrapper, user, pk, fpk) => {
-                        (user, pk, fpk, Some(*session_uuid_wrapper.as_ref()))
-                    }
-                    _ => {
-                        error!("Expected initialize frame from mp");
-                        return Err(MoshpitError::InvalidFrame.into());
-                    }
-                };
-                let user_str = String::from_utf8_lossy(&user).to_string();
-                let (home_dir, shell) = if self.validate_user(&user_str).await? {
-                    self.get_home_dir_shell(&user_str).await?
-                } else {
-                    return Err(MoshpitError::KeyNotEstablished.into());
-                };
-                if !check_authorized_keys(&home_dir, &fpk)? {
-                    return Err(MoshpitError::KeyNotEstablished.into());
+            match self.reader.read_frame().await? {
+                None => {
+                    error!("server_kex: client closed connection before sending Initialize");
+                    return Err(MoshpitError::InvalidFrame.into());
                 }
-                let rnk = self.handle_initialize(
-                    &pk,
-                    &self.tx_event.clone(),
-                    private_key_path,
-                    public_key_path,
-                )?;
-                (rnk, user_str, shell, req_uuid)
-            } else {
-                error!("Expected initialize frame from mp");
-                return Err(MoshpitError::InvalidFrame.into());
+                Some(frame) => {
+                    let (user, pk, fpk, req_uuid) = match frame {
+                        Frame::Initialize(user, pk, fpk) => {
+                            trace!("server_kex: received Initialize from client");
+                            (user, pk, fpk, None)
+                        }
+                        Frame::ResumeRequest(session_uuid_wrapper, user, pk, fpk) => {
+                            trace!(
+                                "server_kex: received ResumeRequest for session {}",
+                                session_uuid_wrapper
+                            );
+                            (user, pk, fpk, Some(*session_uuid_wrapper.as_ref()))
+                        }
+                        other => {
+                            error!(
+                                "server_kex: expected Initialize/ResumeRequest but got frame id={}",
+                                other.id()
+                            );
+                            return Err(MoshpitError::InvalidFrame.into());
+                        }
+                    };
+                    let user_str = String::from_utf8_lossy(&user).to_string();
+                    trace!(
+                        "server_kex: validating system account for user '{}'",
+                        user_str
+                    );
+                    let (home_dir, shell) = if self.validate_user(&user_str).await? {
+                        trace!(
+                            "server_kex: user '{}' is valid, getting home/shell",
+                            user_str
+                        );
+                        self.get_home_dir_shell(&user_str).await?
+                    } else {
+                        error!("server_kex: '{}' is not a valid system account", user_str);
+                        return Err(MoshpitError::KeyNotEstablished.into());
+                    };
+                    trace!(
+                        "server_kex: home_dir='{}', checking authorized_keys",
+                        home_dir
+                    );
+                    if !check_authorized_keys(&home_dir, &fpk)? {
+                        error!(
+                            "server_kex: client pubkey not in '{home_dir}/.mp/authorized_keys' \
+                             (file missing, wrong permissions, or key not added)",
+                        );
+                        return Err(MoshpitError::KeyNotEstablished.into());
+                    }
+                    trace!("server_kex: authorized_keys OK, running handle_initialize");
+                    let rnk = self.handle_initialize(
+                        &pk,
+                        &self.tx_event.clone(),
+                        private_key_path,
+                        public_key_path,
+                    )?;
+                    trace!("server_kex: PeerInitialize sent to client");
+                    (rnk, user_str, shell, req_uuid)
+                }
             };
 
-        if let Some(frame) = self.reader.read_frame().await? {
-            if let Frame::Check(nonce, enc) = frame {
+        trace!("server_kex: waiting for Check frame");
+        match self.reader.read_frame().await? {
+            Some(Frame::Check(nonce, enc)) => {
+                trace!("server_kex: received Check frame, verifying");
                 self.handle_check(&rnk, nonce, enc, &self.tx_event.clone())?;
-            } else {
-                error!("Expected check frame from mp");
+                trace!("server_kex: Check verified, KeyAgreement sent");
+            }
+            Some(other) => {
+                error!("server_kex: expected Check but got frame id={}", other.id());
                 return Err(MoshpitError::InvalidFrame.into());
             }
-        } else {
-            error!("Expected check frame from mp");
-            return Err(MoshpitError::InvalidFrame.into());
+            None => {
+                error!("server_kex: client closed connection before sending Check");
+                return Err(MoshpitError::InvalidFrame.into());
+            }
         }
 
         // Determine session UUID: reuse the requested session if user matches,
@@ -269,16 +393,23 @@ impl KexReader {
 
         let udp_arc = self.handle_udp_setup(socket_addr, port_pool).await?;
 
-        if let Some(frame) = self.reader.read_frame().await? {
-            if let Frame::MoshpitAddr(moshpit_addr) = frame {
+        trace!("server_kex: waiting for MoshpitAddr from client");
+        match self.reader.read_frame().await? {
+            Some(Frame::MoshpitAddr(moshpit_addr)) => {
+                trace!("server_kex: received MoshpitAddr {moshpit_addr}");
                 udp_arc.connect(moshpit_addr).await?;
-            } else {
-                error!("Expected moshpit address frame");
+            }
+            Some(other) => {
+                error!(
+                    "server_kex: expected MoshpitAddr but got frame id={}",
+                    other.id()
+                );
                 return Err(MoshpitError::InvalidFrame.into());
             }
-        } else {
-            error!("Expected moshpit address frame");
-            return Err(MoshpitError::InvalidFrame.into());
+            None => {
+                error!("server_kex: client closed connection before sending MoshpitAddr");
+                return Err(MoshpitError::InvalidFrame.into());
+            }
         }
 
         let skex = ServerKex::builder()

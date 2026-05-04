@@ -226,6 +226,12 @@ async fn run_session_loop(
             Err(e) => {
                 reconnect_attempt = reconnect_attempt.saturating_add(1);
                 error!("Failed to connect to {socket_addr}: {e}, retrying in {backoff:?}");
+                // If raw mode is not yet active (first connection attempt), the
+                // failure may be due to a wrong passphrase.  Reset the cache so
+                // the user can re-enter it with a clean terminal on the next try.
+                if kb_rx_shared.is_none() {
+                    *pass_cache.lock().unwrap() = PassCache::Uncached;
+                }
                 countdown_reconnect_banner(
                     &stdout_tx,
                     backoff.as_secs(),
