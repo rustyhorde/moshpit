@@ -1,0 +1,13 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    remove|upgrade|deconfigure|failed-upgrade)
+        if systemctl is-active --quiet mps.service 2>/dev/null; then
+            systemctl stop mps.service || true
+        fi
+        if systemctl is-enabled --quiet mps.service 2>/dev/null; then
+            systemctl disable mps.service || true
+        fi
+        ;;
+esac
