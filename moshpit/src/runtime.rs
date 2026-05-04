@@ -1146,4 +1146,81 @@ mod tests {
         let result = connect_and_kex(&mut config, addr, "127.0.0.1", port, &pass_cache).await;
         assert!(result.is_err());
     }
+
+    #[test]
+    fn fatal_kex_error_display_includes_error_and_path() {
+        use libmoshpit::MoshpitError;
+        let key_path = PathBuf::from("/home/user/.mp/id_ed25519");
+        let fatal = FatalKexError {
+            inner: MoshpitError::KeyFileMissing,
+            key_path: key_path.clone(),
+        };
+        let display = format!("{fatal}");
+        assert!(
+            display.contains("Key file not found"),
+            "display should contain error message, got: {display}"
+        );
+        assert!(
+            display.contains("/home/user/.mp/id_ed25519"),
+            "display should contain key path, got: {display}"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_and_kex_missing_key_file_wrapped_as_fatal_error() {
+        use clap::Parser as _;
+        let home = TestHome::new();
+        let config_path = home.path().join("config.toml");
+        // Non-existent key paths
+        let priv_path = home.path().join("nonexistent_id_ed25519");
+        let pub_path = home.path().join("nonexistent_id_ed25519.pub");
+        std::fs::write(
+            &config_path,
+            "[tracing.stdout]\n\
+             with_target = false\n\
+             with_thread_ids = false\n\
+             with_thread_names = false\n\
+             with_line_number = false\n\
+             with_level = false\n\
+             [tracing.file]\n\
+             quiet = 0\n\
+             verbose = 0\n\
+             [tracing.file.layer]\n\
+             with_target = false\n\
+             with_thread_ids = false\n\
+             with_thread_names = false\n\
+             with_line_number = false\n\
+             with_level = false\n",
+        )
+        .unwrap();
+        let cli = Cli::try_parse_from([
+            "moshpit",
+            "-c",
+            config_path.to_str().unwrap(),
+            "-p",
+            priv_path.to_str().unwrap(),
+            "-k",
+            pub_path.to_str().unwrap(),
+            "user@host",
+        ])
+        .unwrap();
+        let mut config = load::<Cli, Config, Cli>(&cli, &cli).unwrap();
+        let pass_cache = Arc::new(std::sync::Mutex::new(PassCache::Uncached));
+
+        // Bind a real listener so TCP connection succeeds
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(spawn(async move {
+            if let Ok((_, _)) = listener.accept().await {}
+        }));
+
+        let addr = format!("127.0.0.1:{port}").parse().unwrap();
+        let result = connect_and_kex(&mut config, addr, "127.0.0.1", port, &pass_cache).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.downcast_ref::<FatalKexError>().is_some(),
+            "missing key file should produce FatalKexError, got: {err}"
+        );
+    }
 }

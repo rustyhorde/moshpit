@@ -497,3 +497,93 @@ async fn run_server_kex<T: KexConfig>(
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn kex_state_machine_server_mode_completes_after_uuid() {
+        let (tx, rx) = unbounded_channel();
+        let mut sm = KexStateMachine::builder().rx_event(rx).build();
+        let key = [1u8; 32];
+        let hmac_key = [2u8; 64];
+        let uuid = Uuid::new_v4();
+        tx.send(KexEvent::KeyMaterial(key)).unwrap();
+        tx.send(KexEvent::HMACKeyMaterial(hmac_key)).unwrap();
+        tx.send(KexEvent::Uuid(uuid)).unwrap();
+        drop(tx);
+        let kex = sm.handle_events(false).await.unwrap();
+        assert_eq!(kex.key(), key);
+        assert_eq!(kex.hmac_key(), hmac_key);
+        assert_eq!(kex.uuid(), uuid);
+        assert!(kex.moshpits_addr().is_none());
+        assert!(kex.session_uuid().is_none());
+    }
+
+    #[tokio::test]
+    async fn kex_state_machine_client_mode_full_sequence() {
+        let (tx, rx) = unbounded_channel();
+        let mut sm = KexStateMachine::builder().rx_event(rx).build();
+        let key = [3u8; 32];
+        let hmac_key = [4u8; 64];
+        let uuid = Uuid::new_v4();
+        let session_uuid = Uuid::new_v4();
+        let addr: SocketAddr = "127.0.0.1:50001".parse().unwrap();
+        tx.send(KexEvent::KeyMaterial(key)).unwrap();
+        tx.send(KexEvent::HMACKeyMaterial(hmac_key)).unwrap();
+        tx.send(KexEvent::Uuid(uuid)).unwrap();
+        tx.send(KexEvent::SessionInfo(session_uuid, false)).unwrap();
+        tx.send(KexEvent::MoshpitsAddr(addr)).unwrap();
+        let kex = sm.handle_events(true).await.unwrap();
+        assert_eq!(kex.key(), key);
+        assert_eq!(kex.hmac_key(), hmac_key);
+        assert_eq!(kex.uuid(), uuid);
+        assert_eq!(kex.session_uuid(), Some(session_uuid));
+        assert_eq!(kex.moshpits_addr(), Some(addr));
+        assert!(!kex.is_resume());
+    }
+
+    #[tokio::test]
+    async fn kex_state_machine_wrong_event_order_returns_invalid_state() {
+        let (tx, rx) = unbounded_channel();
+        let mut sm = KexStateMachine::builder().rx_event(rx).build();
+        // Send Uuid when state is AwaitingKeyMaterial — wrong order
+        tx.send(KexEvent::Uuid(Uuid::new_v4())).unwrap();
+        drop(tx);
+        let result = sm.handle_events(true).await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .downcast_ref::<MoshpitError>()
+                .is_some_and(|e| *e == MoshpitError::InvalidKexState),
+        );
+    }
+
+    #[tokio::test]
+    async fn kex_state_machine_channel_dropped_returns_invalid_state() {
+        let (tx, rx) = unbounded_channel::<KexEvent>();
+        let mut sm = KexStateMachine::builder().rx_event(rx).build();
+        // Drop sender immediately — recv() returns None, falls through to InvalidKexState
+        drop(tx);
+        let result = sm.handle_events(true).await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .downcast_ref::<MoshpitError>()
+                .is_some_and(|e| *e == MoshpitError::InvalidKexState),
+        );
+    }
+
+    #[test]
+    fn kex_mode_display_formatting() {
+        assert_eq!(format!("{}", KexMode::Client), "Client");
+        let addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        assert_eq!(
+            format!("{}", KexMode::Server(addr)),
+            "Server(127.0.0.1:12345)"
+        );
+    }
+}
