@@ -102,6 +102,21 @@ impl PassCache {
     }
 }
 
+/// An unrecoverable key-exchange error that should not trigger the retry loop.
+#[derive(Debug)]
+struct FatalKexError {
+    inner: MoshpitError,
+    key_path: PathBuf,
+}
+
+impl std::fmt::Display for FatalKexError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} (key: {})", self.inner, self.key_path.display())
+    }
+}
+
+impl std::error::Error for FatalKexError {}
+
 /// Show a mosh-style reconnecting banner at the top of the terminal.
 ///
 /// The banner is white-on-blue, occupies the entire first row, and is
@@ -224,8 +239,22 @@ async fn run_session_loop(
                 time::sleep(Duration::from_millis(500)).await;
             }
             Err(e) => {
+                if let Some(fatal) = e.downcast_ref::<FatalKexError>() {
+                    eprintln!("mp: fatal key error: {fatal}");
+                    eprintln!(
+                        "mp: run `mp-keygen` to regenerate your keypair at {}",
+                        fatal.key_path.display()
+                    );
+                    return Err(e);
+                }
                 reconnect_attempt = reconnect_attempt.saturating_add(1);
                 error!("Failed to connect to {socket_addr}: {e}, retrying in {backoff:?}");
+                // If raw mode is not yet active (first connection attempt), the
+                // failure may be due to a wrong passphrase.  Reset the cache so
+                // the user can re-enter it with a clean terminal on the next try.
+                if kb_rx_shared.is_none() {
+                    *pass_cache.lock().unwrap() = PassCache::Uncached;
+                }
                 countdown_reconnect_banner(
                     &stdout_tx,
                     backoff.as_secs(),
@@ -240,6 +269,7 @@ async fn run_session_loop(
 }
 
 /// Connect via TCP, run the key exchange, and persist the session UUID.
+#[cfg_attr(nightly, allow(clippy::too_many_lines))]
 async fn connect_and_kex(
     config: &mut Config,
     socket_addr: SocketAddr,
@@ -257,10 +287,20 @@ async fn connect_and_kex(
     let pass_fn = move || -> Result<Option<String>> {
         let guard = cache.lock().unwrap();
         if guard.is_cached() {
+            info!(
+                "passphrase: returning cached value (has_passphrase={})",
+                guard.passphrase().is_some()
+            );
             return Ok(guard.passphrase());
         }
         drop(guard);
-        let result = read_passpharase();
+        info!("passphrase: prompting user");
+        let result = tokio::task::block_in_place(read_passpharase);
+        match &result {
+            Ok(Some(_)) => info!("passphrase: prompt returned a passphrase"),
+            Ok(None) => info!("passphrase: prompt returned None (key may be unencrypted)"),
+            Err(e) => error!("passphrase: prompt failed: {e}"),
+        }
         if let Ok(ref pass) = result {
             *cache.lock().unwrap() = match pass {
                 Some(s) => PassCache::Passphrase(s.clone()),
@@ -317,7 +357,31 @@ async fn connect_and_kex(
         Some(tofu_fn),
         Some(mismatch_fn),
     )
-    .await?;
+    .await
+    .map_err(|e| {
+        if let Some(&moshpit_err) = e.downcast_ref::<MoshpitError>() {
+            match moshpit_err {
+                MoshpitError::KeyFileMissing
+                | MoshpitError::KeyCorrupt
+                | MoshpitError::KeyPairMismatch
+                | MoshpitError::DecryptionFailed
+                | MoshpitError::InvalidPublicKeyFormat
+                | MoshpitError::InvalidKeyHeader => {
+                    let key_path = config
+                        .key_pair_paths()
+                        .ok()
+                        .map(|(p, _)| p)
+                        .unwrap_or_default();
+                    return anyhow::anyhow!(FatalKexError {
+                        inner: moshpit_err,
+                        key_path,
+                    });
+                }
+                _ => {}
+            }
+        }
+        e
+    })?;
 
     if let Some(session_uuid) = kex.session_uuid() {
         if let Err(e) = write_session_uuid(server_ip, server_port, session_uuid) {
@@ -627,10 +691,6 @@ fn create_key_dir(path: &Path) -> Result<()> {
 fn read_passpharase() -> Result<Option<String>> {
     Password::new()
         .with_prompt("Please enter your private key passphrase")
-        .with_confirmation(
-            "Confirm the passphrase",
-            "The entered passphrases do not match",
-        )
         .report(false)
         .interact()
         .map(Some)
@@ -1085,5 +1145,82 @@ mod tests {
         // TcpStream::connect will succeed, but run_key_exchange will fail
         let result = connect_and_kex(&mut config, addr, "127.0.0.1", port, &pass_cache).await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn fatal_kex_error_display_includes_error_and_path() {
+        use libmoshpit::MoshpitError;
+        let key_path = PathBuf::from("/home/user/.mp/id_ed25519");
+        let fatal = FatalKexError {
+            inner: MoshpitError::KeyFileMissing,
+            key_path: key_path.clone(),
+        };
+        let display = format!("{fatal}");
+        assert!(
+            display.contains("Key file not found"),
+            "display should contain error message, got: {display}"
+        );
+        assert!(
+            display.contains("/home/user/.mp/id_ed25519"),
+            "display should contain key path, got: {display}"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_and_kex_missing_key_file_wrapped_as_fatal_error() {
+        use clap::Parser as _;
+        let home = TestHome::new();
+        let config_path = home.path().join("config.toml");
+        // Non-existent key paths
+        let priv_path = home.path().join("nonexistent_id_ed25519");
+        let pub_path = home.path().join("nonexistent_id_ed25519.pub");
+        std::fs::write(
+            &config_path,
+            "[tracing.stdout]\n\
+             with_target = false\n\
+             with_thread_ids = false\n\
+             with_thread_names = false\n\
+             with_line_number = false\n\
+             with_level = false\n\
+             [tracing.file]\n\
+             quiet = 0\n\
+             verbose = 0\n\
+             [tracing.file.layer]\n\
+             with_target = false\n\
+             with_thread_ids = false\n\
+             with_thread_names = false\n\
+             with_line_number = false\n\
+             with_level = false\n",
+        )
+        .unwrap();
+        let cli = Cli::try_parse_from([
+            "moshpit",
+            "-c",
+            config_path.to_str().unwrap(),
+            "-p",
+            priv_path.to_str().unwrap(),
+            "-k",
+            pub_path.to_str().unwrap(),
+            "user@host",
+        ])
+        .unwrap();
+        let mut config = load::<Cli, Config, Cli>(&cli, &cli).unwrap();
+        let pass_cache = Arc::new(std::sync::Mutex::new(PassCache::Uncached));
+
+        // Bind a real listener so TCP connection succeeds
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(spawn(async move {
+            if let Ok((_, _)) = listener.accept().await {}
+        }));
+
+        let addr = format!("127.0.0.1:{port}").parse().unwrap();
+        let result = connect_and_kex(&mut config, addr, "127.0.0.1", port, &pass_cache).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.downcast_ref::<FatalKexError>().is_some(),
+            "missing key file should produce FatalKexError, got: {err}"
+        );
     }
 }

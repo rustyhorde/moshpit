@@ -10,7 +10,7 @@ use std::{
     collections::BTreeSet,
     fs::OpenOptions,
     io::{BufRead, BufReader},
-    net::SocketAddr,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -27,7 +27,6 @@ use aws_lc_rs::{
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bon::Builder;
-use local_ip_address::local_ip;
 use tokio::{
     net::UdpSocket,
     process::Command,
@@ -97,26 +96,54 @@ impl KexReader {
     ///
     /// # Errors
     ///
+    #[cfg_attr(nightly, allow(clippy::too_many_lines))]
     pub async fn client_kex(&mut self, epk: &PrivateKey) -> Result<()> {
-        if let Some(frame) = self.reader.read_frame().await? {
-            if let Frame::PeerInitialize(pk, salt_bytes) = frame {
-                if let Some(host) = &self.server_destination
-                    && !check_known_hosts(
+        trace!("client_kex: waiting for PeerInitialize");
+        match self.reader.read_frame().await? {
+            None => {
+                error!("client_kex: server closed connection before sending PeerInitialize");
+                return Err(anyhow::anyhow!(
+                    "Server closed connection during key exchange"
+                ));
+            }
+            Some(Frame::PeerInitialize(pk, salt_bytes)) => {
+                trace!(
+                    "client_kex: received PeerInitialize ({} byte pubkey)",
+                    pk.len()
+                );
+
+                if let Some(host) = &self.server_destination {
+                    trace!("client_kex: checking known_hosts for host '{host}'");
+                    match check_known_hosts(
                         host,
                         &pk,
                         self.tofu_fn.as_ref(),
                         self.host_key_mismatch_fn.as_ref(),
-                    )?
-                {
-                    self.tx_event
-                        .send(KexEvent::Failure)
-                        .map_err(|_| Unspecified)?;
-                    return Err(anyhow::anyhow!("Host key verification failed"));
+                    ) {
+                        Err(e) => {
+                            error!("client_kex: known_hosts check error for '{host}': {e}");
+                            let _ = self.tx_event.send(KexEvent::Failure);
+                            return Err(e);
+                        }
+                        Ok(false) => {
+                            error!("client_kex: host key verification rejected for '{host}'");
+                            let _ = self.tx_event.send(KexEvent::Failure);
+                            return Err(anyhow::anyhow!(
+                                "Host key verification failed for '{host}'"
+                            ));
+                        }
+                        Ok(true) => {
+                            trace!("client_kex: host key verified for '{host}'");
+                        }
+                    }
+                } else {
+                    trace!("client_kex: no server_destination set, skipping host-key check");
                 }
 
                 let peer_public_key = UnparsedPublicKey::new(&X25519, &pk);
                 let salt = Salt::new(HKDF_SHA256, &salt_bytes);
 
+                trace!("client_kex: running ECDH agree()");
                 agree(epk, peer_public_key, Unspecified, |key_material| {
                     let pseudo_random_key = salt.extract(key_material);
                     let mut check = b"Yoda".to_vec();
@@ -144,41 +171,98 @@ impl KexReader {
                         .send(Frame::Check(*nonce.as_ref(), check))
                         .map_err(|_| Unspecified)?;
                     Ok(())
+                })
+                .inspect(|()| trace!("client_kex: agree() succeeded, Check frame sent"))
+                .inspect_err(|_| {
+                    error!(
+                        "client_kex: agree() failed — channel closed or crypto error \
+                         (wrong passphrase?)"
+                    );
                 })?;
-            } else {
-                self.tx_event
-                    .send(KexEvent::Failure)
-                    .map_err(|_| Unspecified)?;
+            }
+            Some(other) => {
+                error!(
+                    "client_kex: expected PeerInitialize but got frame id={}",
+                    other.id()
+                );
+                let _ = self.tx_event.send(KexEvent::Failure);
                 return Err(MoshpitError::KeyNotEstablished.into());
             }
         }
 
-        if let Some(frame) = self.reader.read_frame().await?
-            && let Frame::KeyAgreement(uuid) = frame
-        {
-            self.tx_event
-                .send(KexEvent::Uuid(*uuid.as_ref()))
-                .map_err(|_| Unspecified)?;
+        trace!("client_kex: waiting for KeyAgreement");
+        match self.reader.read_frame().await? {
+            Some(Frame::KeyAgreement(uuid)) => {
+                trace!("client_kex: received KeyAgreement uuid={}", uuid);
+                self.tx_event
+                    .send(KexEvent::Uuid(*uuid.as_ref()))
+                    .map_err(|_| Unspecified)?;
+            }
+            Some(other) => {
+                error!(
+                    "client_kex: expected KeyAgreement but got frame id={}",
+                    other.id()
+                );
+                return Err(MoshpitError::KeyNotEstablished.into());
+            }
+            None => {
+                error!("client_kex: server closed connection before sending KeyAgreement");
+                return Err(anyhow::anyhow!(
+                    "Server closed connection before KeyAgreement"
+                ));
+            }
         }
 
         // Receive stable session token (sent by server after KeyAgreement)
-        if let Some(frame) = self.reader.read_frame().await?
-            && let Frame::SessionToken(session_uuid_wrapper) = frame
-        {
-            let session_uuid = *session_uuid_wrapper.as_ref();
-            let is_resume = self.requested_session_uuid == Some(session_uuid);
-            self.tx_event
-                .send(KexEvent::SessionInfo(session_uuid, is_resume))
-                .map_err(|_| Unspecified)?;
+        trace!("client_kex: waiting for SessionToken");
+        match self.reader.read_frame().await? {
+            Some(Frame::SessionToken(session_uuid_wrapper)) => {
+                let session_uuid = *session_uuid_wrapper.as_ref();
+                let is_resume = self.requested_session_uuid == Some(session_uuid);
+                trace!("client_kex: received SessionToken {session_uuid} (resume={is_resume})");
+                self.tx_event
+                    .send(KexEvent::SessionInfo(session_uuid, is_resume))
+                    .map_err(|_| Unspecified)?;
+            }
+            Some(other) => {
+                error!(
+                    "client_kex: expected SessionToken but got frame id={}",
+                    other.id()
+                );
+                return Err(MoshpitError::KeyNotEstablished.into());
+            }
+            None => {
+                error!("client_kex: server closed connection before sending SessionToken");
+                return Err(anyhow::anyhow!(
+                    "Server closed connection before SessionToken"
+                ));
+            }
         }
 
-        if let Some(frame) = self.reader.read_frame().await?
-            && let Frame::MoshpitsAddr(addr) = frame
-        {
-            self.tx_event
-                .send(KexEvent::MoshpitsAddr(addr))
-                .map_err(|_| Unspecified)?;
+        trace!("client_kex: waiting for MoshpitsAddr");
+        match self.reader.read_frame().await? {
+            Some(Frame::MoshpitsAddr(addr)) => {
+                trace!("client_kex: received MoshpitsAddr {addr}");
+                self.tx_event
+                    .send(KexEvent::MoshpitsAddr(addr))
+                    .map_err(|_| Unspecified)?;
+            }
+            Some(other) => {
+                error!(
+                    "client_kex: expected MoshpitsAddr but got frame id={}",
+                    other.id()
+                );
+                return Err(MoshpitError::KeyNotEstablished.into());
+            }
+            None => {
+                error!("client_kex: server closed connection before sending MoshpitsAddr");
+                return Err(anyhow::anyhow!(
+                    "Server closed connection before MoshpitsAddr"
+                ));
+            }
         }
+
+        trace!("client_kex: complete");
         Ok(())
     }
 
@@ -186,6 +270,7 @@ impl KexReader {
     ///
     /// # Errors
     ///
+    #[cfg_attr(nightly, allow(clippy::too_many_lines))]
     pub async fn server_kex(
         &mut self,
         socket_addr: SocketAddr,
@@ -194,49 +279,87 @@ impl KexReader {
         public_key_path: &PathBuf,
         session_registry: Option<SessionRegistry>,
     ) -> Result<(ServerKex, Arc<UdpSocket>)> {
+        trace!("server_kex: waiting for Initialize/ResumeRequest from client");
         let (rnk, user_str, shell, requested_session_uuid_opt) =
-            if let Some(frame) = self.reader.read_frame().await? {
-                let (user, pk, fpk, req_uuid) = match frame {
-                    Frame::Initialize(user, pk, fpk) => (user, pk, fpk, None),
-                    Frame::ResumeRequest(session_uuid_wrapper, user, pk, fpk) => {
-                        (user, pk, fpk, Some(*session_uuid_wrapper.as_ref()))
-                    }
-                    _ => {
-                        error!("Expected initialize frame from mp");
-                        return Err(MoshpitError::InvalidFrame.into());
-                    }
-                };
-                let user_str = String::from_utf8_lossy(&user).to_string();
-                let (home_dir, shell) = if self.validate_user(&user_str).await? {
-                    self.get_home_dir_shell(&user_str).await?
-                } else {
-                    return Err(MoshpitError::KeyNotEstablished.into());
-                };
-                if !check_authorized_keys(&home_dir, &fpk)? {
-                    return Err(MoshpitError::KeyNotEstablished.into());
+            match self.reader.read_frame().await? {
+                None => {
+                    error!("server_kex: client closed connection before sending Initialize");
+                    return Err(MoshpitError::InvalidFrame.into());
                 }
-                let rnk = self.handle_initialize(
-                    &pk,
-                    &self.tx_event.clone(),
-                    private_key_path,
-                    public_key_path,
-                )?;
-                (rnk, user_str, shell, req_uuid)
-            } else {
-                error!("Expected initialize frame from mp");
-                return Err(MoshpitError::InvalidFrame.into());
+                Some(frame) => {
+                    let (user, pk, fpk, req_uuid) = match frame {
+                        Frame::Initialize(user, pk, fpk) => {
+                            trace!("server_kex: received Initialize from client");
+                            (user, pk, fpk, None)
+                        }
+                        Frame::ResumeRequest(session_uuid_wrapper, user, pk, fpk) => {
+                            trace!(
+                                "server_kex: received ResumeRequest for session {}",
+                                session_uuid_wrapper
+                            );
+                            (user, pk, fpk, Some(*session_uuid_wrapper.as_ref()))
+                        }
+                        other => {
+                            error!(
+                                "server_kex: expected Initialize/ResumeRequest but got frame id={}",
+                                other.id()
+                            );
+                            return Err(MoshpitError::InvalidFrame.into());
+                        }
+                    };
+                    let user_str = String::from_utf8_lossy(&user).to_string();
+                    trace!(
+                        "server_kex: validating system account for user '{}'",
+                        user_str
+                    );
+                    let (home_dir, shell) = if self.validate_user(&user_str).await? {
+                        trace!(
+                            "server_kex: user '{}' is valid, getting home/shell",
+                            user_str
+                        );
+                        self.get_home_dir_shell(&user_str).await?
+                    } else {
+                        error!("server_kex: '{}' is not a valid system account", user_str);
+                        return Err(MoshpitError::KeyNotEstablished.into());
+                    };
+                    trace!(
+                        "server_kex: home_dir='{}', checking authorized_keys",
+                        home_dir
+                    );
+                    if !check_authorized_keys(&home_dir, &fpk)? {
+                        error!(
+                            "server_kex: client pubkey not in '{home_dir}/.mp/authorized_keys' \
+                             (file missing, wrong permissions, or key not added)",
+                        );
+                        return Err(MoshpitError::KeyNotEstablished.into());
+                    }
+                    trace!("server_kex: authorized_keys OK, running handle_initialize");
+                    let rnk = self.handle_initialize(
+                        &pk,
+                        &self.tx_event.clone(),
+                        private_key_path,
+                        public_key_path,
+                    )?;
+                    trace!("server_kex: PeerInitialize sent to client");
+                    (rnk, user_str, shell, req_uuid)
+                }
             };
 
-        if let Some(frame) = self.reader.read_frame().await? {
-            if let Frame::Check(nonce, enc) = frame {
+        trace!("server_kex: waiting for Check frame");
+        match self.reader.read_frame().await? {
+            Some(Frame::Check(nonce, enc)) => {
+                trace!("server_kex: received Check frame, verifying");
                 self.handle_check(&rnk, nonce, enc, &self.tx_event.clone())?;
-            } else {
-                error!("Expected check frame from mp");
+                trace!("server_kex: Check verified, KeyAgreement sent");
+            }
+            Some(other) => {
+                error!("server_kex: expected Check but got frame id={}", other.id());
                 return Err(MoshpitError::InvalidFrame.into());
             }
-        } else {
-            error!("Expected check frame from mp");
-            return Err(MoshpitError::InvalidFrame.into());
+            None => {
+                error!("server_kex: client closed connection before sending Check");
+                return Err(MoshpitError::InvalidFrame.into());
+            }
         }
 
         // Determine session UUID: reuse the requested session if user matches,
@@ -270,16 +393,23 @@ impl KexReader {
 
         let udp_arc = self.handle_udp_setup(socket_addr, port_pool).await?;
 
-        if let Some(frame) = self.reader.read_frame().await? {
-            if let Frame::MoshpitAddr(moshpit_addr) = frame {
+        trace!("server_kex: waiting for MoshpitAddr from client");
+        match self.reader.read_frame().await? {
+            Some(Frame::MoshpitAddr(moshpit_addr)) => {
+                trace!("server_kex: received MoshpitAddr {moshpit_addr}");
                 udp_arc.connect(moshpit_addr).await?;
-            } else {
-                error!("Expected moshpit address frame");
+            }
+            Some(other) => {
+                error!(
+                    "server_kex: expected MoshpitAddr but got frame id={}",
+                    other.id()
+                );
                 return Err(MoshpitError::InvalidFrame.into());
             }
-        } else {
-            error!("Expected moshpit address frame");
-            return Err(MoshpitError::InvalidFrame.into());
+            None => {
+                error!("server_kex: client closed connection before sending MoshpitAddr");
+                return Err(MoshpitError::InvalidFrame.into());
+            }
         }
 
         let skex = ServerKex::builder()
@@ -384,17 +514,28 @@ impl KexReader {
 
     async fn handle_udp_setup(
         &mut self,
-        mut socket_addr: SocketAddr,
+        socket_addr: SocketAddr,
         port_pool: Arc<Mutex<BTreeSet<u16>>>,
     ) -> Result<Arc<UdpSocket>> {
         let mut port_p = port_pool.lock().await;
         let next_port = port_p.pop_first().unwrap_or(49999);
-        socket_addr.set_port(next_port);
-        let my_local_ip = local_ip()?;
-        let udp_socket_addr = SocketAddr::new(my_local_ip, socket_addr.port());
-        trace!("binding moshpits socket at {udp_socket_addr}");
-        self.tx.send(Frame::MoshpitsAddr(udp_socket_addr))?;
-        let udp_listener = UdpSocket::bind(udp_socket_addr).await?;
+
+        // Advertise the IP that the client used to reach us (the TCP connection's
+        // local address).  This is the IP the client can actually route UDP packets
+        // to, regardless of which bind address the listener was configured with.
+        let udp_addr_for_client = SocketAddr::new(socket_addr.ip(), next_port);
+        trace!("advertising moshpits UDP socket at {udp_addr_for_client}");
+        self.tx.send(Frame::MoshpitsAddr(udp_addr_for_client))?;
+
+        // Bind to all interfaces so we can receive from the client regardless of
+        // NAT, multi-homing, or routing asymmetry.
+        let unspecified = match socket_addr {
+            SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        };
+        let bind_addr = SocketAddr::new(unspecified, next_port);
+        trace!("binding moshpits UDP socket at {bind_addr}");
+        let udp_listener = UdpSocket::bind(bind_addr).await?;
         Ok(Arc::new(udp_listener))
     }
 
@@ -1008,5 +1149,345 @@ mod tests {
             !result,
             "world-readable authorized_keys must be rejected (permission check)"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Helpers for KexReader / client_kex / handle_check / handle_udp_setup tests
+    // -----------------------------------------------------------------------
+
+    use std::collections::BTreeSet;
+    use std::sync::Arc as StdArc;
+
+    use aws_lc_rs::{
+        aead::{AES_256_GCM_SIV, Aad, RandomizedNonceKey},
+        agreement::{PrivateKey, X25519},
+    };
+    use tokio::sync::Mutex as TokioMutex;
+    use tokio::{
+        net::{TcpListener, TcpStream},
+        sync::mpsc::unbounded_channel,
+    };
+
+    use crate::{ConnectionReader, ConnectionWriter, Frame, KexEvent, UuidWrapper};
+
+    /// Create two connected TCP stream pairs.
+    /// Returns `(client_reader, client_writer, server_reader, server_writer)`.
+    async fn make_bidirectional_loopback() -> (
+        ConnectionReader,
+        ConnectionWriter,
+        ConnectionReader,
+        ConnectionWriter,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (server_stream, client_stream) = tokio::join!(
+            async { listener.accept().await.map(|(s, _)| s).unwrap() },
+            TcpStream::connect(addr),
+        );
+        let client_stream = client_stream.unwrap();
+        let (server_r, server_w) = server_stream.into_split();
+        let (client_r, client_w) = client_stream.into_split();
+        (
+            ConnectionReader::builder().reader(client_r).build(),
+            ConnectionWriter::builder().writer(client_w).build(),
+            ConnectionReader::builder().reader(server_r).build(),
+            ConnectionWriter::builder().writer(server_w).build(),
+        )
+    }
+
+    /// Build a `KexReader` around `reader` and return channel receivers
+    /// so tests can observe outbound frames and events.
+    fn make_test_kex_reader(
+        reader: ConnectionReader,
+    ) -> (
+        super::super::KexReader,
+        tokio::sync::mpsc::UnboundedReceiver<Frame>,
+        tokio::sync::mpsc::UnboundedReceiver<KexEvent>,
+    ) {
+        let (tx, rx_frames) = unbounded_channel::<Frame>();
+        let (tx_event, rx_events) = unbounded_channel::<KexEvent>();
+        let kex_reader = super::super::KexReader::builder()
+            .reader(reader)
+            .tx(tx)
+            .tx_event(tx_event)
+            .build();
+        (kex_reader, rx_frames, rx_events)
+    }
+
+    // -----------------------------------------------------------------------
+    // handle_udp_setup tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn handle_udp_setup_pops_first_port_from_pool() {
+        let (client_reader, _client_writer, _server_reader, _server_writer) =
+            make_bidirectional_loopback().await;
+        let (mut kex_reader, mut rx_frames, _rx_events) = make_test_kex_reader(client_reader);
+
+        let mut pool = BTreeSet::new();
+        let _ = pool.insert(50001u16);
+        let port_pool = StdArc::new(TokioMutex::new(pool));
+        let socket_addr: std::net::SocketAddr = "127.0.0.1:9000".parse().unwrap();
+
+        let udp_arc = kex_reader
+            .handle_udp_setup(socket_addr, port_pool)
+            .await
+            .unwrap();
+
+        let frame = rx_frames.recv().await.unwrap();
+        let advertised_port = match frame {
+            Frame::MoshpitsAddr(a) => a.port(),
+            other => panic!("expected MoshpitsAddr, got {other:?}"),
+        };
+        assert_eq!(advertised_port, 50001);
+        // Socket should be bound (local_addr succeeds)
+        assert!(udp_arc.local_addr().is_ok());
+    }
+
+    #[tokio::test]
+    async fn handle_udp_setup_empty_pool_falls_back_to_port_49999() {
+        let (client_reader, _client_writer, _server_reader, _server_writer) =
+            make_bidirectional_loopback().await;
+        let (mut kex_reader, mut rx_frames, _rx_events) = make_test_kex_reader(client_reader);
+
+        let pool: BTreeSet<u16> = BTreeSet::new();
+        let port_pool = StdArc::new(TokioMutex::new(pool));
+        let socket_addr: std::net::SocketAddr = "127.0.0.1:9000".parse().unwrap();
+
+        let _udp_arc = kex_reader
+            .handle_udp_setup(socket_addr, port_pool)
+            .await
+            .unwrap();
+
+        let frame = rx_frames.recv().await.unwrap();
+        let advertised_port = match frame {
+            Frame::MoshpitsAddr(a) => a.port(),
+            other => panic!("expected MoshpitsAddr, got {other:?}"),
+        };
+        assert_eq!(advertised_port, 49999);
+    }
+
+    // -----------------------------------------------------------------------
+    // handle_check tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn handle_check_valid_yoda_payload_succeeds() {
+        let (client_reader, _cw, _sr, _sw) = make_bidirectional_loopback().await;
+        let (mut kex_reader, mut rx_frames, _rx_events) = make_test_kex_reader(client_reader);
+
+        let key_bytes = [1u8; 32];
+        let rnk = RandomizedNonceKey::new(&AES_256_GCM_SIV, &key_bytes).unwrap();
+
+        // Encrypt "Yoda" the same way client_kex does
+        let mut plaintext = b"Yoda".to_vec();
+        let nonce = rnk
+            .seal_in_place_append_tag(Aad::empty(), &mut plaintext)
+            .unwrap();
+
+        let (tx_event_clone, _rx_event_clone) = unbounded_channel::<KexEvent>();
+        kex_reader
+            .handle_check(&rnk, *nonce.as_ref(), plaintext, &tx_event_clone)
+            .unwrap();
+
+        // Should have sent KeyAgreement frame via kex_reader's own tx
+        let frame = rx_frames.recv().await.unwrap();
+        assert!(
+            matches!(frame, Frame::KeyAgreement(_)),
+            "expected KeyAgreement, got {frame:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_check_invalid_payload_returns_decryption_failed() {
+        use crate::MoshpitError;
+
+        let (client_reader, _cw, _sr, _sw) = make_bidirectional_loopback().await;
+        let (mut kex_reader, _rx_frames, _rx_events) = make_test_kex_reader(client_reader);
+
+        let key_bytes = [1u8; 32];
+        let rnk = RandomizedNonceKey::new(&AES_256_GCM_SIV, &key_bytes).unwrap();
+
+        let nonce_bytes = [0u8; 12];
+        let garbage = vec![0u8; 32]; // not a valid ciphertext
+
+        let (tx_event_clone, _) = unbounded_channel::<KexEvent>();
+        let result = kex_reader.handle_check(&rnk, nonce_bytes, garbage, &tx_event_clone);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .downcast_ref::<MoshpitError>()
+                .is_some_and(|e| *e == MoshpitError::DecryptionFailed),
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // client_kex tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn client_kex_server_closes_immediately_returns_error() {
+        let (client_reader, _client_writer, _server_reader, server_writer) =
+            make_bidirectional_loopback().await;
+        let (mut kex_reader, _rx_frames, _rx_events) = make_test_kex_reader(client_reader);
+
+        // Drop server writer immediately — client reads EOF
+        drop(server_writer);
+
+        let epk = PrivateKey::generate(&X25519).unwrap();
+        let result = kex_reader.client_kex(&epk).await;
+        assert!(
+            result.is_err(),
+            "expected error when server closes immediately"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_kex_wrong_initial_frame_returns_key_not_established() {
+        use crate::MoshpitError;
+
+        let (client_reader, _client_writer, _server_reader, mut server_writer) =
+            make_bidirectional_loopback().await;
+        let (mut kex_reader, _rx_frames, _rx_events) = make_test_kex_reader(client_reader);
+
+        // Server sends wrong frame type
+        server_writer.write_frame(&Frame::KexFailure).await.unwrap();
+        drop(server_writer);
+
+        let epk = PrivateKey::generate(&X25519).unwrap();
+        let result = kex_reader.client_kex(&epk).await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .downcast_ref::<MoshpitError>()
+                .is_some_and(|e| *e == MoshpitError::KeyNotEstablished),
+        );
+    }
+
+    #[tokio::test]
+    async fn client_kex_server_closes_after_peer_initialize_returns_error() {
+        let (client_reader, _client_writer, _server_reader, mut server_writer) =
+            make_bidirectional_loopback().await;
+        let (mut kex_reader, _rx_frames, _rx_events) = make_test_kex_reader(client_reader);
+
+        // Server sends PeerInitialize with a valid X25519 public key, then closes
+        let server_epk = PrivateKey::generate(&X25519).unwrap();
+        let server_pub = server_epk.compute_public_key().unwrap();
+        let salt = vec![0u8; 32];
+        server_writer
+            .write_frame(&Frame::PeerInitialize(server_pub.as_ref().to_vec(), salt))
+            .await
+            .unwrap();
+        drop(server_writer);
+
+        let epk = PrivateKey::generate(&X25519).unwrap();
+        let result = kex_reader.client_kex(&epk).await;
+        assert!(
+            result.is_err(),
+            "expected error after server closes post-PeerInitialize"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_kex_wrong_frame_after_peer_initialize_returns_key_not_established() {
+        use crate::MoshpitError;
+
+        let (client_reader, _client_writer, _server_reader, mut server_writer) =
+            make_bidirectional_loopback().await;
+        let (mut kex_reader, _rx_frames, _rx_events) = make_test_kex_reader(client_reader);
+
+        let server_epk = PrivateKey::generate(&X25519).unwrap();
+        let server_pub = server_epk.compute_public_key().unwrap();
+        let salt = vec![0u8; 32];
+        server_writer
+            .write_frame(&Frame::PeerInitialize(server_pub.as_ref().to_vec(), salt))
+            .await
+            .unwrap();
+        // Send wrong frame instead of KeyAgreement
+        server_writer.write_frame(&Frame::KexFailure).await.unwrap();
+        drop(server_writer);
+
+        let epk = PrivateKey::generate(&X25519).unwrap();
+        let result = kex_reader.client_kex(&epk).await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .downcast_ref::<MoshpitError>()
+                .is_some_and(|e| *e == MoshpitError::KeyNotEstablished),
+        );
+    }
+
+    #[tokio::test]
+    async fn client_kex_happy_path_sends_all_events() {
+        use uuid::Uuid;
+
+        let (client_reader, _client_writer, _server_reader, mut server_writer) =
+            make_bidirectional_loopback().await;
+        // We need a separate tx/rx so we can observe the frames KexReader tries to send
+        let (tx_out, mut rx_out) = unbounded_channel::<Frame>();
+        let (tx_event_out, mut rx_event_out) = unbounded_channel::<KexEvent>();
+        let kex_reader = super::super::KexReader::builder()
+            .reader(client_reader)
+            .tx(tx_out)
+            .tx_event(tx_event_out)
+            .build();
+
+        let server_epk = PrivateKey::generate(&X25519).unwrap();
+        let server_pub = server_epk.compute_public_key().unwrap();
+        let mut salt_bytes = [0u8; 32];
+        aws_lc_rs::rand::fill(&mut salt_bytes).unwrap();
+
+        let conn_uuid = Uuid::new_v4();
+        let session_uuid = Uuid::new_v4();
+        let moshpits_addr: std::net::SocketAddr = "127.0.0.1:50002".parse().unwrap();
+
+        // Spawn mock server task
+        let server_handle = tokio::spawn(async move {
+            // Send PeerInitialize
+            server_writer
+                .write_frame(&Frame::PeerInitialize(
+                    server_pub.as_ref().to_vec(),
+                    salt_bytes.to_vec(),
+                ))
+                .await
+                .unwrap();
+            // Drain the Check frame that client_kex sends
+            drop(rx_out.recv().await);
+            // Send KeyAgreement, SessionToken, MoshpitsAddr
+            server_writer
+                .write_frame(&Frame::KeyAgreement(UuidWrapper::new(conn_uuid)))
+                .await
+                .unwrap();
+            server_writer
+                .write_frame(&Frame::SessionToken(UuidWrapper::new(session_uuid)))
+                .await
+                .unwrap();
+            server_writer
+                .write_frame(&Frame::MoshpitsAddr(moshpits_addr))
+                .await
+                .unwrap();
+        });
+
+        let client_epk = PrivateKey::generate(&X25519).unwrap();
+        let mut kex_reader = kex_reader;
+        kex_reader.client_kex(&client_epk).await.unwrap();
+        server_handle.await.unwrap();
+
+        // Collect all events
+        let mut events = Vec::new();
+        while let Ok(e) = rx_event_out.try_recv() {
+            events.push(e);
+        }
+
+        // Should have: KeyMaterial, HMACKeyMaterial, Uuid, SessionInfo, MoshpitsAddr
+        assert_eq!(events.len(), 5, "expected 5 kex events, got: {events:?}");
+        assert!(matches!(events[0], KexEvent::KeyMaterial(_)));
+        assert!(matches!(events[1], KexEvent::HMACKeyMaterial(_)));
+        assert!(matches!(events[2], KexEvent::Uuid(_)));
+        assert!(matches!(events[3], KexEvent::SessionInfo(_, false)));
+        assert!(matches!(events[4], KexEvent::MoshpitsAddr(_)));
     }
 }

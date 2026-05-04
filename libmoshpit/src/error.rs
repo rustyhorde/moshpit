@@ -73,6 +73,15 @@ pub enum Error {
     /// A frame was received that exceeds the maximum allowed length
     #[error("Frame too large")]
     FrameTooLarge,
+    /// A key file was not found or could not be read
+    #[error("Key file not found")]
+    KeyFileMissing,
+    /// A key file is corrupt or has an invalid format
+    #[error("Key file is corrupt or has an invalid format")]
+    KeyCorrupt,
+    /// Public key does not match private key
+    #[error("Public key does not match private key")]
+    KeyPairMismatch,
 }
 
 /// Converts an `anyhow::Error` into a suitable exit code or clap message for a CLI application.

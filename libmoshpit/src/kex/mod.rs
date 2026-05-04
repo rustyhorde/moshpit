@@ -8,7 +8,7 @@
 
 use std::{
     fmt::{self, Display, Formatter},
-    net::SocketAddr,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
 };
 
@@ -19,7 +19,6 @@ use aws_lc_rs::{
 };
 use bon::Builder;
 use getset::{CopyGetters, Getters};
-use local_ip_address::local_ip;
 use serde::{Deserialize, Serialize};
 use tokio::{
     net::{
@@ -30,7 +29,7 @@ use tokio::{
     sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
     task::JoinHandle,
 };
-use tracing::{error, trace};
+use tracing::{error, info, trace};
 use uuid::Uuid;
 
 use crate::{
@@ -297,6 +296,7 @@ pub async fn run_key_exchange<T: KexConfig>(
     })
 }
 
+#[cfg_attr(nightly, allow(clippy::too_many_lines))]
 async fn run_client_kex<T: KexConfig>(
     config: T,
     tx: UnboundedSender<Frame>,
@@ -307,16 +307,35 @@ async fn run_client_kex<T: KexConfig>(
     callbacks: HostKeyCallbacks,
 ) -> Result<(Kex, Arc<UdpSocket>, Option<ServerKex>)> {
     let (private_key_path, public_key_path) = config.key_pair_paths()?;
-    trace!("Loading private key from {}", private_key_path.display());
-    trace!("Loading public key from {}", public_key_path.display());
+    info!("Loading private key from {}", private_key_path.display());
+    info!("Loading public key from {}", public_key_path.display());
 
     // Load the moshpit public and private key
-    let (unenc_key_pair_opt, enc_key_pair_opt) = load_private_key(&private_key_path)?;
-    let (full_public_key_bytes, public_key_bytes) = load_public_key(&public_key_path)?;
+    let (unenc_key_pair_opt, enc_key_pair_opt) = load_private_key(&private_key_path)
+        .inspect_err(|e| {
+            error!(
+                "Failed to load private key from {}: {e}",
+                private_key_path.display()
+            );
+        })
+        .map_err(|_| MoshpitError::KeyFileMissing)?;
+    let (full_public_key_bytes, public_key_bytes) = load_public_key(&public_key_path)
+        .inspect_err(|e| {
+            error!(
+                "Failed to load public key from {}: {e}",
+                public_key_path.display()
+            );
+        })
+        .map_err(|_| MoshpitError::KeyFileMissing)?;
 
     let (pk, my_public_key) = if let Some(enc_key_pair) = enc_key_pair_opt {
+        info!("Private key is encrypted — invoking passphrase prompt");
         // Get the passphrase
-        if let Some(passphrase) = passphrase_fn()? {
+        if let Some(passphrase) = passphrase_fn().map_err(|e| {
+            error!("Passphrase prompt failed: {e}");
+            e
+        })? {
+            info!("Passphrase received, decrypting private key");
             let salt_bytes = enc_key_pair.salt_bytes();
             let nonce_bytes = enc_key_pair.nonce_bytes();
             let mut encrypted_private_key_bytes =
@@ -326,25 +345,46 @@ async fn run_client_kex<T: KexConfig>(
                 salt_bytes,
                 nonce_bytes,
                 &mut encrypted_private_key_bytes,
-            )?;
+            )
+            .inspect_err(|e| {
+                error!("Private key decryption failed: {e}");
+            })
+            .map_err(|_| MoshpitError::KeyCorrupt)?;
 
             let private_key = PrivateKey::from_private_key(
                 &X25519,
                 &encrypted_private_key_bytes[..AES_256_KEY_LEN],
-            )?;
-            let public_key = private_key.compute_public_key()?;
+            )
+            .inspect_err(|e| {
+                error!("Failed to parse decrypted private key bytes: {e}");
+            })
+            .map_err(|_| MoshpitError::KeyCorrupt)?;
+            let public_key = private_key
+                .compute_public_key()
+                .inspect_err(|e| {
+                    error!("Failed to compute public key from decrypted private key: {e}");
+                })
+                .map_err(|_| MoshpitError::KeyCorrupt)?;
 
             if public_key.as_ref() != public_key_bytes.as_slice() {
-                return Err(anyhow::anyhow!("Public key does not match the private key"));
+                error!(
+                    "Computed public key does not match stored public key at {}",
+                    public_key_path.display()
+                );
+                return Err(MoshpitError::KeyPairMismatch.into());
             }
+            info!("Private key decrypted and verified successfully");
             (private_key, public_key)
         } else {
-            return Err(anyhow::anyhow!("No valid private key found"));
+            error!("Passphrase prompt returned no input — cannot decrypt key");
+            return Err(MoshpitError::KeyCorrupt.into());
         }
     } else if let Some(unenc_key_pair) = unenc_key_pair_opt {
+        info!("Private key is unencrypted — no passphrase needed");
         unenc_key_pair.take()
     } else {
-        return Err(anyhow::anyhow!("No valid private key found"));
+        error!("No valid key pair found in {}", private_key_path.display());
+        return Err(MoshpitError::KeyFileMissing.into());
     };
 
     // Setup the TCP frame reader
@@ -368,12 +408,16 @@ async fn run_client_kex<T: KexConfig>(
             .maybe_host_key_mismatch_fn(host_key_mismatch_fn)
             .build();
         if let Err(e) = frame_reader.client_kex(&pk).await {
-            trace!("{e}");
+            error!("client_kex failed: {e}");
         }
     });
 
     // Send the initialize or resume-request frame with our public key
     let frame = if let Some(session_uuid) = config.resume_session_uuid() {
+        info!(
+            "Sending ResumeRequest for session {session_uuid} (user='{}')",
+            config.user().unwrap_or_default()
+        );
         Frame::ResumeRequest(
             UuidWrapper::new(session_uuid),
             config.user().unwrap_or_default().as_bytes().to_vec(),
@@ -381,6 +425,10 @@ async fn run_client_kex<T: KexConfig>(
             full_public_key_bytes,
         )
     } else {
+        info!(
+            "Sending Initialize for user='{}'",
+            config.user().unwrap_or_default()
+        );
         Frame::Initialize(
             config.user().unwrap_or_default().as_bytes().to_vec(),
             my_public_key.as_ref().to_vec(),
@@ -393,9 +441,14 @@ async fn run_client_kex<T: KexConfig>(
 
     if let Some(moshpits_addr) = kex.moshpits_addr() {
         trace!("Connecting to moshpits at {moshpits_addr}");
-        let my_local_ip = local_ip()?;
-        let socket_addr = SocketAddr::new(my_local_ip, 0);
-        let udp_listener = UdpSocket::bind(socket_addr).await?;
+        // Bind to the unspecified address on port 0 so the OS assigns both the
+        // outbound interface and an ephemeral port automatically.
+        let bind_addr = if moshpits_addr.is_ipv6() {
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
+        } else {
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+        };
+        let udp_listener = UdpSocket::bind(bind_addr).await?;
         udp_listener.connect(moshpits_addr).await?;
         let frame = Frame::MoshpitAddr(udp_listener.local_addr()?);
         tx.send(frame.clone())?;
@@ -442,5 +495,95 @@ async fn run_server_kex<T: KexConfig>(
         Err(anyhow::anyhow!(
             "Port pool is required for server key exchange"
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn kex_state_machine_server_mode_completes_after_uuid() {
+        let (tx, rx) = unbounded_channel();
+        let mut sm = KexStateMachine::builder().rx_event(rx).build();
+        let key = [1u8; 32];
+        let hmac_key = [2u8; 64];
+        let uuid = Uuid::new_v4();
+        tx.send(KexEvent::KeyMaterial(key)).unwrap();
+        tx.send(KexEvent::HMACKeyMaterial(hmac_key)).unwrap();
+        tx.send(KexEvent::Uuid(uuid)).unwrap();
+        drop(tx);
+        let kex = sm.handle_events(false).await.unwrap();
+        assert_eq!(kex.key(), key);
+        assert_eq!(kex.hmac_key(), hmac_key);
+        assert_eq!(kex.uuid(), uuid);
+        assert!(kex.moshpits_addr().is_none());
+        assert!(kex.session_uuid().is_none());
+    }
+
+    #[tokio::test]
+    async fn kex_state_machine_client_mode_full_sequence() {
+        let (tx, rx) = unbounded_channel();
+        let mut sm = KexStateMachine::builder().rx_event(rx).build();
+        let key = [3u8; 32];
+        let hmac_key = [4u8; 64];
+        let uuid = Uuid::new_v4();
+        let session_uuid = Uuid::new_v4();
+        let addr: SocketAddr = "127.0.0.1:50001".parse().unwrap();
+        tx.send(KexEvent::KeyMaterial(key)).unwrap();
+        tx.send(KexEvent::HMACKeyMaterial(hmac_key)).unwrap();
+        tx.send(KexEvent::Uuid(uuid)).unwrap();
+        tx.send(KexEvent::SessionInfo(session_uuid, false)).unwrap();
+        tx.send(KexEvent::MoshpitsAddr(addr)).unwrap();
+        let kex = sm.handle_events(true).await.unwrap();
+        assert_eq!(kex.key(), key);
+        assert_eq!(kex.hmac_key(), hmac_key);
+        assert_eq!(kex.uuid(), uuid);
+        assert_eq!(kex.session_uuid(), Some(session_uuid));
+        assert_eq!(kex.moshpits_addr(), Some(addr));
+        assert!(!kex.is_resume());
+    }
+
+    #[tokio::test]
+    async fn kex_state_machine_wrong_event_order_returns_invalid_state() {
+        let (tx, rx) = unbounded_channel();
+        let mut sm = KexStateMachine::builder().rx_event(rx).build();
+        // Send Uuid when state is AwaitingKeyMaterial — wrong order
+        tx.send(KexEvent::Uuid(Uuid::new_v4())).unwrap();
+        drop(tx);
+        let result = sm.handle_events(true).await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .downcast_ref::<MoshpitError>()
+                .is_some_and(|e| *e == MoshpitError::InvalidKexState),
+        );
+    }
+
+    #[tokio::test]
+    async fn kex_state_machine_channel_dropped_returns_invalid_state() {
+        let (tx, rx) = unbounded_channel::<KexEvent>();
+        let mut sm = KexStateMachine::builder().rx_event(rx).build();
+        // Drop sender immediately — recv() returns None, falls through to InvalidKexState
+        drop(tx);
+        let result = sm.handle_events(true).await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .downcast_ref::<MoshpitError>()
+                .is_some_and(|e| *e == MoshpitError::InvalidKexState),
+        );
+    }
+
+    #[test]
+    fn kex_mode_display_formatting() {
+        assert_eq!(format!("{}", KexMode::Client), "Client");
+        let addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        assert_eq!(
+            format!("{}", KexMode::Server(addr)),
+            "Server(127.0.0.1:12345)"
+        );
     }
 }
