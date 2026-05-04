@@ -13,9 +13,8 @@ description: |
 homepage: https://github.com/rustyhorde/moshpit
 license: MIT OR Apache-2.0
 
-overrides:
-  deb:
-    compression: xz
+deb:
+  compression: xz
 
 contents:
   # Binary

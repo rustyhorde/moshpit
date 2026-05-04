@@ -16,12 +16,12 @@ license: MIT OR Apache-2.0
 depends:
   - moshpit-keygen
 
-overrides:
-  deb:
-    compression: xz
-    scripts:
-      postinstall: packaging/debian/scripts/moshpits-postinst
-      preremove: packaging/debian/scripts/moshpits-prerm
+deb:
+  compression: xz
+
+scripts:
+  postinstall: packaging/debian/scripts/moshpits-postinst
+  preremove: packaging/debian/scripts/moshpits-prerm
 
 contents:
   # Binary
