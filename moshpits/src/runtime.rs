@@ -22,7 +22,7 @@ use std::{
 #[cfg(unix)]
 use std::{
     ffi::{CStr, CString},
-    os::unix::process::CommandExt,
+    os::unix::{fs::OpenOptionsExt as _, process::CommandExt},
     process::Stdio,
 };
 
@@ -777,9 +777,15 @@ fn spawn_pty(
                 error!("Unable to determine PTY slave tty path");
                 return;
             };
+            // O_NOCTTY: prevent the server process (a daemon/session leader with
+            // no controlling terminal) from acquiring the PTY slave as its own
+            // controlling terminal.  Without this flag, the kernel would silently
+            // assign the slave to the server's session, causing the subsequent
+            // ioctl(TIOCSCTTY) in the child to fail with EPERM.
             let slave = match std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
+                .custom_flags(libc::O_NOCTTY)
                 .open(&tty_path)
             {
                 Ok(file) => file,
@@ -1445,5 +1451,26 @@ mod test {
                 .unwrap();
         // Falls back to new session → Some(term_rx)
         assert!(maybe_rx.is_some());
+    }
+
+    // ── Phase 5: platform helper functions ────────────────────────────────────
+
+    #[cfg(all(unix, target_os = "linux"))]
+    use super::{initgroups_base_group, tiocsctty_ioctl_request};
+
+    #[cfg(all(unix, target_os = "linux"))]
+    #[test]
+    fn tiocsctty_ioctl_request_is_nonzero() {
+        // libc::TIOCSCTTY is 0x540E on Linux — must never be zero
+        assert_ne!(tiocsctty_ioctl_request(), 0);
+    }
+
+    #[cfg(all(unix, target_os = "linux"))]
+    #[test]
+    fn initgroups_base_group_roundtrip() {
+        // On Linux this is a trivial pass-through of gid_t
+        assert_eq!(initgroups_base_group(42), 42);
+        assert_eq!(initgroups_base_group(0), 0);
+        assert_eq!(initgroups_base_group(u32::MAX), u32::MAX);
     }
 }

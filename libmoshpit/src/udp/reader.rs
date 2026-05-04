@@ -1050,4 +1050,323 @@ mod tests {
             }
         }
     }
+
+    // ── Phase 1: intercept_queries ─────────────────────────────────────────────
+
+    /// Build a `UdpReader` wired with a `query_response_tx` so CSI/OSC responses
+    /// can be observed in tests.
+    async fn make_reader_with_response_rx()
+    -> (UdpReader, tokio::sync::mpsc::Receiver<EncryptedFrame>) {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (tx, rx) = tokio::sync::mpsc::channel::<EncryptedFrame>(16);
+        let reader = UdpReader::builder()
+            .socket(socket)
+            .id(Uuid::new_v4())
+            .rnk([0u8; 32])
+            .unwrap()
+            .hmac([0u8; 64])
+            .query_response_tx(tx)
+            .build();
+        (reader, rx)
+    }
+
+    fn make_emulator() -> Arc<Mutex<Emulator>> {
+        Arc::new(Mutex::new(Emulator::new(24, 80)))
+    }
+
+    // --- plain bytes passthrough ---
+
+    #[tokio::test]
+    async fn intercept_queries_plain_bytes_passthrough() {
+        let (reader, _rx) = make_reader_with_response_rx().await;
+        let emu = make_emulator();
+        let input = b"hello world";
+        let out = reader.intercept_queries(input, &emu);
+        assert_eq!(out, input);
+    }
+
+    #[tokio::test]
+    async fn intercept_queries_empty_passthrough() {
+        let (reader, _rx) = make_reader_with_response_rx().await;
+        let emu = make_emulator();
+        let out = reader.intercept_queries(b"", &emu);
+        assert!(out.is_empty());
+    }
+
+    // --- VT (0x0B) and FF (0x0C) normalisation to CR+LF ---
+
+    #[tokio::test]
+    async fn intercept_queries_vt_normalized_to_crlf() {
+        let (reader, _rx) = make_reader_with_response_rx().await;
+        let emu = make_emulator();
+        let out = reader.intercept_queries(b"\x0b", &emu);
+        assert_eq!(out, b"\r\n");
+    }
+
+    #[tokio::test]
+    async fn intercept_queries_ff_normalized_to_crlf() {
+        let (reader, _rx) = make_reader_with_response_rx().await;
+        let emu = make_emulator();
+        let out = reader.intercept_queries(b"\x0c", &emu);
+        assert_eq!(out, b"\r\n");
+    }
+
+    #[tokio::test]
+    async fn intercept_queries_multiple_vt_ff() {
+        let (reader, _rx) = make_reader_with_response_rx().await;
+        let emu = make_emulator();
+        let out = reader.intercept_queries(b"\x0ba\x0c", &emu);
+        assert_eq!(out, b"\r\na\r\n");
+    }
+
+    // --- unknown ESC sequence passes through unchanged ---
+
+    #[tokio::test]
+    async fn intercept_queries_unknown_esc_passthrough() {
+        let (reader, mut rx) = make_reader_with_response_rx().await;
+        let emu = make_emulator();
+        // ESC M (reverse index) — not a CSI or OSC, passes through unchanged
+        let input = b"\x1bM";
+        let out = reader.intercept_queries(input, &emu);
+        // Unknown ESC sequences pass through unmodified
+        assert_eq!(out, input);
+        assert!(rx.try_recv().is_err(), "no response frame for unknown ESC");
+    }
+
+    // --- CSI queries: intercept DSR (ESC[6n) ---
+
+    #[tokio::test]
+    async fn intercept_queries_csi_dsr_sends_response_and_strips_from_stdout() {
+        let (reader, mut rx) = make_reader_with_response_rx().await;
+        let emu = make_emulator();
+        // DSR: ESC [ 6 n
+        let out = reader.intercept_queries(b"\x1b[6n", &emu);
+        // The query should be stripped from output
+        assert!(out.is_empty(), "DSR query must not pass through to stdout");
+        // A response frame should have been sent
+        let frame = rx.try_recv().expect("expected a response frame");
+        let EncryptedFrame::Bytes((_id, resp)) = frame else {
+            panic!("expected Bytes frame, got {frame:?}");
+        };
+        // Response format: ESC [ row ; col R
+        let s = String::from_utf8(resp).unwrap();
+        assert!(s.starts_with("\x1b["), "response must start with ESC [");
+        assert!(s.ends_with('R'), "response must end with R");
+    }
+
+    // --- CSI DA1 (ESC[0c) ---
+
+    #[tokio::test]
+    async fn intercept_queries_csi_da1_sends_response() {
+        let (reader, mut rx) = make_reader_with_response_rx().await;
+        let emu = make_emulator();
+        let out = reader.intercept_queries(b"\x1b[0c", &emu);
+        assert!(out.is_empty(), "DA1 query must not pass through");
+        let frame = rx.try_recv().expect("expected response for DA1");
+        let EncryptedFrame::Bytes((_id, resp)) = frame else {
+            panic!("expected Bytes frame");
+        };
+        assert_eq!(resp, b"\x1b[?62c");
+    }
+
+    // --- CSI DA1 with empty param (ESC[c) ---
+
+    #[tokio::test]
+    async fn intercept_queries_csi_da1_empty_param_sends_response() {
+        let (reader, mut rx) = make_reader_with_response_rx().await;
+        let emu = make_emulator();
+        let out = reader.intercept_queries(b"\x1b[c", &emu);
+        assert!(
+            out.is_empty(),
+            "DA1 (empty param) query must not pass through"
+        );
+        let frame = rx
+            .try_recv()
+            .expect("expected response for DA1 empty param");
+        let EncryptedFrame::Bytes((_id, resp)) = frame else {
+            panic!("expected Bytes frame");
+        };
+        assert_eq!(resp, b"\x1b[?62c");
+    }
+
+    // --- CSI DA2 (ESC[>0c) ---
+
+    #[tokio::test]
+    async fn intercept_queries_csi_da2_sends_response() {
+        let (reader, mut rx) = make_reader_with_response_rx().await;
+        let emu = make_emulator();
+        let out = reader.intercept_queries(b"\x1b[>0c", &emu);
+        assert!(out.is_empty(), "DA2 query must not pass through");
+        let frame = rx.try_recv().expect("expected response for DA2");
+        let EncryptedFrame::Bytes((_id, resp)) = frame else {
+            panic!("expected Bytes frame");
+        };
+        assert_eq!(resp, b"\x1b[>1;10;0c");
+    }
+
+    // --- CSI DA3 (ESC[=0c) ---
+
+    #[tokio::test]
+    async fn intercept_queries_csi_da3_sends_response() {
+        let (reader, mut rx) = make_reader_with_response_rx().await;
+        let emu = make_emulator();
+        let out = reader.intercept_queries(b"\x1b[=0c", &emu);
+        assert!(out.is_empty(), "DA3 query must not pass through");
+        let frame = rx.try_recv().expect("expected response for DA3");
+        let EncryptedFrame::Bytes((_id, resp)) = frame else {
+            panic!("expected Bytes frame");
+        };
+        assert_eq!(resp, b"\x1bP!|00000000\x1b\\");
+    }
+
+    // --- unrecognised CSI passes through ---
+
+    #[tokio::test]
+    async fn intercept_queries_csi_unrecognised_passes_through() {
+        let (reader, mut rx) = make_reader_with_response_rx().await;
+        let emu = make_emulator();
+        // ESC [ 2 J (erase screen) — not a recognised query
+        let input = b"\x1b[2J";
+        let out = reader.intercept_queries(input, &emu);
+        assert_eq!(out, input, "unrecognised CSI must pass through unchanged");
+        assert!(rx.try_recv().is_err(), "no response frame expected");
+    }
+
+    // --- OSC 10 color query (foreground) ---
+
+    #[tokio::test]
+    async fn intercept_queries_osc10_fg_color_sends_response() {
+        let (reader, mut rx) = make_reader_with_response_rx().await;
+        let emu = make_emulator();
+        // OSC 10 ;? BEL  — foreground color query
+        let out = reader.intercept_queries(b"\x1b]10;?\x07", &emu);
+        assert!(out.is_empty(), "OSC 10 query must not pass through");
+        let frame = rx.try_recv().expect("expected OSC 10 response");
+        let EncryptedFrame::Bytes((_id, resp)) = frame else {
+            panic!("expected Bytes frame");
+        };
+        let s = String::from_utf8(resp).unwrap();
+        assert!(s.starts_with("\x1b]10;"), "response must be OSC 10");
+        assert!(s.ends_with('\x07'), "response must be BEL-terminated");
+    }
+
+    // --- OSC 11 color query (background) ---
+
+    #[tokio::test]
+    async fn intercept_queries_osc11_bg_color_sends_response() {
+        let (reader, mut rx) = make_reader_with_response_rx().await;
+        let emu = make_emulator();
+        let out = reader.intercept_queries(b"\x1b]11;?\x07", &emu);
+        assert!(out.is_empty(), "OSC 11 query must not pass through");
+        let frame = rx.try_recv().expect("expected OSC 11 response");
+        let EncryptedFrame::Bytes((_id, resp)) = frame else {
+            panic!("expected Bytes frame");
+        };
+        let s = String::from_utf8(resp).unwrap();
+        assert!(s.starts_with("\x1b]11;"), "response must be OSC 11");
+    }
+
+    // --- OSC 12 color query (cursor color) ---
+
+    #[tokio::test]
+    async fn intercept_queries_osc12_cursor_color_sends_response() {
+        let (reader, mut rx) = make_reader_with_response_rx().await;
+        let emu = make_emulator();
+        let out = reader.intercept_queries(b"\x1b]12;?\x07", &emu);
+        assert!(out.is_empty(), "OSC 12 query must not pass through");
+        let frame = rx.try_recv().expect("expected OSC 12 response");
+        let EncryptedFrame::Bytes((_id, resp)) = frame else {
+            panic!("expected Bytes frame");
+        };
+        let s = String::from_utf8(resp).unwrap();
+        assert!(s.starts_with("\x1b]12;"));
+    }
+
+    // --- unrecognised OSC passes through ---
+
+    #[tokio::test]
+    async fn intercept_queries_osc_unrecognised_passes_through() {
+        let (reader, mut rx) = make_reader_with_response_rx().await;
+        let emu = make_emulator();
+        // OSC 0 (title) — not a color query
+        let input = b"\x1b]0;title\x07";
+        let out = reader.intercept_queries(input, &emu);
+        assert_eq!(out, input, "unrecognised OSC must pass through unchanged");
+        assert!(rx.try_recv().is_err(), "no response frame expected");
+    }
+
+    // --- OSC with ST terminator (ESC \) ---
+
+    #[tokio::test]
+    async fn intercept_queries_osc_st_terminator_recognized() {
+        let (reader, mut rx) = make_reader_with_response_rx().await;
+        let emu = make_emulator();
+        // OSC 10 ;? ST  (ST = ESC \)
+        let out = reader.intercept_queries(b"\x1b]10;?\x1b\\", &emu);
+        assert!(
+            out.is_empty(),
+            "OSC 10 with ST terminator must not pass through"
+        );
+        let frame = rx.try_recv().expect("expected OSC 10 response");
+        assert!(matches!(frame, EncryptedFrame::Bytes(_)));
+    }
+
+    // --- NAK routing via handle_arrival ---
+
+    #[tokio::test]
+    async fn handle_arrival_nak_routed_to_retransmit_tx() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (retransmit_tx, mut retransmit_rx) = tokio::sync::mpsc::channel::<Vec<u64>>(4);
+        let mut reader = UdpReader::builder()
+            .socket(socket)
+            .id(Uuid::new_v4())
+            .rnk([0u8; 32])
+            .unwrap()
+            .hmac([0u8; 64])
+            .retransmit_tx(retransmit_tx)
+            .build();
+
+        let nak_frame = EncryptedFrame::Nak(vec![5, 6, 7]);
+        let ready = reader.handle_arrival(nak_frame, 0);
+        // NAK frames are consumed; not delivered to the caller
+        assert!(
+            ready.is_empty(),
+            "NAK frames must not be returned from handle_arrival"
+        );
+        // Retransmit request must have been forwarded
+        let seqs = retransmit_rx
+            .try_recv()
+            .expect("expected retransmit request");
+        assert_eq!(seqs, vec![5, 6, 7]);
+    }
+
+    // --- window give-up path in check_nak_timeouts ---
+
+    #[tokio::test]
+    async fn check_nak_timeouts_window_give_up_advances_next_seq() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let mut reader = UdpReader::builder()
+            .socket(socket)
+            .id(Uuid::new_v4())
+            .rnk([0u8; 32])
+            .unwrap()
+            .hmac([0u8; 64])
+            .build();
+
+        // Simulate a gap at seq=0: record it in gap_first_seen
+        let _ = reader.gap_first_seen.insert(0, Instant::now());
+        // Set highest_seq_seen so that seq=0 is outside the retransmit window
+        reader.highest_seq_seen = RETRANSMIT_WINDOW + 1;
+        // next_seq is still 0
+        assert_eq!(reader.next_seq, 0);
+
+        let delivered = reader.check_nak_timeouts();
+        // Gap is given up on — next_seq should advance past it
+        assert_eq!(
+            reader.next_seq, 1,
+            "next_seq must advance past given-up gap"
+        );
+        assert!(reader.gap_first_seen.is_empty(), "gap must be cleared");
+        assert!(delivered.is_empty(), "no buffered frames to deliver");
+    }
 }

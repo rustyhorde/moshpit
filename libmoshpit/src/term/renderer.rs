@@ -264,4 +264,123 @@ mod tests {
         assert!(s.contains('a'));
         assert!(s.contains("\x1b[u"));
     }
+
+    // ── Phase 3: extended renderer tests ──────────────────────────────────────
+
+    #[test]
+    fn render_with_content_produces_nonempty_output() {
+        let mut r = Renderer::new(24, 80);
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        parser.process(b"hello");
+        let out = r.render(parser.screen(), &[], None);
+        assert!(!out.is_empty());
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("hello"));
+    }
+
+    #[test]
+    fn render_second_call_with_no_change_produces_minimal_output() {
+        let mut r = Renderer::new(24, 80);
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        parser.process(b"hello");
+        // First render (full refresh)
+        let first = r.render(parser.screen(), &[], None);
+        assert!(!first.is_empty());
+        // Second render without changes: only cursor positioning
+        let second = r.render(parser.screen(), &[], None);
+        // Should be much shorter than the first (just cursor move, no cell redraws)
+        assert!(
+            second.len() < first.len(),
+            "second render with no changes should be smaller"
+        );
+    }
+
+    #[test]
+    fn render_with_overlay_cell_contains_overlay_character() {
+        use super::super::prediction::OverlayCell;
+        let mut r = Renderer::new(24, 80);
+        let parser = vt100::Parser::new(24, 80, 0);
+        let overlays = vec![OverlayCell {
+            row: 0,
+            col: 0,
+            ch: 'Z',
+            flagged: false,
+        }];
+        let out = r.render(parser.screen(), &overlays, None);
+        let s = String::from_utf8_lossy(&out);
+        assert!(
+            s.contains('Z'),
+            "overlay character 'Z' must appear in output"
+        );
+    }
+
+    #[test]
+    fn render_with_flagged_overlay_contains_underline_sequence() {
+        use super::super::prediction::OverlayCell;
+        let mut r = Renderer::new(24, 80);
+        let parser = vt100::Parser::new(24, 80, 0);
+        let overlays = vec![OverlayCell {
+            row: 2,
+            col: 5,
+            ch: 'F',
+            flagged: true,
+        }];
+        let out = r.render(parser.screen(), &overlays, None);
+        let s = String::from_utf8_lossy(&out);
+        // Underline on: ESC[4m, underline off: ESC[24m
+        assert!(
+            s.contains("\x1b[4m"),
+            "flagged overlay must include underline-on sequence"
+        );
+        assert!(
+            s.contains("\x1b[24m"),
+            "flagged overlay must include underline-off sequence"
+        );
+        assert!(s.contains('F'));
+    }
+
+    #[test]
+    fn render_with_cursor_override_positions_cursor_at_override() {
+        use super::super::prediction::OverlayCursor;
+        let mut r = Renderer::new(24, 80);
+        let parser = vt100::Parser::new(24, 80, 0);
+        let cursor_override = Some(OverlayCursor { row: 5, col: 10 });
+        let out = r.render(parser.screen(), &[], cursor_override);
+        let s = String::from_utf8_lossy(&out);
+        // Cursor should be positioned at row+1=6, col+1=11 (1-based)
+        assert!(
+            s.contains("\x1b[6;11H"),
+            "cursor override must position cursor at (6,11): {s:?}"
+        );
+    }
+
+    #[test]
+    fn paint_overlays_to_ansi_with_cursor_positions_cursor() {
+        use super::super::prediction::OverlayCursor;
+        let out = paint_overlays_to_ansi(&[], Some(OverlayCursor { row: 3, col: 7 }));
+        let s = String::from_utf8_lossy(&out);
+        assert!(
+            s.contains("\x1b[4;8H"),
+            "cursor overlay must produce ESC[4;8H: {s:?}"
+        );
+    }
+
+    #[test]
+    fn render_size_change_triggers_full_refresh() {
+        let mut r = Renderer::new(24, 80);
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        parser.process(b"hello");
+        // First render to initialise
+        let first = r.render(parser.screen(), &[], None);
+        assert!(!first.is_empty());
+        // Change size
+        r.set_size(30, 100);
+        assert!(!r.initialized);
+        // Next render should be a full refresh (larger output)
+        let mut parser2 = vt100::Parser::new(30, 100, 0);
+        parser2.process(b"world");
+        let after_resize = r.render(parser2.screen(), &[], None);
+        assert!(r.initialized);
+        assert!(!after_resize.is_empty());
+    }
 }
