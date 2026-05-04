@@ -402,9 +402,9 @@ impl KexReader {
             SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
         };
-        let udp_bind_addr = SocketAddr::new(unspecified, next_port);
-        trace!("binding moshpits socket at {udp_bind_addr}");
-        let udp_listener = UdpSocket::bind(udp_bind_addr).await?;
+        let bind_addr = SocketAddr::new(unspecified, next_port);
+        trace!("binding moshpits UDP socket at {bind_addr}");
+        let udp_listener = UdpSocket::bind(bind_addr).await?;
         Ok(Arc::new(udp_listener))
     }
 

@@ -8,7 +8,7 @@
 
 use std::{
     fmt::{self, Display, Formatter},
-    net::SocketAddr,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
 };
 
@@ -19,7 +19,6 @@ use aws_lc_rs::{
 };
 use bon::Builder;
 use getset::{CopyGetters, Getters};
-use local_ip_address::local_ip;
 use serde::{Deserialize, Serialize};
 use tokio::{
     net::{
@@ -393,9 +392,14 @@ async fn run_client_kex<T: KexConfig>(
 
     if let Some(moshpits_addr) = kex.moshpits_addr() {
         trace!("Connecting to moshpits at {moshpits_addr}");
-        let my_local_ip = local_ip()?;
-        let socket_addr = SocketAddr::new(my_local_ip, 0);
-        let udp_listener = UdpSocket::bind(socket_addr).await?;
+        // Bind to the unspecified address on port 0 so the OS assigns both the
+        // outbound interface and an ephemeral port automatically.
+        let bind_addr = if moshpits_addr.is_ipv6() {
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
+        } else {
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+        };
+        let udp_listener = UdpSocket::bind(bind_addr).await?;
         udp_listener.connect(moshpits_addr).await?;
         let frame = Frame::MoshpitAddr(udp_listener.local_addr()?);
         tx.send(frame.clone())?;
