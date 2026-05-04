@@ -22,7 +22,7 @@ use std::{
 #[cfg(unix)]
 use std::{
     ffi::{CStr, CString},
-    os::unix::process::CommandExt,
+    os::unix::{fs::OpenOptionsExt as _, process::CommandExt},
     process::Stdio,
 };
 
@@ -777,9 +777,15 @@ fn spawn_pty(
                 error!("Unable to determine PTY slave tty path");
                 return;
             };
+            // O_NOCTTY: prevent the server process (a daemon/session leader with
+            // no controlling terminal) from acquiring the PTY slave as its own
+            // controlling terminal.  Without this flag, the kernel would silently
+            // assign the slave to the server's session, causing the subsequent
+            // ioctl(TIOCSCTTY) in the child to fail with EPERM.
             let slave = match std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
+                .custom_flags(libc::O_NOCTTY)
                 .open(&tty_path)
             {
                 Ok(file) => file,
