@@ -1,7 +1,8 @@
 on:
   push:
     tags:
-      - "v[0-9]*"
+      - "v[0-9]*"        # full release
+      - "v[0-9]*-rc*"    # pre-release / build test only
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -131,6 +132,7 @@ jobs:
   # ── Create GitHub release ────────────────────────────────────────────────────
   release:
     name: 📝 Create GitHub Release 📝
+    if: "!contains(github.ref_name, '-rc')"
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -170,6 +172,7 @@ jobs:
   # ── Update PKGBUILDs ─────────────────────────────────────────────────────────
   update-pkgbuilds:
     name: 📦 Update PKGBUILDs 📦
+    if: "!contains(github.ref_name, '-rc')"
     needs: [build, release]
     runs-on: ubuntu-latest
     permissions:
@@ -283,6 +286,7 @@ jobs:
   # ── Push to AUR ──────────────────────────────────────────────────────────────
   aur-publish:
     name: 🏹 Publish to AUR 🏹
+    if: "!contains(github.ref_name, '-rc')"
     needs: [build, update-pkgbuilds]
     runs-on: ubuntu-latest
     permissions:
