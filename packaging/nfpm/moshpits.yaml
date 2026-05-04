@@ -18,15 +18,19 @@ depends:
 
 deb:
   compression: xz
-  scripts:
-    postinstall: packaging/nfpm/scripts/moshpits-postinst
-    preremove: packaging/nfpm/scripts/moshpits-prerm
 
 rpm:
   compression: xz
-  scripts:
-    postinstall: packaging/nfpm/scripts/moshpits-rpm-postinst
-    preremove: packaging/nfpm/scripts/moshpits-rpm-prerm
+
+overrides:
+  deb:
+    scripts:
+      postinstall: packaging/nfpm/scripts/moshpits-postinst
+      preremove: packaging/nfpm/scripts/moshpits-prerm
+  rpm:
+    scripts:
+      postinstall: packaging/nfpm/scripts/moshpits-rpm-postinst
+      preremove: packaging/nfpm/scripts/moshpits-rpm-prerm
 
 contents:
   # Binary
