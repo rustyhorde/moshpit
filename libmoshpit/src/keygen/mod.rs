@@ -656,7 +656,7 @@ mod tests {
         let decrypt_res =
             decrypt_private_key("test", salt_bytes, nonce_bytes, &mut decrypted_bytes);
         assert!(decrypt_res.is_ok());
-        assert!(encrypted_private_key_bytes != decrypted_bytes);
+        assert_ne!(encrypted_private_key_bytes, decrypted_bytes);
         Ok(())
     }
 
