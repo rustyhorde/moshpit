@@ -1,0 +1,15 @@
+#!/bin/sh
+set -e
+
+# $1 == 0: removal
+# $1 == 1: upgrade (no-op — new package's %post will handle it)
+case "$1" in
+    0)
+        if systemctl is-active --quiet mps.service 2>/dev/null; then
+            systemctl stop mps.service || true
+        fi
+        if systemctl is-enabled --quiet mps.service 2>/dev/null; then
+            systemctl disable mps.service || true
+        fi
+        ;;
+esac

@@ -1,5 +1,5 @@
 # nfpm package configuration for moshpit-keygen
-# Build with: VERSION=<ver> nfpm package --config packaging/debian/moshpit-keygen.yaml --packager deb --target release-assets/
+# Build with: VERSION=<ver> nfpm package --config packaging/nfpm/moshpit-keygen.yaml --packager deb|rpm --target release-assets/
 name: moshpit-keygen
 arch: amd64
 version: ${VERSION}
@@ -14,6 +14,9 @@ homepage: https://github.com/rustyhorde/moshpit
 license: MIT OR Apache-2.0
 
 deb:
+  compression: xz
+
+rpm:
   compression: xz
 
 contents:
