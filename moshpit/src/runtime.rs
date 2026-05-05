@@ -1324,18 +1324,14 @@ fn session_file_path_in_home(home: &Path, host: &str, port: u16) -> Option<PathB
     Some(home.join(".mp").join("sessions").join(name))
 }
 
-/// Read a persisted session UUID from disk, if any.
-fn read_session_uuid(host: &str, port: u16) -> Option<Uuid> {
-    let path = session_file_path(host, port)?;
-    let mut file = std::fs::File::open(&path).ok()?;
+fn read_uuid_from_path(path: &Path) -> Option<Uuid> {
+    let mut file = std::fs::File::open(path).ok()?;
     let mut buf = String::new();
     let _ = file.read_to_string(&mut buf).ok();
     buf.trim().parse::<Uuid>().ok()
 }
 
-/// Write (or overwrite) the session UUID to disk.
-fn write_session_uuid(host: &str, port: u16, session_uuid: Uuid) -> Result<()> {
-    let path = session_file_path(host, port).ok_or_else(|| anyhow::anyhow!("no home dir"))?;
+fn write_uuid_to_path(path: &Path, uuid: Uuid) -> Result<()> {
     if let Some(parent) = path.parent() {
         #[cfg(unix)]
         {
@@ -1358,15 +1354,26 @@ fn write_session_uuid(host: &str, port: u16, session_uuid: Uuid) -> Result<()> {
                 .create(true)
                 .truncate(true)
                 .mode(0o600)
-                .open(&path)?
+                .open(path)?
         }
         #[cfg(not(unix))]
         {
-            std::fs::File::create(&path)?
+            std::fs::File::create(path)?
         }
     };
-    write!(file, "{session_uuid}")?;
+    write!(file, "{uuid}")?;
     Ok(())
+}
+
+/// Read a persisted session UUID from disk, if any.
+fn read_session_uuid(host: &str, port: u16) -> Option<Uuid> {
+    read_uuid_from_path(&session_file_path(host, port)?)
+}
+
+/// Write (or overwrite) the session UUID to disk.
+fn write_session_uuid(host: &str, port: u16, session_uuid: Uuid) -> Result<()> {
+    let path = session_file_path(host, port).ok_or_else(|| anyhow::anyhow!("no home dir"))?;
+    write_uuid_to_path(&path, session_uuid)
 }
 
 #[cfg(test)]
@@ -1434,6 +1441,57 @@ mod tests {
         let _ = countdown_reconnect_banner(&tx, 0, 1, 10, &token).await;
         let msg = rx.recv().await.unwrap();
         assert!(String::from_utf8_lossy(&msg).contains("attempt #1"));
+    }
+
+    #[tokio::test]
+    async fn countdown_banner_pre_cancelled_returns_true() {
+        let (tx, mut _rx) = channel(10);
+        let token = CancellationToken::new();
+        token.cancel();
+        let result = countdown_reconnect_banner(&tx, 0, 1, 10, &token).await;
+        assert!(result);
+    }
+
+    #[test]
+    fn read_uuid_from_path_missing_file_returns_none() {
+        let dir = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        let path = dir.join("session");
+        assert!(read_uuid_from_path(&path).is_none());
+    }
+
+    #[test]
+    fn read_uuid_from_path_garbage_returns_none() {
+        let dir = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session");
+        std::fs::write(&path, "not-a-uuid").unwrap();
+        assert!(read_uuid_from_path(&path).is_none());
+    }
+
+    #[test]
+    fn write_and_read_uuid_roundtrip() {
+        let dir = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        let path = dir.join("sub").join("session");
+        let uuid = Uuid::new_v4();
+        write_uuid_to_path(&path, uuid).unwrap();
+        assert_eq!(read_uuid_from_path(&path), Some(uuid));
+    }
+
+    #[test]
+    fn write_uuid_creates_parent_directories() {
+        let dir = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        let nested = dir.join("a").join("b").join("c").join("session");
+        let uuid = Uuid::new_v4();
+        write_uuid_to_path(&nested, uuid).unwrap();
+        assert!(nested.exists());
+    }
+
+    #[test]
+    fn client_id_path_is_under_dot_mp() {
+        let home = TestHome::new();
+        let path = client_id_path(home.path());
+        assert!(path.starts_with(home.path().join(".mp")));
+        assert_eq!(path.file_name().unwrap(), "client_id");
     }
 
     #[test]
@@ -1748,8 +1806,100 @@ mod tests {
         assert_eq!(key_event_to_bytes(ctrl_char('7')), b"\x1f");
     }
 
-    #[cfg(windows)]
-    mod windows_key_encoding {
+    mod escape_listener {
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+        use tokio::sync::mpsc::channel;
+        use tokio_util::sync::CancellationToken;
+
+        use super::super::run_escape_listener;
+
+        #[tokio::test]
+        async fn done_token_cancels_listener_without_triggering_exit() {
+            let (tx, rx) = channel::<Vec<u8>>(8);
+            let kb_rx = Arc::new(Mutex::new(rx));
+            let exit_token = CancellationToken::new();
+            let done_token = CancellationToken::new();
+            done_token.cancel();
+            run_escape_listener(kb_rx, exit_token.clone(), done_token).await;
+            assert!(!exit_token.is_cancelled());
+            drop(tx);
+        }
+
+        #[tokio::test]
+        async fn sender_drop_stops_listener_without_triggering_exit() {
+            let (tx, rx) = channel::<Vec<u8>>(8);
+            let kb_rx = Arc::new(Mutex::new(rx));
+            let exit_token = CancellationToken::new();
+            let done_token = CancellationToken::new();
+            drop(tx);
+            run_escape_listener(kb_rx, exit_token.clone(), done_token).await;
+            assert!(!exit_token.is_cancelled());
+        }
+
+        #[tokio::test]
+        async fn normal_bytes_do_not_trigger_exit() {
+            let (tx, rx) = channel::<Vec<u8>>(8);
+            let kb_rx = Arc::new(Mutex::new(rx));
+            let exit_token = CancellationToken::new();
+            let done_token = CancellationToken::new();
+            tx.send(b"hello".to_vec()).await.unwrap();
+            drop(tx);
+            run_escape_listener(kb_rx, exit_token.clone(), done_token).await;
+            assert!(!exit_token.is_cancelled());
+        }
+
+        #[tokio::test]
+        async fn escape_prefix_then_non_dot_does_not_trigger_exit() {
+            let (tx, rx) = channel::<Vec<u8>>(8);
+            let kb_rx = Arc::new(Mutex::new(rx));
+            let exit_token = CancellationToken::new();
+            let done_token = CancellationToken::new();
+            // 0x1E followed by 'x' — state resets to Normal
+            tx.send(vec![0x1E, b'x']).await.unwrap();
+            drop(tx);
+            run_escape_listener(kb_rx, exit_token.clone(), done_token).await;
+            assert!(!exit_token.is_cancelled());
+        }
+
+        #[tokio::test]
+        async fn repeated_escape_prefix_stays_pending_without_triggering_exit() {
+            let (tx, rx) = channel::<Vec<u8>>(8);
+            let kb_rx = Arc::new(Mutex::new(rx));
+            let exit_token = CancellationToken::new();
+            let done_token = CancellationToken::new();
+            // Multiple 0x1E bytes — stays in PendingDot but never completes
+            tx.send(vec![0x1E, 0x1E, 0x1E]).await.unwrap();
+            drop(tx);
+            run_escape_listener(kb_rx, exit_token.clone(), done_token).await;
+            assert!(!exit_token.is_cancelled());
+        }
+
+        #[tokio::test]
+        async fn full_sequence_in_one_chunk_triggers_exit() {
+            let (tx, rx) = channel::<Vec<u8>>(8);
+            let kb_rx = Arc::new(Mutex::new(rx));
+            let exit_token = CancellationToken::new();
+            let done_token = CancellationToken::new();
+            tx.send(vec![0x1E, 0x2E]).await.unwrap();
+            run_escape_listener(kb_rx, exit_token.clone(), done_token).await;
+            assert!(exit_token.is_cancelled());
+        }
+
+        #[tokio::test]
+        async fn sequence_split_across_sends_triggers_exit() {
+            let (tx, rx) = channel::<Vec<u8>>(8);
+            let kb_rx = Arc::new(Mutex::new(rx));
+            let exit_token = CancellationToken::new();
+            let done_token = CancellationToken::new();
+            tx.send(vec![0x1E]).await.unwrap();
+            tx.send(vec![0x2E]).await.unwrap();
+            run_escape_listener(kb_rx, exit_token.clone(), done_token).await;
+            assert!(exit_token.is_cancelled());
+        }
+    }
+
+    mod key_encoding {
         use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 
         use super::super::key_event_to_bytes;
@@ -1840,11 +1990,71 @@ mod tests {
         }
 
         #[test]
+        fn navigation_keys_with_modifier() {
+            let ctrl = KeyModifiers::CONTROL;
+            assert_eq!(
+                key_event_to_bytes(press_mod(KeyCode::Home, ctrl)),
+                b"\x1b[1;5H"
+            );
+            assert_eq!(
+                key_event_to_bytes(press_mod(KeyCode::End, ctrl)),
+                b"\x1b[1;5F"
+            );
+            assert_eq!(
+                key_event_to_bytes(press_mod(KeyCode::Insert, ctrl)),
+                b"\x1b[2;5~"
+            );
+            assert_eq!(
+                key_event_to_bytes(press_mod(KeyCode::Delete, ctrl)),
+                b"\x1b[3;5~"
+            );
+            assert_eq!(
+                key_event_to_bytes(press_mod(KeyCode::PageUp, ctrl)),
+                b"\x1b[5;5~"
+            );
+            assert_eq!(
+                key_event_to_bytes(press_mod(KeyCode::PageDown, ctrl)),
+                b"\x1b[6;5~"
+            );
+        }
+
+        #[test]
         fn function_keys() {
             assert_eq!(key_event_to_bytes(press(KeyCode::F(1))), b"\x1bOP");
+            assert_eq!(key_event_to_bytes(press(KeyCode::F(2))), b"\x1bOQ");
+            assert_eq!(key_event_to_bytes(press(KeyCode::F(3))), b"\x1bOR");
             assert_eq!(key_event_to_bytes(press(KeyCode::F(4))), b"\x1bOS");
             assert_eq!(key_event_to_bytes(press(KeyCode::F(5))), b"\x1b[15~");
+            assert_eq!(key_event_to_bytes(press(KeyCode::F(6))), b"\x1b[17~");
+            assert_eq!(key_event_to_bytes(press(KeyCode::F(7))), b"\x1b[18~");
+            assert_eq!(key_event_to_bytes(press(KeyCode::F(8))), b"\x1b[19~");
+            assert_eq!(key_event_to_bytes(press(KeyCode::F(9))), b"\x1b[20~");
+            assert_eq!(key_event_to_bytes(press(KeyCode::F(10))), b"\x1b[21~");
+            assert_eq!(key_event_to_bytes(press(KeyCode::F(11))), b"\x1b[23~");
             assert_eq!(key_event_to_bytes(press(KeyCode::F(12))), b"\x1b[24~");
+        }
+
+        #[test]
+        fn function_keys_out_of_range_produce_no_bytes() {
+            assert!(key_event_to_bytes(press(KeyCode::F(0))).is_empty());
+            assert!(key_event_to_bytes(press(KeyCode::F(13))).is_empty());
+        }
+
+        #[test]
+        fn function_keys_with_modifier() {
+            let shift = KeyModifiers::SHIFT;
+            assert_eq!(
+                key_event_to_bytes(press_mod(KeyCode::F(1), shift)),
+                b"\x1b[1;2P"
+            );
+            assert_eq!(
+                key_event_to_bytes(press_mod(KeyCode::F(5), shift)),
+                b"\x1b[15;2~"
+            );
+            assert_eq!(
+                key_event_to_bytes(press_mod(KeyCode::F(12), shift)),
+                b"\x1b[24;2~"
+            );
         }
 
         #[test]
@@ -1854,6 +2064,7 @@ mod tests {
             assert_eq!(key_event_to_bytes(press(KeyCode::Tab)), b"\t");
             assert_eq!(key_event_to_bytes(press(KeyCode::BackTab)), b"\x1b[Z");
             assert_eq!(key_event_to_bytes(press(KeyCode::Esc)), b"\x1b");
+            assert_eq!(key_event_to_bytes(press(KeyCode::Null)), b"\x00");
         }
 
         #[test]
@@ -1861,6 +2072,14 @@ mod tests {
             assert_eq!(key_event_to_bytes(press(KeyCode::Char('a'))), b"a");
             assert_eq!(key_event_to_bytes(press(KeyCode::Char('Z'))), b"Z");
             assert_eq!(key_event_to_bytes(press(KeyCode::Char('!'))), b"!");
+        }
+
+        #[test]
+        fn non_ascii_char_encodes_utf8() {
+            assert_eq!(
+                key_event_to_bytes(press(KeyCode::Char('\u{00e9}'))), // é
+                "\u{00e9}".as_bytes()
+            );
         }
 
         #[test]
@@ -1878,11 +2097,29 @@ mod tests {
                 key_event_to_bytes(press_mod(KeyCode::Char('z'), ctrl)),
                 b"\x1a"
             );
+            // Ctrl-@ → NUL (0x00)
+            assert_eq!(
+                key_event_to_bytes(press_mod(KeyCode::Char('@'), ctrl)),
+                b"\x00"
+            );
+            // Ctrl-[ → ESC (0x1B)
+            assert_eq!(
+                key_event_to_bytes(press_mod(KeyCode::Char('['), ctrl)),
+                b"\x1b"
+            );
             // Ctrl-^ is the moshpit escape prefix
             assert_eq!(
                 key_event_to_bytes(press_mod(KeyCode::Char('^'), ctrl)),
                 b"\x1e"
             );
+        }
+
+        #[test]
+        fn ctrl_non_ascii_encodes_utf8_fallback() {
+            let ctrl = KeyModifiers::CONTROL;
+            // Non-ASCII + Ctrl has no standard control code; falls through to UTF-8
+            let result = key_event_to_bytes(press_mod(KeyCode::Char('\u{00e9}'), ctrl));
+            assert_eq!(result, "\u{00e9}".as_bytes());
         }
 
         #[test]
@@ -1892,6 +2129,30 @@ mod tests {
                 key_event_to_bytes(press_mod(KeyCode::Char('a'), alt)),
                 b"\x1ba"
             );
+            assert_eq!(
+                key_event_to_bytes(press_mod(KeyCode::Char('z'), alt)),
+                b"\x1bz"
+            );
+        }
+
+        #[test]
+        fn ctrl_alt_chars_prefix_with_escape_and_control_code() {
+            let ctrl_alt = KeyModifiers::CONTROL | KeyModifiers::ALT;
+            // Ctrl+Alt+a → ESC + 0x01
+            assert_eq!(
+                key_event_to_bytes(press_mod(KeyCode::Char('a'), ctrl_alt)),
+                b"\x1b\x01"
+            );
+        }
+
+        #[test]
+        fn ctrl_alt_non_ascii_utf8_fallback() {
+            let ctrl_alt = KeyModifiers::CONTROL | KeyModifiers::ALT;
+            // Non-ASCII + Ctrl+Alt falls through to UTF-8 with ESC prefix
+            let result = key_event_to_bytes(press_mod(KeyCode::Char('\u{00e9}'), ctrl_alt));
+            let mut expected = b"\x1b".to_vec();
+            expected.extend_from_slice("\u{00e9}".as_bytes());
+            assert_eq!(result, expected);
         }
     }
 }
