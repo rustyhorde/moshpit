@@ -211,6 +211,81 @@ async fn run_escape_listener(
     }
 }
 
+/// Sets up the stdin reader thread on the first successful connection, or clears
+/// the reconnect banner on subsequent reconnects.  Returns the shared keyboard
+/// channel.
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn ensure_stdin_reader(
+    kb_rx_shared: &mut Option<Arc<Mutex<Receiver<Vec<u8>>>>>,
+    stdout_tx: &Sender<Vec<u8>>,
+) -> Result<Arc<Mutex<Receiver<Vec<u8>>>>> {
+    if let Some(ref rx) = *kb_rx_shared {
+        clear_reconnect_banner(stdout_tx).await;
+        return Ok(rx.clone());
+    }
+    enable_raw_mode()?;
+    let (kb_tx, kb_rx) = channel::<Vec<u8>>(64);
+    let _stdin_thread = thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match stdin().read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if kb_tx.blocking_send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    let shared = Arc::new(Mutex::new(kb_rx));
+    *kb_rx_shared = Some(shared.clone());
+    Ok(shared)
+}
+
+/// Runs the reconnect countdown, optionally alongside an escape-sequence
+/// listener when stdin raw mode is already active.  Returns `true` if the user
+/// pressed `Ctrl-^ .` to quit.
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn countdown_with_escape(
+    stdout_tx: &Sender<Vec<u8>>,
+    backoff_secs: u64,
+    attempt: u32,
+    max_backoff_secs: u64,
+    exit_token: &CancellationToken,
+    kb_rx: Option<Arc<Mutex<Receiver<Vec<u8>>>>>,
+) -> bool {
+    let Some(kb_rx_ref) = kb_rx else {
+        // Raw mode not yet active (first attempt); no escape detection.
+        let _ = countdown_reconnect_banner(
+            stdout_tx,
+            backoff_secs,
+            attempt,
+            max_backoff_secs,
+            exit_token,
+        )
+        .await;
+        return false;
+    };
+    let escape_done = CancellationToken::new();
+    let escape_handle = spawn(run_escape_listener(
+        kb_rx_ref,
+        exit_token.clone(),
+        escape_done.clone(),
+    ));
+    let exiting = countdown_reconnect_banner(
+        stdout_tx,
+        backoff_secs,
+        attempt,
+        max_backoff_secs,
+        exit_token,
+    )
+    .await;
+    escape_done.cancel();
+    drop(escape_handle.await);
+    exiting
+}
+
 /// Persistent reconnect loop.  Runs until the shell exits (via `process::exit`).
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn run_session_loop(
@@ -257,35 +332,10 @@ async fn run_session_loop(
         {
             Ok((kex, udp_arc, nak_timeout)) => {
                 backoff = Duration::from_secs(2);
-
                 // Enable raw mode and start the stdin reader on the first
-                // successful kex.  By this point the passphrase has been
-                // collected and cached, so raw mode won't interfere with it
-                // on reconnects.
-                let kb_rx = if let Some(ref rx) = kb_rx_shared {
-                    // This is a reconnect — clear the banner before the session starts.
-                    clear_reconnect_banner(&stdout_tx).await;
-                    rx.clone()
-                } else {
-                    enable_raw_mode()?;
-                    let (kb_tx, kb_rx) = channel::<Vec<u8>>(64);
-                    let _stdin_thread = thread::spawn(move || {
-                        let mut buf = [0u8; 4096];
-                        loop {
-                            match stdin().read(&mut buf) {
-                                Ok(0) | Err(_) => break,
-                                Ok(n) => {
-                                    if kb_tx.blocking_send(buf[..n].to_vec()).is_err() {
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    });
-                    let shared = Arc::new(Mutex::new(kb_rx));
-                    kb_rx_shared = Some(shared.clone());
-                    shared
-                };
+                // successful kex (passphrase already cached; raw mode won't
+                // interfere).  On reconnects, clears the banner instead.
+                let kb_rx = ensure_stdin_reader(&mut kb_rx_shared, &stdout_tx).await?;
 
                 run_udp_session(
                     kex,
@@ -329,38 +379,16 @@ async fn run_session_loop(
                 if kb_rx_shared.is_none() {
                     *pass_cache.lock().unwrap() = PassCache::Uncached;
                 }
-                let should_exit = if let Some(kb_rx_ref) = &kb_rx_shared {
-                    // Raw mode is active — run escape listener alongside the countdown.
-                    let escape_done = CancellationToken::new();
-                    let escape_handle = spawn(run_escape_listener(
-                        kb_rx_ref.clone(),
-                        exit_token.clone(),
-                        escape_done.clone(),
-                    ));
-                    let exiting = countdown_reconnect_banner(
-                        &stdout_tx,
-                        backoff.as_secs(),
-                        reconnect_attempt,
-                        max_backoff.as_secs(),
-                        &exit_token,
-                    )
-                    .await;
-                    escape_done.cancel();
-                    drop(escape_handle.await);
-                    exiting
-                } else {
-                    // Raw mode not yet active (first attempt); no escape detection.
-                    let _ = countdown_reconnect_banner(
-                        &stdout_tx,
-                        backoff.as_secs(),
-                        reconnect_attempt,
-                        max_backoff.as_secs(),
-                        &exit_token,
-                    )
-                    .await;
-                    false
-                };
-                if should_exit {
+                if countdown_with_escape(
+                    &stdout_tx,
+                    backoff.as_secs(),
+                    reconnect_attempt,
+                    max_backoff.as_secs(),
+                    &exit_token,
+                    kb_rx_shared.clone(),
+                )
+                .await
+                {
                     clear_reconnect_banner(&stdout_tx).await;
                     let msg = b"\r\n\x1b[0m[moshpit] Disconnected.\r\n";
                     drop(stdout_tx.send(msg.to_vec()).await);
