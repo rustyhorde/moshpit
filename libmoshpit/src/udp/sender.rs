@@ -24,7 +24,7 @@ use tokio::{
     net::UdpSocket,
     select,
     sync::{mpsc::Receiver, oneshot},
-    time::interval,
+    time::{interval, sleep},
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -75,6 +75,11 @@ pub struct UdpSender {
     /// ensuring the UDP socket is connected (via `recv_from` bootstrap in
     /// `server_frame_loop`) before `send()` is called.
     peer_discovered_rx: Option<oneshot::Receiver<()>>,
+    /// Optional additional delay applied after peer discovery (server-side only).
+    /// When set, `frame_loop` sleeps for this duration after the NAT address is
+    /// confirmed, giving slow NAT devices extra time to stabilise the binding
+    /// before bulk terminal data starts flowing.
+    warmup_delay: Option<Duration>,
 }
 
 impl UdpSender {
@@ -90,6 +95,12 @@ impl UdpSender {
         // This prevents send() from being called on an unconnected socket.
         if let Some(rx) = self.peer_discovered_rx.take() {
             let _ = rx.await;
+        }
+        // Optional warmup delay: after peer discovery, pause before sending any
+        // data frames so that slow NAT devices have extra time to establish the
+        // bidirectional binding.  Configured via `--warmup-delay` on the server.
+        if let Some(delay) = self.warmup_delay {
+            sleep(delay).await;
         }
         let mut retransmit_active = true;
         // Drain pending_retransmit at the same cadence as NAK_CHECK_INTERVAL on the

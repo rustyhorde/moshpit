@@ -238,6 +238,8 @@ async fn run_session_loop(
                     udp_arc,
                     nak_timeout,
                     kb_rx,
+                    config.nat_warmup(),
+                    config.nat_warmup_count(),
                     stdout_tx.clone(),
                     config.predict(),
                 )
@@ -421,13 +423,15 @@ async fn connect_and_kex(
 
 /// Set up UDP tasks for one session and wait until the server disconnects.
 #[cfg_attr(nightly, allow(clippy::too_many_lines))]
+#[cfg_attr(nightly, allow(clippy::too_many_arguments))]
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn run_udp_session(
     kex: Kex,
     udp_arc: Arc<UdpSocket>,
     nak_timeout: Duration,
     kb_rx: Arc<Mutex<Receiver<Vec<u8>>>>,
-
+    nat_warmup: bool,
+    nat_warmup_count: u32,
     stdout_tx: Sender<Vec<u8>>,
     display_preference: DisplayPreference,
 ) -> Result<()> {
@@ -464,6 +468,21 @@ async fn run_udp_session(
     let (cols, rows) = terminal_size().map_or((80, 24), |(w, h)| (w.0, h.0));
     tx.send(EncryptedFrame::Resize((kex.uuid_wrapper(), cols, rows)))
         .await?;
+
+    // NAT warmup: send keepalive frames before the session loop begins so that
+    // a bidirectional NAT binding is established before the server starts
+    // sending terminal diffs.  This prevents the initial burst of dropped
+    // packets that causes head-of-line blocking under some NAT configurations.
+    // Off by default; opt in with `--nat-warmup` / `MOSHPIT_NAT_WARMUP=true`.
+    if nat_warmup {
+        info!(
+            "NAT warmup: sending {} keepalive frame(s)",
+            nat_warmup_count
+        );
+        for _ in 0..nat_warmup_count {
+            tx.send(EncryptedFrame::Keepalive).await?;
+        }
+    }
 
     // ── Prediction / emulator shared state ──────────────────────────────────
     let emulator = Arc::new(std::sync::Mutex::new(Emulator::new(rows, cols)));

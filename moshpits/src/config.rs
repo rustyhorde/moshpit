@@ -43,6 +43,11 @@ pub(crate) struct Config {
     private_key_path: Option<String>,
     #[getset(get = "pub(crate)")]
     public_key_path: Option<String>,
+    /// Optional extra delay (ms) after peer discovery before bulk data is sent.
+    /// Provides margin for NAT bindings on slow NAT devices.
+    #[serde(default)]
+    #[getset(get_copy = "pub(crate)")]
+    warmup_delay_ms: Option<u64>,
 }
 
 impl Config {

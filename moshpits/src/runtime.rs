@@ -407,6 +407,7 @@ async fn handle_connection(
     let (sock_read, sock_write) = socket.into_split();
     let port_pool = config.port_pool();
     let session_registry = config.session_registry();
+    let warmup_delay = config.warmup_delay_ms().map(Duration::from_millis);
     let (kex, udp_arc, skex_opt) =
         run_key_exchange(config, sock_read, sock_write, || Ok(None), None, None).await?;
     info!("Key exchange completed with moshpit");
@@ -477,6 +478,7 @@ async fn handle_connection(
         .hmac(kex.hmac_key())
         .rnk(kex.key())?
         .peer_discovered_rx(peer_discovered_rx)
+        .maybe_warmup_delay(warmup_delay)
         .build();
 
     let reader_token = conn_token.clone();

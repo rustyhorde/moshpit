@@ -52,11 +52,24 @@ pub(crate) struct Config {
     #[serde(default)]
     #[getset(get_copy = "pub(crate)")]
     predict: DisplayPreference,
+    /// Send NAT warmup keepalives before the UDP session loop starts.
+    /// Off by default; enable with `--nat-warmup` / `MOSHPIT_NAT_WARMUP=true`.
+    #[serde(default)]
+    #[getset(get_copy = "pub(crate)")]
+    nat_warmup: bool,
+    /// Number of keepalive frames to send during NAT warmup.
+    #[serde(default = "Config::default_nat_warmup_count")]
+    #[getset(get_copy = "pub(crate)")]
+    nat_warmup_count: u32,
 }
 
 impl Config {
     fn default_max_reconnect_backoff_secs() -> u64 {
         3600
+    }
+
+    fn default_nat_warmup_count() -> u32 {
+        3
     }
 
     fn load_key_paths(&self) -> Result<(PathBuf, PathBuf)> {
@@ -89,6 +102,8 @@ impl Default for Config {
             resume_session_uuid: None,
             max_reconnect_backoff_secs: Self::default_max_reconnect_backoff_secs(),
             predict: DisplayPreference::default(),
+            nat_warmup: false,
+            nat_warmup_count: Self::default_nat_warmup_count(),
         }
     }
 }
