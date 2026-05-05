@@ -211,6 +211,271 @@ async fn run_escape_listener(
     }
 }
 
+/// Converts a crossterm `KeyEvent` to the ANSI escape bytes a Unix terminal
+/// would produce for the same keypress.  Returns an empty `Vec` for events that
+/// should not be forwarded (key-release events, unhandled keys, etc.).
+///
+/// Used on Windows where the console is event-based: `std::io::stdin().read()`
+/// does not receive arrow keys or other special keys because they arrive as
+/// `KEY_EVENT` records rather than bytes.  `crossterm::event::read()` bridges
+/// this gap by calling `ReadConsoleInput` internally and exposing a typed
+/// `KeyEvent`; this function then re-encodes those events as the ANSI sequences
+/// the server expects.
+#[cfg(windows)]
+fn key_event_to_bytes(event: crossterm::event::KeyEvent) -> Vec<u8> {
+    use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+    // Only forward press events; Windows always reports both press and release.
+    if event.kind != KeyEventKind::Press {
+        return Vec::new();
+    }
+    let mods = event.modifiers;
+    let ctrl = mods.contains(KeyModifiers::CONTROL);
+    let alt = mods.contains(KeyModifiers::ALT);
+    let shift = mods.contains(KeyModifiers::SHIFT);
+    // CSI modifier parameter: 1 + shift + alt*2 + ctrl*4
+    let mod_param = 1u8 + (shift as u8) + (alt as u8 * 2) + (ctrl as u8 * 4);
+    let has_mod = mod_param > 1;
+
+    match event.code {
+        KeyCode::Char(c) => {
+            let mut out = Vec::new();
+            if ctrl {
+                let byte = match c.to_ascii_lowercase() {
+                    '@' => 0x00,
+                    'a'..='z' => c.to_ascii_lowercase() as u8 - b'a' + 1,
+                    '[' => 0x1b,
+                    '\\' => 0x1c,
+                    ']' => 0x1d,
+                    '^' => 0x1e,
+                    '_' => 0x1f,
+                    _ => {
+                        let mut buf = [0u8; 4];
+                        let s = c.encode_utf8(&mut buf);
+                        if alt {
+                            out.push(0x1b);
+                        }
+                        out.extend_from_slice(s.as_bytes());
+                        return out;
+                    }
+                };
+                if alt {
+                    out.push(0x1b);
+                }
+                out.push(byte);
+                return out;
+            }
+            if alt {
+                out.push(0x1b);
+            }
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            out
+        }
+        KeyCode::Backspace => vec![0x7f],
+        KeyCode::Enter => vec![b'\r'],
+        KeyCode::Tab => vec![b'\t'],
+        KeyCode::BackTab => b"\x1b[Z".to_vec(),
+        KeyCode::Esc => vec![0x1b],
+        KeyCode::Null => vec![0x00],
+        KeyCode::Up => {
+            if has_mod {
+                format!("\x1b[1;{mod_param}A").into_bytes()
+            } else {
+                b"\x1b[A".to_vec()
+            }
+        }
+        KeyCode::Down => {
+            if has_mod {
+                format!("\x1b[1;{mod_param}B").into_bytes()
+            } else {
+                b"\x1b[B".to_vec()
+            }
+        }
+        KeyCode::Right => {
+            if has_mod {
+                format!("\x1b[1;{mod_param}C").into_bytes()
+            } else {
+                b"\x1b[C".to_vec()
+            }
+        }
+        KeyCode::Left => {
+            if has_mod {
+                format!("\x1b[1;{mod_param}D").into_bytes()
+            } else {
+                b"\x1b[D".to_vec()
+            }
+        }
+        KeyCode::Home => {
+            if has_mod {
+                format!("\x1b[1;{mod_param}H").into_bytes()
+            } else {
+                b"\x1b[H".to_vec()
+            }
+        }
+        KeyCode::End => {
+            if has_mod {
+                format!("\x1b[1;{mod_param}F").into_bytes()
+            } else {
+                b"\x1b[F".to_vec()
+            }
+        }
+        KeyCode::Insert => {
+            if has_mod {
+                format!("\x1b[2;{mod_param}~").into_bytes()
+            } else {
+                b"\x1b[2~".to_vec()
+            }
+        }
+        KeyCode::Delete => {
+            if has_mod {
+                format!("\x1b[3;{mod_param}~").into_bytes()
+            } else {
+                b"\x1b[3~".to_vec()
+            }
+        }
+        KeyCode::PageUp => {
+            if has_mod {
+                format!("\x1b[5;{mod_param}~").into_bytes()
+            } else {
+                b"\x1b[5~".to_vec()
+            }
+        }
+        KeyCode::PageDown => {
+            if has_mod {
+                format!("\x1b[6;{mod_param}~").into_bytes()
+            } else {
+                b"\x1b[6~".to_vec()
+            }
+        }
+        KeyCode::F(n) => match n {
+            1 => {
+                if has_mod {
+                    format!("\x1b[1;{mod_param}P").into_bytes()
+                } else {
+                    b"\x1bOP".to_vec()
+                }
+            }
+            2 => {
+                if has_mod {
+                    format!("\x1b[1;{mod_param}Q").into_bytes()
+                } else {
+                    b"\x1bOQ".to_vec()
+                }
+            }
+            3 => {
+                if has_mod {
+                    format!("\x1b[1;{mod_param}R").into_bytes()
+                } else {
+                    b"\x1bOR".to_vec()
+                }
+            }
+            4 => {
+                if has_mod {
+                    format!("\x1b[1;{mod_param}S").into_bytes()
+                } else {
+                    b"\x1bOS".to_vec()
+                }
+            }
+            5 => {
+                if has_mod {
+                    format!("\x1b[15;{mod_param}~").into_bytes()
+                } else {
+                    b"\x1b[15~".to_vec()
+                }
+            }
+            6 => {
+                if has_mod {
+                    format!("\x1b[17;{mod_param}~").into_bytes()
+                } else {
+                    b"\x1b[17~".to_vec()
+                }
+            }
+            7 => {
+                if has_mod {
+                    format!("\x1b[18;{mod_param}~").into_bytes()
+                } else {
+                    b"\x1b[18~".to_vec()
+                }
+            }
+            8 => {
+                if has_mod {
+                    format!("\x1b[19;{mod_param}~").into_bytes()
+                } else {
+                    b"\x1b[19~".to_vec()
+                }
+            }
+            9 => {
+                if has_mod {
+                    format!("\x1b[20;{mod_param}~").into_bytes()
+                } else {
+                    b"\x1b[20~".to_vec()
+                }
+            }
+            10 => {
+                if has_mod {
+                    format!("\x1b[21;{mod_param}~").into_bytes()
+                } else {
+                    b"\x1b[21~".to_vec()
+                }
+            }
+            11 => {
+                if has_mod {
+                    format!("\x1b[23;{mod_param}~").into_bytes()
+                } else {
+                    b"\x1b[23~".to_vec()
+                }
+            }
+            12 => {
+                if has_mod {
+                    format!("\x1b[24;{mod_param}~").into_bytes()
+                } else {
+                    b"\x1b[24~".to_vec()
+                }
+            }
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
+/// Windows stdin reader: uses `crossterm::event::read()` which calls
+/// `ReadConsoleInput` internally, so arrow keys and all other special keys are
+/// received as typed `KeyEvent`s and re-encoded as ANSI escape sequences.
+#[cfg(windows)]
+fn stdin_reader_loop(kb_tx: &Sender<Vec<u8>>) {
+    use crossterm::event::{Event, read};
+    loop {
+        match read() {
+            Ok(Event::Key(key_event)) => {
+                let bytes = key_event_to_bytes(key_event);
+                if !bytes.is_empty() && kb_tx.blocking_send(bytes).is_err() {
+                    break;
+                }
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+}
+
+/// Unix stdin reader: the terminal driver translates all key presses—including
+/// arrow keys—into ANSI escape sequences before they reach `stdin`, so a plain
+/// `read()` is sufficient.
+#[cfg(not(windows))]
+fn stdin_reader_loop(kb_tx: &Sender<Vec<u8>>) {
+    let mut buf = [0u8; 4096];
+    loop {
+        match stdin().read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if kb_tx.blocking_send(buf[..n].to_vec()).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
 /// Sets up the stdin reader thread on the first successful connection, or clears
 /// the reconnect banner on subsequent reconnects.  Returns the shared keyboard
 /// channel.
@@ -225,19 +490,7 @@ async fn ensure_stdin_reader(
     }
     enable_raw_mode()?;
     let (kb_tx, kb_rx) = channel::<Vec<u8>>(64);
-    let _stdin_thread = thread::spawn(move || {
-        let mut buf = [0u8; 4096];
-        loop {
-            match stdin().read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if kb_tx.blocking_send(buf[..n].to_vec()).is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-    });
+    let _stdin_thread = thread::spawn(move || stdin_reader_loop(&kb_tx));
     let shared = Arc::new(Mutex::new(kb_rx));
     *kb_rx_shared = Some(shared.clone());
     Ok(shared)
@@ -1429,5 +1682,152 @@ mod tests {
             err.downcast_ref::<FatalKexError>().is_some(),
             "missing key file should produce FatalKexError, got: {err}"
         );
+    }
+
+    #[cfg(windows)]
+    mod windows_key_encoding {
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+
+        use super::super::key_event_to_bytes;
+
+        fn press(code: KeyCode) -> KeyEvent {
+            KeyEvent {
+                code,
+                modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Press,
+                state: KeyEventState::empty(),
+            }
+        }
+
+        fn press_mod(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+            KeyEvent {
+                code,
+                modifiers: mods,
+                kind: KeyEventKind::Press,
+                state: KeyEventState::empty(),
+            }
+        }
+
+        fn release(code: KeyCode) -> KeyEvent {
+            KeyEvent {
+                code,
+                modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Release,
+                state: KeyEventState::empty(),
+            }
+        }
+
+        #[test]
+        fn release_events_produce_no_bytes() {
+            assert!(key_event_to_bytes(release(KeyCode::Char('a'))).is_empty());
+            assert!(key_event_to_bytes(release(KeyCode::Up)).is_empty());
+        }
+
+        #[test]
+        fn arrow_keys_produce_csi_sequences() {
+            assert_eq!(key_event_to_bytes(press(KeyCode::Up)), b"\x1b[A");
+            assert_eq!(key_event_to_bytes(press(KeyCode::Down)), b"\x1b[B");
+            assert_eq!(key_event_to_bytes(press(KeyCode::Right)), b"\x1b[C");
+            assert_eq!(key_event_to_bytes(press(KeyCode::Left)), b"\x1b[D");
+        }
+
+        #[test]
+        fn arrow_keys_with_shift_use_modifier_param() {
+            let shift = KeyModifiers::SHIFT;
+            assert_eq!(
+                key_event_to_bytes(press_mod(KeyCode::Up, shift)),
+                b"\x1b[1;2A"
+            );
+            assert_eq!(
+                key_event_to_bytes(press_mod(KeyCode::Down, shift)),
+                b"\x1b[1;2B"
+            );
+            assert_eq!(
+                key_event_to_bytes(press_mod(KeyCode::Right, shift)),
+                b"\x1b[1;2C"
+            );
+            assert_eq!(
+                key_event_to_bytes(press_mod(KeyCode::Left, shift)),
+                b"\x1b[1;2D"
+            );
+        }
+
+        #[test]
+        fn arrow_keys_with_ctrl_use_modifier_param() {
+            let ctrl = KeyModifiers::CONTROL;
+            assert_eq!(
+                key_event_to_bytes(press_mod(KeyCode::Up, ctrl)),
+                b"\x1b[1;5A"
+            );
+            assert_eq!(
+                key_event_to_bytes(press_mod(KeyCode::Left, ctrl)),
+                b"\x1b[1;5D"
+            );
+        }
+
+        #[test]
+        fn navigation_keys() {
+            assert_eq!(key_event_to_bytes(press(KeyCode::Home)), b"\x1b[H");
+            assert_eq!(key_event_to_bytes(press(KeyCode::End)), b"\x1b[F");
+            assert_eq!(key_event_to_bytes(press(KeyCode::Insert)), b"\x1b[2~");
+            assert_eq!(key_event_to_bytes(press(KeyCode::Delete)), b"\x1b[3~");
+            assert_eq!(key_event_to_bytes(press(KeyCode::PageUp)), b"\x1b[5~");
+            assert_eq!(key_event_to_bytes(press(KeyCode::PageDown)), b"\x1b[6~");
+        }
+
+        #[test]
+        fn function_keys() {
+            assert_eq!(key_event_to_bytes(press(KeyCode::F(1))), b"\x1bOP");
+            assert_eq!(key_event_to_bytes(press(KeyCode::F(4))), b"\x1bOS");
+            assert_eq!(key_event_to_bytes(press(KeyCode::F(5))), b"\x1b[15~");
+            assert_eq!(key_event_to_bytes(press(KeyCode::F(12))), b"\x1b[24~");
+        }
+
+        #[test]
+        fn simple_keys() {
+            assert_eq!(key_event_to_bytes(press(KeyCode::Backspace)), b"\x7f");
+            assert_eq!(key_event_to_bytes(press(KeyCode::Enter)), b"\r");
+            assert_eq!(key_event_to_bytes(press(KeyCode::Tab)), b"\t");
+            assert_eq!(key_event_to_bytes(press(KeyCode::BackTab)), b"\x1b[Z");
+            assert_eq!(key_event_to_bytes(press(KeyCode::Esc)), b"\x1b");
+        }
+
+        #[test]
+        fn printable_chars() {
+            assert_eq!(key_event_to_bytes(press(KeyCode::Char('a'))), b"a");
+            assert_eq!(key_event_to_bytes(press(KeyCode::Char('Z'))), b"Z");
+            assert_eq!(key_event_to_bytes(press(KeyCode::Char('!'))), b"!");
+        }
+
+        #[test]
+        fn ctrl_chars_produce_control_codes() {
+            let ctrl = KeyModifiers::CONTROL;
+            assert_eq!(
+                key_event_to_bytes(press_mod(KeyCode::Char('a'), ctrl)),
+                b"\x01"
+            );
+            assert_eq!(
+                key_event_to_bytes(press_mod(KeyCode::Char('c'), ctrl)),
+                b"\x03"
+            );
+            assert_eq!(
+                key_event_to_bytes(press_mod(KeyCode::Char('z'), ctrl)),
+                b"\x1a"
+            );
+            // Ctrl-^ is the moshpit escape prefix
+            assert_eq!(
+                key_event_to_bytes(press_mod(KeyCode::Char('^'), ctrl)),
+                b"\x1e"
+            );
+        }
+
+        #[test]
+        fn alt_chars_prefix_with_escape() {
+            let alt = KeyModifiers::ALT;
+            assert_eq!(
+                key_event_to_bytes(press_mod(KeyCode::Char('a'), alt)),
+                b"\x1ba"
+            );
+        }
     }
 }
