@@ -222,61 +222,51 @@ async fn run_escape_listener(
 /// `KeyEvent`; this function then re-encodes those events as the ANSI sequences
 /// the server expects.
 #[cfg(windows)]
-fn key_event_to_bytes(event: crossterm::event::KeyEvent) -> Vec<u8> {
-    use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
-    // Only forward press events; Windows always reports both press and release.
-    if event.kind != KeyEventKind::Press {
-        return Vec::new();
-    }
-    let mods = event.modifiers;
-    let ctrl = mods.contains(KeyModifiers::CONTROL);
-    let alt = mods.contains(KeyModifiers::ALT);
-    let shift = mods.contains(KeyModifiers::SHIFT);
-    // CSI modifier parameter: 1 + shift + alt*2 + ctrl*4
-    let mod_param = 1u8 + (shift as u8) + (alt as u8 * 2) + (ctrl as u8 * 4);
-    let has_mod = mod_param > 1;
-
-    match event.code {
-        KeyCode::Char(c) => {
-            let mut out = Vec::new();
-            if ctrl {
-                let byte = match c.to_ascii_lowercase() {
-                    '@' => 0x00,
-                    'a'..='z' => c.to_ascii_lowercase() as u8 - b'a' + 1,
-                    '[' => 0x1b,
-                    '\\' => 0x1c,
-                    ']' => 0x1d,
-                    '^' => 0x1e,
-                    '_' => 0x1f,
-                    _ => {
-                        let mut buf = [0u8; 4];
-                        let s = c.encode_utf8(&mut buf);
-                        if alt {
-                            out.push(0x1b);
-                        }
-                        out.extend_from_slice(s.as_bytes());
-                        return out;
-                    }
-                };
+fn encode_char_key(c: char, ctrl: bool, alt: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    if ctrl {
+        let byte = match c.to_ascii_lowercase() {
+            '@' => 0x00,
+            'a'..='z' => c.to_ascii_lowercase() as u8 - b'a' + 1,
+            '[' => 0x1b,
+            '\\' => 0x1c,
+            ']' => 0x1d,
+            '^' => 0x1e,
+            '_' => 0x1f,
+            _ => {
+                let mut buf = [0u8; 4];
+                let s = c.encode_utf8(&mut buf);
                 if alt {
                     out.push(0x1b);
                 }
-                out.push(byte);
+                out.extend_from_slice(s.as_bytes());
                 return out;
             }
-            if alt {
-                out.push(0x1b);
-            }
-            let mut buf = [0u8; 4];
-            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-            out
+        };
+        if alt {
+            out.push(0x1b);
         }
-        KeyCode::Backspace => vec![0x7f],
-        KeyCode::Enter => vec![b'\r'],
-        KeyCode::Tab => vec![b'\t'],
-        KeyCode::BackTab => b"\x1b[Z".to_vec(),
-        KeyCode::Esc => vec![0x1b],
-        KeyCode::Null => vec![0x00],
+        out.push(byte);
+        return out;
+    }
+
+    if alt {
+        out.push(0x1b);
+    }
+    let mut buf = [0u8; 4];
+    out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+    out
+}
+
+#[cfg(windows)]
+fn encode_nav_key(
+    code: crossterm::event::KeyCode,
+    has_mod: bool,
+    mod_param: u8,
+) -> Option<Vec<u8>> {
+    use crossterm::event::KeyCode;
+
+    let bytes = match code {
         KeyCode::Up => {
             if has_mod {
                 format!("\x1b[1;{mod_param}A").into_bytes()
@@ -347,94 +337,127 @@ fn key_event_to_bytes(event: crossterm::event::KeyEvent) -> Vec<u8> {
                 b"\x1b[6~".to_vec()
             }
         }
-        KeyCode::F(n) => match n {
-            1 => {
-                if has_mod {
-                    format!("\x1b[1;{mod_param}P").into_bytes()
-                } else {
-                    b"\x1bOP".to_vec()
-                }
+        _ => return None,
+    };
+    Some(bytes)
+}
+
+#[cfg(windows)]
+fn encode_function_key(n: u8, has_mod: bool, mod_param: u8) -> Vec<u8> {
+    match n {
+        1 => {
+            if has_mod {
+                format!("\x1b[1;{mod_param}P").into_bytes()
+            } else {
+                b"\x1bOP".to_vec()
             }
-            2 => {
-                if has_mod {
-                    format!("\x1b[1;{mod_param}Q").into_bytes()
-                } else {
-                    b"\x1bOQ".to_vec()
-                }
+        }
+        2 => {
+            if has_mod {
+                format!("\x1b[1;{mod_param}Q").into_bytes()
+            } else {
+                b"\x1bOQ".to_vec()
             }
-            3 => {
-                if has_mod {
-                    format!("\x1b[1;{mod_param}R").into_bytes()
-                } else {
-                    b"\x1bOR".to_vec()
-                }
+        }
+        3 => {
+            if has_mod {
+                format!("\x1b[1;{mod_param}R").into_bytes()
+            } else {
+                b"\x1bOR".to_vec()
             }
-            4 => {
-                if has_mod {
-                    format!("\x1b[1;{mod_param}S").into_bytes()
-                } else {
-                    b"\x1bOS".to_vec()
-                }
+        }
+        4 => {
+            if has_mod {
+                format!("\x1b[1;{mod_param}S").into_bytes()
+            } else {
+                b"\x1bOS".to_vec()
             }
-            5 => {
-                if has_mod {
-                    format!("\x1b[15;{mod_param}~").into_bytes()
-                } else {
-                    b"\x1b[15~".to_vec()
-                }
+        }
+        5 => {
+            if has_mod {
+                format!("\x1b[15;{mod_param}~").into_bytes()
+            } else {
+                b"\x1b[15~".to_vec()
             }
-            6 => {
-                if has_mod {
-                    format!("\x1b[17;{mod_param}~").into_bytes()
-                } else {
-                    b"\x1b[17~".to_vec()
-                }
+        }
+        6 => {
+            if has_mod {
+                format!("\x1b[17;{mod_param}~").into_bytes()
+            } else {
+                b"\x1b[17~".to_vec()
             }
-            7 => {
-                if has_mod {
-                    format!("\x1b[18;{mod_param}~").into_bytes()
-                } else {
-                    b"\x1b[18~".to_vec()
-                }
+        }
+        7 => {
+            if has_mod {
+                format!("\x1b[18;{mod_param}~").into_bytes()
+            } else {
+                b"\x1b[18~".to_vec()
             }
-            8 => {
-                if has_mod {
-                    format!("\x1b[19;{mod_param}~").into_bytes()
-                } else {
-                    b"\x1b[19~".to_vec()
-                }
+        }
+        8 => {
+            if has_mod {
+                format!("\x1b[19;{mod_param}~").into_bytes()
+            } else {
+                b"\x1b[19~".to_vec()
             }
-            9 => {
-                if has_mod {
-                    format!("\x1b[20;{mod_param}~").into_bytes()
-                } else {
-                    b"\x1b[20~".to_vec()
-                }
+        }
+        9 => {
+            if has_mod {
+                format!("\x1b[20;{mod_param}~").into_bytes()
+            } else {
+                b"\x1b[20~".to_vec()
             }
-            10 => {
-                if has_mod {
-                    format!("\x1b[21;{mod_param}~").into_bytes()
-                } else {
-                    b"\x1b[21~".to_vec()
-                }
+        }
+        10 => {
+            if has_mod {
+                format!("\x1b[21;{mod_param}~").into_bytes()
+            } else {
+                b"\x1b[21~".to_vec()
             }
-            11 => {
-                if has_mod {
-                    format!("\x1b[23;{mod_param}~").into_bytes()
-                } else {
-                    b"\x1b[23~".to_vec()
-                }
+        }
+        11 => {
+            if has_mod {
+                format!("\x1b[23;{mod_param}~").into_bytes()
+            } else {
+                b"\x1b[23~".to_vec()
             }
-            12 => {
-                if has_mod {
-                    format!("\x1b[24;{mod_param}~").into_bytes()
-                } else {
-                    b"\x1b[24~".to_vec()
-                }
+        }
+        12 => {
+            if has_mod {
+                format!("\x1b[24;{mod_param}~").into_bytes()
+            } else {
+                b"\x1b[24~".to_vec()
             }
-            _ => Vec::new(),
-        },
+        }
         _ => Vec::new(),
+    }
+}
+
+#[cfg(windows)]
+fn key_event_to_bytes(event: crossterm::event::KeyEvent) -> Vec<u8> {
+    use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+    // Only forward press events; Windows always reports both press and release.
+    if event.kind != KeyEventKind::Press {
+        return Vec::new();
+    }
+    let mods = event.modifiers;
+    let ctrl = mods.contains(KeyModifiers::CONTROL);
+    let alt = mods.contains(KeyModifiers::ALT);
+    let shift = mods.contains(KeyModifiers::SHIFT);
+    // CSI modifier parameter: 1 + shift + alt*2 + ctrl*4
+    let mod_param = 1u8 + u8::from(shift) + (u8::from(alt) * 2) + (u8::from(ctrl) * 4);
+    let has_mod = mod_param > 1;
+
+    match event.code {
+        KeyCode::Char(c) => encode_char_key(c, ctrl, alt),
+        KeyCode::Backspace => vec![0x7f],
+        KeyCode::Enter => vec![b'\r'],
+        KeyCode::Tab => vec![b'\t'],
+        KeyCode::BackTab => b"\x1b[Z".to_vec(),
+        KeyCode::Esc => vec![0x1b],
+        KeyCode::Null => vec![0x00],
+        KeyCode::F(n) => encode_function_key(n, has_mod, mod_param),
+        code => encode_nav_key(code, has_mod, mod_param).unwrap_or_default(),
     }
 }
 
