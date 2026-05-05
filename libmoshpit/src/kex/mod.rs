@@ -450,8 +450,6 @@ async fn run_client_kex<T: KexConfig>(
         };
         let udp_listener = UdpSocket::bind(bind_addr).await?;
         udp_listener.connect(moshpits_addr).await?;
-        let frame = Frame::MoshpitAddr(udp_listener.local_addr()?);
-        tx.send(frame.clone())?;
         Ok((kex, Arc::new(udp_listener), None))
     } else {
         Err(MoshpitError::InvalidMoshpitsAddress.into())

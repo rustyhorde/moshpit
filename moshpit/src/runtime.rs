@@ -12,9 +12,12 @@ use std::{
     io::{Read as _, Write as _, stdin, stdout},
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[cfg(target_family = "unix")]
@@ -22,7 +25,7 @@ use std::os::unix::fs::DirBuilderExt;
 
 use anyhow::{Context as _, Result};
 use clap::Parser as _;
-use crossterm::terminal::enable_raw_mode;
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use dialoguer::{Confirm, Password};
 use libmoshpit::{
     DisplayPreference, Emulator, EncryptedFrame, Kex, KexConfig as _, KexMode, KeyPair,
@@ -117,6 +120,13 @@ impl std::fmt::Display for FatalKexError {
 
 impl std::error::Error for FatalKexError {}
 
+#[derive(Clone, Copy, Default)]
+enum EscapeState {
+    #[default]
+    Normal,
+    PendingDot,
+}
+
 /// Show a mosh-style reconnecting banner at the top of the terminal.
 ///
 /// The banner is white-on-blue, occupies the entire first row, and is
@@ -129,7 +139,7 @@ async fn show_reconnect_banner(stdout_tx: &Sender<Vec<u8>>) {
     // ESC[K          – erase to end of line (fills line with blue)
     // ESC[0m         – reset attributes
     // ESC[u          – restore cursor position
-    let msg = b"\x1b[s\x1b[1;1H\x1b[44;97;1m [moshpit] server unreachable, reconnecting... \x1b[K\x1b[0m\x1b[u";
+    let msg = b"\x1b[s\x1b[1;1H\x1b[44;97;1m [moshpit] server unreachable, reconnecting... (Ctrl-^ . to quit) \x1b[K\x1b[0m\x1b[u";
     drop(stdout_tx.send(msg.to_vec()).await);
 }
 
@@ -141,25 +151,388 @@ async fn clear_reconnect_banner(stdout_tx: &Sender<Vec<u8>>) {
 }
 
 /// Redraw the banner once per second, counting down from `total_secs` to 0.
+/// Returns `true` if the user pressed the escape sequence (`Ctrl-^ .`) to quit.
 async fn countdown_reconnect_banner(
     stdout_tx: &Sender<Vec<u8>>,
     total_secs: u64,
     attempt: u32,
     max_backoff_secs: u64,
-) {
+    exit_token: &CancellationToken,
+) -> bool {
     for remaining in (0..=total_secs).rev() {
         let msg = format!(
             "\x1b[s\x1b[1;1H\x1b[44;97;1m [moshpit] server unreachable, reconnecting \
-(attempt #{attempt}, {remaining}s, max {max_backoff_secs}s)... \x1b[K\x1b[0m\x1b[u"
+(attempt #{attempt}, {remaining}s, max {max_backoff_secs}s, Ctrl-^ . to quit)... \x1b[K\x1b[0m\x1b[u"
         );
         drop(stdout_tx.send(msg.into_bytes()).await);
         if remaining > 0 {
-            time::sleep(Duration::from_secs(1)).await;
+            select! {
+                () = exit_token.cancelled() => return true,
+                () = time::sleep(Duration::from_secs(1)) => {}
+            }
+        }
+    }
+    exit_token.is_cancelled()
+}
+
+/// Holds the `kb_rx` mutex during reconnect countdowns and detects `Ctrl-^ .`.
+/// Cancels `exit_token` when the escape sequence is detected, then returns.
+/// Stops when `done_token` is cancelled (countdown finished normally).
+async fn run_escape_listener(
+    kb_rx: Arc<Mutex<Receiver<Vec<u8>>>>,
+    exit_token: CancellationToken,
+    done_token: CancellationToken,
+) {
+    let mut state = EscapeState::Normal;
+    let mut rx = kb_rx.lock().await;
+    loop {
+        select! {
+            () = done_token.cancelled() => break,
+            data = rx.recv() => match data {
+                None => break,
+                Some(data) => {
+                    for &byte in &data {
+                        state = match state {
+                            EscapeState::Normal => {
+                                if byte == 0x1E { EscapeState::PendingDot } else { EscapeState::Normal }
+                            }
+                            EscapeState::PendingDot => {
+                                if byte == 0x2E {
+                                    exit_token.cancel();
+                                    return;
+                                } else if byte == 0x1E {
+                                    EscapeState::PendingDot
+                                } else {
+                                    EscapeState::Normal
+                                }
+                            }
+                        };
+                    }
+                }
+            }
         }
     }
 }
 
+fn encode_char_key(c: char, ctrl: bool, alt: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    if ctrl {
+        let byte = match c.to_ascii_lowercase() {
+            '@' => 0x00,
+            'a'..='z' => c.to_ascii_lowercase() as u8 - b'a' + 1,
+            '[' => 0x1b,
+            // crossterm's Unix parser maps 0x1C-0x1F to Char('4'-'7') + CONTROL
+            // (e.g. Ctrl+6 / Ctrl+^ → 0x1E → Char('6') + CONTROL).  Accepting
+            // both the digit and the traditional symbol form keeps behaviour
+            // consistent across platforms and terminal emulators.
+            '\\' | '4' => 0x1c,
+            ']' | '5' => 0x1d,
+            '^' | '6' => 0x1e,
+            '_' | '7' => 0x1f,
+            _ => {
+                let mut buf = [0u8; 4];
+                let s = c.encode_utf8(&mut buf);
+                if alt {
+                    out.push(0x1b);
+                }
+                out.extend_from_slice(s.as_bytes());
+                return out;
+            }
+        };
+        if alt {
+            out.push(0x1b);
+        }
+        out.push(byte);
+        return out;
+    }
+
+    if alt {
+        out.push(0x1b);
+    }
+    let mut buf = [0u8; 4];
+    out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+    out
+}
+
+fn encode_nav_key(
+    code: crossterm::event::KeyCode,
+    has_mod: bool,
+    mod_param: u8,
+) -> Option<Vec<u8>> {
+    use crossterm::event::KeyCode;
+
+    let bytes = match code {
+        KeyCode::Up => {
+            if has_mod {
+                format!("\x1b[1;{mod_param}A").into_bytes()
+            } else {
+                b"\x1b[A".to_vec()
+            }
+        }
+        KeyCode::Down => {
+            if has_mod {
+                format!("\x1b[1;{mod_param}B").into_bytes()
+            } else {
+                b"\x1b[B".to_vec()
+            }
+        }
+        KeyCode::Right => {
+            if has_mod {
+                format!("\x1b[1;{mod_param}C").into_bytes()
+            } else {
+                b"\x1b[C".to_vec()
+            }
+        }
+        KeyCode::Left => {
+            if has_mod {
+                format!("\x1b[1;{mod_param}D").into_bytes()
+            } else {
+                b"\x1b[D".to_vec()
+            }
+        }
+        KeyCode::Home => {
+            if has_mod {
+                format!("\x1b[1;{mod_param}H").into_bytes()
+            } else {
+                b"\x1b[H".to_vec()
+            }
+        }
+        KeyCode::End => {
+            if has_mod {
+                format!("\x1b[1;{mod_param}F").into_bytes()
+            } else {
+                b"\x1b[F".to_vec()
+            }
+        }
+        KeyCode::Insert => {
+            if has_mod {
+                format!("\x1b[2;{mod_param}~").into_bytes()
+            } else {
+                b"\x1b[2~".to_vec()
+            }
+        }
+        KeyCode::Delete => {
+            if has_mod {
+                format!("\x1b[3;{mod_param}~").into_bytes()
+            } else {
+                b"\x1b[3~".to_vec()
+            }
+        }
+        KeyCode::PageUp => {
+            if has_mod {
+                format!("\x1b[5;{mod_param}~").into_bytes()
+            } else {
+                b"\x1b[5~".to_vec()
+            }
+        }
+        KeyCode::PageDown => {
+            if has_mod {
+                format!("\x1b[6;{mod_param}~").into_bytes()
+            } else {
+                b"\x1b[6~".to_vec()
+            }
+        }
+        _ => return None,
+    };
+    Some(bytes)
+}
+
+fn encode_function_key(n: u8, has_mod: bool, mod_param: u8) -> Vec<u8> {
+    match n {
+        1 => {
+            if has_mod {
+                format!("\x1b[1;{mod_param}P").into_bytes()
+            } else {
+                b"\x1bOP".to_vec()
+            }
+        }
+        2 => {
+            if has_mod {
+                format!("\x1b[1;{mod_param}Q").into_bytes()
+            } else {
+                b"\x1bOQ".to_vec()
+            }
+        }
+        3 => {
+            if has_mod {
+                format!("\x1b[1;{mod_param}R").into_bytes()
+            } else {
+                b"\x1bOR".to_vec()
+            }
+        }
+        4 => {
+            if has_mod {
+                format!("\x1b[1;{mod_param}S").into_bytes()
+            } else {
+                b"\x1bOS".to_vec()
+            }
+        }
+        5 => {
+            if has_mod {
+                format!("\x1b[15;{mod_param}~").into_bytes()
+            } else {
+                b"\x1b[15~".to_vec()
+            }
+        }
+        6 => {
+            if has_mod {
+                format!("\x1b[17;{mod_param}~").into_bytes()
+            } else {
+                b"\x1b[17~".to_vec()
+            }
+        }
+        7 => {
+            if has_mod {
+                format!("\x1b[18;{mod_param}~").into_bytes()
+            } else {
+                b"\x1b[18~".to_vec()
+            }
+        }
+        8 => {
+            if has_mod {
+                format!("\x1b[19;{mod_param}~").into_bytes()
+            } else {
+                b"\x1b[19~".to_vec()
+            }
+        }
+        9 => {
+            if has_mod {
+                format!("\x1b[20;{mod_param}~").into_bytes()
+            } else {
+                b"\x1b[20~".to_vec()
+            }
+        }
+        10 => {
+            if has_mod {
+                format!("\x1b[21;{mod_param}~").into_bytes()
+            } else {
+                b"\x1b[21~".to_vec()
+            }
+        }
+        11 => {
+            if has_mod {
+                format!("\x1b[23;{mod_param}~").into_bytes()
+            } else {
+                b"\x1b[23~".to_vec()
+            }
+        }
+        12 => {
+            if has_mod {
+                format!("\x1b[24;{mod_param}~").into_bytes()
+            } else {
+                b"\x1b[24~".to_vec()
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Converts a crossterm `KeyEvent` to the ANSI escape bytes a terminal would
+/// produce for the same keypress.  Returns an empty `Vec` for events that
+/// should not be forwarded (key-release events, unhandled keys, etc.).
+///
+/// On Windows the console API reports key presses as structured events; on Unix
+/// crossterm parses raw stdin bytes in raw mode.  Either way this re-encodes
+/// the event as ANSI bytes for forwarding to the server.
+fn key_event_to_bytes(event: crossterm::event::KeyEvent) -> Vec<u8> {
+    use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+    // Only forward press events; Windows always reports both press and release.
+    if event.kind != KeyEventKind::Press {
+        return Vec::new();
+    }
+    let mods = event.modifiers;
+    let ctrl = mods.contains(KeyModifiers::CONTROL);
+    let alt = mods.contains(KeyModifiers::ALT);
+    let shift = mods.contains(KeyModifiers::SHIFT);
+    // CSI modifier parameter: 1 + shift + alt*2 + ctrl*4
+    let mod_param = 1u8 + u8::from(shift) + (u8::from(alt) * 2) + (u8::from(ctrl) * 4);
+    let has_mod = mod_param > 1;
+
+    match event.code {
+        KeyCode::Char(c) => encode_char_key(c, ctrl, alt),
+        KeyCode::Backspace => vec![0x7f],
+        KeyCode::Enter => vec![b'\r'],
+        KeyCode::Tab => vec![b'\t'],
+        KeyCode::BackTab => b"\x1b[Z".to_vec(),
+        KeyCode::Esc => vec![0x1b],
+        KeyCode::Null => vec![0x00],
+        KeyCode::F(n) => encode_function_key(n, has_mod, mod_param),
+        code => encode_nav_key(code, has_mod, mod_param).unwrap_or_default(),
+    }
+}
+
+/// Temporarily pauses the stdin reader and restores cooked mode, calls `f`,
+/// then re-enables raw mode and resumes the reader.  Wraps interactive prompts
+/// (passphrase, TOFU, key-mismatch) that require a functioning line editor.
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn with_cooked_term<T>(paused: &AtomicBool, f: impl FnOnce() -> T) -> T {
+    paused.store(true, Ordering::SeqCst);
+    // Give the reader thread time to observe the pause before raw mode drops.
+    thread::sleep(Duration::from_millis(100));
+    drop(disable_raw_mode());
+    let result = f();
+    drop(enable_raw_mode());
+    paused.store(false, Ordering::SeqCst);
+    result
+}
+
+/// Polls for crossterm key events and forwards their ANSI byte encoding to the
+/// keyboard channel.  When `paused` is set, idles so `with_cooked_term` can
+/// safely disable raw mode around interactive prompts.
+fn stdin_reader_loop(kb_tx: &Sender<Vec<u8>>, paused: &AtomicBool) {
+    use crossterm::event::{Event, poll, read};
+    loop {
+        if paused.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(50));
+            continue;
+        }
+        match poll(Duration::from_millis(50)) {
+            Ok(true) => {
+                if let Ok(Event::Key(ke)) = read() {
+                    let bytes = key_event_to_bytes(ke);
+                    if !bytes.is_empty() && kb_tx.blocking_send(bytes).is_err() {
+                        break;
+                    }
+                }
+            }
+            Ok(false) => {}
+            Err(_) => break,
+        }
+    }
+}
+
+/// Runs the reconnect countdown alongside an escape-sequence listener.
+/// Returns `true` if the user pressed `Ctrl-^ .` to quit.
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn countdown_with_escape(
+    stdout_tx: &Sender<Vec<u8>>,
+    backoff_secs: u64,
+    attempt: u32,
+    max_backoff_secs: u64,
+    exit_token: &CancellationToken,
+    kb_rx: Arc<Mutex<Receiver<Vec<u8>>>>,
+) -> bool {
+    let escape_done = CancellationToken::new();
+    let escape_handle = spawn(run_escape_listener(
+        kb_rx,
+        exit_token.clone(),
+        escape_done.clone(),
+    ));
+    let exiting = countdown_reconnect_banner(
+        stdout_tx,
+        backoff_secs,
+        attempt,
+        max_backoff_secs,
+        exit_token,
+    )
+    .await;
+    escape_done.cancel();
+    drop(escape_handle.await);
+    exiting
+}
+
 /// Persistent reconnect loop.  Runs until the shell exits (via `process::exit`).
+#[cfg_attr(nightly, allow(clippy::too_many_lines))]
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn run_session_loop(
     config: Config,
@@ -187,9 +560,19 @@ async fn run_session_loop(
     let mut config = config;
     let mut backoff = Duration::from_secs(2);
     let mut reconnect_attempt: u32 = 0;
-    // Stdin reader is started once, after the first successful kex (so that raw
-    // mode is not active while dialoguer reads the passphrase).
-    let mut kb_rx_shared: Option<Arc<Mutex<Receiver<Vec<u8>>>>> = None;
+    // Shared exit token: cancelled when the user presses Ctrl-^ . to quit.
+    let exit_token = CancellationToken::new();
+
+    // Start the stdin reader before the first KEX so Ctrl-^ . is always
+    // detectable.  with_cooked_term pauses it around interactive prompts.
+    let stdin_paused = Arc::new(AtomicBool::new(false));
+    enable_raw_mode()?;
+    let (kb_tx, kb_rx) = channel::<Vec<u8>>(64);
+    let paused_for_reader = stdin_paused.clone();
+    let _stdin_thread = thread::spawn(move || stdin_reader_loop(&kb_tx, &paused_for_reader));
+    let kb_rx_shared = Arc::new(Mutex::new(kb_rx));
+
+    let mut had_successful_kex = false;
 
     loop {
         match connect_and_kex(
@@ -198,42 +581,36 @@ async fn run_session_loop(
             &server_ip,
             server_port,
             &pass_cache,
+            stdin_paused.clone(),
         )
         .await
         {
-            Ok((kex, udp_arc)) => {
+            Ok((kex, udp_arc, nak_timeout)) => {
                 backoff = Duration::from_secs(2);
+                clear_reconnect_banner(&stdout_tx).await;
+                had_successful_kex = true;
 
-                // Enable raw mode and start the stdin reader on the first
-                // successful kex.  By this point the passphrase has been
-                // collected and cached, so raw mode won't interfere with it
-                // on reconnects.
-                let kb_rx = if let Some(ref rx) = kb_rx_shared {
-                    // This is a reconnect — clear the banner before the session starts.
-                    clear_reconnect_banner(&stdout_tx).await;
-                    rx.clone()
-                } else {
-                    enable_raw_mode()?;
-                    let (kb_tx, kb_rx) = channel::<Vec<u8>>(64);
-                    let _stdin_thread = thread::spawn(move || {
-                        let mut buf = [0u8; 4096];
-                        loop {
-                            match stdin().read(&mut buf) {
-                                Ok(0) | Err(_) => break,
-                                Ok(n) => {
-                                    if kb_tx.blocking_send(buf[..n].to_vec()).is_err() {
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    });
-                    let shared = Arc::new(Mutex::new(kb_rx));
-                    kb_rx_shared = Some(shared.clone());
-                    shared
-                };
-
-                run_udp_session(kex, udp_arc, kb_rx, stdout_tx.clone(), config.predict()).await?;
+                let session_result = run_udp_session(
+                    kex,
+                    udp_arc,
+                    nak_timeout,
+                    kb_rx_shared.clone(),
+                    config.nat_warmup(),
+                    config.nat_warmup_count(),
+                    stdout_tx.clone(),
+                    config.predict(),
+                    exit_token.clone(),
+                )
+                .await;
+                if let Err(e) = session_result {
+                    drop(disable_raw_mode());
+                    return Err(e);
+                }
+                if exit_token.is_cancelled() {
+                    drop(disable_raw_mode());
+                    time::sleep(Duration::from_millis(100)).await;
+                    std::process::exit(0);
+                }
                 // Session dropped — show the reconnecting banner while we retry.
                 show_reconnect_banner(&stdout_tx).await;
                 time::sleep(Duration::from_millis(500)).await;
@@ -245,23 +622,39 @@ async fn run_session_loop(
                         "mp: run `mp-keygen` to regenerate your keypair at {}",
                         fatal.key_path.display()
                     );
+                    drop(disable_raw_mode());
+                    return Err(e);
+                }
+                if e.downcast_ref::<MoshpitError>()
+                    .is_some_and(|e| *e == MoshpitError::HostKeyRejected)
+                {
+                    drop(disable_raw_mode());
                     return Err(e);
                 }
                 reconnect_attempt = reconnect_attempt.saturating_add(1);
                 error!("Failed to connect to {socket_addr}: {e}, retrying in {backoff:?}");
-                // If raw mode is not yet active (first connection attempt), the
-                // failure may be due to a wrong passphrase.  Reset the cache so
-                // the user can re-enter it with a clean terminal on the next try.
-                if kb_rx_shared.is_none() {
+                // Reset passphrase cache on early failures so the user can
+                // re-enter it on the next attempt.
+                if !had_successful_kex {
                     *pass_cache.lock().unwrap() = PassCache::Uncached;
                 }
-                countdown_reconnect_banner(
+                if countdown_with_escape(
                     &stdout_tx,
                     backoff.as_secs(),
                     reconnect_attempt,
                     max_backoff.as_secs(),
+                    &exit_token,
+                    kb_rx_shared.clone(),
                 )
-                .await;
+                .await
+                {
+                    clear_reconnect_banner(&stdout_tx).await;
+                    let msg = b"\r\n\x1b[0m[moshpit] Disconnected.\r\n";
+                    drop(stdout_tx.send(msg.to_vec()).await);
+                    drop(disable_raw_mode());
+                    time::sleep(Duration::from_millis(100)).await;
+                    std::process::exit(0);
+                }
                 backoff = (backoff * 2).min(max_backoff);
             }
         }
@@ -276,7 +669,8 @@ async fn connect_and_kex(
     server_ip: &str,
     server_port: u16,
     pass_cache: &Arc<std::sync::Mutex<PassCache>>,
-) -> Result<(Kex, Arc<UdpSocket>)> {
+    stdin_paused: Arc<AtomicBool>,
+) -> Result<(Kex, Arc<UdpSocket>, Duration)> {
     // Refresh resume UUID from disk (may have been updated by previous connection).
     let _ = config.set_resume_session_uuid(read_session_uuid(server_ip, server_port));
 
@@ -284,6 +678,7 @@ async fn connect_and_kex(
     info!("Connected to {}", socket.peer_addr()?);
 
     let cache = pass_cache.clone();
+    let paused_pass = stdin_paused.clone();
     let pass_fn = move || -> Result<Option<String>> {
         let guard = cache.lock().unwrap();
         if guard.is_cached() {
@@ -295,7 +690,8 @@ async fn connect_and_kex(
         }
         drop(guard);
         info!("passphrase: prompting user");
-        let result = tokio::task::block_in_place(read_passpharase);
+        let result =
+            tokio::task::block_in_place(|| with_cooked_term(&paused_pass, read_passpharase));
         match &result {
             Ok(Some(_)) => info!("passphrase: prompt returned a passphrase"),
             Ok(None) => info!("passphrase: prompt returned None (key may be unencrypted)"),
@@ -312,43 +708,51 @@ async fn connect_and_kex(
 
     let (sock_read, sock_write) = socket.into_split();
 
-    let tofu_fn: libmoshpit::TofuFn = Arc::new(|host: &str, fingerprint: &str| -> Result<bool> {
-        tokio::task::block_in_place(|| {
-            let prompt = format!(
-                "The authenticity of host '{host}' can't be established.\n\
-                 Fingerprint is SHA256:{fingerprint}.\n\
-                 Are you sure you want to continue connecting? (yes/no)"
-            );
-            let input: String = dialoguer::Input::new()
-                .with_prompt(prompt)
-                .interact_text()?;
-            Ok(input.eq_ignore_ascii_case("yes"))
-        })
-    });
-
-    let mismatch_fn: libmoshpit::HostKeyMismatchFn = Arc::new(
-        |host: &str, old_fingerprint: &str, new_fingerprint: &str| -> Result<bool> {
+    let paused_tofu = stdin_paused.clone();
+    let tofu_fn: libmoshpit::TofuFn =
+        Arc::new(move |host: &str, fingerprint: &str| -> Result<bool> {
             tokio::task::block_in_place(|| {
-                eprintln!("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@");
-                eprintln!("@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @");
-                eprintln!("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@");
-                eprintln!("Potential DNS spoofing or machine-in-the-middle detected.");
-                eprintln!("Host: {host}");
-                eprintln!("Offending key fingerprint: SHA256:{old_fingerprint}");
-                eprintln!("Presented key fingerprint: SHA256:{new_fingerprint}");
+                with_cooked_term(&paused_tofu, || {
+                    let prompt = format!(
+                        "The authenticity of host '{host}' can't be established.\n\
+                     Fingerprint is SHA256:{fingerprint}.\n\
+                     Are you sure you want to continue connecting? (yes/no)"
+                    );
+                    let input: String = dialoguer::Input::new()
+                        .with_prompt(prompt)
+                        .interact_text()?;
+                    Ok(input.eq_ignore_ascii_case("yes"))
+                })
+            })
+        });
 
-                Confirm::new()
-                    .with_prompt(
-                        "Update ~/.mp/known_hosts with the newly presented key for this host?",
-                    )
-                    .default(false)
-                    .wait_for_newline(true)
-                    .interact()
-                    .map_err(Into::into)
+    let paused_mismatch = stdin_paused;
+    let mismatch_fn: libmoshpit::HostKeyMismatchFn = Arc::new(
+        move |host: &str, old_fingerprint: &str, new_fingerprint: &str| -> Result<bool> {
+            tokio::task::block_in_place(|| {
+                with_cooked_term(&paused_mismatch, || {
+                    eprintln!("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@");
+                    eprintln!("@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @");
+                    eprintln!("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@");
+                    eprintln!("Potential DNS spoofing or machine-in-the-middle detected.");
+                    eprintln!("Host: {host}");
+                    eprintln!("Offending key fingerprint: SHA256:{old_fingerprint}");
+                    eprintln!("Presented key fingerprint: SHA256:{new_fingerprint}");
+
+                    Confirm::new()
+                        .with_prompt(
+                            "Update ~/.mp/known_hosts with the newly presented key for this host?",
+                        )
+                        .default(false)
+                        .wait_for_newline(true)
+                        .interact()
+                        .map_err(Into::into)
+                })
             })
         },
     );
 
+    let kex_start = Instant::now();
     let (kex, udp_arc, _) = run_key_exchange(
         config.clone(),
         sock_read,
@@ -393,18 +797,32 @@ async fn connect_and_kex(
             info!("New session {session_uuid} started");
         }
     }
-    Ok((kex, udp_arc))
+    // Use the TCP KEX elapsed time as a proxy for network RTT.  The key
+    // exchange involves ~2 round trips, so the total elapsed time is
+    // approximately 2× RTT, making it a reasonable base for the NAK backoff
+    // schedule.  Clamp to [20 ms, 500 ms] to handle both LAN and high-latency
+    // paths without risking spurious NAKs or excessively slow recovery.
+    let nak_timeout = kex_start
+        .elapsed()
+        .clamp(Duration::from_millis(20), Duration::from_millis(500));
+    info!("nak_timeout set to {:?} from kex elapsed time", nak_timeout);
+    Ok((kex, udp_arc, nak_timeout))
 }
 
 /// Set up UDP tasks for one session and wait until the server disconnects.
 #[cfg_attr(nightly, allow(clippy::too_many_lines))]
+#[cfg_attr(nightly, allow(clippy::too_many_arguments))]
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn run_udp_session(
     kex: Kex,
     udp_arc: Arc<UdpSocket>,
+    nak_timeout: Duration,
     kb_rx: Arc<Mutex<Receiver<Vec<u8>>>>,
+    nat_warmup: bool,
+    nat_warmup_count: u32,
     stdout_tx: Sender<Vec<u8>>,
     display_preference: DisplayPreference,
+    exit_token: CancellationToken,
 ) -> Result<()> {
     let (reconnect_tx, mut reconnect_rx) = channel::<()>(1);
     let token = CancellationToken::new();
@@ -419,6 +837,7 @@ async fn run_udp_session(
         .nak_out_tx(tx.clone())
         .retransmit_tx(retransmit_tx)
         .silence_timeout(Duration::from_secs(15))
+        .nak_timeout(nak_timeout)
         .reconnect_tx(reconnect_tx)
         .query_response_tx(tx.clone())
         .build();
@@ -438,6 +857,21 @@ async fn run_udp_session(
     let (cols, rows) = terminal_size().map_or((80, 24), |(w, h)| (w.0, h.0));
     tx.send(EncryptedFrame::Resize((kex.uuid_wrapper(), cols, rows)))
         .await?;
+
+    // NAT warmup: send keepalive frames before the session loop begins so that
+    // a bidirectional NAT binding is established before the server starts
+    // sending terminal diffs.  This prevents the initial burst of dropped
+    // packets that causes head-of-line blocking under some NAT configurations.
+    // Off by default; opt in with `--nat-warmup` / `MOSHPIT_NAT_WARMUP=true`.
+    if nat_warmup {
+        info!(
+            "NAT warmup: sending {} keepalive frame(s)",
+            nat_warmup_count
+        );
+        for _ in 0..nat_warmup_count {
+            tx.send(EncryptedFrame::Keepalive).await?;
+        }
+    }
 
     // ── Prediction / emulator shared state ──────────────────────────────────
     let emulator = Arc::new(std::sync::Mutex::new(Emulator::new(rows, cols)));
@@ -473,6 +907,7 @@ async fn run_udp_session(
 
     // Stdin forwarder: holds the shared kb_rx mutex for this session's lifetime.
     let fwd_token = token.clone();
+    let exit_token_fwd = exit_token.clone();
     let session_tx = tx;
     let uuid_wrapper = kex.uuid_wrapper();
     let emu_fwd = emulator.clone();
@@ -480,32 +915,70 @@ async fn run_udp_session(
     let stdout_tx_fwd = stdout_tx;
     let _forwarder = spawn(async move {
         let mut rx = kb_rx.lock().await;
+        let mut escape_state = EscapeState::Normal;
         loop {
             select! {
                 () = fwd_token.cancelled() => break,
                 data = rx.recv() => match data {
                     Some(data) => {
-                        // Forward to server.
-                        if session_tx
-                            .send(EncryptedFrame::Bytes((uuid_wrapper, data.clone())))
-                            .await
-                            .is_err()
-                        {
-                            break;
+                        let mut to_forward: Vec<u8> = Vec::new();
+                        let mut exit_requested = false;
+                        for &byte in &data {
+                            escape_state = match escape_state {
+                                EscapeState::Normal => {
+                                    if byte == 0x1E {
+                                        EscapeState::PendingDot
+                                    } else {
+                                        to_forward.push(byte);
+                                        EscapeState::Normal
+                                    }
+                                }
+                                EscapeState::PendingDot => {
+                                    if byte == 0x2E {
+                                        exit_requested = true;
+                                        break;
+                                    } else if byte == 0x1E {
+                                        // Repeated prefix: discard, stay pending
+                                        EscapeState::PendingDot
+                                    } else {
+                                        // Forward the held 0x1E and the current byte
+                                        to_forward.push(0x1E);
+                                        to_forward.push(byte);
+                                        EscapeState::Normal
+                                    }
+                                }
+                            };
                         }
-                        // Local echo prediction: feed each byte to the engine.
-                        let (overlays, cursor) = {
-                            let emu = emu_fwd.lock().unwrap();
-                            let screen = emu.screen();
-                            let mut pred = pred_fwd.lock().unwrap();
-                            for byte in &data {
-                                pred.new_user_byte(*byte, screen);
+                        if !to_forward.is_empty() {
+                            // Forward to server.
+                            if session_tx
+                                .send(EncryptedFrame::Bytes((uuid_wrapper, to_forward.clone())))
+                                .await
+                                .is_err()
+                            {
+                                break;
                             }
-                            pred.apply(screen)
-                        };
-                        let preview = paint_overlays_to_ansi(&overlays, cursor);
-                        if !preview.is_empty() {
-                            drop(stdout_tx_fwd.send(preview).await);
+                            // Local echo prediction: feed each byte to the engine.
+                            let (overlays, cursor) = {
+                                let emu = emu_fwd.lock().unwrap();
+                                let screen = emu.screen();
+                                let mut pred = pred_fwd.lock().unwrap();
+                                for byte in &to_forward {
+                                    pred.new_user_byte(*byte, screen);
+                                }
+                                pred.apply(screen)
+                            };
+                            let preview = paint_overlays_to_ansi(&overlays, cursor);
+                            if !preview.is_empty() {
+                                drop(stdout_tx_fwd.send(preview).await);
+                            }
+                        }
+                        if exit_requested {
+                            let msg = b"\r\n\x1b[0m[moshpit] Disconnected.\r\n";
+                            drop(stdout_tx_fwd.send(msg.to_vec()).await);
+                            exit_token_fwd.cancel();
+                            fwd_token.cancel();
+                            break;
                         }
                     }
                     None => break,
@@ -514,8 +987,11 @@ async fn run_udp_session(
         }
     });
 
-    // Wait for reconnect signal; `process::exit` handles all clean exits.
-    let _ = reconnect_rx.recv().await;
+    // Wait for a reconnect signal or a user-requested exit (Ctrl-^ .).
+    select! {
+        _ = reconnect_rx.recv() => {}
+        () = exit_token.cancelled() => {}
+    }
     token.cancel();
     // Allow the stdin forwarder to release the kb_rx mutex before the next session.
     time::sleep(Duration::from_millis(150)).await;
@@ -848,18 +1324,14 @@ fn session_file_path_in_home(home: &Path, host: &str, port: u16) -> Option<PathB
     Some(home.join(".mp").join("sessions").join(name))
 }
 
-/// Read a persisted session UUID from disk, if any.
-fn read_session_uuid(host: &str, port: u16) -> Option<Uuid> {
-    let path = session_file_path(host, port)?;
-    let mut file = std::fs::File::open(&path).ok()?;
+fn read_uuid_from_path(path: &Path) -> Option<Uuid> {
+    let mut file = std::fs::File::open(path).ok()?;
     let mut buf = String::new();
     let _ = file.read_to_string(&mut buf).ok();
     buf.trim().parse::<Uuid>().ok()
 }
 
-/// Write (or overwrite) the session UUID to disk.
-fn write_session_uuid(host: &str, port: u16, session_uuid: Uuid) -> Result<()> {
-    let path = session_file_path(host, port).ok_or_else(|| anyhow::anyhow!("no home dir"))?;
+fn write_uuid_to_path(path: &Path, uuid: Uuid) -> Result<()> {
     if let Some(parent) = path.parent() {
         #[cfg(unix)]
         {
@@ -882,15 +1354,26 @@ fn write_session_uuid(host: &str, port: u16, session_uuid: Uuid) -> Result<()> {
                 .create(true)
                 .truncate(true)
                 .mode(0o600)
-                .open(&path)?
+                .open(path)?
         }
         #[cfg(not(unix))]
         {
-            std::fs::File::create(&path)?
+            std::fs::File::create(path)?
         }
     };
-    write!(file, "{session_uuid}")?;
+    write!(file, "{uuid}")?;
     Ok(())
+}
+
+/// Read a persisted session UUID from disk, if any.
+fn read_session_uuid(host: &str, port: u16) -> Option<Uuid> {
+    read_uuid_from_path(&session_file_path(host, port)?)
+}
+
+/// Write (or overwrite) the session UUID to disk.
+fn write_session_uuid(host: &str, port: u16, session_uuid: Uuid) -> Result<()> {
+    let path = session_file_path(host, port).ok_or_else(|| anyhow::anyhow!("no home dir"))?;
+    write_uuid_to_path(&path, session_uuid)
 }
 
 #[cfg(test)]
@@ -954,9 +1437,61 @@ mod tests {
         let msg = rx.recv().await.unwrap();
         assert!(String::from_utf8_lossy(&msg).ends_with("\x1b[0m\x1b[K\x1b[u"));
 
-        countdown_reconnect_banner(&tx, 0, 1, 10).await;
+        let token = CancellationToken::new();
+        let _ = countdown_reconnect_banner(&tx, 0, 1, 10, &token).await;
         let msg = rx.recv().await.unwrap();
         assert!(String::from_utf8_lossy(&msg).contains("attempt #1"));
+    }
+
+    #[tokio::test]
+    async fn countdown_banner_pre_cancelled_returns_true() {
+        let (tx, mut _rx) = channel(10);
+        let token = CancellationToken::new();
+        token.cancel();
+        let result = countdown_reconnect_banner(&tx, 0, 1, 10, &token).await;
+        assert!(result);
+    }
+
+    #[test]
+    fn read_uuid_from_path_missing_file_returns_none() {
+        let dir = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        let path = dir.join("session");
+        assert!(read_uuid_from_path(&path).is_none());
+    }
+
+    #[test]
+    fn read_uuid_from_path_garbage_returns_none() {
+        let dir = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session");
+        std::fs::write(&path, "not-a-uuid").unwrap();
+        assert!(read_uuid_from_path(&path).is_none());
+    }
+
+    #[test]
+    fn write_and_read_uuid_roundtrip() {
+        let dir = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        let path = dir.join("sub").join("session");
+        let uuid = Uuid::new_v4();
+        write_uuid_to_path(&path, uuid).unwrap();
+        assert_eq!(read_uuid_from_path(&path), Some(uuid));
+    }
+
+    #[test]
+    fn write_uuid_creates_parent_directories() {
+        let dir = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        let nested = dir.join("a").join("b").join("c").join("session");
+        let uuid = Uuid::new_v4();
+        write_uuid_to_path(&nested, uuid).unwrap();
+        assert!(nested.exists());
+    }
+
+    #[test]
+    fn client_id_path_is_under_dot_mp() {
+        let home = TestHome::new();
+        let path = client_id_path(home.path());
+        assert!(path.starts_with(home.path().join(".mp")));
+        assert_eq!(path.file_name().unwrap(), "client_id");
     }
 
     #[test]
@@ -1072,7 +1607,15 @@ mod tests {
         let addr = format!("127.0.0.1:{port}").parse().unwrap();
 
         // This should fail with ConnectionRefused
-        let result = connect_and_kex(&mut config, addr, "127.0.0.1", port, &pass_cache).await;
+        let result = connect_and_kex(
+            &mut config,
+            addr,
+            "127.0.0.1",
+            port,
+            &pass_cache,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
         assert!(result.is_err());
         assert!(
             result
@@ -1143,7 +1686,15 @@ mod tests {
         let addr = format!("127.0.0.1:{port}").parse().unwrap();
 
         // TcpStream::connect will succeed, but run_key_exchange will fail
-        let result = connect_and_kex(&mut config, addr, "127.0.0.1", port, &pass_cache).await;
+        let result = connect_and_kex(
+            &mut config,
+            addr,
+            "127.0.0.1",
+            port,
+            &pass_cache,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
         assert!(result.is_err());
     }
 
@@ -1215,12 +1766,393 @@ mod tests {
         }));
 
         let addr = format!("127.0.0.1:{port}").parse().unwrap();
-        let result = connect_and_kex(&mut config, addr, "127.0.0.1", port, &pass_cache).await;
+        let result = connect_and_kex(
+            &mut config,
+            addr,
+            "127.0.0.1",
+            port,
+            &pass_cache,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
             err.downcast_ref::<FatalKexError>().is_some(),
             "missing key file should produce FatalKexError, got: {err}"
         );
+    }
+
+    // crossterm's Unix parser maps 0x1C-0x1F bytes to Char('4'-'7') + CONTROL.
+    // Verify that encode_char_key round-trips these correctly on all platforms.
+    #[test]
+    fn ctrl_digit_aliases_produce_correct_control_codes() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+
+        fn ctrl_char(c: char) -> KeyEvent {
+            KeyEvent {
+                code: KeyCode::Char(c),
+                modifiers: KeyModifiers::CONTROL,
+                kind: KeyEventKind::Press,
+                state: KeyEventState::empty(),
+            }
+        }
+
+        // Ctrl+6 (crossterm Unix: 0x1E → Char('6') + CONTROL) — escape prefix
+        assert_eq!(key_event_to_bytes(ctrl_char('6')), b"\x1e");
+        // Ctrl+4 (0x1C), Ctrl+5 (0x1D), Ctrl+7 (0x1F)
+        assert_eq!(key_event_to_bytes(ctrl_char('4')), b"\x1c");
+        assert_eq!(key_event_to_bytes(ctrl_char('5')), b"\x1d");
+        assert_eq!(key_event_to_bytes(ctrl_char('7')), b"\x1f");
+    }
+
+    mod escape_listener {
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+        use tokio::sync::mpsc::channel;
+        use tokio_util::sync::CancellationToken;
+
+        use super::super::run_escape_listener;
+
+        #[tokio::test]
+        async fn done_token_cancels_listener_without_triggering_exit() {
+            let (tx, rx) = channel::<Vec<u8>>(8);
+            let kb_rx = Arc::new(Mutex::new(rx));
+            let exit_token = CancellationToken::new();
+            let done_token = CancellationToken::new();
+            done_token.cancel();
+            run_escape_listener(kb_rx, exit_token.clone(), done_token).await;
+            assert!(!exit_token.is_cancelled());
+            drop(tx);
+        }
+
+        #[tokio::test]
+        async fn sender_drop_stops_listener_without_triggering_exit() {
+            let (tx, rx) = channel::<Vec<u8>>(8);
+            let kb_rx = Arc::new(Mutex::new(rx));
+            let exit_token = CancellationToken::new();
+            let done_token = CancellationToken::new();
+            drop(tx);
+            run_escape_listener(kb_rx, exit_token.clone(), done_token).await;
+            assert!(!exit_token.is_cancelled());
+        }
+
+        #[tokio::test]
+        async fn normal_bytes_do_not_trigger_exit() {
+            let (tx, rx) = channel::<Vec<u8>>(8);
+            let kb_rx = Arc::new(Mutex::new(rx));
+            let exit_token = CancellationToken::new();
+            let done_token = CancellationToken::new();
+            tx.send(b"hello".to_vec()).await.unwrap();
+            drop(tx);
+            run_escape_listener(kb_rx, exit_token.clone(), done_token).await;
+            assert!(!exit_token.is_cancelled());
+        }
+
+        #[tokio::test]
+        async fn escape_prefix_then_non_dot_does_not_trigger_exit() {
+            let (tx, rx) = channel::<Vec<u8>>(8);
+            let kb_rx = Arc::new(Mutex::new(rx));
+            let exit_token = CancellationToken::new();
+            let done_token = CancellationToken::new();
+            // 0x1E followed by 'x' — state resets to Normal
+            tx.send(vec![0x1E, b'x']).await.unwrap();
+            drop(tx);
+            run_escape_listener(kb_rx, exit_token.clone(), done_token).await;
+            assert!(!exit_token.is_cancelled());
+        }
+
+        #[tokio::test]
+        async fn repeated_escape_prefix_stays_pending_without_triggering_exit() {
+            let (tx, rx) = channel::<Vec<u8>>(8);
+            let kb_rx = Arc::new(Mutex::new(rx));
+            let exit_token = CancellationToken::new();
+            let done_token = CancellationToken::new();
+            // Multiple 0x1E bytes — stays in PendingDot but never completes
+            tx.send(vec![0x1E, 0x1E, 0x1E]).await.unwrap();
+            drop(tx);
+            run_escape_listener(kb_rx, exit_token.clone(), done_token).await;
+            assert!(!exit_token.is_cancelled());
+        }
+
+        #[tokio::test]
+        async fn full_sequence_in_one_chunk_triggers_exit() {
+            let (tx, rx) = channel::<Vec<u8>>(8);
+            let kb_rx = Arc::new(Mutex::new(rx));
+            let exit_token = CancellationToken::new();
+            let done_token = CancellationToken::new();
+            tx.send(vec![0x1E, 0x2E]).await.unwrap();
+            run_escape_listener(kb_rx, exit_token.clone(), done_token).await;
+            assert!(exit_token.is_cancelled());
+        }
+
+        #[tokio::test]
+        async fn sequence_split_across_sends_triggers_exit() {
+            let (tx, rx) = channel::<Vec<u8>>(8);
+            let kb_rx = Arc::new(Mutex::new(rx));
+            let exit_token = CancellationToken::new();
+            let done_token = CancellationToken::new();
+            tx.send(vec![0x1E]).await.unwrap();
+            tx.send(vec![0x2E]).await.unwrap();
+            run_escape_listener(kb_rx, exit_token.clone(), done_token).await;
+            assert!(exit_token.is_cancelled());
+        }
+    }
+
+    mod key_encoding {
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+
+        use super::super::key_event_to_bytes;
+
+        fn press(code: KeyCode) -> KeyEvent {
+            KeyEvent {
+                code,
+                modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Press,
+                state: KeyEventState::empty(),
+            }
+        }
+
+        fn press_mod(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+            KeyEvent {
+                code,
+                modifiers: mods,
+                kind: KeyEventKind::Press,
+                state: KeyEventState::empty(),
+            }
+        }
+
+        fn release(code: KeyCode) -> KeyEvent {
+            KeyEvent {
+                code,
+                modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Release,
+                state: KeyEventState::empty(),
+            }
+        }
+
+        #[test]
+        fn release_events_produce_no_bytes() {
+            assert!(key_event_to_bytes(release(KeyCode::Char('a'))).is_empty());
+            assert!(key_event_to_bytes(release(KeyCode::Up)).is_empty());
+        }
+
+        #[test]
+        fn arrow_keys_produce_csi_sequences() {
+            assert_eq!(key_event_to_bytes(press(KeyCode::Up)), b"\x1b[A");
+            assert_eq!(key_event_to_bytes(press(KeyCode::Down)), b"\x1b[B");
+            assert_eq!(key_event_to_bytes(press(KeyCode::Right)), b"\x1b[C");
+            assert_eq!(key_event_to_bytes(press(KeyCode::Left)), b"\x1b[D");
+        }
+
+        #[test]
+        fn arrow_keys_with_shift_use_modifier_param() {
+            let shift = KeyModifiers::SHIFT;
+            assert_eq!(
+                key_event_to_bytes(press_mod(KeyCode::Up, shift)),
+                b"\x1b[1;2A"
+            );
+            assert_eq!(
+                key_event_to_bytes(press_mod(KeyCode::Down, shift)),
+                b"\x1b[1;2B"
+            );
+            assert_eq!(
+                key_event_to_bytes(press_mod(KeyCode::Right, shift)),
+                b"\x1b[1;2C"
+            );
+            assert_eq!(
+                key_event_to_bytes(press_mod(KeyCode::Left, shift)),
+                b"\x1b[1;2D"
+            );
+        }
+
+        #[test]
+        fn arrow_keys_with_ctrl_use_modifier_param() {
+            let ctrl = KeyModifiers::CONTROL;
+            assert_eq!(
+                key_event_to_bytes(press_mod(KeyCode::Up, ctrl)),
+                b"\x1b[1;5A"
+            );
+            assert_eq!(
+                key_event_to_bytes(press_mod(KeyCode::Left, ctrl)),
+                b"\x1b[1;5D"
+            );
+        }
+
+        #[test]
+        fn navigation_keys() {
+            assert_eq!(key_event_to_bytes(press(KeyCode::Home)), b"\x1b[H");
+            assert_eq!(key_event_to_bytes(press(KeyCode::End)), b"\x1b[F");
+            assert_eq!(key_event_to_bytes(press(KeyCode::Insert)), b"\x1b[2~");
+            assert_eq!(key_event_to_bytes(press(KeyCode::Delete)), b"\x1b[3~");
+            assert_eq!(key_event_to_bytes(press(KeyCode::PageUp)), b"\x1b[5~");
+            assert_eq!(key_event_to_bytes(press(KeyCode::PageDown)), b"\x1b[6~");
+        }
+
+        #[test]
+        fn navigation_keys_with_modifier() {
+            let ctrl = KeyModifiers::CONTROL;
+            assert_eq!(
+                key_event_to_bytes(press_mod(KeyCode::Home, ctrl)),
+                b"\x1b[1;5H"
+            );
+            assert_eq!(
+                key_event_to_bytes(press_mod(KeyCode::End, ctrl)),
+                b"\x1b[1;5F"
+            );
+            assert_eq!(
+                key_event_to_bytes(press_mod(KeyCode::Insert, ctrl)),
+                b"\x1b[2;5~"
+            );
+            assert_eq!(
+                key_event_to_bytes(press_mod(KeyCode::Delete, ctrl)),
+                b"\x1b[3;5~"
+            );
+            assert_eq!(
+                key_event_to_bytes(press_mod(KeyCode::PageUp, ctrl)),
+                b"\x1b[5;5~"
+            );
+            assert_eq!(
+                key_event_to_bytes(press_mod(KeyCode::PageDown, ctrl)),
+                b"\x1b[6;5~"
+            );
+        }
+
+        #[test]
+        fn function_keys() {
+            assert_eq!(key_event_to_bytes(press(KeyCode::F(1))), b"\x1bOP");
+            assert_eq!(key_event_to_bytes(press(KeyCode::F(2))), b"\x1bOQ");
+            assert_eq!(key_event_to_bytes(press(KeyCode::F(3))), b"\x1bOR");
+            assert_eq!(key_event_to_bytes(press(KeyCode::F(4))), b"\x1bOS");
+            assert_eq!(key_event_to_bytes(press(KeyCode::F(5))), b"\x1b[15~");
+            assert_eq!(key_event_to_bytes(press(KeyCode::F(6))), b"\x1b[17~");
+            assert_eq!(key_event_to_bytes(press(KeyCode::F(7))), b"\x1b[18~");
+            assert_eq!(key_event_to_bytes(press(KeyCode::F(8))), b"\x1b[19~");
+            assert_eq!(key_event_to_bytes(press(KeyCode::F(9))), b"\x1b[20~");
+            assert_eq!(key_event_to_bytes(press(KeyCode::F(10))), b"\x1b[21~");
+            assert_eq!(key_event_to_bytes(press(KeyCode::F(11))), b"\x1b[23~");
+            assert_eq!(key_event_to_bytes(press(KeyCode::F(12))), b"\x1b[24~");
+        }
+
+        #[test]
+        fn function_keys_out_of_range_produce_no_bytes() {
+            assert!(key_event_to_bytes(press(KeyCode::F(0))).is_empty());
+            assert!(key_event_to_bytes(press(KeyCode::F(13))).is_empty());
+        }
+
+        #[test]
+        fn function_keys_with_modifier() {
+            let shift = KeyModifiers::SHIFT;
+            assert_eq!(
+                key_event_to_bytes(press_mod(KeyCode::F(1), shift)),
+                b"\x1b[1;2P"
+            );
+            assert_eq!(
+                key_event_to_bytes(press_mod(KeyCode::F(5), shift)),
+                b"\x1b[15;2~"
+            );
+            assert_eq!(
+                key_event_to_bytes(press_mod(KeyCode::F(12), shift)),
+                b"\x1b[24;2~"
+            );
+        }
+
+        #[test]
+        fn simple_keys() {
+            assert_eq!(key_event_to_bytes(press(KeyCode::Backspace)), b"\x7f");
+            assert_eq!(key_event_to_bytes(press(KeyCode::Enter)), b"\r");
+            assert_eq!(key_event_to_bytes(press(KeyCode::Tab)), b"\t");
+            assert_eq!(key_event_to_bytes(press(KeyCode::BackTab)), b"\x1b[Z");
+            assert_eq!(key_event_to_bytes(press(KeyCode::Esc)), b"\x1b");
+            assert_eq!(key_event_to_bytes(press(KeyCode::Null)), b"\x00");
+        }
+
+        #[test]
+        fn printable_chars() {
+            assert_eq!(key_event_to_bytes(press(KeyCode::Char('a'))), b"a");
+            assert_eq!(key_event_to_bytes(press(KeyCode::Char('Z'))), b"Z");
+            assert_eq!(key_event_to_bytes(press(KeyCode::Char('!'))), b"!");
+        }
+
+        #[test]
+        fn non_ascii_char_encodes_utf8() {
+            assert_eq!(
+                key_event_to_bytes(press(KeyCode::Char('\u{00e9}'))), // é
+                "\u{00e9}".as_bytes()
+            );
+        }
+
+        #[test]
+        fn ctrl_chars_produce_control_codes() {
+            let ctrl = KeyModifiers::CONTROL;
+            assert_eq!(
+                key_event_to_bytes(press_mod(KeyCode::Char('a'), ctrl)),
+                b"\x01"
+            );
+            assert_eq!(
+                key_event_to_bytes(press_mod(KeyCode::Char('c'), ctrl)),
+                b"\x03"
+            );
+            assert_eq!(
+                key_event_to_bytes(press_mod(KeyCode::Char('z'), ctrl)),
+                b"\x1a"
+            );
+            // Ctrl-@ → NUL (0x00)
+            assert_eq!(
+                key_event_to_bytes(press_mod(KeyCode::Char('@'), ctrl)),
+                b"\x00"
+            );
+            // Ctrl-[ → ESC (0x1B)
+            assert_eq!(
+                key_event_to_bytes(press_mod(KeyCode::Char('['), ctrl)),
+                b"\x1b"
+            );
+            // Ctrl-^ is the moshpit escape prefix
+            assert_eq!(
+                key_event_to_bytes(press_mod(KeyCode::Char('^'), ctrl)),
+                b"\x1e"
+            );
+        }
+
+        #[test]
+        fn ctrl_non_ascii_encodes_utf8_fallback() {
+            let ctrl = KeyModifiers::CONTROL;
+            // Non-ASCII + Ctrl has no standard control code; falls through to UTF-8
+            let result = key_event_to_bytes(press_mod(KeyCode::Char('\u{00e9}'), ctrl));
+            assert_eq!(result, "\u{00e9}".as_bytes());
+        }
+
+        #[test]
+        fn alt_chars_prefix_with_escape() {
+            let alt = KeyModifiers::ALT;
+            assert_eq!(
+                key_event_to_bytes(press_mod(KeyCode::Char('a'), alt)),
+                b"\x1ba"
+            );
+            assert_eq!(
+                key_event_to_bytes(press_mod(KeyCode::Char('z'), alt)),
+                b"\x1bz"
+            );
+        }
+
+        #[test]
+        fn ctrl_alt_chars_prefix_with_escape_and_control_code() {
+            let ctrl_alt = KeyModifiers::CONTROL | KeyModifiers::ALT;
+            // Ctrl+Alt+a → ESC + 0x01
+            assert_eq!(
+                key_event_to_bytes(press_mod(KeyCode::Char('a'), ctrl_alt)),
+                b"\x1b\x01"
+            );
+        }
+
+        #[test]
+        fn ctrl_alt_non_ascii_utf8_fallback() {
+            let ctrl_alt = KeyModifiers::CONTROL | KeyModifiers::ALT;
+            // Non-ASCII + Ctrl+Alt falls through to UTF-8 with ESC prefix
+            let result = key_event_to_bytes(press_mod(KeyCode::Char('\u{00e9}'), ctrl_alt));
+            let mut expected = b"\x1b".to_vec();
+            expected.extend_from_slice("\u{00e9}".as_bytes());
+            assert_eq!(result, expected);
+        }
     }
 }

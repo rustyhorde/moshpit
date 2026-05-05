@@ -28,12 +28,13 @@ use bytes::BytesMut;
 use tokio::{
     net::UdpSocket,
     select,
-    sync::mpsc::Sender,
+    sync::{mpsc::Sender, oneshot},
     time::{Instant as TokioInstant, interval, sleep, sleep_until},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use uuid::Uuid;
+use zstd::decode_all;
 
 use crate::{
     Emulator, EncryptedFrame, MoshpitError, PredictionEngine, Renderer, TerminalMessage,
@@ -47,7 +48,16 @@ const NAK_TIMEOUT: Duration = Duration::from_millis(50);
 /// Maximum backoff cap for repeated NAK retries (50 * 2^4 = 800 ms).
 const NAK_BACKOFF_MAX_SHIFT: u32 = 4;
 /// Maximum number of NAK retries before giving up on a permanently lost packet.
-const MAX_NAK_RETRIES: u32 = 10;
+const MAX_NAK_RETRIES: u32 = 4;
+/// Number of NAK retries after which the client sends a [`EncryptedFrame::RepaintRequest`]
+/// to the server.  Fires exactly once per gap (when retry count reaches this value),
+/// asking for an out-of-band full-screen snapshot to unblock the display without waiting
+/// for retransmit to succeed or retry exhaustion.
+const REPAINT_REQUEST_THRESHOLD: u32 = 2;
+/// Number of frames buffered out-of-order before an immediate [`EncryptedFrame::RepaintRequest`]
+/// is sent.  A large `recv_buffer` means many gaps exist simultaneously — the display is
+/// stalled.  Firing early skips waiting for the first NAK retry cycle (~50 ms).
+const RECV_BUFFER_REPAINT_THRESHOLD: usize = 25;
 /// Maximum sequence jump allowed before dropping the frame to prevent `DoS`.
 const MAX_SEQ_JUMP: u64 = 1024;
 
@@ -86,6 +96,11 @@ pub struct UdpReader {
     /// [`MAX_NAK_RETRIES`] retries.
     #[builder(default)]
     highest_seq_seen: u64,
+    /// Base NAK timeout derived from the measured TCP key-exchange round-trip time.
+    /// When set, replaces the hardcoded [`NAK_TIMEOUT`] constant as the base for
+    /// the exponential backoff schedule, adapting retransmit requests to the
+    /// observed network latency.  `None` falls back to [`NAK_TIMEOUT`] (50 ms).
+    nak_timeout: Option<Duration>,
     /// If no frame is received within this duration the server is assumed unreachable.
     /// Triggers reconnect via [`reconnect_tx`](Self::reconnect_tx) when set, otherwise calls
     /// [`process::exit`].
@@ -103,6 +118,16 @@ pub struct UdpReader {
     /// Background color returned for OSC 11 queries from the server shell.
     /// Format: `rgb:RRRR/GGGG/BBBB`.  Defaults to a dark background when `None`.
     terminal_bg_color: Option<String>,
+    /// Oneshot sender fired after the server has discovered the client's real post-NAT
+    /// address via the first `recv_from` and connected the UDP socket to it.  The
+    /// paired [`UdpSender`](crate::UdpSender) awaits this signal before sending any
+    /// packets so it never calls `send()` on an unconnected socket.
+    peer_discovered_tx: Option<oneshot::Sender<()>>,
+    /// Fired by the server's [`server_frame_loop`](Self::server_frame_loop) when a
+    /// [`EncryptedFrame::RepaintRequest`] arrives from the client.  The paired receiver
+    /// is held by a task in `moshpits` that responds with an immediate
+    /// [`EncryptedFrame::ScreenState`].
+    repaint_tx: Option<Sender<()>>,
 }
 
 impl UdpReader {
@@ -308,6 +333,37 @@ impl UdpReader {
             }
             ready
         } else {
+            // A ScreenState is a complete screen snapshot — it obsoletes every
+            // preceding diff.  Deliver it immediately by discarding all pending
+            // gaps and buffered frames with sequence numbers below `seq`, then
+            // drain any already-buffered frames that follow it in order.
+            if matches!(
+                frame,
+                EncryptedFrame::ScreenState(_) | EncryptedFrame::ScreenStateCompressed(_)
+            ) {
+                for obsolete in self.next_seq..seq {
+                    let _removed = self.recv_buffer.remove(&obsolete);
+                    let _removed = self.gap_first_seen.remove(&obsolete);
+                    let _removed = self.gap_nak_count.remove(&obsolete);
+                }
+                let _removed = self.gap_first_seen.remove(&seq);
+                let _removed = self.gap_nak_count.remove(&seq);
+                self.next_seq = seq + 1;
+                let mut ready = Vec::new();
+                if let Some(f) = self.route_or_deliver(frame) {
+                    ready.push(f);
+                }
+                while let Some(buffered) = self.recv_buffer.remove(&self.next_seq) {
+                    let _removed = self.gap_first_seen.remove(&self.next_seq);
+                    let _removed = self.gap_nak_count.remove(&self.next_seq);
+                    self.next_seq += 1;
+                    if let Some(f) = self.route_or_deliver(buffered) {
+                        ready.push(f);
+                    }
+                }
+                return ready;
+            }
+
             // Out of order: buffer the frame and record any new gaps.
             //
             // The arriving packet is no longer missing — remove it from gap
@@ -316,6 +372,16 @@ impl UdpReader {
             let _prev = self.recv_buffer.insert(seq, frame);
             let _removed = self.gap_first_seen.remove(&seq);
             let _removed = self.gap_nak_count.remove(&seq);
+
+            // If the buffer has grown large, the display is stalled behind many simultaneous
+            // gaps.  Send an immediate RepaintRequest instead of waiting for the first NAK
+            // retry cycle to elapse (~50 ms).
+            if self.recv_buffer.len() >= RECV_BUFFER_REPAINT_THRESHOLD
+                && let Some(ref tx) = self.nak_out_tx
+                && let Err(e) = tx.try_send(EncryptedFrame::RepaintRequest)
+            {
+                warn!("Failed to send early RepaintRequest: {e}");
+            }
 
             // Only register positions that are genuinely absent — positions
             // already in recv_buffer will be delivered automatically once the
@@ -377,7 +443,7 @@ impl UdpReader {
         // When the server has sent RETRANSMIT_WINDOW more packets past a gap,
         // it has already evicted the lost packet from its buffer and retransmit
         // requests for it will silently fail.  Giving up immediately avoids the
-        // full MAX_NAK_RETRIES × backoff wait (≈5.5 s) during which all
+        // full MAX_NAK_RETRIES × backoff wait (≈750 ms) during which all
         // subsequent output is stalled in recv_buffer.
         let window_give_up: Vec<u64> = self
             .gap_first_seen
@@ -432,16 +498,18 @@ impl UdpReader {
 
         // 2. Normal NAK logic — request retransmission for recent gaps.
         // Each gap uses an exponentially backed-off timeout based on how many
-        // times it has already been NAKed: timeout = NAK_TIMEOUT * 2^retry_count
-        // (capped at NAK_TIMEOUT * 2^NAK_BACKOFF_MAX_SHIFT), so repeated misses
+        // times it has already been NAKed: timeout = base * 2^retry_count
+        // (capped at base * 2^NAK_BACKOFF_MAX_SHIFT), so repeated misses
         // back off rather than flooding the sender with duplicate retransmit requests.
+        // The base is the RTT-derived nak_timeout when available, else NAK_TIMEOUT.
+        let base_nak_timeout = self.nak_timeout.unwrap_or(NAK_TIMEOUT);
         let timed_out: Vec<u64> = self
             .gap_first_seen
             .iter()
             .filter_map(|(&seq, &t)| {
                 let retries = self.gap_nak_count.get(&seq).copied().unwrap_or(0);
                 let shift = retries.min(NAK_BACKOFF_MAX_SHIFT);
-                let backoff = NAK_TIMEOUT * (1u32 << shift);
+                let backoff = base_nak_timeout * (1u32 << shift);
                 if now.duration_since(t) >= backoff {
                     Some(seq)
                 } else {
@@ -451,16 +519,31 @@ impl UdpReader {
             .collect();
         if !timed_out.is_empty() {
             // Reset each gap's timer so the next backoff interval starts from now.
+            // Track whether any gap just hit the RepaintRequest threshold.
+            let mut send_repaint_request = false;
             for &seq in &timed_out {
                 if let Some(t) = self.gap_first_seen.get_mut(&seq) {
                     *t = now;
                 }
-                *self.gap_nak_count.entry(seq).or_insert(0) += 1;
+                let count = self.gap_nak_count.entry(seq).or_insert(0);
+                *count += 1;
+                if *count == REPAINT_REQUEST_THRESHOLD {
+                    send_repaint_request = true;
+                }
             }
             if let Some(ref tx) = self.nak_out_tx
                 && let Err(e) = tx.try_send(EncryptedFrame::Nak(timed_out))
             {
                 warn!("Failed to send NAK: {e}");
+            }
+            // When any gap reaches the repaint threshold, ask the server for an immediate
+            // full-screen snapshot.  This unblocks the display without waiting for
+            // retransmit to succeed or retries to be exhausted.
+            if send_repaint_request
+                && let Some(ref tx) = self.nak_out_tx
+                && let Err(e) = tx.try_send(EncryptedFrame::RepaintRequest)
+            {
+                warn!("Failed to send RepaintRequest: {e}");
             }
         }
 
@@ -473,11 +556,61 @@ impl UdpReader {
     /// * I/O error.
     /// * Frame parsing error.
     ///
+    #[cfg_attr(nightly, allow(clippy::too_many_lines))]
     pub async fn server_frame_loop(
         &mut self,
         token: CancellationToken,
         term_tx: Sender<TerminalMessage>,
     ) -> Result<()> {
+        // Wait for the first UDP datagram from the client.  This reveals the
+        // client's real post-NAT address which we then connect the socket to.
+        // The peer_discovered_tx oneshot is fired afterwards so that UdpSender
+        // can start sending once the socket is connected.
+        {
+            let mut buf = vec![0u8; 65535];
+            let (first_len, peer_addr) = self.socket.recv_from(&mut buf).await?;
+            self.socket.connect(peer_addr).await?;
+            if let Some(tx) = self.peer_discovered_tx.take() {
+                let _ = tx.send(());
+            }
+            // Process the first packet through the normal pipeline.
+            let mut first_buf = BytesMut::from(&buf[..first_len]);
+            match self.parse_encrypted_frame(&mut first_buf) {
+                Ok(Some((frame, seq))) => {
+                    for ready in self.handle_arrival(frame, seq) {
+                        match ready {
+                            EncryptedFrame::Bytes((_id, message)) => {
+                                term_tx.send(TerminalMessage::Input(message)).await?;
+                            }
+                            EncryptedFrame::Resize((_id, columns, rows)) => {
+                                term_tx
+                                    .send(TerminalMessage::Resize { rows, columns })
+                                    .await?;
+                            }
+                            EncryptedFrame::RepaintRequest => {
+                                if let Some(ref tx) = self.repaint_tx
+                                    && let Err(e) = tx.try_send(())
+                                {
+                                    warn!("Failed to signal repaint request: {e}");
+                                }
+                            }
+                            EncryptedFrame::Nak(_)
+                            | EncryptedFrame::Shutdown
+                            | EncryptedFrame::Keepalive
+                            | EncryptedFrame::ScrollbackStart
+                            | EncryptedFrame::ScrollbackEnd
+                            | EncryptedFrame::ScreenState(_)
+                            | EncryptedFrame::ScreenStateCompressed(_) => {}
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!("Failed to parse first UDP frame from client: {e}");
+                }
+            }
+        }
+
         let mut nak_check = interval(NAK_CHECK_INTERVAL);
         loop {
             select! {
@@ -491,9 +624,17 @@ impl UdpReader {
                             EncryptedFrame::Resize((_id, columns, rows)) => {
                                 term_tx.send(TerminalMessage::Resize { rows, columns }).await?;
                             }
+                            EncryptedFrame::RepaintRequest => {
+                                if let Some(ref tx) = self.repaint_tx
+                                    && let Err(e) = tx.try_send(())
+                                {
+                                    warn!("Failed to signal repaint request: {e}");
+                                }
+                            }
                             EncryptedFrame::Nak(_) | EncryptedFrame::Shutdown | EncryptedFrame::Keepalive
                             | EncryptedFrame::ScrollbackStart | EncryptedFrame::ScrollbackEnd
-                            | EncryptedFrame::ScreenState(_) => {}
+                            | EncryptedFrame::ScreenState(_)
+                            | EncryptedFrame::ScreenStateCompressed(_) => {}
                         }
                     }
                 },
@@ -508,9 +649,17 @@ impl UdpReader {
                                     EncryptedFrame::Resize((_id, columns, rows)) => {
                                         term_tx.send(TerminalMessage::Resize { rows, columns }).await?;
                                     }
+                                    EncryptedFrame::RepaintRequest => {
+                                        if let Some(ref tx) = self.repaint_tx
+                                            && let Err(e) = tx.try_send(())
+                                        {
+                                            warn!("Failed to signal repaint request: {e}");
+                                        }
+                                    }
                                     EncryptedFrame::Nak(_) | EncryptedFrame::Shutdown | EncryptedFrame::Keepalive
                                     | EncryptedFrame::ScrollbackStart | EncryptedFrame::ScrollbackEnd
-                                    | EncryptedFrame::ScreenState(_) => {}
+                                    | EncryptedFrame::ScreenState(_)
+                                    | EncryptedFrame::ScreenStateCompressed(_) => {}
                                 }
                             }
                         }
@@ -586,7 +735,7 @@ impl UdpReader {
                             EncryptedFrame::Resize(_) => {
                                 error!("Received Resize frame on client, which is unexpected");
                             }
-                            EncryptedFrame::Nak(_) | EncryptedFrame::Keepalive => {}
+                            EncryptedFrame::Nak(_) | EncryptedFrame::Keepalive | EncryptedFrame::RepaintRequest => {}
                             EncryptedFrame::Shutdown => {
                                 info!("Server is shutting down, reconnecting");
                                 self.signal_reconnect_or_exit(0);
@@ -627,6 +776,31 @@ impl UdpReader {
                                     error!("Error sending ScreenState repaint to stdout channel: {e}");
                                 }
                             }
+                            EncryptedFrame::ScreenStateCompressed(compressed) => {
+                                match decode_all(compressed.as_slice()) {
+                                    Ok(payload) => {
+                                        let (rows, cols) = {
+                                            let emu = emulator.lock().unwrap();
+                                            emu.screen().size()
+                                        };
+                                        let mut tmp = vt100::Parser::new(rows, cols, 0);
+                                        tmp.process(&payload);
+                                        let repaint = {
+                                            let mut rend = renderer.lock().unwrap();
+                                            rend.invalidate();
+                                            rend.render(tmp.screen(), &[], None)
+                                        };
+                                        if !repaint.is_empty()
+                                            && let Err(e) = stdout_tx.send(repaint).await
+                                        {
+                                            error!("Error sending ScreenStateCompressed repaint to stdout channel: {e}");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to decompress ScreenStateCompressed: {e}");
+                                    }
+                                }
+                            }
                         }
                     }
                 },
@@ -653,7 +827,7 @@ impl UdpReader {
                                     EncryptedFrame::Resize(_) => {
                                         error!("Received Resize frame on client, which is unexpected");
                                     }
-                                    EncryptedFrame::Nak(_) | EncryptedFrame::Keepalive => {}
+                                    EncryptedFrame::Nak(_) | EncryptedFrame::Keepalive | EncryptedFrame::RepaintRequest => {}
                                     EncryptedFrame::Shutdown => {
                                         info!("Server is shutting down, reconnecting");
                                         self.signal_reconnect_or_exit(0);
@@ -692,6 +866,31 @@ impl UdpReader {
                                             && let Err(e) = stdout_tx.send(repaint).await
                                         {
                                             error!("Error sending ScreenState repaint to stdout channel: {e}");
+                                        }
+                                    }
+                                    EncryptedFrame::ScreenStateCompressed(compressed) => {
+                                        match decode_all(compressed.as_slice()) {
+                                            Ok(payload) => {
+                                                let (rows, cols) = {
+                                                    let emu = emulator.lock().unwrap();
+                                                    emu.screen().size()
+                                                };
+                                                let mut tmp = vt100::Parser::new(rows, cols, 0);
+                                                tmp.process(&payload);
+                                                let repaint = {
+                                                    let mut rend = renderer.lock().unwrap();
+                                                    rend.invalidate();
+                                                    rend.render(tmp.screen(), &[], None)
+                                                };
+                                                if !repaint.is_empty()
+                                                    && let Err(e) = stdout_tx.send(repaint).await
+                                                {
+                                                    error!("Error sending ScreenStateCompressed repaint to stdout channel: {e}");
+                                                }
+                                            }
+                                            Err(e) => {
+                                                error!("Failed to decompress ScreenStateCompressed: {e}");
+                                            }
                                         }
                                     }
                                     EncryptedFrame::Bytes((_id, message)) => {

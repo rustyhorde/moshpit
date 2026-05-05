@@ -34,8 +34,6 @@ pub enum Frame {
     KeyAgreement(UuidWrapper),
     /// The address the moshpits listener is bound to.
     MoshpitsAddr(SocketAddr),
-    /// The address the moshpit listener is bound to.
-    MoshpitAddr(SocketAddr),
     /// Key exchange failure notification.
     KexFailure,
     /// A stable session token sent from moshpits to moshpit after key agreement.
@@ -56,10 +54,9 @@ impl Frame {
             Frame::Check(_, _) => 2,
             Frame::KeyAgreement(_) => 3,
             Frame::MoshpitsAddr(_) => 4,
-            Frame::MoshpitAddr(_) => 5,
-            Frame::KexFailure => 6,
-            Frame::SessionToken(_) => 7,
-            Frame::ResumeRequest(_, _, _, _) => 8,
+            Frame::KexFailure => 5,
+            Frame::SessionToken(_) => 6,
+            Frame::ResumeRequest(_, _, _, _) => 7,
         }
     }
 
@@ -70,7 +67,7 @@ impl Frame {
     ///
     pub fn parse(src: &mut Cursor<&[u8]>) -> Result<Option<Self>> {
         match get_u8(src) {
-            Some(0..=8) => {
+            Some(0..=7) => {
                 if let Some(length_slice) = get_usize(src)? {
                     let length = usize::from_be_bytes(length_slice.try_into()?);
                     if length > MAX_FRAME_LENGTH {
@@ -120,7 +117,6 @@ impl Display for Frame {
             }
             Frame::KeyAgreement(uuid) => write!(f, "KeyAgreement({uuid})"),
             Frame::MoshpitsAddr(addr) => write!(f, "MoshpitsAddr({addr})"),
-            Frame::MoshpitAddr(addr) => write!(f, "MoshpitAddr({addr})"),
             Frame::KexFailure => write!(f, "KexFailure"),
             Frame::SessionToken(uuid) => write!(f, "SessionToken({uuid})"),
             Frame::ResumeRequest(uuid, user, epk, fpk) => write!(

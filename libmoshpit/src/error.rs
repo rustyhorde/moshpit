@@ -82,6 +82,9 @@ pub enum Error {
     /// Public key does not match private key
     #[error("Public key does not match private key")]
     KeyPairMismatch,
+    /// The user explicitly rejected the server's host key (TOFU or mismatch prompt)
+    #[error("Host key rejected by user")]
+    HostKeyRejected,
 }
 
 /// Converts an `anyhow::Error` into a suitable exit code or clap message for a CLI application.

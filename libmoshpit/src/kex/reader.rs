@@ -128,9 +128,7 @@ impl KexReader {
                         Ok(false) => {
                             error!("client_kex: host key verification rejected for '{host}'");
                             let _ = self.tx_event.send(KexEvent::Failure);
-                            return Err(anyhow::anyhow!(
-                                "Host key verification failed for '{host}'"
-                            ));
+                            return Err(MoshpitError::HostKeyRejected.into());
                         }
                         Ok(true) => {
                             trace!("client_kex: host key verified for '{host}'");
@@ -392,25 +390,6 @@ impl KexReader {
             .send(Frame::SessionToken(UuidWrapper::new(session_uuid)))?;
 
         let udp_arc = self.handle_udp_setup(socket_addr, port_pool).await?;
-
-        trace!("server_kex: waiting for MoshpitAddr from client");
-        match self.reader.read_frame().await? {
-            Some(Frame::MoshpitAddr(moshpit_addr)) => {
-                trace!("server_kex: received MoshpitAddr {moshpit_addr}");
-                udp_arc.connect(moshpit_addr).await?;
-            }
-            Some(other) => {
-                error!(
-                    "server_kex: expected MoshpitAddr but got frame id={}",
-                    other.id()
-                );
-                return Err(MoshpitError::InvalidFrame.into());
-            }
-            None => {
-                error!("server_kex: client closed connection before sending MoshpitAddr");
-                return Err(MoshpitError::InvalidFrame.into());
-            }
-        }
 
         let skex = ServerKex::builder()
             .user(user_str)

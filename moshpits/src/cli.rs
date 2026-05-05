@@ -79,6 +79,16 @@ pub(crate) struct Cli {
     )]
     #[getset(get = "pub(crate)")]
     public_key_path: Option<String>,
+    /// Additional delay in milliseconds after the client's first UDP datagram
+    /// is received, before bulk terminal data is sent.  Provides extra margin
+    /// for NAT bindings on slow NAT devices when clients use `--nat-warmup`.
+    #[clap(
+        long,
+        value_name = "MILLIS",
+        help = "Extra delay (ms) after peer discovery before sending terminal data"
+    )]
+    #[getset(get_copy = "pub(crate)")]
+    warmup_delay_ms: Option<u64>,
 }
 
 impl Source for Cli {
@@ -123,6 +133,12 @@ impl Source for Cli {
             let _old = map.insert(
                 "public_key_path".to_string(),
                 Value::new(Some(&origin), ValueKind::String(public_key_path.clone())),
+            );
+        }
+        if let Some(warmup_delay_ms) = self.warmup_delay_ms {
+            let _old = map.insert(
+                "warmup_delay_ms".to_string(),
+                Value::new(Some(&origin), ValueKind::U64(warmup_delay_ms)),
             );
         }
         Ok(map)

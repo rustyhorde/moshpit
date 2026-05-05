@@ -47,6 +47,7 @@ uuid = { workspace = true }
 vt100 = { workspace = true }
 whoami = "2.1.2"
 zeroize = { workspace = true }
+zstd = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",

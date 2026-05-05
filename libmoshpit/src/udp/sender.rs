@@ -20,7 +20,12 @@ use bincode_next::{config::standard, encode_to_vec};
 use bon::Builder;
 use getset::MutGetters;
 use std::time::Duration;
-use tokio::{net::UdpSocket, select, sync::mpsc::Receiver, time::interval};
+use tokio::{
+    net::UdpSocket,
+    select,
+    sync::{mpsc::Receiver, oneshot},
+    time::{interval, sleep},
+};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -65,6 +70,16 @@ pub struct UdpSender {
     /// Populated from `retransmit_rx`; drained on every retransmit tick.
     #[builder(default)]
     pending_retransmit: HashSet<u64>,
+    /// Oneshot receiver paired with [`UdpReader::peer_discovered_tx`](crate::UdpReader).
+    /// When present, `frame_loop` waits for the signal before sending any packets,
+    /// ensuring the UDP socket is connected (via `recv_from` bootstrap in
+    /// `server_frame_loop`) before `send()` is called.
+    peer_discovered_rx: Option<oneshot::Receiver<()>>,
+    /// Optional additional delay applied after peer discovery (server-side only).
+    /// When set, `frame_loop` sleeps for this duration after the NAT address is
+    /// confirmed, giving slow NAT devices extra time to stabilise the binding
+    /// before bulk terminal data starts flowing.
+    warmup_delay: Option<Duration>,
 }
 
 impl UdpSender {
@@ -75,6 +90,18 @@ impl UdpSender {
     /// * I/O error.
     ///
     pub async fn frame_loop(&mut self, token: CancellationToken) -> Result<()> {
+        // If paired with a server UdpReader, wait until the reader has discovered
+        // the client's post-NAT address and called connect() on the shared socket.
+        // This prevents send() from being called on an unconnected socket.
+        if let Some(rx) = self.peer_discovered_rx.take() {
+            let _ = rx.await;
+        }
+        // Optional warmup delay: after peer discovery, pause before sending any
+        // data frames so that slow NAT devices have extra time to establish the
+        // bidirectional binding.  Configured via `--warmup-delay` on the server.
+        if let Some(delay) = self.warmup_delay {
+            sleep(delay).await;
+        }
         let mut retransmit_active = true;
         // Drain pending_retransmit at the same cadence as NAK_CHECK_INTERVAL on the
         // reader side, so retransmits are coalesced across multiple NAK messages that

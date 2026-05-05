@@ -44,11 +44,13 @@ use tokio::{
     sync::{
         Mutex,
         mpsc::{Receiver, Sender, channel},
+        oneshot,
     },
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, trace};
 use uuid::Uuid;
+use zstd::encode_all;
 
 use crate::{
     cli::Cli,
@@ -65,6 +67,13 @@ struct ClientInfo {
     user: String,
     session_uuid: Uuid,
 }
+
+/// Normal screen-sync interval when the terminal is idle.
+const SCREEN_SYNC_IDLE_INTERVAL: Duration = Duration::from_millis(50);
+/// Reduced screen-sync interval during rapid terminal output bursts (Option H).
+const SCREEN_SYNC_BURST_INTERVAL: Duration = Duration::from_millis(10);
+/// Dirty-counter delta threshold above which a tick is classified as a burst.
+const SCREEN_SYNC_BURST_DIRTY_THRESHOLD: u64 = 5;
 
 /// Shared mutable state for the server status banner.
 #[derive(Clone)]
@@ -355,7 +364,10 @@ async fn resolve_session(
                 emu.screen().contents_formatted()
             };
             let screen_state_bytes = screen_state.len();
-            tx.send(EncryptedFrame::ScreenState(screen_state)).await?;
+            let compressed =
+                encode_all(screen_state.as_slice(), 3).unwrap_or_else(|_| screen_state.clone());
+            tx.send(EncryptedFrame::ScreenStateCompressed(compressed))
+                .await?;
             info!(
                 user = skex.user(),
                 session = %session_uuid,
@@ -406,6 +418,7 @@ async fn handle_connection(
     let (sock_read, sock_write) = socket.into_split();
     let port_pool = config.port_pool();
     let session_registry = config.session_registry();
+    let warmup_delay = config.warmup_delay_ms().map(Duration::from_millis);
     let (kex, udp_arc, skex_opt) =
         run_key_exchange(config, sock_read, sock_write, || Ok(None), None, None).await?;
     info!("Key exchange completed with moshpit");
@@ -421,6 +434,10 @@ async fn handle_connection(
     let udp_send = udp_arc.clone();
 
     let conn_token = CancellationToken::new();
+
+    // Oneshot channel that lets UdpSender wait until UdpReader has discovered
+    // the client's real post-NAT address and connected the shared UDP socket.
+    let (peer_discovered_tx, peer_discovered_rx) = oneshot::channel::<()>();
 
     // Resolve channels and decide whether to spawn a new PTY.
     let (term_tx, maybe_term_rx, output_handle, scrollback, server_emulator, dirty_counter) =
@@ -453,6 +470,7 @@ async fn handle_connection(
         banner_dc.remove(dc_kex_uuid).await;
     });
 
+    let (repaint_tx, mut repaint_rx) = channel::<()>(1);
     let mut udp_reader = UdpReader::builder()
         .socket(udp_recv)
         .id(kex.uuid())
@@ -460,6 +478,8 @@ async fn handle_connection(
         .rnk(kex.key())?
         .nak_out_tx(tx.clone())
         .retransmit_tx(retransmit_tx)
+        .peer_discovered_tx(peer_discovered_tx)
+        .repaint_tx(repaint_tx)
         .build();
     let mut udp_sender = UdpSender::builder()
         .socket(udp_send)
@@ -468,6 +488,8 @@ async fn handle_connection(
         .id(kex.uuid())
         .hmac(kex.hmac_key())
         .rnk(kex.key())?
+        .peer_discovered_rx(peer_discovered_rx)
+        .maybe_warmup_delay(warmup_delay)
         .build();
 
     let reader_token = conn_token.clone();
@@ -483,24 +505,35 @@ async fn handle_connection(
 
     spawn_connection_watchdogs(tx.clone(), conn_token.clone(), server_token);
 
-    // Periodic screen-state sync: every 50 ms send ScreenState to the client when the
-    // screen has changed.  The dirty_counter is incremented by spawn_pty_reader on every
-    // PTY output chunk and by spawn_pty on every Resize event, so this tick is a pure
-    // atomic load — essentially free — when the terminal is idle.
+    // Periodic screen-state sync: normally every 50 ms, but drops to 10 ms during rapid
+    // bursts (Option H — adaptive tick rate).  The dirty_counter is incremented by
+    // spawn_pty_reader on every PTY output chunk and by spawn_pty on every Resize event,
+    // so the load is a pure atomic read — essentially free — when the terminal is idle.
+    //
+    // When the counter advances by SCREEN_SYNC_BURST_DIRTY_THRESHOLD or more in a single tick
+    // period, the screen is changing quickly: switch to SCREEN_SYNC_BURST_INTERVAL so the
+    // client receives a fresh full-screen snapshot faster than the normal 50 ms cadence.
+    // Return to SCREEN_SYNC_IDLE_INTERVAL once the delta drops below the threshold.
     let sync_emu = server_emulator.clone();
     let sync_tx = tx.clone();
     let sync_token = conn_token.clone();
     let sync_dirty = dirty_counter.clone();
     let _screen_sync = spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_millis(50));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_dirty: u64 = 0;
+        let mut interval = SCREEN_SYNC_IDLE_INTERVAL;
         loop {
             select! {
                 () = sync_token.cancelled() => break,
-                _ = ticker.tick() => {
+                () = tokio::time::sleep(interval) => {
                     let current = sync_dirty.load(Ordering::Relaxed);
-                    if current == last_dirty {
+                    let delta = current.wrapping_sub(last_dirty);
+                    // Adapt tick rate based on how active the screen has been.
+                    interval = if delta >= SCREEN_SYNC_BURST_DIRTY_THRESHOLD {
+                        SCREEN_SYNC_BURST_INTERVAL
+                    } else {
+                        SCREEN_SYNC_IDLE_INTERVAL
+                    };
+                    if delta == 0 {
                         // Screen has not changed since last tick — skip expensive formatting.
                         continue;
                     }
@@ -509,7 +542,39 @@ async fn handle_connection(
                         let emu = sync_emu.lock().await;
                         emu.screen().contents_formatted()
                     };
-                    if sync_tx.send(EncryptedFrame::ScreenState(contents)).await.is_err() {
+                    let compressed = encode_all(contents.as_slice(), 3)
+                        .unwrap_or_else(|_| contents.clone());
+                    if sync_tx.send(EncryptedFrame::ScreenStateCompressed(compressed)).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    // Respond to RepaintRequest frames from the client with an immediate ScreenState.
+    // The repaint_rx channel has capacity 1; bursts of requests are coalesced naturally
+    // since the channel is drained before each response is sent.
+    let repaint_emu = server_emulator.clone();
+    let repaint_tx_out = tx.clone();
+    let repaint_token = conn_token.clone();
+    let _repaint_on_request = spawn(async move {
+        loop {
+            select! {
+                () = repaint_token.cancelled() => break,
+                msg = repaint_rx.recv() => {
+                    if msg.is_none() {
+                        break;
+                    }
+                    // Drain any additional queued requests — one ScreenState covers them all.
+                    while repaint_rx.try_recv().is_ok() {}
+                    let contents = {
+                        let emu = repaint_emu.lock().await;
+                        emu.screen().contents_formatted()
+                    };
+                    let compressed = encode_all(contents.as_slice(), 3)
+                        .unwrap_or_else(|_| contents.clone());
+                    if repaint_tx_out.send(EncryptedFrame::ScreenStateCompressed(compressed)).await.is_err() {
                         break;
                     }
                 }
@@ -1433,7 +1498,10 @@ mod test {
         // A ScreenState frame should have been sent on the *new* connection's tx
         let mut saw_screen_state = false;
         while let Ok(frame) = rx2.try_recv() {
-            if matches!(frame, EncryptedFrame::ScreenState(_)) {
+            if matches!(
+                frame,
+                EncryptedFrame::ScreenState(_) | EncryptedFrame::ScreenStateCompressed(_)
+            ) {
                 saw_screen_state = true;
                 break;
             }

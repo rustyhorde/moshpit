@@ -100,6 +100,24 @@ pub(crate) struct Cli {
     )]
     #[getset(get = "pub(crate)")]
     predict: String,
+    /// Send warmup keepalives before the UDP session starts to establish
+    /// a bidirectional NAT binding before bulk terminal data flows.
+    /// Only useful on NAT paths; adds one round-trip of startup latency.
+    #[clap(
+        long,
+        help = "Send NAT warmup keepalives at UDP session start (opt-in)"
+    )]
+    #[getset(get_copy = "pub(crate)")]
+    nat_warmup: bool,
+    /// Number of keepalive frames to send during NAT warmup (default: 3).
+    #[clap(
+        long,
+        value_name = "N",
+        default_value_t = 3,
+        help = "Number of NAT warmup keepalives to send (default: 3)"
+    )]
+    #[getset(get_copy = "pub(crate)")]
+    nat_warmup_count: u32,
 }
 
 impl Source for Cli {
@@ -156,6 +174,17 @@ impl Source for Cli {
         let _old = map.insert(
             "predict".to_string(),
             Value::new(Some(&origin), ValueKind::String(self.predict.clone())),
+        );
+        let _old = map.insert(
+            "nat_warmup".to_string(),
+            Value::new(Some(&origin), ValueKind::Boolean(self.nat_warmup)),
+        );
+        let _old = map.insert(
+            "nat_warmup_count".to_string(),
+            Value::new(
+                Some(&origin),
+                ValueKind::U64(u32::into(self.nat_warmup_count)),
+            ),
         );
         Ok(map)
     }
