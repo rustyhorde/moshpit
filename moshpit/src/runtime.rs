@@ -12,7 +12,10 @@ use std::{
     io::{Read as _, Write as _, stdin, stdout},
     net::SocketAddr,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -169,7 +172,7 @@ async fn countdown_reconnect_banner(
             }
         }
     }
-    false
+    exit_token.is_cancelled()
 }
 
 /// Holds the `kb_rx` mutex during reconnect countdowns and detects `Ctrl-^ .`.
@@ -218,10 +221,14 @@ fn encode_char_key(c: char, ctrl: bool, alt: bool) -> Vec<u8> {
             '@' => 0x00,
             'a'..='z' => c.to_ascii_lowercase() as u8 - b'a' + 1,
             '[' => 0x1b,
-            '\\' => 0x1c,
-            ']' => 0x1d,
-            '^' => 0x1e,
-            '_' => 0x1f,
+            // crossterm's Unix parser maps 0x1C-0x1F to Char('4'-'7') + CONTROL
+            // (e.g. Ctrl+6 / Ctrl+^ → 0x1E → Char('6') + CONTROL).  Accepting
+            // both the digit and the traditional symbol form keeps behaviour
+            // consistent across platforms and terminal emulators.
+            '\\' | '4' => 0x1c,
+            ']' | '5' => 0x1d,
+            '^' | '6' => 0x1e,
+            '_' | '7' => 0x1f,
             _ => {
                 let mut buf = [0u8; 4];
                 let s = c.encode_utf8(&mut buf);
@@ -424,12 +431,9 @@ fn encode_function_key(n: u8, has_mod: bool, mod_param: u8) -> Vec<u8> {
 /// produce for the same keypress.  Returns an empty `Vec` for events that
 /// should not be forwarded (key-release events, unhandled keys, etc.).
 ///
-/// On Windows this is the primary path for all keyboard input: the console is
-/// event-based (`ReadConsoleInput`/`KEY_EVENT`) so `std::io::stdin().read()`
-/// does not receive arrow keys or other special keys.  On Unix it is used by
-/// the pre-KEX escape detector (`poll_escape_loop`) which calls
-/// `crossterm::event::read()` to receive typed events during reconnect
-/// countdowns before the dedicated raw-stdin thread is started.
+/// On Windows the console API reports key presses as structured events; on Unix
+/// crossterm parses raw stdin bytes in raw mode.  Either way this re-encodes
+/// the event as ANSI bytes for forwarding to the server.
 fn key_event_to_bytes(event: crossterm::event::KeyEvent) -> Vec<u8> {
     use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
     // Only forward press events; Windows always reports both press and release.
@@ -457,107 +461,48 @@ fn key_event_to_bytes(event: crossterm::event::KeyEvent) -> Vec<u8> {
     }
 }
 
-/// Windows stdin reader: uses `crossterm::event::read()` which calls
-/// `ReadConsoleInput` internally, so arrow keys and all other special keys are
-/// received as typed `KeyEvent`s and re-encoded as ANSI escape sequences.
-#[cfg(windows)]
-fn stdin_reader_loop(kb_tx: &Sender<Vec<u8>>) {
-    use crossterm::event::{Event, read};
+/// Temporarily pauses the stdin reader and restores cooked mode, calls `f`,
+/// then re-enables raw mode and resumes the reader.  Wraps interactive prompts
+/// (passphrase, TOFU, key-mismatch) that require a functioning line editor.
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn with_cooked_term<T>(paused: &AtomicBool, f: impl FnOnce() -> T) -> T {
+    paused.store(true, Ordering::SeqCst);
+    // Give the reader thread time to observe the pause before raw mode drops.
+    thread::sleep(Duration::from_millis(100));
+    drop(disable_raw_mode());
+    let result = f();
+    drop(enable_raw_mode());
+    paused.store(false, Ordering::SeqCst);
+    result
+}
+
+/// Polls for crossterm key events and forwards their ANSI byte encoding to the
+/// keyboard channel.  When `paused` is set, idles so `with_cooked_term` can
+/// safely disable raw mode around interactive prompts.
+fn stdin_reader_loop(kb_tx: &Sender<Vec<u8>>, paused: &AtomicBool) {
+    use crossterm::event::{Event, poll, read};
     loop {
-        match read() {
-            Ok(Event::Key(key_event)) => {
-                let bytes = key_event_to_bytes(key_event);
-                if !bytes.is_empty() && kb_tx.blocking_send(bytes).is_err() {
-                    break;
+        if paused.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(50));
+            continue;
+        }
+        match poll(Duration::from_millis(50)) {
+            Ok(true) => {
+                if let Ok(Event::Key(ke)) = read() {
+                    let bytes = key_event_to_bytes(ke);
+                    if !bytes.is_empty() && kb_tx.blocking_send(bytes).is_err() {
+                        break;
+                    }
                 }
             }
-            Ok(_) => {}
+            Ok(false) => {}
             Err(_) => break,
         }
     }
 }
 
-/// Unix stdin reader: the terminal driver translates all key presses—including
-/// arrow keys—into ANSI escape sequences before they reach `stdin`, so a plain
-/// `read()` is sufficient.
-#[cfg(not(windows))]
-fn stdin_reader_loop(kb_tx: &Sender<Vec<u8>>) {
-    let mut buf = [0u8; 4096];
-    loop {
-        match stdin().read(&mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                if kb_tx.blocking_send(buf[..n].to_vec()).is_err() {
-                    break;
-                }
-            }
-        }
-    }
-}
-
-/// Sets up the stdin reader thread on the first successful connection, or clears
-/// the reconnect banner on subsequent reconnects.  Returns the shared keyboard
-/// channel.
-#[cfg_attr(coverage_nightly, coverage(off))]
-async fn ensure_stdin_reader(
-    kb_rx_shared: &mut Option<Arc<Mutex<Receiver<Vec<u8>>>>>,
-    stdout_tx: &Sender<Vec<u8>>,
-) -> Result<Arc<Mutex<Receiver<Vec<u8>>>>> {
-    if let Some(ref rx) = *kb_rx_shared {
-        clear_reconnect_banner(stdout_tx).await;
-        return Ok(rx.clone());
-    }
-    enable_raw_mode()?;
-    let (kb_tx, kb_rx) = channel::<Vec<u8>>(64);
-    let _stdin_thread = thread::spawn(move || stdin_reader_loop(&kb_tx));
-    let shared = Arc::new(Mutex::new(kb_rx));
-    *kb_rx_shared = Some(shared.clone());
-    Ok(shared)
-}
-
-/// Blocking poll loop for `Ctrl-^ .` escape detection.  Called via
-/// `spawn_blocking` during reconnect countdowns that occur before the first
-/// successful KEX (i.e. when the dedicated raw-stdin reader thread has not
-/// been started yet).  Exits when either token is cancelled.
-#[cfg_attr(coverage_nightly, coverage(off))]
-fn poll_escape_loop(exit_token: &CancellationToken, done_token: &CancellationToken) {
-    use crossterm::event::{Event, poll, read};
-    let mut state = EscapeState::Normal;
-    loop {
-        if done_token.is_cancelled() {
-            break;
-        }
-        if let Ok(true) = poll(Duration::from_millis(100))
-            && let Ok(Event::Key(ke)) = read()
-        {
-            for &byte in &key_event_to_bytes(ke) {
-                state = match state {
-                    EscapeState::Normal => {
-                        if byte == 0x1E {
-                            EscapeState::PendingDot
-                        } else {
-                            EscapeState::Normal
-                        }
-                    }
-                    EscapeState::PendingDot => {
-                        if byte == 0x2E {
-                            exit_token.cancel();
-                            return;
-                        } else if byte == 0x1E {
-                            EscapeState::PendingDot
-                        } else {
-                            EscapeState::Normal
-                        }
-                    }
-                };
-            }
-        }
-    }
-}
-
-/// Runs the reconnect countdown, optionally alongside an escape-sequence
-/// listener when stdin raw mode is already active.  Returns `true` if the user
-/// pressed `Ctrl-^ .` to quit.
+/// Runs the reconnect countdown alongside an escape-sequence listener.
+/// Returns `true` if the user pressed `Ctrl-^ .` to quit.
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn countdown_with_escape(
     stdout_tx: &Sender<Vec<u8>>,
@@ -565,36 +510,11 @@ async fn countdown_with_escape(
     attempt: u32,
     max_backoff_secs: u64,
     exit_token: &CancellationToken,
-    kb_rx: Option<Arc<Mutex<Receiver<Vec<u8>>>>>,
+    kb_rx: Arc<Mutex<Receiver<Vec<u8>>>>,
 ) -> bool {
-    let Some(kb_rx_ref) = kb_rx else {
-        // Raw mode not yet active (before first successful KEX).  Enable it
-        // temporarily so the escape sequence can be detected during the
-        // countdown, then restore cooked mode before the next KEX attempt so
-        // dialoguer prompts work correctly.
-        drop(enable_raw_mode());
-        let escape_done = CancellationToken::new();
-        let detector_handle = tokio::task::spawn_blocking({
-            let exit_token = exit_token.clone();
-            let escape_done = escape_done.clone();
-            move || poll_escape_loop(&exit_token, &escape_done)
-        });
-        let exiting = countdown_reconnect_banner(
-            stdout_tx,
-            backoff_secs,
-            attempt,
-            max_backoff_secs,
-            exit_token,
-        )
-        .await;
-        escape_done.cancel();
-        drop(detector_handle.await);
-        drop(disable_raw_mode());
-        return exiting;
-    };
     let escape_done = CancellationToken::new();
     let escape_handle = spawn(run_escape_listener(
-        kb_rx_ref,
+        kb_rx,
         exit_token.clone(),
         escape_done.clone(),
     ));
@@ -612,6 +532,7 @@ async fn countdown_with_escape(
 }
 
 /// Persistent reconnect loop.  Runs until the shell exits (via `process::exit`).
+#[cfg_attr(nightly, allow(clippy::too_many_lines))]
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn run_session_loop(
     config: Config,
@@ -639,11 +560,19 @@ async fn run_session_loop(
     let mut config = config;
     let mut backoff = Duration::from_secs(2);
     let mut reconnect_attempt: u32 = 0;
-    // Stdin reader is started once, after the first successful kex (so that raw
-    // mode is not active while dialoguer reads the passphrase).
-    let mut kb_rx_shared: Option<Arc<Mutex<Receiver<Vec<u8>>>>> = None;
     // Shared exit token: cancelled when the user presses Ctrl-^ . to quit.
     let exit_token = CancellationToken::new();
+
+    // Start the stdin reader before the first KEX so Ctrl-^ . is always
+    // detectable.  with_cooked_term pauses it around interactive prompts.
+    let stdin_paused = Arc::new(AtomicBool::new(false));
+    enable_raw_mode()?;
+    let (kb_tx, kb_rx) = channel::<Vec<u8>>(64);
+    let paused_for_reader = stdin_paused.clone();
+    let _stdin_thread = thread::spawn(move || stdin_reader_loop(&kb_tx, &paused_for_reader));
+    let kb_rx_shared = Arc::new(Mutex::new(kb_rx));
+
+    let mut had_successful_kex = false;
 
     loop {
         match connect_and_kex(
@@ -652,29 +581,33 @@ async fn run_session_loop(
             &server_ip,
             server_port,
             &pass_cache,
+            stdin_paused.clone(),
         )
         .await
         {
             Ok((kex, udp_arc, nak_timeout)) => {
                 backoff = Duration::from_secs(2);
-                // Enable raw mode and start the stdin reader on the first
-                // successful kex (passphrase already cached; raw mode won't
-                // interfere).  On reconnects, clears the banner instead.
-                let kb_rx = ensure_stdin_reader(&mut kb_rx_shared, &stdout_tx).await?;
+                clear_reconnect_banner(&stdout_tx).await;
+                had_successful_kex = true;
 
-                run_udp_session(
+                let session_result = run_udp_session(
                     kex,
                     udp_arc,
                     nak_timeout,
-                    kb_rx,
+                    kb_rx_shared.clone(),
                     config.nat_warmup(),
                     config.nat_warmup_count(),
                     stdout_tx.clone(),
                     config.predict(),
                     exit_token.clone(),
                 )
-                .await?;
+                .await;
+                if let Err(e) = session_result {
+                    drop(disable_raw_mode());
+                    return Err(e);
+                }
                 if exit_token.is_cancelled() {
+                    drop(disable_raw_mode());
                     time::sleep(Duration::from_millis(100)).await;
                     std::process::exit(0);
                 }
@@ -689,19 +622,20 @@ async fn run_session_loop(
                         "mp: run `mp-keygen` to regenerate your keypair at {}",
                         fatal.key_path.display()
                     );
+                    drop(disable_raw_mode());
                     return Err(e);
                 }
                 if e.downcast_ref::<MoshpitError>()
                     .is_some_and(|e| *e == MoshpitError::HostKeyRejected)
                 {
+                    drop(disable_raw_mode());
                     return Err(e);
                 }
                 reconnect_attempt = reconnect_attempt.saturating_add(1);
                 error!("Failed to connect to {socket_addr}: {e}, retrying in {backoff:?}");
-                // If raw mode is not yet active (first connection attempt), the
-                // failure may be due to a wrong passphrase.  Reset the cache so
-                // the user can re-enter it with a clean terminal on the next try.
-                if kb_rx_shared.is_none() {
+                // Reset passphrase cache on early failures so the user can
+                // re-enter it on the next attempt.
+                if !had_successful_kex {
                     *pass_cache.lock().unwrap() = PassCache::Uncached;
                 }
                 if countdown_with_escape(
@@ -717,6 +651,7 @@ async fn run_session_loop(
                     clear_reconnect_banner(&stdout_tx).await;
                     let msg = b"\r\n\x1b[0m[moshpit] Disconnected.\r\n";
                     drop(stdout_tx.send(msg.to_vec()).await);
+                    drop(disable_raw_mode());
                     time::sleep(Duration::from_millis(100)).await;
                     std::process::exit(0);
                 }
@@ -734,6 +669,7 @@ async fn connect_and_kex(
     server_ip: &str,
     server_port: u16,
     pass_cache: &Arc<std::sync::Mutex<PassCache>>,
+    stdin_paused: Arc<AtomicBool>,
 ) -> Result<(Kex, Arc<UdpSocket>, Duration)> {
     // Refresh resume UUID from disk (may have been updated by previous connection).
     let _ = config.set_resume_session_uuid(read_session_uuid(server_ip, server_port));
@@ -742,6 +678,7 @@ async fn connect_and_kex(
     info!("Connected to {}", socket.peer_addr()?);
 
     let cache = pass_cache.clone();
+    let paused_pass = stdin_paused.clone();
     let pass_fn = move || -> Result<Option<String>> {
         let guard = cache.lock().unwrap();
         if guard.is_cached() {
@@ -753,7 +690,8 @@ async fn connect_and_kex(
         }
         drop(guard);
         info!("passphrase: prompting user");
-        let result = tokio::task::block_in_place(read_passpharase);
+        let result =
+            tokio::task::block_in_place(|| with_cooked_term(&paused_pass, read_passpharase));
         match &result {
             Ok(Some(_)) => info!("passphrase: prompt returned a passphrase"),
             Ok(None) => info!("passphrase: prompt returned None (key may be unencrypted)"),
@@ -770,39 +708,46 @@ async fn connect_and_kex(
 
     let (sock_read, sock_write) = socket.into_split();
 
-    let tofu_fn: libmoshpit::TofuFn = Arc::new(|host: &str, fingerprint: &str| -> Result<bool> {
-        tokio::task::block_in_place(|| {
-            let prompt = format!(
-                "The authenticity of host '{host}' can't be established.\n\
-                 Fingerprint is SHA256:{fingerprint}.\n\
-                 Are you sure you want to continue connecting? (yes/no)"
-            );
-            let input: String = dialoguer::Input::new()
-                .with_prompt(prompt)
-                .interact_text()?;
-            Ok(input.eq_ignore_ascii_case("yes"))
-        })
-    });
-
-    let mismatch_fn: libmoshpit::HostKeyMismatchFn = Arc::new(
-        |host: &str, old_fingerprint: &str, new_fingerprint: &str| -> Result<bool> {
+    let paused_tofu = stdin_paused.clone();
+    let tofu_fn: libmoshpit::TofuFn =
+        Arc::new(move |host: &str, fingerprint: &str| -> Result<bool> {
             tokio::task::block_in_place(|| {
-                eprintln!("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@");
-                eprintln!("@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @");
-                eprintln!("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@");
-                eprintln!("Potential DNS spoofing or machine-in-the-middle detected.");
-                eprintln!("Host: {host}");
-                eprintln!("Offending key fingerprint: SHA256:{old_fingerprint}");
-                eprintln!("Presented key fingerprint: SHA256:{new_fingerprint}");
+                with_cooked_term(&paused_tofu, || {
+                    let prompt = format!(
+                        "The authenticity of host '{host}' can't be established.\n\
+                     Fingerprint is SHA256:{fingerprint}.\n\
+                     Are you sure you want to continue connecting? (yes/no)"
+                    );
+                    let input: String = dialoguer::Input::new()
+                        .with_prompt(prompt)
+                        .interact_text()?;
+                    Ok(input.eq_ignore_ascii_case("yes"))
+                })
+            })
+        });
 
-                Confirm::new()
-                    .with_prompt(
-                        "Update ~/.mp/known_hosts with the newly presented key for this host?",
-                    )
-                    .default(false)
-                    .wait_for_newline(true)
-                    .interact()
-                    .map_err(Into::into)
+    let paused_mismatch = stdin_paused;
+    let mismatch_fn: libmoshpit::HostKeyMismatchFn = Arc::new(
+        move |host: &str, old_fingerprint: &str, new_fingerprint: &str| -> Result<bool> {
+            tokio::task::block_in_place(|| {
+                with_cooked_term(&paused_mismatch, || {
+                    eprintln!("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@");
+                    eprintln!("@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @");
+                    eprintln!("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@");
+                    eprintln!("Potential DNS spoofing or machine-in-the-middle detected.");
+                    eprintln!("Host: {host}");
+                    eprintln!("Offending key fingerprint: SHA256:{old_fingerprint}");
+                    eprintln!("Presented key fingerprint: SHA256:{new_fingerprint}");
+
+                    Confirm::new()
+                        .with_prompt(
+                            "Update ~/.mp/known_hosts with the newly presented key for this host?",
+                        )
+                        .default(false)
+                        .wait_for_newline(true)
+                        .interact()
+                        .map_err(Into::into)
+                })
             })
         },
     );
@@ -1604,7 +1549,15 @@ mod tests {
         let addr = format!("127.0.0.1:{port}").parse().unwrap();
 
         // This should fail with ConnectionRefused
-        let result = connect_and_kex(&mut config, addr, "127.0.0.1", port, &pass_cache).await;
+        let result = connect_and_kex(
+            &mut config,
+            addr,
+            "127.0.0.1",
+            port,
+            &pass_cache,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
         assert!(result.is_err());
         assert!(
             result
@@ -1675,7 +1628,15 @@ mod tests {
         let addr = format!("127.0.0.1:{port}").parse().unwrap();
 
         // TcpStream::connect will succeed, but run_key_exchange will fail
-        let result = connect_and_kex(&mut config, addr, "127.0.0.1", port, &pass_cache).await;
+        let result = connect_and_kex(
+            &mut config,
+            addr,
+            "127.0.0.1",
+            port,
+            &pass_cache,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
         assert!(result.is_err());
     }
 
@@ -1747,13 +1708,44 @@ mod tests {
         }));
 
         let addr = format!("127.0.0.1:{port}").parse().unwrap();
-        let result = connect_and_kex(&mut config, addr, "127.0.0.1", port, &pass_cache).await;
+        let result = connect_and_kex(
+            &mut config,
+            addr,
+            "127.0.0.1",
+            port,
+            &pass_cache,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
             err.downcast_ref::<FatalKexError>().is_some(),
             "missing key file should produce FatalKexError, got: {err}"
         );
+    }
+
+    // crossterm's Unix parser maps 0x1C-0x1F bytes to Char('4'-'7') + CONTROL.
+    // Verify that encode_char_key round-trips these correctly on all platforms.
+    #[test]
+    fn ctrl_digit_aliases_produce_correct_control_codes() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+
+        fn ctrl_char(c: char) -> KeyEvent {
+            KeyEvent {
+                code: KeyCode::Char(c),
+                modifiers: KeyModifiers::CONTROL,
+                kind: KeyEventKind::Press,
+                state: KeyEventState::empty(),
+            }
+        }
+
+        // Ctrl+6 (crossterm Unix: 0x1E → Char('6') + CONTROL) — escape prefix
+        assert_eq!(key_event_to_bytes(ctrl_char('6')), b"\x1e");
+        // Ctrl+4 (0x1C), Ctrl+5 (0x1D), Ctrl+7 (0x1F)
+        assert_eq!(key_event_to_bytes(ctrl_char('4')), b"\x1c");
+        assert_eq!(key_event_to_bytes(ctrl_char('5')), b"\x1d");
+        assert_eq!(key_event_to_bytes(ctrl_char('7')), b"\x1f");
     }
 
     #[cfg(windows)]
