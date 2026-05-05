@@ -1,5 +1,5 @@
 # nfpm package configuration for moshpits (server)
-# Build with: VERSION=<ver> nfpm package --config packaging/debian/moshpits.yaml --packager deb --target release-assets/
+# Build with: VERSION=<ver> nfpm package --config packaging/nfpm/moshpits.yaml --packager deb|rpm --target release-assets/
 name: moshpits
 arch: amd64
 version: ${VERSION}
@@ -19,9 +19,18 @@ depends:
 deb:
   compression: xz
 
-scripts:
-  postinstall: packaging/debian/scripts/moshpits-postinst
-  preremove: packaging/debian/scripts/moshpits-prerm
+rpm:
+  compression: xz
+
+overrides:
+  deb:
+    scripts:
+      postinstall: packaging/nfpm/scripts/moshpits-postinst
+      preremove: packaging/nfpm/scripts/moshpits-prerm
+  rpm:
+    scripts:
+      postinstall: packaging/nfpm/scripts/moshpits-rpm-postinst
+      preremove: packaging/nfpm/scripts/moshpits-rpm-prerm
 
 contents:
   # Binary

@@ -105,22 +105,24 @@ jobs:
             | tar -xz -C /usr/local/bin nfpm
           nfpm --version
 
-      - name: Build Debian packages
+      - name: Build Debian and RPM packages
         env:
           VERSION: ${{ steps.version.outputs.pkgver }}
         run: |
-          nfpm package \
-            --config packaging/debian/moshpit-keygen.yaml \
-            --packager deb \
-            --target release-assets/
-          nfpm package \
-            --config packaging/debian/moshpit.yaml \
-            --packager deb \
-            --target release-assets/
-          nfpm package \
-            --config packaging/debian/moshpits.yaml \
-            --packager deb \
-            --target release-assets/
+          for packager in deb rpm; do
+            nfpm package \
+              --config packaging/nfpm/moshpit-keygen.yaml \
+              --packager "$packager" \
+              --target release-assets/
+            nfpm package \
+              --config packaging/nfpm/moshpit.yaml \
+              --packager "$packager" \
+              --target release-assets/
+            nfpm package \
+              --config packaging/nfpm/moshpits.yaml \
+              --packager "$packager" \
+              --target release-assets/
+          done
 
       - name: Upload release assets artifact
         # v7
