@@ -48,6 +48,11 @@ const NAK_TIMEOUT: Duration = Duration::from_millis(50);
 const NAK_BACKOFF_MAX_SHIFT: u32 = 4;
 /// Maximum number of NAK retries before giving up on a permanently lost packet.
 const MAX_NAK_RETRIES: u32 = 4;
+/// Number of NAK retries after which the client sends a [`EncryptedFrame::RepaintRequest`]
+/// to the server.  Fires exactly once per gap (when retry count reaches this value),
+/// asking for an out-of-band full-screen snapshot to unblock the display without waiting
+/// for retransmit to succeed or retry exhaustion.
+const REPAINT_REQUEST_THRESHOLD: u32 = 2;
 /// Maximum sequence jump allowed before dropping the frame to prevent `DoS`.
 const MAX_SEQ_JUMP: u64 = 1024;
 
@@ -113,6 +118,11 @@ pub struct UdpReader {
     /// paired [`UdpSender`](crate::UdpSender) awaits this signal before sending any
     /// packets so it never calls `send()` on an unconnected socket.
     peer_discovered_tx: Option<oneshot::Sender<()>>,
+    /// Fired by the server's [`server_frame_loop`](Self::server_frame_loop) when a
+    /// [`EncryptedFrame::RepaintRequest`] arrives from the client.  The paired receiver
+    /// is held by a task in `moshpits` that responds with an immediate
+    /// [`EncryptedFrame::ScreenState`].
+    repaint_tx: Option<Sender<()>>,
 }
 
 impl UdpReader {
@@ -491,16 +501,31 @@ impl UdpReader {
             .collect();
         if !timed_out.is_empty() {
             // Reset each gap's timer so the next backoff interval starts from now.
+            // Track whether any gap just hit the RepaintRequest threshold.
+            let mut send_repaint_request = false;
             for &seq in &timed_out {
                 if let Some(t) = self.gap_first_seen.get_mut(&seq) {
                     *t = now;
                 }
-                *self.gap_nak_count.entry(seq).or_insert(0) += 1;
+                let count = self.gap_nak_count.entry(seq).or_insert(0);
+                *count += 1;
+                if *count == REPAINT_REQUEST_THRESHOLD {
+                    send_repaint_request = true;
+                }
             }
             if let Some(ref tx) = self.nak_out_tx
                 && let Err(e) = tx.try_send(EncryptedFrame::Nak(timed_out))
             {
                 warn!("Failed to send NAK: {e}");
+            }
+            // When any gap reaches the repaint threshold, ask the server for an immediate
+            // full-screen snapshot.  This unblocks the display without waiting for
+            // retransmit to succeed or retries to be exhausted.
+            if send_repaint_request
+                && let Some(ref tx) = self.nak_out_tx
+                && let Err(e) = tx.try_send(EncryptedFrame::RepaintRequest)
+            {
+                warn!("Failed to send RepaintRequest: {e}");
             }
         }
 
@@ -513,6 +538,7 @@ impl UdpReader {
     /// * I/O error.
     /// * Frame parsing error.
     ///
+    #[cfg_attr(nightly, allow(clippy::too_many_lines))]
     pub async fn server_frame_loop(
         &mut self,
         token: CancellationToken,
@@ -543,6 +569,13 @@ impl UdpReader {
                                     .send(TerminalMessage::Resize { rows, columns })
                                     .await?;
                             }
+                            EncryptedFrame::RepaintRequest => {
+                                if let Some(ref tx) = self.repaint_tx
+                                    && let Err(e) = tx.try_send(())
+                                {
+                                    warn!("Failed to signal repaint request: {e}");
+                                }
+                            }
                             EncryptedFrame::Nak(_)
                             | EncryptedFrame::Shutdown
                             | EncryptedFrame::Keepalive
@@ -572,6 +605,13 @@ impl UdpReader {
                             EncryptedFrame::Resize((_id, columns, rows)) => {
                                 term_tx.send(TerminalMessage::Resize { rows, columns }).await?;
                             }
+                            EncryptedFrame::RepaintRequest => {
+                                if let Some(ref tx) = self.repaint_tx
+                                    && let Err(e) = tx.try_send(())
+                                {
+                                    warn!("Failed to signal repaint request: {e}");
+                                }
+                            }
                             EncryptedFrame::Nak(_) | EncryptedFrame::Shutdown | EncryptedFrame::Keepalive
                             | EncryptedFrame::ScrollbackStart | EncryptedFrame::ScrollbackEnd
                             | EncryptedFrame::ScreenState(_) => {}
@@ -588,6 +628,13 @@ impl UdpReader {
                                     }
                                     EncryptedFrame::Resize((_id, columns, rows)) => {
                                         term_tx.send(TerminalMessage::Resize { rows, columns }).await?;
+                                    }
+                                    EncryptedFrame::RepaintRequest => {
+                                        if let Some(ref tx) = self.repaint_tx
+                                            && let Err(e) = tx.try_send(())
+                                        {
+                                            warn!("Failed to signal repaint request: {e}");
+                                        }
                                     }
                                     EncryptedFrame::Nak(_) | EncryptedFrame::Shutdown | EncryptedFrame::Keepalive
                                     | EncryptedFrame::ScrollbackStart | EncryptedFrame::ScrollbackEnd
@@ -667,7 +714,7 @@ impl UdpReader {
                             EncryptedFrame::Resize(_) => {
                                 error!("Received Resize frame on client, which is unexpected");
                             }
-                            EncryptedFrame::Nak(_) | EncryptedFrame::Keepalive => {}
+                            EncryptedFrame::Nak(_) | EncryptedFrame::Keepalive | EncryptedFrame::RepaintRequest => {}
                             EncryptedFrame::Shutdown => {
                                 info!("Server is shutting down, reconnecting");
                                 self.signal_reconnect_or_exit(0);
@@ -734,7 +781,7 @@ impl UdpReader {
                                     EncryptedFrame::Resize(_) => {
                                         error!("Received Resize frame on client, which is unexpected");
                                     }
-                                    EncryptedFrame::Nak(_) | EncryptedFrame::Keepalive => {}
+                                    EncryptedFrame::Nak(_) | EncryptedFrame::Keepalive | EncryptedFrame::RepaintRequest => {}
                                     EncryptedFrame::Shutdown => {
                                         info!("Server is shutting down, reconnecting");
                                         self.signal_reconnect_or_exit(0);

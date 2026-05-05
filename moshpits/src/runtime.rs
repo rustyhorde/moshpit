@@ -458,6 +458,7 @@ async fn handle_connection(
         banner_dc.remove(dc_kex_uuid).await;
     });
 
+    let (repaint_tx, mut repaint_rx) = channel::<()>(1);
     let mut udp_reader = UdpReader::builder()
         .socket(udp_recv)
         .id(kex.uuid())
@@ -466,6 +467,7 @@ async fn handle_connection(
         .nak_out_tx(tx.clone())
         .retransmit_tx(retransmit_tx)
         .peer_discovered_tx(peer_discovered_tx)
+        .repaint_tx(repaint_tx)
         .build();
     let mut udp_sender = UdpSender::builder()
         .socket(udp_send)
@@ -517,6 +519,34 @@ async fn handle_connection(
                         emu.screen().contents_formatted()
                     };
                     if sync_tx.send(EncryptedFrame::ScreenState(contents)).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    // Respond to RepaintRequest frames from the client with an immediate ScreenState.
+    // The repaint_rx channel has capacity 1; bursts of requests are coalesced naturally
+    // since the channel is drained before each response is sent.
+    let repaint_emu = server_emulator.clone();
+    let repaint_tx_out = tx.clone();
+    let repaint_token = conn_token.clone();
+    let _repaint_on_request = spawn(async move {
+        loop {
+            select! {
+                () = repaint_token.cancelled() => break,
+                msg = repaint_rx.recv() => {
+                    if msg.is_none() {
+                        break;
+                    }
+                    // Drain any additional queued requests — one ScreenState covers them all.
+                    while repaint_rx.try_recv().is_ok() {}
+                    let contents = {
+                        let emu = repaint_emu.lock().await;
+                        emu.screen().contents_formatted()
+                    };
+                    if repaint_tx_out.send(EncryptedFrame::ScreenState(contents)).await.is_err() {
                         break;
                     }
                 }

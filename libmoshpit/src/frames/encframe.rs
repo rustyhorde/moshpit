@@ -56,6 +56,9 @@ pub enum EncryptedFrame {
     /// Full screen state from the server-side vt100 emulator; client feeds bytes into a
     /// temporary [`vt100::Parser`] and renders the result for an instant clean repaint.
     ScreenState(Vec<u8>),
+    /// Client requests an immediate full-screen repaint from the server.
+    /// Sent when NAK retries for any gap reach the repaint threshold.
+    RepaintRequest,
 }
 
 impl EncryptedFrame {
@@ -71,6 +74,7 @@ impl EncryptedFrame {
             EncryptedFrame::ScrollbackStart => 5,
             EncryptedFrame::ScrollbackEnd => 6,
             EncryptedFrame::ScreenState(_) => 7,
+            EncryptedFrame::RepaintRequest => 8,
         }
     }
 
