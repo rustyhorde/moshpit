@@ -68,6 +68,13 @@ struct ClientInfo {
     session_uuid: Uuid,
 }
 
+/// Normal screen-sync interval when the terminal is idle.
+const SCREEN_SYNC_IDLE_INTERVAL: Duration = Duration::from_millis(50);
+/// Reduced screen-sync interval during rapid terminal output bursts (Option H).
+const SCREEN_SYNC_BURST_INTERVAL: Duration = Duration::from_millis(10);
+/// Dirty-counter delta threshold above which a tick is classified as a burst.
+const SCREEN_SYNC_BURST_DIRTY_THRESHOLD: u64 = 5;
+
 /// Shared mutable state for the server status banner.
 #[derive(Clone)]
 struct BannerState {
@@ -498,24 +505,35 @@ async fn handle_connection(
 
     spawn_connection_watchdogs(tx.clone(), conn_token.clone(), server_token);
 
-    // Periodic screen-state sync: every 50 ms send ScreenState to the client when the
-    // screen has changed.  The dirty_counter is incremented by spawn_pty_reader on every
-    // PTY output chunk and by spawn_pty on every Resize event, so this tick is a pure
-    // atomic load — essentially free — when the terminal is idle.
+    // Periodic screen-state sync: normally every 50 ms, but drops to 10 ms during rapid
+    // bursts (Option H — adaptive tick rate).  The dirty_counter is incremented by
+    // spawn_pty_reader on every PTY output chunk and by spawn_pty on every Resize event,
+    // so the load is a pure atomic read — essentially free — when the terminal is idle.
+    //
+    // When the counter advances by SCREEN_SYNC_BURST_DIRTY_THRESHOLD or more in a single tick
+    // period, the screen is changing quickly: switch to SCREEN_SYNC_BURST_INTERVAL so the
+    // client receives a fresh full-screen snapshot faster than the normal 50 ms cadence.
+    // Return to SCREEN_SYNC_IDLE_INTERVAL once the delta drops below the threshold.
     let sync_emu = server_emulator.clone();
     let sync_tx = tx.clone();
     let sync_token = conn_token.clone();
     let sync_dirty = dirty_counter.clone();
     let _screen_sync = spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_millis(50));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_dirty: u64 = 0;
+        let mut interval = SCREEN_SYNC_IDLE_INTERVAL;
         loop {
             select! {
                 () = sync_token.cancelled() => break,
-                _ = ticker.tick() => {
+                () = tokio::time::sleep(interval) => {
                     let current = sync_dirty.load(Ordering::Relaxed);
-                    if current == last_dirty {
+                    let delta = current.wrapping_sub(last_dirty);
+                    // Adapt tick rate based on how active the screen has been.
+                    interval = if delta >= SCREEN_SYNC_BURST_DIRTY_THRESHOLD {
+                        SCREEN_SYNC_BURST_INTERVAL
+                    } else {
+                        SCREEN_SYNC_IDLE_INTERVAL
+                    };
+                    if delta == 0 {
                         // Screen has not changed since last tick — skip expensive formatting.
                         continue;
                     }
