@@ -128,9 +128,7 @@ impl KexReader {
                         Ok(false) => {
                             error!("client_kex: host key verification rejected for '{host}'");
                             let _ = self.tx_event.send(KexEvent::Failure);
-                            return Err(anyhow::anyhow!(
-                                "Host key verification failed for '{host}'"
-                            ));
+                            return Err(MoshpitError::HostKeyRejected.into());
                         }
                         Ok(true) => {
                             trace!("client_kex: host key verified for '{host}'");

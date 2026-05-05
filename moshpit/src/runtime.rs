@@ -247,6 +247,11 @@ async fn run_session_loop(
                     );
                     return Err(e);
                 }
+                if e.downcast_ref::<MoshpitError>()
+                    .is_some_and(|e| *e == MoshpitError::HostKeyRejected)
+                {
+                    return Err(e);
+                }
                 reconnect_attempt = reconnect_attempt.saturating_add(1);
                 error!("Failed to connect to {socket_addr}: {e}, retrying in {backoff:?}");
                 // If raw mode is not yet active (first connection attempt), the
