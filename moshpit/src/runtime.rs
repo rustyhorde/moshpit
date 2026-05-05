@@ -14,7 +14,7 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[cfg(target_family = "unix")]
@@ -201,7 +201,7 @@ async fn run_session_loop(
         )
         .await
         {
-            Ok((kex, udp_arc)) => {
+            Ok((kex, udp_arc, nak_timeout)) => {
                 backoff = Duration::from_secs(2);
 
                 // Enable raw mode and start the stdin reader on the first
@@ -233,7 +233,15 @@ async fn run_session_loop(
                     shared
                 };
 
-                run_udp_session(kex, udp_arc, kb_rx, stdout_tx.clone(), config.predict()).await?;
+                run_udp_session(
+                    kex,
+                    udp_arc,
+                    nak_timeout,
+                    kb_rx,
+                    stdout_tx.clone(),
+                    config.predict(),
+                )
+                .await?;
                 // Session dropped — show the reconnecting banner while we retry.
                 show_reconnect_banner(&stdout_tx).await;
                 time::sleep(Duration::from_millis(500)).await;
@@ -281,7 +289,7 @@ async fn connect_and_kex(
     server_ip: &str,
     server_port: u16,
     pass_cache: &Arc<std::sync::Mutex<PassCache>>,
-) -> Result<(Kex, Arc<UdpSocket>)> {
+) -> Result<(Kex, Arc<UdpSocket>, Duration)> {
     // Refresh resume UUID from disk (may have been updated by previous connection).
     let _ = config.set_resume_session_uuid(read_session_uuid(server_ip, server_port));
 
@@ -354,6 +362,7 @@ async fn connect_and_kex(
         },
     );
 
+    let kex_start = Instant::now();
     let (kex, udp_arc, _) = run_key_exchange(
         config.clone(),
         sock_read,
@@ -398,7 +407,16 @@ async fn connect_and_kex(
             info!("New session {session_uuid} started");
         }
     }
-    Ok((kex, udp_arc))
+    // Use the TCP KEX elapsed time as a proxy for network RTT.  The key
+    // exchange involves ~2 round trips, so the total elapsed time is
+    // approximately 2× RTT, making it a reasonable base for the NAK backoff
+    // schedule.  Clamp to [20 ms, 500 ms] to handle both LAN and high-latency
+    // paths without risking spurious NAKs or excessively slow recovery.
+    let nak_timeout = kex_start
+        .elapsed()
+        .clamp(Duration::from_millis(20), Duration::from_millis(500));
+    info!("nak_timeout set to {:?} from kex elapsed time", nak_timeout);
+    Ok((kex, udp_arc, nak_timeout))
 }
 
 /// Set up UDP tasks for one session and wait until the server disconnects.
@@ -407,7 +425,9 @@ async fn connect_and_kex(
 async fn run_udp_session(
     kex: Kex,
     udp_arc: Arc<UdpSocket>,
+    nak_timeout: Duration,
     kb_rx: Arc<Mutex<Receiver<Vec<u8>>>>,
+
     stdout_tx: Sender<Vec<u8>>,
     display_preference: DisplayPreference,
 ) -> Result<()> {
@@ -424,6 +444,7 @@ async fn run_udp_session(
         .nak_out_tx(tx.clone())
         .retransmit_tx(retransmit_tx)
         .silence_timeout(Duration::from_secs(15))
+        .nak_timeout(nak_timeout)
         .reconnect_tx(reconnect_tx)
         .query_response_tx(tx.clone())
         .build();

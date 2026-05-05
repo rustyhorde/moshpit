@@ -86,6 +86,11 @@ pub struct UdpReader {
     /// [`MAX_NAK_RETRIES`] retries.
     #[builder(default)]
     highest_seq_seen: u64,
+    /// Base NAK timeout derived from the measured TCP key-exchange round-trip time.
+    /// When set, replaces the hardcoded [`NAK_TIMEOUT`] constant as the base for
+    /// the exponential backoff schedule, adapting retransmit requests to the
+    /// observed network latency.  `None` falls back to [`NAK_TIMEOUT`] (50 ms).
+    nak_timeout: Option<Duration>,
     /// If no frame is received within this duration the server is assumed unreachable.
     /// Triggers reconnect via [`reconnect_tx`](Self::reconnect_tx) when set, otherwise calls
     /// [`process::exit`].
@@ -465,16 +470,18 @@ impl UdpReader {
 
         // 2. Normal NAK logic — request retransmission for recent gaps.
         // Each gap uses an exponentially backed-off timeout based on how many
-        // times it has already been NAKed: timeout = NAK_TIMEOUT * 2^retry_count
-        // (capped at NAK_TIMEOUT * 2^NAK_BACKOFF_MAX_SHIFT), so repeated misses
+        // times it has already been NAKed: timeout = base * 2^retry_count
+        // (capped at base * 2^NAK_BACKOFF_MAX_SHIFT), so repeated misses
         // back off rather than flooding the sender with duplicate retransmit requests.
+        // The base is the RTT-derived nak_timeout when available, else NAK_TIMEOUT.
+        let base_nak_timeout = self.nak_timeout.unwrap_or(NAK_TIMEOUT);
         let timed_out: Vec<u64> = self
             .gap_first_seen
             .iter()
             .filter_map(|(&seq, &t)| {
                 let retries = self.gap_nak_count.get(&seq).copied().unwrap_or(0);
                 let shift = retries.min(NAK_BACKOFF_MAX_SHIFT);
-                let backoff = NAK_TIMEOUT * (1u32 << shift);
+                let backoff = base_nak_timeout * (1u32 << shift);
                 if now.duration_since(t) >= backoff {
                     Some(seq)
                 } else {
