@@ -59,6 +59,10 @@ pub enum EncryptedFrame {
     /// Client requests an immediate full-screen repaint from the server.
     /// Sent when NAK retries for any gap reach the repaint threshold.
     RepaintRequest,
+    /// Full screen state compressed with zstd for reliable single-datagram delivery.
+    /// Replaces uncompressed [`EncryptedFrame::ScreenState`] for all normal screen syncs.
+    /// Client decompresses before feeding bytes into a temporary [`vt100::Parser`].
+    ScreenStateCompressed(Vec<u8>),
 }
 
 impl EncryptedFrame {
@@ -75,6 +79,7 @@ impl EncryptedFrame {
             EncryptedFrame::ScrollbackEnd => 6,
             EncryptedFrame::ScreenState(_) => 7,
             EncryptedFrame::RepaintRequest => 8,
+            EncryptedFrame::ScreenStateCompressed(_) => 9,
         }
     }
 
@@ -206,6 +211,8 @@ mod tests {
         assert_eq!(EncryptedFrame::ScrollbackStart.id(), 5);
         assert_eq!(EncryptedFrame::ScrollbackEnd.id(), 6);
         assert_eq!(EncryptedFrame::ScreenState(vec![]).id(), 7);
+        assert_eq!(EncryptedFrame::RepaintRequest.id(), 8);
+        assert_eq!(EncryptedFrame::ScreenStateCompressed(vec![]).id(), 9);
     }
 
     #[test]

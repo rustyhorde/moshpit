@@ -50,6 +50,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, trace};
 use uuid::Uuid;
+use zstd::encode_all;
 
 use crate::{
     cli::Cli,
@@ -356,7 +357,9 @@ async fn resolve_session(
                 emu.screen().contents_formatted()
             };
             let screen_state_bytes = screen_state.len();
-            tx.send(EncryptedFrame::ScreenState(screen_state)).await?;
+            let compressed = encode_all(screen_state.as_slice(), 3)
+                .unwrap_or_else(|_| screen_state.clone());
+            tx.send(EncryptedFrame::ScreenStateCompressed(compressed)).await?;
             info!(
                 user = skex.user(),
                 session = %session_uuid,
@@ -520,7 +523,9 @@ async fn handle_connection(
                         let emu = sync_emu.lock().await;
                         emu.screen().contents_formatted()
                     };
-                    if sync_tx.send(EncryptedFrame::ScreenState(contents)).await.is_err() {
+                    let compressed = encode_all(contents.as_slice(), 3)
+                        .unwrap_or_else(|_| contents.clone());
+                    if sync_tx.send(EncryptedFrame::ScreenStateCompressed(compressed)).await.is_err() {
                         break;
                     }
                 }
@@ -548,7 +553,9 @@ async fn handle_connection(
                         let emu = repaint_emu.lock().await;
                         emu.screen().contents_formatted()
                     };
-                    if repaint_tx_out.send(EncryptedFrame::ScreenState(contents)).await.is_err() {
+                    let compressed = encode_all(contents.as_slice(), 3)
+                        .unwrap_or_else(|_| contents.clone());
+                    if repaint_tx_out.send(EncryptedFrame::ScreenStateCompressed(compressed)).await.is_err() {
                         break;
                     }
                 }
@@ -1472,7 +1479,7 @@ mod test {
         // A ScreenState frame should have been sent on the *new* connection's tx
         let mut saw_screen_state = false;
         while let Ok(frame) = rx2.try_recv() {
-            if matches!(frame, EncryptedFrame::ScreenState(_)) {
+            if matches!(frame, EncryptedFrame::ScreenState(_) | EncryptedFrame::ScreenStateCompressed(_)) {
                 saw_screen_state = true;
                 break;
             }

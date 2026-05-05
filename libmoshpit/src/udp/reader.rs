@@ -34,6 +34,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use uuid::Uuid;
+use zstd::decode_all;
 
 use crate::{
     Emulator, EncryptedFrame, MoshpitError, PredictionEngine, Renderer, TerminalMessage,
@@ -53,6 +54,10 @@ const MAX_NAK_RETRIES: u32 = 4;
 /// asking for an out-of-band full-screen snapshot to unblock the display without waiting
 /// for retransmit to succeed or retry exhaustion.
 const REPAINT_REQUEST_THRESHOLD: u32 = 2;
+/// Number of frames buffered out-of-order before an immediate [`EncryptedFrame::RepaintRequest`]
+/// is sent.  A large `recv_buffer` means many gaps exist simultaneously — the display is
+/// stalled.  Firing early skips waiting for the first NAK retry cycle (~50 ms).
+const RECV_BUFFER_REPAINT_THRESHOLD: usize = 25;
 /// Maximum sequence jump allowed before dropping the frame to prevent `DoS`.
 const MAX_SEQ_JUMP: u64 = 1024;
 
@@ -332,7 +337,7 @@ impl UdpReader {
             // preceding diff.  Deliver it immediately by discarding all pending
             // gaps and buffered frames with sequence numbers below `seq`, then
             // drain any already-buffered frames that follow it in order.
-            if matches!(frame, EncryptedFrame::ScreenState(_)) {
+            if matches!(frame, EncryptedFrame::ScreenState(_) | EncryptedFrame::ScreenStateCompressed(_)) {
                 for obsolete in self.next_seq..seq {
                     let _removed = self.recv_buffer.remove(&obsolete);
                     let _removed = self.gap_first_seen.remove(&obsolete);
@@ -364,6 +369,16 @@ impl UdpReader {
             let _prev = self.recv_buffer.insert(seq, frame);
             let _removed = self.gap_first_seen.remove(&seq);
             let _removed = self.gap_nak_count.remove(&seq);
+
+            // If the buffer has grown large, the display is stalled behind many simultaneous
+            // gaps.  Send an immediate RepaintRequest instead of waiting for the first NAK
+            // retry cycle to elapse (~50 ms).
+            if self.recv_buffer.len() >= RECV_BUFFER_REPAINT_THRESHOLD
+                && let Some(ref tx) = self.nak_out_tx
+                && let Err(e) = tx.try_send(EncryptedFrame::RepaintRequest)
+            {
+                warn!("Failed to send early RepaintRequest: {e}");
+            }
 
             // Only register positions that are genuinely absent — positions
             // already in recv_buffer will be delivered automatically once the
@@ -581,7 +596,8 @@ impl UdpReader {
                             | EncryptedFrame::Keepalive
                             | EncryptedFrame::ScrollbackStart
                             | EncryptedFrame::ScrollbackEnd
-                            | EncryptedFrame::ScreenState(_) => {}
+                            | EncryptedFrame::ScreenState(_)
+                            | EncryptedFrame::ScreenStateCompressed(_) => {}
                         }
                     }
                 }
@@ -614,7 +630,8 @@ impl UdpReader {
                             }
                             EncryptedFrame::Nak(_) | EncryptedFrame::Shutdown | EncryptedFrame::Keepalive
                             | EncryptedFrame::ScrollbackStart | EncryptedFrame::ScrollbackEnd
-                            | EncryptedFrame::ScreenState(_) => {}
+                            | EncryptedFrame::ScreenState(_)
+                            | EncryptedFrame::ScreenStateCompressed(_) => {}
                         }
                     }
                 },
@@ -638,7 +655,8 @@ impl UdpReader {
                                     }
                                     EncryptedFrame::Nak(_) | EncryptedFrame::Shutdown | EncryptedFrame::Keepalive
                                     | EncryptedFrame::ScrollbackStart | EncryptedFrame::ScrollbackEnd
-                                    | EncryptedFrame::ScreenState(_) => {}
+                                    | EncryptedFrame::ScreenState(_)
+                                    | EncryptedFrame::ScreenStateCompressed(_) => {}
                                 }
                             }
                         }
@@ -755,6 +773,31 @@ impl UdpReader {
                                     error!("Error sending ScreenState repaint to stdout channel: {e}");
                                 }
                             }
+                            EncryptedFrame::ScreenStateCompressed(compressed) => {
+                                match decode_all(compressed.as_slice()) {
+                                    Ok(payload) => {
+                                        let (rows, cols) = {
+                                            let emu = emulator.lock().unwrap();
+                                            emu.screen().size()
+                                        };
+                                        let mut tmp = vt100::Parser::new(rows, cols, 0);
+                                        tmp.process(&payload);
+                                        let repaint = {
+                                            let mut rend = renderer.lock().unwrap();
+                                            rend.invalidate();
+                                            rend.render(tmp.screen(), &[], None)
+                                        };
+                                        if !repaint.is_empty()
+                                            && let Err(e) = stdout_tx.send(repaint).await
+                                        {
+                                            error!("Error sending ScreenStateCompressed repaint to stdout channel: {e}");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to decompress ScreenStateCompressed: {e}");
+                                    }
+                                }
+                            }
                         }
                     }
                 },
@@ -820,6 +863,31 @@ impl UdpReader {
                                             && let Err(e) = stdout_tx.send(repaint).await
                                         {
                                             error!("Error sending ScreenState repaint to stdout channel: {e}");
+                                        }
+                                    }
+                                    EncryptedFrame::ScreenStateCompressed(compressed) => {
+                                        match decode_all(compressed.as_slice()) {
+                                            Ok(payload) => {
+                                                let (rows, cols) = {
+                                                    let emu = emulator.lock().unwrap();
+                                                    emu.screen().size()
+                                                };
+                                                let mut tmp = vt100::Parser::new(rows, cols, 0);
+                                                tmp.process(&payload);
+                                                let repaint = {
+                                                    let mut rend = renderer.lock().unwrap();
+                                                    rend.invalidate();
+                                                    rend.render(tmp.screen(), &[], None)
+                                                };
+                                                if !repaint.is_empty()
+                                                    && let Err(e) = stdout_tx.send(repaint).await
+                                                {
+                                                    error!("Error sending ScreenStateCompressed repaint to stdout channel: {e}");
+                                                }
+                                            }
+                                            Err(e) => {
+                                                error!("Failed to decompress ScreenStateCompressed: {e}");
+                                            }
                                         }
                                     }
                                     EncryptedFrame::Bytes((_id, message)) => {
