@@ -117,6 +117,13 @@ impl std::fmt::Display for FatalKexError {
 
 impl std::error::Error for FatalKexError {}
 
+#[derive(Clone, Copy, Default)]
+enum EscapeState {
+    #[default]
+    Normal,
+    PendingDot,
+}
+
 /// Show a mosh-style reconnecting banner at the top of the terminal.
 ///
 /// The banner is white-on-blue, occupies the entire first row, and is
@@ -129,7 +136,7 @@ async fn show_reconnect_banner(stdout_tx: &Sender<Vec<u8>>) {
     // ESC[K          – erase to end of line (fills line with blue)
     // ESC[0m         – reset attributes
     // ESC[u          – restore cursor position
-    let msg = b"\x1b[s\x1b[1;1H\x1b[44;97;1m [moshpit] server unreachable, reconnecting... \x1b[K\x1b[0m\x1b[u";
+    let msg = b"\x1b[s\x1b[1;1H\x1b[44;97;1m [moshpit] server unreachable, reconnecting... (Ctrl-^ . to quit) \x1b[K\x1b[0m\x1b[u";
     drop(stdout_tx.send(msg.to_vec()).await);
 }
 
@@ -141,20 +148,65 @@ async fn clear_reconnect_banner(stdout_tx: &Sender<Vec<u8>>) {
 }
 
 /// Redraw the banner once per second, counting down from `total_secs` to 0.
+/// Returns `true` if the user pressed the escape sequence (`Ctrl-^ .`) to quit.
 async fn countdown_reconnect_banner(
     stdout_tx: &Sender<Vec<u8>>,
     total_secs: u64,
     attempt: u32,
     max_backoff_secs: u64,
-) {
+    exit_token: &CancellationToken,
+) -> bool {
     for remaining in (0..=total_secs).rev() {
         let msg = format!(
             "\x1b[s\x1b[1;1H\x1b[44;97;1m [moshpit] server unreachable, reconnecting \
-(attempt #{attempt}, {remaining}s, max {max_backoff_secs}s)... \x1b[K\x1b[0m\x1b[u"
+(attempt #{attempt}, {remaining}s, max {max_backoff_secs}s, Ctrl-^ . to quit)... \x1b[K\x1b[0m\x1b[u"
         );
         drop(stdout_tx.send(msg.into_bytes()).await);
         if remaining > 0 {
-            time::sleep(Duration::from_secs(1)).await;
+            select! {
+                () = exit_token.cancelled() => return true,
+                () = time::sleep(Duration::from_secs(1)) => {}
+            }
+        }
+    }
+    false
+}
+
+/// Holds the `kb_rx` mutex during reconnect countdowns and detects `Ctrl-^ .`.
+/// Cancels `exit_token` when the escape sequence is detected, then returns.
+/// Stops when `done_token` is cancelled (countdown finished normally).
+async fn run_escape_listener(
+    kb_rx: Arc<Mutex<Receiver<Vec<u8>>>>,
+    exit_token: CancellationToken,
+    done_token: CancellationToken,
+) {
+    let mut state = EscapeState::Normal;
+    let mut rx = kb_rx.lock().await;
+    loop {
+        select! {
+            () = done_token.cancelled() => break,
+            data = rx.recv() => match data {
+                None => break,
+                Some(data) => {
+                    for &byte in &data {
+                        state = match state {
+                            EscapeState::Normal => {
+                                if byte == 0x1E { EscapeState::PendingDot } else { EscapeState::Normal }
+                            }
+                            EscapeState::PendingDot => {
+                                if byte == 0x2E {
+                                    exit_token.cancel();
+                                    return;
+                                } else if byte == 0x1E {
+                                    EscapeState::PendingDot
+                                } else {
+                                    EscapeState::Normal
+                                }
+                            }
+                        };
+                    }
+                }
+            }
         }
     }
 }
@@ -190,6 +242,8 @@ async fn run_session_loop(
     // Stdin reader is started once, after the first successful kex (so that raw
     // mode is not active while dialoguer reads the passphrase).
     let mut kb_rx_shared: Option<Arc<Mutex<Receiver<Vec<u8>>>>> = None;
+    // Shared exit token: cancelled when the user presses Ctrl-^ . to quit.
+    let exit_token = CancellationToken::new();
 
     loop {
         match connect_and_kex(
@@ -242,8 +296,13 @@ async fn run_session_loop(
                     config.nat_warmup_count(),
                     stdout_tx.clone(),
                     config.predict(),
+                    exit_token.clone(),
                 )
                 .await?;
+                if exit_token.is_cancelled() {
+                    time::sleep(Duration::from_millis(100)).await;
+                    std::process::exit(0);
+                }
                 // Session dropped — show the reconnecting banner while we retry.
                 show_reconnect_banner(&stdout_tx).await;
                 time::sleep(Duration::from_millis(500)).await;
@@ -270,13 +329,44 @@ async fn run_session_loop(
                 if kb_rx_shared.is_none() {
                     *pass_cache.lock().unwrap() = PassCache::Uncached;
                 }
-                countdown_reconnect_banner(
-                    &stdout_tx,
-                    backoff.as_secs(),
-                    reconnect_attempt,
-                    max_backoff.as_secs(),
-                )
-                .await;
+                let should_exit = if let Some(kb_rx_ref) = &kb_rx_shared {
+                    // Raw mode is active — run escape listener alongside the countdown.
+                    let escape_done = CancellationToken::new();
+                    let escape_handle = spawn(run_escape_listener(
+                        kb_rx_ref.clone(),
+                        exit_token.clone(),
+                        escape_done.clone(),
+                    ));
+                    let exiting = countdown_reconnect_banner(
+                        &stdout_tx,
+                        backoff.as_secs(),
+                        reconnect_attempt,
+                        max_backoff.as_secs(),
+                        &exit_token,
+                    )
+                    .await;
+                    escape_done.cancel();
+                    drop(escape_handle.await);
+                    exiting
+                } else {
+                    // Raw mode not yet active (first attempt); no escape detection.
+                    let _ = countdown_reconnect_banner(
+                        &stdout_tx,
+                        backoff.as_secs(),
+                        reconnect_attempt,
+                        max_backoff.as_secs(),
+                        &exit_token,
+                    )
+                    .await;
+                    false
+                };
+                if should_exit {
+                    clear_reconnect_banner(&stdout_tx).await;
+                    let msg = b"\r\n\x1b[0m[moshpit] Disconnected.\r\n";
+                    drop(stdout_tx.send(msg.to_vec()).await);
+                    time::sleep(Duration::from_millis(100)).await;
+                    std::process::exit(0);
+                }
                 backoff = (backoff * 2).min(max_backoff);
             }
         }
@@ -434,6 +524,7 @@ async fn run_udp_session(
     nat_warmup_count: u32,
     stdout_tx: Sender<Vec<u8>>,
     display_preference: DisplayPreference,
+    exit_token: CancellationToken,
 ) -> Result<()> {
     let (reconnect_tx, mut reconnect_rx) = channel::<()>(1);
     let token = CancellationToken::new();
@@ -518,6 +609,7 @@ async fn run_udp_session(
 
     // Stdin forwarder: holds the shared kb_rx mutex for this session's lifetime.
     let fwd_token = token.clone();
+    let exit_token_fwd = exit_token.clone();
     let session_tx = tx;
     let uuid_wrapper = kex.uuid_wrapper();
     let emu_fwd = emulator.clone();
@@ -525,32 +617,70 @@ async fn run_udp_session(
     let stdout_tx_fwd = stdout_tx;
     let _forwarder = spawn(async move {
         let mut rx = kb_rx.lock().await;
+        let mut escape_state = EscapeState::Normal;
         loop {
             select! {
                 () = fwd_token.cancelled() => break,
                 data = rx.recv() => match data {
                     Some(data) => {
-                        // Forward to server.
-                        if session_tx
-                            .send(EncryptedFrame::Bytes((uuid_wrapper, data.clone())))
-                            .await
-                            .is_err()
-                        {
-                            break;
+                        let mut to_forward: Vec<u8> = Vec::new();
+                        let mut exit_requested = false;
+                        for &byte in &data {
+                            escape_state = match escape_state {
+                                EscapeState::Normal => {
+                                    if byte == 0x1E {
+                                        EscapeState::PendingDot
+                                    } else {
+                                        to_forward.push(byte);
+                                        EscapeState::Normal
+                                    }
+                                }
+                                EscapeState::PendingDot => {
+                                    if byte == 0x2E {
+                                        exit_requested = true;
+                                        break;
+                                    } else if byte == 0x1E {
+                                        // Repeated prefix: discard, stay pending
+                                        EscapeState::PendingDot
+                                    } else {
+                                        // Forward the held 0x1E and the current byte
+                                        to_forward.push(0x1E);
+                                        to_forward.push(byte);
+                                        EscapeState::Normal
+                                    }
+                                }
+                            };
                         }
-                        // Local echo prediction: feed each byte to the engine.
-                        let (overlays, cursor) = {
-                            let emu = emu_fwd.lock().unwrap();
-                            let screen = emu.screen();
-                            let mut pred = pred_fwd.lock().unwrap();
-                            for byte in &data {
-                                pred.new_user_byte(*byte, screen);
+                        if !to_forward.is_empty() {
+                            // Forward to server.
+                            if session_tx
+                                .send(EncryptedFrame::Bytes((uuid_wrapper, to_forward.clone())))
+                                .await
+                                .is_err()
+                            {
+                                break;
                             }
-                            pred.apply(screen)
-                        };
-                        let preview = paint_overlays_to_ansi(&overlays, cursor);
-                        if !preview.is_empty() {
-                            drop(stdout_tx_fwd.send(preview).await);
+                            // Local echo prediction: feed each byte to the engine.
+                            let (overlays, cursor) = {
+                                let emu = emu_fwd.lock().unwrap();
+                                let screen = emu.screen();
+                                let mut pred = pred_fwd.lock().unwrap();
+                                for byte in &to_forward {
+                                    pred.new_user_byte(*byte, screen);
+                                }
+                                pred.apply(screen)
+                            };
+                            let preview = paint_overlays_to_ansi(&overlays, cursor);
+                            if !preview.is_empty() {
+                                drop(stdout_tx_fwd.send(preview).await);
+                            }
+                        }
+                        if exit_requested {
+                            let msg = b"\r\n\x1b[0m[moshpit] Disconnected.\r\n";
+                            drop(stdout_tx_fwd.send(msg.to_vec()).await);
+                            exit_token_fwd.cancel();
+                            fwd_token.cancel();
+                            break;
                         }
                     }
                     None => break,
@@ -559,8 +689,11 @@ async fn run_udp_session(
         }
     });
 
-    // Wait for reconnect signal; `process::exit` handles all clean exits.
-    let _ = reconnect_rx.recv().await;
+    // Wait for a reconnect signal or a user-requested exit (Ctrl-^ .).
+    select! {
+        _ = reconnect_rx.recv() => {}
+        () = exit_token.cancelled() => {}
+    }
     token.cancel();
     // Allow the stdin forwarder to release the kb_rx mutex before the next session.
     time::sleep(Duration::from_millis(150)).await;
@@ -999,7 +1132,8 @@ mod tests {
         let msg = rx.recv().await.unwrap();
         assert!(String::from_utf8_lossy(&msg).ends_with("\x1b[0m\x1b[K\x1b[u"));
 
-        countdown_reconnect_banner(&tx, 0, 1, 10).await;
+        let token = CancellationToken::new();
+        let _ = countdown_reconnect_banner(&tx, 0, 1, 10, &token).await;
         let msg = rx.recv().await.unwrap();
         assert!(String::from_utf8_lossy(&msg).contains("attempt #1"));
     }
