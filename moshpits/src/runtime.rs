@@ -44,6 +44,7 @@ use tokio::{
     sync::{
         Mutex,
         mpsc::{Receiver, Sender, channel},
+        oneshot,
     },
 };
 use tokio_util::sync::CancellationToken;
@@ -422,6 +423,10 @@ async fn handle_connection(
 
     let conn_token = CancellationToken::new();
 
+    // Oneshot channel that lets UdpSender wait until UdpReader has discovered
+    // the client's real post-NAT address and connected the shared UDP socket.
+    let (peer_discovered_tx, peer_discovered_rx) = oneshot::channel::<()>();
+
     // Resolve channels and decide whether to spawn a new PTY.
     let (term_tx, maybe_term_rx, output_handle, scrollback, server_emulator, dirty_counter) =
         resolve_session(
@@ -460,6 +465,7 @@ async fn handle_connection(
         .rnk(kex.key())?
         .nak_out_tx(tx.clone())
         .retransmit_tx(retransmit_tx)
+        .peer_discovered_tx(peer_discovered_tx)
         .build();
     let mut udp_sender = UdpSender::builder()
         .socket(udp_send)
@@ -468,6 +474,7 @@ async fn handle_connection(
         .id(kex.uuid())
         .hmac(kex.hmac_key())
         .rnk(kex.key())?
+        .peer_discovered_rx(peer_discovered_rx)
         .build();
 
     let reader_token = conn_token.clone();

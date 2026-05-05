@@ -28,7 +28,7 @@ use bytes::BytesMut;
 use tokio::{
     net::UdpSocket,
     select,
-    sync::mpsc::Sender,
+    sync::{mpsc::Sender, oneshot},
     time::{Instant as TokioInstant, interval, sleep, sleep_until},
 };
 use tokio_util::sync::CancellationToken;
@@ -103,6 +103,11 @@ pub struct UdpReader {
     /// Background color returned for OSC 11 queries from the server shell.
     /// Format: `rgb:RRRR/GGGG/BBBB`.  Defaults to a dark background when `None`.
     terminal_bg_color: Option<String>,
+    /// Oneshot sender fired after the server has discovered the client's real post-NAT
+    /// address via the first `recv_from` and connected the UDP socket to it.  The
+    /// paired [`UdpSender`](crate::UdpSender) awaits this signal before sending any
+    /// packets so it never calls `send()` on an unconnected socket.
+    peer_discovered_tx: Option<oneshot::Sender<()>>,
 }
 
 impl UdpReader {
@@ -478,6 +483,47 @@ impl UdpReader {
         token: CancellationToken,
         term_tx: Sender<TerminalMessage>,
     ) -> Result<()> {
+        // Wait for the first UDP datagram from the client.  This reveals the
+        // client's real post-NAT address which we then connect the socket to.
+        // The peer_discovered_tx oneshot is fired afterwards so that UdpSender
+        // can start sending once the socket is connected.
+        {
+            let mut buf = vec![0u8; 65535];
+            let (first_len, peer_addr) = self.socket.recv_from(&mut buf).await?;
+            self.socket.connect(peer_addr).await?;
+            if let Some(tx) = self.peer_discovered_tx.take() {
+                let _ = tx.send(());
+            }
+            // Process the first packet through the normal pipeline.
+            let mut first_buf = BytesMut::from(&buf[..first_len]);
+            match self.parse_encrypted_frame(&mut first_buf) {
+                Ok(Some((frame, seq))) => {
+                    for ready in self.handle_arrival(frame, seq) {
+                        match ready {
+                            EncryptedFrame::Bytes((_id, message)) => {
+                                term_tx.send(TerminalMessage::Input(message)).await?;
+                            }
+                            EncryptedFrame::Resize((_id, columns, rows)) => {
+                                term_tx
+                                    .send(TerminalMessage::Resize { rows, columns })
+                                    .await?;
+                            }
+                            EncryptedFrame::Nak(_)
+                            | EncryptedFrame::Shutdown
+                            | EncryptedFrame::Keepalive
+                            | EncryptedFrame::ScrollbackStart
+                            | EncryptedFrame::ScrollbackEnd
+                            | EncryptedFrame::ScreenState(_) => {}
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!("Failed to parse first UDP frame from client: {e}");
+                }
+            }
+        }
+
         let mut nak_check = interval(NAK_CHECK_INTERVAL);
         loop {
             select! {
