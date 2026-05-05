@@ -22,7 +22,7 @@ use std::os::unix::fs::DirBuilderExt;
 
 use anyhow::{Context as _, Result};
 use clap::Parser as _;
-use crossterm::terminal::enable_raw_mode;
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use dialoguer::{Confirm, Password};
 use libmoshpit::{
     DisplayPreference, Emulator, EncryptedFrame, Kex, KexConfig as _, KexMode, KeyPair,
@@ -211,17 +211,6 @@ async fn run_escape_listener(
     }
 }
 
-/// Converts a crossterm `KeyEvent` to the ANSI escape bytes a Unix terminal
-/// would produce for the same keypress.  Returns an empty `Vec` for events that
-/// should not be forwarded (key-release events, unhandled keys, etc.).
-///
-/// Used on Windows where the console is event-based: `std::io::stdin().read()`
-/// does not receive arrow keys or other special keys because they arrive as
-/// `KEY_EVENT` records rather than bytes.  `crossterm::event::read()` bridges
-/// this gap by calling `ReadConsoleInput` internally and exposing a typed
-/// `KeyEvent`; this function then re-encodes those events as the ANSI sequences
-/// the server expects.
-#[cfg(windows)]
 fn encode_char_key(c: char, ctrl: bool, alt: bool) -> Vec<u8> {
     let mut out = Vec::new();
     if ctrl {
@@ -258,7 +247,6 @@ fn encode_char_key(c: char, ctrl: bool, alt: bool) -> Vec<u8> {
     out
 }
 
-#[cfg(windows)]
 fn encode_nav_key(
     code: crossterm::event::KeyCode,
     has_mod: bool,
@@ -342,7 +330,6 @@ fn encode_nav_key(
     Some(bytes)
 }
 
-#[cfg(windows)]
 fn encode_function_key(n: u8, has_mod: bool, mod_param: u8) -> Vec<u8> {
     match n {
         1 => {
@@ -433,7 +420,16 @@ fn encode_function_key(n: u8, has_mod: bool, mod_param: u8) -> Vec<u8> {
     }
 }
 
-#[cfg(windows)]
+/// Converts a crossterm `KeyEvent` to the ANSI escape bytes a terminal would
+/// produce for the same keypress.  Returns an empty `Vec` for events that
+/// should not be forwarded (key-release events, unhandled keys, etc.).
+///
+/// On Windows this is the primary path for all keyboard input: the console is
+/// event-based (`ReadConsoleInput`/`KEY_EVENT`) so `std::io::stdin().read()`
+/// does not receive arrow keys or other special keys.  On Unix it is used by
+/// the pre-KEX escape detector (`poll_escape_loop`) which calls
+/// `crossterm::event::read()` to receive typed events during reconnect
+/// countdowns before the dedicated raw-stdin thread is started.
 fn key_event_to_bytes(event: crossterm::event::KeyEvent) -> Vec<u8> {
     use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
     // Only forward press events; Windows always reports both press and release.
@@ -519,6 +515,46 @@ async fn ensure_stdin_reader(
     Ok(shared)
 }
 
+/// Blocking poll loop for `Ctrl-^ .` escape detection.  Called via
+/// `spawn_blocking` during reconnect countdowns that occur before the first
+/// successful KEX (i.e. when the dedicated raw-stdin reader thread has not
+/// been started yet).  Exits when either token is cancelled.
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn poll_escape_loop(exit_token: &CancellationToken, done_token: &CancellationToken) {
+    use crossterm::event::{Event, poll, read};
+    let mut state = EscapeState::Normal;
+    loop {
+        if done_token.is_cancelled() {
+            break;
+        }
+        if let Ok(true) = poll(Duration::from_millis(100))
+            && let Ok(Event::Key(ke)) = read()
+        {
+            for &byte in &key_event_to_bytes(ke) {
+                state = match state {
+                    EscapeState::Normal => {
+                        if byte == 0x1E {
+                            EscapeState::PendingDot
+                        } else {
+                            EscapeState::Normal
+                        }
+                    }
+                    EscapeState::PendingDot => {
+                        if byte == 0x2E {
+                            exit_token.cancel();
+                            return;
+                        } else if byte == 0x1E {
+                            EscapeState::PendingDot
+                        } else {
+                            EscapeState::Normal
+                        }
+                    }
+                };
+            }
+        }
+    }
+}
+
 /// Runs the reconnect countdown, optionally alongside an escape-sequence
 /// listener when stdin raw mode is already active.  Returns `true` if the user
 /// pressed `Ctrl-^ .` to quit.
@@ -532,8 +568,18 @@ async fn countdown_with_escape(
     kb_rx: Option<Arc<Mutex<Receiver<Vec<u8>>>>>,
 ) -> bool {
     let Some(kb_rx_ref) = kb_rx else {
-        // Raw mode not yet active (first attempt); no escape detection.
-        let _ = countdown_reconnect_banner(
+        // Raw mode not yet active (before first successful KEX).  Enable it
+        // temporarily so the escape sequence can be detected during the
+        // countdown, then restore cooked mode before the next KEX attempt so
+        // dialoguer prompts work correctly.
+        drop(enable_raw_mode());
+        let escape_done = CancellationToken::new();
+        let detector_handle = tokio::task::spawn_blocking({
+            let exit_token = exit_token.clone();
+            let escape_done = escape_done.clone();
+            move || poll_escape_loop(&exit_token, &escape_done)
+        });
+        let exiting = countdown_reconnect_banner(
             stdout_tx,
             backoff_secs,
             attempt,
@@ -541,7 +587,10 @@ async fn countdown_with_escape(
             exit_token,
         )
         .await;
-        return false;
+        escape_done.cancel();
+        drop(detector_handle.await);
+        drop(disable_raw_mode());
+        return exiting;
     };
     let escape_done = CancellationToken::new();
     let escape_handle = spawn(run_escape_listener(
