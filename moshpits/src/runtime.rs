@@ -7,9 +7,9 @@
 // modified, or distributed except according to those terms.
 
 use std::{
-    collections::{BTreeSet, HashMap, VecDeque},
+    collections::{BTreeSet, VecDeque},
     ffi::OsString,
-    io::{IsTerminal as _, Read as _, Write as _},
+    io::Read as _,
     net::SocketAddr,
     sync::{
         Arc,
@@ -61,13 +61,6 @@ use crate::{
     },
 };
 
-/// Info about a currently-connected moshpit client.
-struct ClientInfo {
-    peer_addr: SocketAddr,
-    user: String,
-    session_uuid: Uuid,
-}
-
 /// Default minimum inter-packet delay between consecutive diff chunks sent to the client.
 const DEFAULT_PACING_DELAY_US: u64 = 1000;
 
@@ -77,132 +70,6 @@ const SCREEN_SYNC_IDLE_INTERVAL: Duration = Duration::from_millis(50);
 const SCREEN_SYNC_BURST_INTERVAL: Duration = Duration::from_millis(10);
 /// Dirty-counter delta threshold above which a tick is classified as a burst.
 const SCREEN_SYNC_BURST_DIRTY_THRESHOLD: u64 = 5;
-
-/// Shared mutable state for the server status banner.
-#[derive(Clone)]
-struct BannerState {
-    inner: Arc<Mutex<BannerInner>>,
-    /// `false` when stderr is not a TTY; banner operations become no-ops.
-    enabled: bool,
-}
-
-struct BannerInner {
-    clients: HashMap<Uuid, ClientInfo>,
-    /// Number of banner lines written on the last render, used to clear stale lines.
-    prev_lines: usize,
-}
-
-impl BannerState {
-    fn new(enabled: bool) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(BannerInner {
-                clients: HashMap::new(),
-                prev_lines: 0,
-            })),
-            enabled,
-        }
-    }
-
-    async fn insert(&self, kex_uuid: Uuid, info: ClientInfo) {
-        let mut inner = self.inner.lock().await;
-        drop(inner.clients.insert(kex_uuid, info));
-        if self.enabled {
-            Self::render_and_write(&mut inner);
-        }
-    }
-
-    /// Remove the entry for this connection.  Each connection has a unique kex UUID as
-    /// its key, so there is no risk of evicting a different connection's entry.
-    async fn remove(&self, kex_uuid: Uuid) {
-        let mut inner = self.inner.lock().await;
-        if inner.clients.remove(&kex_uuid).is_some() && self.enabled {
-            Self::render_and_write(&mut inner);
-        }
-    }
-
-    /// Redraw the banner without changing the client list.
-    ///
-    /// Called periodically to repair any damage caused by log output that
-    /// momentarily overwrote the banner rows.
-    async fn refresh(&self) {
-        if !self.enabled {
-            return;
-        }
-        let mut inner = self.inner.lock().await;
-        if !inner.clients.is_empty() {
-            Self::render_and_write(&mut inner);
-        }
-    }
-
-    fn render_and_write(inner: &mut BannerInner) {
-        let clients: Vec<&ClientInfo> = inner.clients.values().collect();
-        let bytes = render_banner(&clients, inner.prev_lines);
-        inner.prev_lines = if clients.is_empty() {
-            0
-        } else {
-            clients.len() + 1
-        };
-        drop(std::io::stderr().write_all(&bytes));
-        drop(std::io::stderr().flush());
-    }
-}
-
-/// Render the server status banner as a byte sequence of raw ANSI escape codes.
-///
-/// The banner is anchored to the **top** of the terminal, occupying rows 1 through
-/// `banner_lines` (header + one row per client).  Normal log output scrolls below
-/// and may temporarily overwrite the banner; the 5-second periodic refresh task in
-/// [`run`] repaints it.
-///
-/// Layout (2 clients):
-/// ```text
-/// row 1 : [moshpits] 2 client(s) connected
-/// row 2 : client 1 info
-/// row 3 : client 2 info
-/// row 4+: scrolling tracing output
-/// ```
-fn render_banner(clients: &[&ClientInfo], prev_lines: usize) -> Vec<u8> {
-    let mut out = Vec::<u8>::new();
-    out.extend_from_slice(b"\x1b[s"); // save cursor
-
-    if clients.is_empty() {
-        // Erase every line that was part of the previous banner.
-        for row in 1..=prev_lines {
-            out.extend_from_slice(format!("\x1b[{row};1H\x1b[0m\x1b[K").as_bytes());
-        }
-        out.extend_from_slice(b"\x1b[u"); // restore cursor
-    } else {
-        let n = clients.len();
-        let banner_lines = n + 1; // header + one row per client
-
-        // Header row (row 1).
-        out.extend_from_slice(
-            format!("\x1b[1;1H\x1b[44;97;1m [moshpits] {n} client(s) connected \x1b[K\x1b[0m")
-                .as_bytes(),
-        );
-        // One row per client.
-        for (i, c) in clients.iter().enumerate() {
-            let row = 2 + i;
-            let peer = c.peer_addr;
-            let user = &c.user;
-            let sid = c.session_uuid;
-            out.extend_from_slice(
-                format!("\x1b[{row};1H\x1b[44;97;1m  {peer:<25}  {user:<15}  {sid} \x1b[K\x1b[0m")
-                    .as_bytes(),
-            );
-        }
-
-        // When the banner shrank (fewer clients than last render), clear the rows
-        // that are no longer part of the banner.
-        for row in (banner_lines + 1)..=prev_lines {
-            out.extend_from_slice(format!("\x1b[{row};1H\x1b[0m\x1b[K").as_bytes());
-        }
-
-        out.extend_from_slice(b"\x1b[u"); // restore cursor
-    }
-
-    out
-}
 
 #[allow(unsafe_code)]
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -258,29 +125,13 @@ where
     let session_registry = new_session_registry();
     let _ = config.set_session_registry(session_registry);
     let full_registry = new_full_registry();
-    let banner = BannerState::new(std::io::stderr().is_terminal());
 
     let server_token = CancellationToken::new();
-
-    // Periodically redraw the banner to repair any transient overwrite from log output.
-    let banner_refresh = banner.clone();
-    let refresh_token = server_token.clone();
-    let _banner_refresh = spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_secs(5));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            select! {
-                () = refresh_token.cancelled() => break,
-                _ = ticker.tick() => banner_refresh.refresh().await,
-            }
-        }
-    });
 
     loop {
         let config_c = config.clone();
         let st = server_token.clone();
         let fr_c = full_registry.clone();
-        let banner_c = banner.clone();
         select! {
             _ = tokio::signal::ctrl_c() => {
                 info!("Received Ctrl-C, shutting down server");
@@ -304,7 +155,7 @@ where
                         let mut config_conn = config_c;
                         let _ = config_conn.set_mode(KexMode::Server(tcp_local_addr));
                         let _conn = spawn(async move {
-                            if let Err(e) = handle_connection(config_conn, socket, st, fr_c, banner_c).await {
+                            if let Err(e) = handle_connection(config_conn, socket, st, fr_c).await {
                                 error!("{e}");
                             }
                         });
@@ -421,9 +272,7 @@ async fn handle_connection(
     socket: TcpStream,
     server_token: CancellationToken,
     full_registry: FullSessionRegistry,
-    banner: BannerState,
 ) -> Result<()> {
-    let peer_addr = socket.peer_addr()?;
     let (sock_read, sock_write) = socket.into_split();
     let port_pool = config.port_pool();
     let session_registry = config.session_registry();
@@ -468,25 +317,6 @@ async fn handle_connection(
         &full_registry,
     )
     .await?;
-
-    // Register this connection in the banner; schedule removal when the connection drops.
-    banner
-        .insert(
-            kex.uuid(),
-            ClientInfo {
-                peer_addr,
-                user: skex.user().to_owned(),
-                session_uuid,
-            },
-        )
-        .await;
-    let banner_dc = banner.clone();
-    let dc_kex_uuid = kex.uuid();
-    let dc_conn_token = conn_token.clone();
-    let _banner_watcher = spawn(async move {
-        dc_conn_token.cancelled().await;
-        banner_dc.remove(dc_kex_uuid).await;
-    });
 
     let (repaint_tx, mut repaint_rx) = channel::<()>(1);
     let mut udp_reader = UdpReader::builder()
@@ -1163,29 +993,14 @@ fn resolve_user_account(username: &str, fallback_shell: &str) -> Result<Resolved
 #[cfg(test)]
 #[allow(dead_code, clippy::all)]
 mod test {
-    use std::net::SocketAddr;
-
     use libmoshpit::{EncryptedFrame, Kex, ServerKex};
     use tokio::sync::mpsc::channel;
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
-    use super::{
-        BannerState, ClientInfo, new_full_registry, new_session, render_banner, resolve_session,
-        spawn_connection_watchdogs,
-    };
     #[cfg(unix)]
     use super::{current_daemon_user, resolve_user_account};
-
-    // ── helpers ────────────────────────────────────────────────────────────────
-
-    fn client(addr: &str, user: &str) -> ClientInfo {
-        ClientInfo {
-            peer_addr: addr.parse::<SocketAddr>().unwrap(),
-            user: user.to_string(),
-            session_uuid: Uuid::nil(),
-        }
-    }
+    use super::{new_full_registry, new_session, resolve_session, spawn_connection_watchdogs};
 
     #[cfg(unix)]
     #[test]
@@ -1216,122 +1031,7 @@ mod test {
         assert!(!account.shell.is_empty());
     }
 
-    // ── Phase 5: render_banner ─────────────────────────────────────────────────
-
-    #[test]
-    fn render_banner_empty_no_prev() {
-        let out = render_banner(&[], 0);
-        assert_eq!(out, b"\x1b[s\x1b[u");
-    }
-
-    #[test]
-    fn render_banner_empty_clears_prev_lines() {
-        let out = render_banner(&[], 2);
-        let s = String::from_utf8_lossy(&out);
-        assert!(s.contains("\x1b[1;1H"));
-        assert!(s.contains("\x1b[2;1H"));
-        assert!(s.ends_with("\x1b[u"));
-    }
-
-    #[test]
-    fn render_banner_single_client() {
-        let c = client("127.0.0.1:1234", "alice");
-        let out = render_banner(&[&c], 0);
-        let s = String::from_utf8_lossy(&out);
-        assert!(s.starts_with("\x1b[s"));
-        // Header on row 1
-        assert!(s.contains("\x1b[1;1H"));
-        // Client row on row 2
-        assert!(s.contains("\x1b[2;1H"));
-        assert!(s.ends_with("\x1b[u"));
-    }
-
-    #[test]
-    fn render_banner_two_clients() {
-        let c1 = client("127.0.0.1:1234", "alice");
-        let c2 = client("127.0.0.1:5678", "bob");
-        let out = render_banner(&[&c1, &c2], 0);
-        let s = String::from_utf8_lossy(&out);
-        assert!(s.contains("\x1b[1;1H"));
-        assert!(s.contains("\x1b[2;1H"));
-        assert!(s.contains("\x1b[3;1H"));
-        assert!(s.ends_with("\x1b[u"));
-    }
-
-    #[test]
-    fn render_banner_shrink_clears_stale_rows() {
-        let c1 = client("127.0.0.1:1234", "alice");
-        // prev_lines=3 (was header + 2 clients), now only 1 client → row 3 must be cleared
-        let out = render_banner(&[&c1], 3);
-        let s = String::from_utf8_lossy(&out);
-        // New banner rows 1 and 2 should be present
-        assert!(s.contains("\x1b[1;1H"));
-        assert!(s.contains("\x1b[2;1H"));
-        // Stale row 3 cleared
-        assert!(s.contains("\x1b[3;1H\x1b[0m\x1b[K"));
-    }
-
-    #[test]
-    fn render_banner_contains_user_and_addr() {
-        let c = client("10.0.0.1:9999", "charlie");
-        let out = render_banner(&[&c], 0);
-        let s = String::from_utf8_lossy(&out);
-        assert!(s.contains("10.0.0.1:9999"));
-        assert!(s.contains("charlie"));
-    }
-
-    // ── Phase 6: BannerState ──────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn banner_state_disabled_new() {
-        let banner = BannerState::new(false);
-        assert!(!banner.enabled);
-        assert!(banner.inner.lock().await.clients.is_empty());
-    }
-
-    #[tokio::test]
-    async fn banner_state_insert_increments_count() {
-        let banner = BannerState::new(false);
-        let uuid = Uuid::new_v4();
-        banner.insert(uuid, client("127.0.0.1:1", "u1")).await;
-        assert_eq!(banner.inner.lock().await.clients.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn banner_state_remove_decrements_count() {
-        let banner = BannerState::new(false);
-        let uuid = Uuid::new_v4();
-        banner.insert(uuid, client("127.0.0.1:1", "u1")).await;
-        banner.remove(uuid).await;
-        assert!(banner.inner.lock().await.clients.is_empty());
-    }
-
-    #[tokio::test]
-    async fn banner_state_remove_nonexistent_noop() {
-        let banner = BannerState::new(false);
-        // Should not panic or change state
-        banner.remove(Uuid::new_v4()).await;
-        assert!(banner.inner.lock().await.clients.is_empty());
-    }
-
-    #[tokio::test]
-    async fn banner_state_refresh_noop_when_disabled() {
-        let banner = BannerState::new(false);
-        banner
-            .insert(Uuid::new_v4(), client("127.0.0.1:1", "u"))
-            .await;
-        // No panic — refresh is a no-op when disabled
-        banner.refresh().await;
-    }
-
-    #[tokio::test]
-    async fn banner_state_enabled_refresh_when_empty() {
-        let banner = BannerState::new(true);
-        // No clients → refresh skips the render call entirely
-        banner.refresh().await;
-    }
-
-    // ── Phase 7: new_session ──────────────────────────────────────────────────
+    // ── Phase 5: new_session ──────────────────────────────────────────────────
 
     #[tokio::test]
     async fn new_session_registers_in_full_registry() {
