@@ -99,6 +99,15 @@ pub(crate) struct Cli {
     )]
     #[getset(get_copy = "pub(crate)")]
     pacing_delay_us: Option<u64>,
+    /// TERM environment variable to set for spawned shells
+    #[clap(
+        long,
+        value_name = "TERM",
+        default_value = "xterm-256color",
+        help = "TERM environment variable for spawned shells"
+    )]
+    #[getset(get = "pub(crate)")]
+    term_type: String,
 }
 
 impl Source for Cli {
@@ -157,6 +166,10 @@ impl Source for Cli {
                 Value::new(Some(&origin), ValueKind::U64(pacing_delay_us)),
             );
         }
+        let _old = map.insert(
+            "term_type".to_string(),
+            Value::new(Some(&origin), ValueKind::String(self.term_type.clone())),
+        );
         Ok(map)
     }
 }

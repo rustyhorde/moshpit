@@ -54,6 +54,15 @@ pub(crate) struct Config {
     #[serde(default)]
     #[getset(get_copy = "pub(crate)")]
     pacing_delay_us: Option<u64>,
+    /// TERM environment variable to set for spawned shells.
+    /// Default: "xterm-256color".
+    #[serde(default = "default_term_type")]
+    #[getset(get = "pub(crate)")]
+    term_type: String,
+}
+
+fn default_term_type() -> String {
+    String::from("xterm-256color")
 }
 
 impl Config {

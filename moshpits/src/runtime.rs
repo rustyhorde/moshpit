@@ -279,6 +279,7 @@ async fn handle_connection(
     let warmup_delay = config.warmup_delay_ms().map(Duration::from_millis);
     let pacing_delay =
         Duration::from_micros(config.pacing_delay_us().unwrap_or(DEFAULT_PACING_DELAY_US));
+    let term_type = config.term_type().clone();
     let (kex, udp_arc, skex_opt) =
         run_key_exchange(config, sock_read, sock_write, || Ok(None), None, None).await?;
     info!("Key exchange completed with moshpit");
@@ -455,6 +456,7 @@ async fn handle_connection(
             dirty_counter,
             diff_in_flight,
             pacing_delay,
+            term_type,
             port_pool,
             session_registry,
             full_registry,
@@ -702,6 +704,7 @@ fn spawn_pty(
     dirty_counter: Arc<AtomicU64>,
     diff_in_flight: Arc<AtomicBool>,
     pacing_delay: Duration,
+    term_type: String,
     port_pool: Arc<Mutex<BTreeSet<u16>>>,
     session_registry: SessionRegistry,
     full_registry: FullSessionRegistry,
@@ -802,6 +805,7 @@ fn spawn_pty(
                 let _ = cmd.env("USER", &account.username);
                 let _ = cmd.env("LOGNAME", &account.username);
                 let _ = cmd.env("SHELL", &account.shell);
+                let _ = cmd.env("TERM", &term_type);
 
                 drop_creds = Some((username_c, login_uid, primary_group_id));
             }
