@@ -99,6 +99,15 @@ pub(crate) struct Cli {
     )]
     #[getset(get_copy = "pub(crate)")]
     pacing_delay_us: Option<u64>,
+    /// TERM environment variable to set for spawned shells
+    #[clap(
+        long,
+        value_name = "TERM",
+        default_value = "xterm-256color",
+        help = "TERM environment variable for spawned shells"
+    )]
+    #[getset(get = "pub(crate)")]
+    term_type: String,
 }
 
 impl Source for Cli {
@@ -157,6 +166,10 @@ impl Source for Cli {
                 Value::new(Some(&origin), ValueKind::U64(pacing_delay_us)),
             );
         }
+        let _old = map.insert(
+            "term_type".to_string(),
+            Value::new(Some(&origin), ValueKind::String(self.term_type.clone())),
+        );
         Ok(map)
     }
 }
@@ -211,6 +224,7 @@ mod test {
         assert!(cli.tracing_absolute_path().is_none());
         assert!(cli.private_key_path().is_none());
         assert!(cli.public_key_path().is_none());
+        assert_eq!(cli.term_type(), "xterm-256color");
     }
 
     #[test]
@@ -238,12 +252,34 @@ mod test {
     }
 
     #[test]
+    fn cli_term_type_default() {
+        let cli = parse(&["mps"]);
+        assert_eq!(cli.term_type(), "xterm-256color");
+    }
+
+    #[test]
+    fn cli_term_type_custom() {
+        let cli = parse(&["mps", "--term-type", "screen-256color"]);
+        assert_eq!(cli.term_type(), "screen-256color");
+    }
+
+    #[test]
+    fn cli_term_type_various_values() {
+        let test_cases = vec!["xterm", "screen", "tmux-256color", "linux", "vt100"];
+        for term in test_cases {
+            let cli = parse(&["mps", "--term-type", term]);
+            assert_eq!(cli.term_type(), term);
+        }
+    }
+
+    #[test]
     fn cli_source_collect() {
         let cli = parse(&["mps"]);
         let map = cli.collect().expect("collect should succeed");
         assert!(map.contains_key("verbose"));
         assert!(map.contains_key("quiet"));
         assert!(map.contains_key("enable_std_output"));
+        assert!(map.contains_key("term_type"));
         // Optional keys absent when not provided
         assert!(!map.contains_key("private_key_path"));
         assert!(!map.contains_key("public_key_path"));
@@ -263,12 +299,21 @@ mod test {
             "/tmp/config.toml",
             "-t",
             "/tmp/trace.log",
+            "--term-type",
+            "tmux-256color",
         ]);
         let map = cli.collect().expect("collect should succeed");
         assert!(map.contains_key("private_key_path"));
         assert!(map.contains_key("public_key_path"));
         assert!(map.contains_key("config_path"));
         assert!(map.contains_key("tracing_path"));
+        assert!(map.contains_key("term_type"));
+        // Verify the term_type value was collected correctly
+        let term_type = map.get("term_type").expect("term_type should be in map");
+        assert_eq!(
+            term_type.clone().into_string().ok(),
+            Some("tmux-256color".to_string())
+        );
     }
 
     #[test]
