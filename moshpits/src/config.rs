@@ -6,7 +6,11 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashMap},
+    path::PathBuf,
+    sync::Arc,
+};
 
 use anyhow::Result;
 use getset::{CloneGetters, CopyGetters, Getters, Setters};
@@ -16,9 +20,7 @@ use tokio::sync::Mutex;
 use tracing::Level;
 use tracing_subscriber_init::{TracingConfig, get_effective_level};
 
-#[derive(
-    Clone, CloneGetters, CopyGetters, Debug, Default, Deserialize, Getters, Serialize, Setters,
-)]
+#[derive(Clone, CloneGetters, CopyGetters, Debug, Deserialize, Getters, Serialize, Setters)]
 pub(crate) struct Config {
     #[serde(skip_deserializing)]
     #[getset(get_copy = "pub(crate)", set = "pub(crate)")]
@@ -63,6 +65,26 @@ pub(crate) struct Config {
 
 fn default_term_type() -> String {
     String::from("xterm-256color")
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            mode: KexMode::default(),
+            port_pool: Arc::new(Mutex::new(BTreeSet::new())),
+            session_registry: Arc::new(Mutex::new(HashMap::new())),
+            verbose: 0,
+            quiet: 0,
+            enable_std_output: false,
+            tracing: Tracing::default(),
+            mps: Mps::default(),
+            private_key_path: None,
+            public_key_path: None,
+            warmup_delay_ms: None,
+            pacing_delay_us: None,
+            term_type: default_term_type(),
+        }
+    }
 }
 
 impl Config {
@@ -216,5 +238,32 @@ mod test {
         let (got_priv, got_pub) = config.key_pair_paths().expect("key_pair_paths");
         assert_eq!(got_priv, PathBuf::from(priv_path));
         assert_eq!(got_pub, PathBuf::from(priv_path).with_extension("pub"));
+    }
+
+    #[test]
+    fn config_default_term_type_is_xterm_256color() {
+        let config = Config::default();
+        assert_eq!(config.term_type(), "xterm-256color");
+    }
+
+    #[test]
+    fn config_term_type_can_be_customized() {
+        let config = Config {
+            term_type: "screen-256color".to_string(),
+            ..Config::default()
+        };
+        assert_eq!(config.term_type(), "screen-256color");
+    }
+
+    #[test]
+    fn config_term_type_accepts_various_values() {
+        let test_cases = vec!["xterm", "screen", "tmux-256color", "linux", "vt100"];
+        for term in test_cases {
+            let config = Config {
+                term_type: term.to_string(),
+                ..Config::default()
+            };
+            assert_eq!(config.term_type(), term);
+        }
     }
 }
