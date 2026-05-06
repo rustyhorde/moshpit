@@ -32,7 +32,7 @@ use tokio::{
     time::{Instant as TokioInstant, interval, sleep, sleep_until},
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 use zstd::decode_all;
 
@@ -53,13 +53,17 @@ const MAX_NAK_RETRIES: u32 = 4;
 /// to the server.  Fires exactly once per gap (when retry count reaches this value),
 /// asking for an out-of-band full-screen snapshot to unblock the display without waiting
 /// for retransmit to succeed or retry exhaustion.
-const REPAINT_REQUEST_THRESHOLD: u32 = 2;
+const REPAINT_REQUEST_THRESHOLD: u32 = 1;
 /// Number of frames buffered out-of-order before an immediate [`EncryptedFrame::RepaintRequest`]
 /// is sent.  A large `recv_buffer` means many gaps exist simultaneously — the display is
 /// stalled.  Firing early skips waiting for the first NAK retry cycle (~50 ms).
 const RECV_BUFFER_REPAINT_THRESHOLD: usize = 25;
 /// Maximum sequence jump allowed before dropping the frame to prevent `DoS`.
 const MAX_SEQ_JUMP: u64 = 1024;
+/// Floor for the adaptive NAK timeout EWMA estimate.
+const MIN_NAK_TIMEOUT: Duration = Duration::from_millis(20);
+/// Ceiling for the adaptive NAK timeout EWMA estimate.
+const MAX_NAK_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// UDP reader for encrypted frames
 #[derive(Builder, Debug)]
@@ -90,6 +94,11 @@ pub struct UdpReader {
     /// Number of NAK retries per gap, used to give up on permanently lost packets
     #[builder(default)]
     gap_nak_count: HashMap<u64, u32>,
+    /// Per-gap NAK send timestamps for RTT measurement.  Populated when a NAK is
+    /// sent; consumed when the gap closes to produce a round-trip sample for the
+    /// adaptive EWMA.
+    #[builder(default)]
+    gap_nak_sent_at: HashMap<u64, Instant>,
     /// Highest sequence number ever received (excluding duplicates).
     /// Used to detect when a gap has fallen outside the sender's retransmit
     /// window so the client can give up immediately instead of waiting for
@@ -138,6 +147,17 @@ impl UdpReader {
         } else {
             process::exit(code);
         }
+    }
+
+    /// Feed a NAK→retransmit round-trip sample into the EWMA (α = 1/8) and
+    /// clamp the result to [`MIN_NAK_TIMEOUT`]..=[`MAX_NAK_TIMEOUT`].
+    fn update_rtt_estimate(&mut self, sample: Duration) {
+        let current = self.nak_timeout.unwrap_or(NAK_TIMEOUT);
+        // 7/8 * current + 1/8 * sample using integer Duration arithmetic.
+        let updated = current.saturating_sub(current / 8) + sample / 8;
+        let clamped = updated.clamp(MIN_NAK_TIMEOUT, MAX_NAK_TIMEOUT);
+        debug!("NAK RTT sample {:?} → nak_timeout {:?}", sample, clamped);
+        self.nak_timeout = Some(clamped);
     }
 
     /// Intercept terminal queries in bytes arriving from the server, respond
@@ -317,6 +337,9 @@ impl UdpReader {
             self.next_seq += 1;
             let _removed = self.gap_first_seen.remove(&seq);
             let _removed = self.gap_nak_count.remove(&seq);
+            if let Some(t) = self.gap_nak_sent_at.remove(&seq) {
+                self.update_rtt_estimate(t.elapsed());
+            }
             let mut ready = Vec::new();
             // NAK frames are consumed inline; all others are returned to the caller.
             if let Some(f) = self.route_or_deliver(frame) {
@@ -326,6 +349,9 @@ impl UdpReader {
             while let Some(buffered) = self.recv_buffer.remove(&self.next_seq) {
                 let _removed = self.gap_first_seen.remove(&self.next_seq);
                 let _removed = self.gap_nak_count.remove(&self.next_seq);
+                if let Some(t) = self.gap_nak_sent_at.remove(&self.next_seq) {
+                    self.update_rtt_estimate(t.elapsed());
+                }
                 self.next_seq += 1;
                 if let Some(f) = self.route_or_deliver(buffered) {
                     ready.push(f);
@@ -345,9 +371,11 @@ impl UdpReader {
                     let _removed = self.recv_buffer.remove(&obsolete);
                     let _removed = self.gap_first_seen.remove(&obsolete);
                     let _removed = self.gap_nak_count.remove(&obsolete);
+                    let _removed = self.gap_nak_sent_at.remove(&obsolete);
                 }
                 let _removed = self.gap_first_seen.remove(&seq);
                 let _removed = self.gap_nak_count.remove(&seq);
+                let _removed = self.gap_nak_sent_at.remove(&seq);
                 self.next_seq = seq + 1;
                 let mut ready = Vec::new();
                 if let Some(f) = self.route_or_deliver(frame) {
@@ -356,6 +384,9 @@ impl UdpReader {
                 while let Some(buffered) = self.recv_buffer.remove(&self.next_seq) {
                     let _removed = self.gap_first_seen.remove(&self.next_seq);
                     let _removed = self.gap_nak_count.remove(&self.next_seq);
+                    if let Some(t) = self.gap_nak_sent_at.remove(&self.next_seq) {
+                        self.update_rtt_estimate(t.elapsed());
+                    }
                     self.next_seq += 1;
                     if let Some(f) = self.route_or_deliver(buffered) {
                         ready.push(f);
@@ -477,6 +508,7 @@ impl UdpReader {
                 }
                 let _removed = self.gap_first_seen.remove(&seq);
                 let _removed = self.gap_nak_count.remove(&seq);
+                let _removed = self.gap_nak_sent_at.remove(&seq);
             }
 
             // Advance next_seq past given-up and buffered frames.
@@ -486,6 +518,7 @@ impl UdpReader {
                 } else if let Some(buffered) = self.recv_buffer.remove(&self.next_seq) {
                     let _removed = self.gap_first_seen.remove(&self.next_seq);
                     let _removed = self.gap_nak_count.remove(&self.next_seq);
+                    let _removed = self.gap_nak_sent_at.remove(&self.next_seq);
                     self.next_seq += 1;
                     if let Some(f) = self.route_or_deliver(buffered) {
                         delivered.push(f);
@@ -530,6 +563,8 @@ impl UdpReader {
                 if *count == REPAINT_REQUEST_THRESHOLD {
                     send_repaint_request = true;
                 }
+                // Record when we sent this NAK so handle_arrival can measure RTT.
+                let _prev = self.gap_nak_sent_at.insert(seq, now);
             }
             if let Some(ref tx) = self.nak_out_tx
                 && let Err(e) = tx.try_send(EncryptedFrame::Nak(timed_out))
@@ -1567,5 +1602,68 @@ mod tests {
         );
         assert!(reader.gap_first_seen.is_empty(), "gap must be cleared");
         assert!(delivered.is_empty(), "no buffered frames to deliver");
+    }
+
+    // ── Option A + Option D ────────────────────────────────────────────────────
+
+    #[test]
+    fn repaint_request_threshold_is_one() {
+        assert_eq!(REPAINT_REQUEST_THRESHOLD, 1);
+    }
+
+    #[test]
+    fn update_rtt_estimate_ewma_basic() {
+        let mut reader = make_reader_sync();
+        // Start from NAK_TIMEOUT (50 ms); 100 ms sample:
+        // new = 7/8*50 + 1/8*100 = 43 + 12 = 55 ms (integer arithmetic)
+        reader.update_rtt_estimate(Duration::from_millis(100));
+        let t = reader.nak_timeout.unwrap();
+        assert!(
+            t >= Duration::from_millis(50) && t <= Duration::from_millis(65),
+            "expected ~55ms, got {t:?}"
+        );
+    }
+
+    #[test]
+    fn update_rtt_estimate_clamped_to_min() {
+        let mut reader = make_reader_sync();
+        reader.nak_timeout = Some(Duration::from_millis(25));
+        reader.update_rtt_estimate(Duration::from_millis(1));
+        assert!(reader.nak_timeout.unwrap() >= MIN_NAK_TIMEOUT);
+    }
+
+    #[test]
+    fn update_rtt_estimate_clamped_to_max() {
+        let mut reader = make_reader_sync();
+        reader.nak_timeout = Some(Duration::from_millis(490));
+        reader.update_rtt_estimate(Duration::from_secs(2));
+        assert!(reader.nak_timeout.unwrap() <= MAX_NAK_TIMEOUT);
+    }
+
+    #[test]
+    fn handle_arrival_measures_rtt_on_gap_close() {
+        let mut reader = make_reader_sync();
+        // Inject a NAK timestamp as if we NAKed for seq=0 ~50 ms ago.
+        let sent = Instant::now()
+            .checked_sub(Duration::from_millis(50))
+            .unwrap();
+        let _prev = reader.gap_nak_sent_at.insert(0, sent);
+        // Deliver seq=0 in order — gap closes, RTT sample taken.
+        drop(reader.handle_arrival(EncryptedFrame::Keepalive, 0));
+        assert!(reader.nak_timeout.is_some(), "nak_timeout must be updated");
+        assert!(reader.gap_nak_sent_at.is_empty(), "entry must be consumed");
+    }
+
+    #[test]
+    fn check_nak_timeouts_give_up_clears_gap_nak_sent_at() {
+        let mut reader = make_reader_sync();
+        let _prev = reader.gap_first_seen.insert(0, Instant::now());
+        let _prev = reader.gap_nak_count.insert(0, MAX_NAK_RETRIES);
+        let _prev = reader.gap_nak_sent_at.insert(0, Instant::now());
+        drop(reader.check_nak_timeouts());
+        assert!(
+            reader.gap_nak_sent_at.is_empty(),
+            "give-up must clear gap_nak_sent_at"
+        );
     }
 }

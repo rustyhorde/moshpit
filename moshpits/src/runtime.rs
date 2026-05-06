@@ -7,13 +7,13 @@
 // modified, or distributed except according to those terms.
 
 use std::{
-    collections::{BTreeSet, HashMap, VecDeque},
+    collections::{BTreeSet, VecDeque},
     ffi::OsString,
-    io::{IsTerminal as _, Read as _, Write as _},
+    io::Read as _,
     net::SocketAddr,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::{self, sleep},
     time::Duration,
@@ -61,12 +61,8 @@ use crate::{
     },
 };
 
-/// Info about a currently-connected moshpit client.
-struct ClientInfo {
-    peer_addr: SocketAddr,
-    user: String,
-    session_uuid: Uuid,
-}
+/// Default minimum inter-packet delay between consecutive diff chunks sent to the client.
+const DEFAULT_PACING_DELAY_US: u64 = 1000;
 
 /// Normal screen-sync interval when the terminal is idle.
 const SCREEN_SYNC_IDLE_INTERVAL: Duration = Duration::from_millis(50);
@@ -74,132 +70,6 @@ const SCREEN_SYNC_IDLE_INTERVAL: Duration = Duration::from_millis(50);
 const SCREEN_SYNC_BURST_INTERVAL: Duration = Duration::from_millis(10);
 /// Dirty-counter delta threshold above which a tick is classified as a burst.
 const SCREEN_SYNC_BURST_DIRTY_THRESHOLD: u64 = 5;
-
-/// Shared mutable state for the server status banner.
-#[derive(Clone)]
-struct BannerState {
-    inner: Arc<Mutex<BannerInner>>,
-    /// `false` when stderr is not a TTY; banner operations become no-ops.
-    enabled: bool,
-}
-
-struct BannerInner {
-    clients: HashMap<Uuid, ClientInfo>,
-    /// Number of banner lines written on the last render, used to clear stale lines.
-    prev_lines: usize,
-}
-
-impl BannerState {
-    fn new(enabled: bool) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(BannerInner {
-                clients: HashMap::new(),
-                prev_lines: 0,
-            })),
-            enabled,
-        }
-    }
-
-    async fn insert(&self, kex_uuid: Uuid, info: ClientInfo) {
-        let mut inner = self.inner.lock().await;
-        drop(inner.clients.insert(kex_uuid, info));
-        if self.enabled {
-            Self::render_and_write(&mut inner);
-        }
-    }
-
-    /// Remove the entry for this connection.  Each connection has a unique kex UUID as
-    /// its key, so there is no risk of evicting a different connection's entry.
-    async fn remove(&self, kex_uuid: Uuid) {
-        let mut inner = self.inner.lock().await;
-        if inner.clients.remove(&kex_uuid).is_some() && self.enabled {
-            Self::render_and_write(&mut inner);
-        }
-    }
-
-    /// Redraw the banner without changing the client list.
-    ///
-    /// Called periodically to repair any damage caused by log output that
-    /// momentarily overwrote the banner rows.
-    async fn refresh(&self) {
-        if !self.enabled {
-            return;
-        }
-        let mut inner = self.inner.lock().await;
-        if !inner.clients.is_empty() {
-            Self::render_and_write(&mut inner);
-        }
-    }
-
-    fn render_and_write(inner: &mut BannerInner) {
-        let clients: Vec<&ClientInfo> = inner.clients.values().collect();
-        let bytes = render_banner(&clients, inner.prev_lines);
-        inner.prev_lines = if clients.is_empty() {
-            0
-        } else {
-            clients.len() + 1
-        };
-        drop(std::io::stderr().write_all(&bytes));
-        drop(std::io::stderr().flush());
-    }
-}
-
-/// Render the server status banner as a byte sequence of raw ANSI escape codes.
-///
-/// The banner is anchored to the **top** of the terminal, occupying rows 1 through
-/// `banner_lines` (header + one row per client).  Normal log output scrolls below
-/// and may temporarily overwrite the banner; the 5-second periodic refresh task in
-/// [`run`] repaints it.
-///
-/// Layout (2 clients):
-/// ```text
-/// row 1 : [moshpits] 2 client(s) connected
-/// row 2 : client 1 info
-/// row 3 : client 2 info
-/// row 4+: scrolling tracing output
-/// ```
-fn render_banner(clients: &[&ClientInfo], prev_lines: usize) -> Vec<u8> {
-    let mut out = Vec::<u8>::new();
-    out.extend_from_slice(b"\x1b[s"); // save cursor
-
-    if clients.is_empty() {
-        // Erase every line that was part of the previous banner.
-        for row in 1..=prev_lines {
-            out.extend_from_slice(format!("\x1b[{row};1H\x1b[0m\x1b[K").as_bytes());
-        }
-        out.extend_from_slice(b"\x1b[u"); // restore cursor
-    } else {
-        let n = clients.len();
-        let banner_lines = n + 1; // header + one row per client
-
-        // Header row (row 1).
-        out.extend_from_slice(
-            format!("\x1b[1;1H\x1b[44;97;1m [moshpits] {n} client(s) connected \x1b[K\x1b[0m")
-                .as_bytes(),
-        );
-        // One row per client.
-        for (i, c) in clients.iter().enumerate() {
-            let row = 2 + i;
-            let peer = c.peer_addr;
-            let user = &c.user;
-            let sid = c.session_uuid;
-            out.extend_from_slice(
-                format!("\x1b[{row};1H\x1b[44;97;1m  {peer:<25}  {user:<15}  {sid} \x1b[K\x1b[0m")
-                    .as_bytes(),
-            );
-        }
-
-        // When the banner shrank (fewer clients than last render), clear the rows
-        // that are no longer part of the banner.
-        for row in (banner_lines + 1)..=prev_lines {
-            out.extend_from_slice(format!("\x1b[{row};1H\x1b[0m\x1b[K").as_bytes());
-        }
-
-        out.extend_from_slice(b"\x1b[u"); // restore cursor
-    }
-
-    out
-}
 
 #[allow(unsafe_code)]
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -255,29 +125,13 @@ where
     let session_registry = new_session_registry();
     let _ = config.set_session_registry(session_registry);
     let full_registry = new_full_registry();
-    let banner = BannerState::new(std::io::stderr().is_terminal());
 
     let server_token = CancellationToken::new();
-
-    // Periodically redraw the banner to repair any transient overwrite from log output.
-    let banner_refresh = banner.clone();
-    let refresh_token = server_token.clone();
-    let _banner_refresh = spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_secs(5));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            select! {
-                () = refresh_token.cancelled() => break,
-                _ = ticker.tick() => banner_refresh.refresh().await,
-            }
-        }
-    });
 
     loop {
         let config_c = config.clone();
         let st = server_token.clone();
         let fr_c = full_registry.clone();
-        let banner_c = banner.clone();
         select! {
             _ = tokio::signal::ctrl_c() => {
                 info!("Received Ctrl-C, shutting down server");
@@ -301,7 +155,7 @@ where
                         let mut config_conn = config_c;
                         let _ = config_conn.set_mode(KexMode::Server(tcp_local_addr));
                         let _conn = spawn(async move {
-                            if let Err(e) = handle_connection(config_conn, socket, st, fr_c, banner_c).await {
+                            if let Err(e) = handle_connection(config_conn, socket, st, fr_c).await {
                                 error!("{e}");
                             }
                         });
@@ -333,6 +187,7 @@ async fn resolve_session(
     Arc<Mutex<VecDeque<u8>>>,
     Arc<Mutex<vt100::Parser>>,
     Arc<AtomicU64>,
+    Arc<AtomicBool>,
 )> {
     let session_uuid = skex.session_uuid();
     if skex.is_resume() {
@@ -343,7 +198,11 @@ async fn resolve_session(
             let scrollback = record.scrollback.clone();
             let server_emulator = record.server_emulator.clone();
             let dirty_counter = record.dirty_counter.clone();
+            let diff_in_flight = record.diff_in_flight.clone();
             drop(reg);
+            // Give the new connection's screen-sync task a clean slate so the
+            // first tick correctly senses whether diffs are flowing.
+            diff_in_flight.store(false, Ordering::Relaxed);
 
             // Replace the output handle with the new connection's channels.
             {
@@ -382,6 +241,7 @@ async fn resolve_session(
                 scrollback,
                 server_emulator,
                 dirty_counter,
+                diff_in_flight,
             ))
         } else {
             // Session expired; start fresh.
@@ -412,13 +272,13 @@ async fn handle_connection(
     socket: TcpStream,
     server_token: CancellationToken,
     full_registry: FullSessionRegistry,
-    banner: BannerState,
 ) -> Result<()> {
-    let peer_addr = socket.peer_addr()?;
     let (sock_read, sock_write) = socket.into_split();
     let port_pool = config.port_pool();
     let session_registry = config.session_registry();
     let warmup_delay = config.warmup_delay_ms().map(Duration::from_millis);
+    let pacing_delay =
+        Duration::from_micros(config.pacing_delay_us().unwrap_or(DEFAULT_PACING_DELAY_US));
     let (kex, udp_arc, skex_opt) =
         run_key_exchange(config, sock_read, sock_write, || Ok(None), None, None).await?;
     info!("Key exchange completed with moshpit");
@@ -440,35 +300,23 @@ async fn handle_connection(
     let (peer_discovered_tx, peer_discovered_rx) = oneshot::channel::<()>();
 
     // Resolve channels and decide whether to spawn a new PTY.
-    let (term_tx, maybe_term_rx, output_handle, scrollback, server_emulator, dirty_counter) =
-        resolve_session(
-            &kex,
-            &skex,
-            &conn_token,
-            udp_port,
-            tx.clone(),
-            &full_registry,
-        )
-        .await?;
-
-    // Register this connection in the banner; schedule removal when the connection drops.
-    banner
-        .insert(
-            kex.uuid(),
-            ClientInfo {
-                peer_addr,
-                user: skex.user().to_owned(),
-                session_uuid,
-            },
-        )
-        .await;
-    let banner_dc = banner.clone();
-    let dc_kex_uuid = kex.uuid();
-    let dc_conn_token = conn_token.clone();
-    let _banner_watcher = spawn(async move {
-        dc_conn_token.cancelled().await;
-        banner_dc.remove(dc_kex_uuid).await;
-    });
+    let (
+        term_tx,
+        maybe_term_rx,
+        output_handle,
+        scrollback,
+        server_emulator,
+        dirty_counter,
+        diff_in_flight,
+    ) = resolve_session(
+        &kex,
+        &skex,
+        &conn_token,
+        udp_port,
+        tx.clone(),
+        &full_registry,
+    )
+    .await?;
 
     let (repaint_tx, mut repaint_rx) = channel::<()>(1);
     let mut udp_reader = UdpReader::builder()
@@ -514,10 +362,16 @@ async fn handle_connection(
     // period, the screen is changing quickly: switch to SCREEN_SYNC_BURST_INTERVAL so the
     // client receives a fresh full-screen snapshot faster than the normal 50 ms cadence.
     // Return to SCREEN_SYNC_IDLE_INTERVAL once the delta drops below the threshold.
+    //
+    // Option C: when diff chunks are actively flowing to the client, skip the snapshot
+    // entirely to avoid competing with the diff stream on the same UDP path.  The
+    // diff_in_flight flag is set by spawn_pty_reader on each chunk send and cleared here
+    // each tick.  Explicit client repaint requests are handled by _repaint_on_request.
     let sync_emu = server_emulator.clone();
     let sync_tx = tx.clone();
     let sync_token = conn_token.clone();
     let sync_dirty = dirty_counter.clone();
+    let sync_diff = diff_in_flight.clone();
     let _screen_sync = spawn(async move {
         let mut last_dirty: u64 = 0;
         let mut interval = SCREEN_SYNC_IDLE_INTERVAL;
@@ -535,6 +389,12 @@ async fn handle_connection(
                     };
                     if delta == 0 {
                         // Screen has not changed since last tick — skip expensive formatting.
+                        continue;
+                    }
+                    // Diffs are actively flowing — skip snapshot to avoid contending with
+                    // the diff stream.  Advance last_dirty so we detect when diffs stop.
+                    if sync_diff.swap(false, Ordering::Relaxed) {
+                        last_dirty = current;
                         continue;
                     }
                     last_dirty = current;
@@ -593,6 +453,8 @@ async fn handle_connection(
             scrollback,
             server_emulator,
             dirty_counter,
+            diff_in_flight,
+            pacing_delay,
             port_pool,
             session_registry,
             full_registry,
@@ -654,6 +516,7 @@ async fn new_session(
     Arc<Mutex<VecDeque<u8>>>,
     Arc<Mutex<vt100::Parser>>,
     Arc<AtomicU64>,
+    Arc<AtomicBool>,
 )> {
     let (term_tx, term_rx) = channel::<TerminalMessage>(256);
     let output_handle = Arc::new(Mutex::new(SessionOutputHandle {
@@ -666,6 +529,7 @@ async fn new_session(
     let server_emulator = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
     // Start at 1 so the first sync tick always sends an initial screen state.
     let dirty_counter = Arc::new(AtomicU64::new(1));
+    let diff_in_flight = Arc::new(AtomicBool::new(false));
 
     {
         let mut fr = full_registry.lock().await;
@@ -677,6 +541,7 @@ async fn new_session(
                 scrollback: scrollback.clone(),
                 server_emulator: server_emulator.clone(),
                 dirty_counter: dirty_counter.clone(),
+                diff_in_flight: diff_in_flight.clone(),
             },
         ));
     }
@@ -688,6 +553,7 @@ async fn new_session(
         scrollback,
         server_emulator,
         dirty_counter,
+        diff_in_flight,
     ))
 }
 
@@ -702,6 +568,8 @@ fn spawn_pty_reader(
     scrollback: Arc<Mutex<VecDeque<u8>>>,
     server_emulator: Arc<Mutex<vt100::Parser>>,
     dirty_counter: Arc<AtomicU64>,
+    diff_in_flight: Arc<AtomicBool>,
+    pacing_delay: Duration,
     port_pool: Arc<Mutex<BTreeSet<u16>>>,
     session_registry: SessionRegistry,
     full_registry: FullSessionRegistry,
@@ -718,8 +586,12 @@ fn spawn_pty_reader(
                     let buf = &buffer[..n];
                     let utf8_buf = String::from_utf8_lossy(buf);
 
-                    // Fragment into MTU-safe chunks.
-                    for chunk in buf.chunks(MAX_UDP_PAYLOAD) {
+                    // Fragment into MTU-safe chunks and pace them to prevent burst
+                    // loss on NAT networks (Option B).
+                    let mut chunks = buf.chunks(MAX_UDP_PAYLOAD).peekable();
+                    while let Some(chunk) = chunks.next() {
+                        let more = chunks.peek().is_some();
+
                         // Write to scrollback ring buffer.
                         {
                             let mut sb = scrollback.blocking_lock();
@@ -745,6 +617,8 @@ fn spawn_pty_reader(
                                 let uuid_wrapper = UuidWrapper::new(h.kex_uuid);
                                 let sender_clone = sender.clone();
                                 drop(h);
+                                // Signal the screen-sync task that diffs are flowing.
+                                diff_in_flight.store(true, Ordering::Relaxed);
                                 let frame = EncryptedFrame::Bytes((uuid_wrapper, chunk.to_vec()));
                                 sender_clone.blocking_send(frame).is_ok()
                             } else {
@@ -755,6 +629,13 @@ fn spawn_pty_reader(
                         if !send_ok {
                             // Client dropped; clear tx but keep the PTY running.
                             output_handle.blocking_lock().tx = None;
+                        }
+
+                        // Space out consecutive chunks within the same PTY read to prevent
+                        // burst loss on stateful NAT devices.  The first chunk is never
+                        // delayed; single-chunk outputs (< 1200 B) have zero added latency.
+                        if more && !pacing_delay.is_zero() {
+                            sleep(pacing_delay);
                         }
                     }
 
@@ -819,6 +700,8 @@ fn spawn_pty(
     scrollback: Arc<Mutex<VecDeque<u8>>>,
     server_emulator: Arc<Mutex<vt100::Parser>>,
     dirty_counter: Arc<AtomicU64>,
+    diff_in_flight: Arc<AtomicBool>,
+    pacing_delay: Duration,
     port_pool: Arc<Mutex<BTreeSet<u16>>>,
     session_registry: SessionRegistry,
     full_registry: FullSessionRegistry,
@@ -991,6 +874,8 @@ fn spawn_pty(
             scrollback,
             server_emulator.clone(),
             dirty_counter.clone(),
+            diff_in_flight,
+            pacing_delay,
             port_pool,
             session_registry,
             full_registry,
@@ -1108,29 +993,14 @@ fn resolve_user_account(username: &str, fallback_shell: &str) -> Result<Resolved
 #[cfg(test)]
 #[allow(dead_code, clippy::all)]
 mod test {
-    use std::net::SocketAddr;
-
     use libmoshpit::{EncryptedFrame, Kex, ServerKex};
     use tokio::sync::mpsc::channel;
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
-    use super::{
-        BannerState, ClientInfo, new_full_registry, new_session, render_banner, resolve_session,
-        spawn_connection_watchdogs,
-    };
     #[cfg(unix)]
     use super::{current_daemon_user, resolve_user_account};
-
-    // ── helpers ────────────────────────────────────────────────────────────────
-
-    fn client(addr: &str, user: &str) -> ClientInfo {
-        ClientInfo {
-            peer_addr: addr.parse::<SocketAddr>().unwrap(),
-            user: user.to_string(),
-            session_uuid: Uuid::nil(),
-        }
-    }
+    use super::{new_full_registry, new_session, resolve_session, spawn_connection_watchdogs};
 
     #[cfg(unix)]
     #[test]
@@ -1161,122 +1031,7 @@ mod test {
         assert!(!account.shell.is_empty());
     }
 
-    // ── Phase 5: render_banner ─────────────────────────────────────────────────
-
-    #[test]
-    fn render_banner_empty_no_prev() {
-        let out = render_banner(&[], 0);
-        assert_eq!(out, b"\x1b[s\x1b[u");
-    }
-
-    #[test]
-    fn render_banner_empty_clears_prev_lines() {
-        let out = render_banner(&[], 2);
-        let s = String::from_utf8_lossy(&out);
-        assert!(s.contains("\x1b[1;1H"));
-        assert!(s.contains("\x1b[2;1H"));
-        assert!(s.ends_with("\x1b[u"));
-    }
-
-    #[test]
-    fn render_banner_single_client() {
-        let c = client("127.0.0.1:1234", "alice");
-        let out = render_banner(&[&c], 0);
-        let s = String::from_utf8_lossy(&out);
-        assert!(s.starts_with("\x1b[s"));
-        // Header on row 1
-        assert!(s.contains("\x1b[1;1H"));
-        // Client row on row 2
-        assert!(s.contains("\x1b[2;1H"));
-        assert!(s.ends_with("\x1b[u"));
-    }
-
-    #[test]
-    fn render_banner_two_clients() {
-        let c1 = client("127.0.0.1:1234", "alice");
-        let c2 = client("127.0.0.1:5678", "bob");
-        let out = render_banner(&[&c1, &c2], 0);
-        let s = String::from_utf8_lossy(&out);
-        assert!(s.contains("\x1b[1;1H"));
-        assert!(s.contains("\x1b[2;1H"));
-        assert!(s.contains("\x1b[3;1H"));
-        assert!(s.ends_with("\x1b[u"));
-    }
-
-    #[test]
-    fn render_banner_shrink_clears_stale_rows() {
-        let c1 = client("127.0.0.1:1234", "alice");
-        // prev_lines=3 (was header + 2 clients), now only 1 client → row 3 must be cleared
-        let out = render_banner(&[&c1], 3);
-        let s = String::from_utf8_lossy(&out);
-        // New banner rows 1 and 2 should be present
-        assert!(s.contains("\x1b[1;1H"));
-        assert!(s.contains("\x1b[2;1H"));
-        // Stale row 3 cleared
-        assert!(s.contains("\x1b[3;1H\x1b[0m\x1b[K"));
-    }
-
-    #[test]
-    fn render_banner_contains_user_and_addr() {
-        let c = client("10.0.0.1:9999", "charlie");
-        let out = render_banner(&[&c], 0);
-        let s = String::from_utf8_lossy(&out);
-        assert!(s.contains("10.0.0.1:9999"));
-        assert!(s.contains("charlie"));
-    }
-
-    // ── Phase 6: BannerState ──────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn banner_state_disabled_new() {
-        let banner = BannerState::new(false);
-        assert!(!banner.enabled);
-        assert!(banner.inner.lock().await.clients.is_empty());
-    }
-
-    #[tokio::test]
-    async fn banner_state_insert_increments_count() {
-        let banner = BannerState::new(false);
-        let uuid = Uuid::new_v4();
-        banner.insert(uuid, client("127.0.0.1:1", "u1")).await;
-        assert_eq!(banner.inner.lock().await.clients.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn banner_state_remove_decrements_count() {
-        let banner = BannerState::new(false);
-        let uuid = Uuid::new_v4();
-        banner.insert(uuid, client("127.0.0.1:1", "u1")).await;
-        banner.remove(uuid).await;
-        assert!(banner.inner.lock().await.clients.is_empty());
-    }
-
-    #[tokio::test]
-    async fn banner_state_remove_nonexistent_noop() {
-        let banner = BannerState::new(false);
-        // Should not panic or change state
-        banner.remove(Uuid::new_v4()).await;
-        assert!(banner.inner.lock().await.clients.is_empty());
-    }
-
-    #[tokio::test]
-    async fn banner_state_refresh_noop_when_disabled() {
-        let banner = BannerState::new(false);
-        banner
-            .insert(Uuid::new_v4(), client("127.0.0.1:1", "u"))
-            .await;
-        // No panic — refresh is a no-op when disabled
-        banner.refresh().await;
-    }
-
-    #[tokio::test]
-    async fn banner_state_enabled_refresh_when_empty() {
-        let banner = BannerState::new(true);
-        // No clients → refresh skips the render call entirely
-        banner.refresh().await;
-    }
-
-    // ── Phase 7: new_session ──────────────────────────────────────────────────
+    // ── Phase 5: new_session ──────────────────────────────────────────────────
 
     #[tokio::test]
     async fn new_session_registers_in_full_registry() {
@@ -1301,7 +1056,7 @@ mod test {
         let session_uuid = Uuid::new_v4();
         let registry = new_full_registry();
 
-        let (_, maybe_rx, _, _, _, _) =
+        let (_, maybe_rx, _, _, _, _, _) =
             new_session(&kex, &conn_token, 50_000, session_uuid, tx, &registry)
                 .await
                 .unwrap();
@@ -1316,7 +1071,7 @@ mod test {
         let session_uuid = Uuid::new_v4();
         let registry = new_full_registry();
 
-        let (_, _, output_handle, _, _, _) =
+        let (_, _, output_handle, _, _, _, _) =
             new_session(&kex, &conn_token, 50_000, session_uuid, tx, &registry)
                 .await
                 .unwrap();
@@ -1331,7 +1086,7 @@ mod test {
         let session_uuid = Uuid::new_v4();
         let registry = new_full_registry();
 
-        let (_, _, _, scrollback, _, _) =
+        let (_, _, _, scrollback, _, _, _) =
             new_session(&kex, &conn_token, 50_000, session_uuid, tx, &registry)
                 .await
                 .unwrap();
@@ -1346,7 +1101,7 @@ mod test {
         let session_uuid = Uuid::new_v4();
         let registry = new_full_registry();
 
-        let (_, _, _, _, emulator, _) =
+        let (_, _, _, _, emulator, _, _) =
             new_session(&kex, &conn_token, 50_000, session_uuid, tx, &registry)
                 .await
                 .unwrap();
@@ -1441,7 +1196,7 @@ mod test {
         let (tx, _rx) = channel::<EncryptedFrame>(4);
         let registry = new_full_registry();
 
-        let (_, maybe_rx, _, _, _, _) =
+        let (_, maybe_rx, _, _, _, _, _) =
             resolve_session(&kex, &skex, &conn_token, 50_000, tx, &registry)
                 .await
                 .unwrap();
@@ -1480,7 +1235,7 @@ mod test {
         let new_conn_token = CancellationToken::new();
         let (tx2, mut rx2) = channel::<EncryptedFrame>(16);
 
-        let (_, maybe_rx, output_handle, _, _, _) = resolve_session(
+        let (_, maybe_rx, output_handle, _, _, _, _) = resolve_session(
             &new_kex,
             &skex_resume,
             &new_conn_token,
@@ -1524,7 +1279,7 @@ mod test {
         let (tx, _rx) = channel::<EncryptedFrame>(4);
         let registry = new_full_registry();
 
-        let (_, maybe_rx, _, _, _, _) =
+        let (_, maybe_rx, _, _, _, _, _) =
             resolve_session(&kex, &skex, &conn_token, 50_000, tx, &registry)
                 .await
                 .unwrap();
