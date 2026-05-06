@@ -267,6 +267,12 @@ Options:
   -t, --tracing-absolute-path <PATH>   Absolute path to an alternate tracing output file
   -p, --private-key-path <PATH>        Absolute path to the server private key
   -k, --public-key-path <PATH>         Absolute path to the server public key
+      --warmup-delay-ms <MILLIS>       Extra delay (ms) after peer discovery before
+                                       sending terminal data
+      --pacing-delay-us <MICROS>       Min inter-packet delay (µs) between diff chunks
+                                       [default: 1000]
+      --term-type <TERM>               TERM environment variable for spawned shells
+                                       [default: xterm-256color]
   -h, --help                           Print help
   -V, --version                        Print version
 ```
@@ -286,6 +292,12 @@ mps --config-absolute-path /etc/moshpits/moshpits.toml
 # Use non-default key files
 mps --private-key-path /etc/moshpits/host_key \
     --public-key-path  /etc/moshpits/host_key.pub
+
+# Use a different TERM type for specialized environments
+mps --term-type screen-256color
+
+# Tune for NAT devices with high warmup delay and packet pacing
+mps --warmup-delay-ms 200 --pacing-delay-us 2000
 ```
 
 ### moshpits configuration
@@ -312,6 +324,22 @@ port = 40404       # TCP port to listen on for client connections
 # when not set.
 # private_key_path = "/path/to/mps_host_ed25519_key"
 # public_key_path  = "/path/to/mps_host_ed25519_key.pub"
+
+# ── PTY environment ───────────────────────────────────────────────────────────
+# TERM environment variable to set for spawned shells. Default: xterm-256color.
+# Matches the VT100/VT220 emulation used by libmoshpit. Required when running
+# as a systemd service to prevent ncurses application failures.
+term_type = "xterm-256color"
+
+# ── NAT device tuning (optional) ──────────────────────────────────────────────
+# Extra delay (ms) after peer discovery before sending bulk terminal data.
+# Provides margin for NAT bindings on slow NAT devices when clients use --nat-warmup.
+# warmup_delay_ms = 100
+
+# Minimum inter-packet delay (µs) between consecutive diff chunks from the same
+# PTY read batch. Spreads back-to-back packets to prevent burst loss on stateful
+# NAT devices. Default: 1000 (1 ms). Set to 0 to disable pacing.
+# pacing_delay_us = 1000
 
 # ── Tracing (log output) ──────────────────────────────────────────────────────
 # stdout layer — controls the format of log lines written to stderr when
@@ -404,6 +432,11 @@ Options:
   -p, --private-key-path <PATH>        Absolute path to the client private key
   -k, --public-key-path <PATH>         Absolute path to the client public key
   -s, --server-port <PORT>             Server TCP port (default: 40404)
+      --predict <MODE>                 Local-echo prediction: adaptive (default),
+                                       always, or never
+      --nat-warmup                     Send NAT warmup keepalives at UDP session start
+      --nat-warmup-count <N>           Number of NAT warmup keepalives to send
+                                       [default: 3]
   -h, --help                           Print help
   -V, --version                        Print version
 ```
@@ -425,6 +458,16 @@ mp -vv \
    --private-key-path ~/.mp/work_id_ed25519 \
    --public-key-path  ~/.mp/work_id_ed25519.pub \
    alice@10.0.0.5
+
+# Disable prediction for low-latency LANs
+mp --predict never 192.168.1.10
+
+# Enable NAT warmup for problematic NAT devices
+mp --nat-warmup --nat-warmup-count 5 192.168.1.10
+
+# Force prediction always on
+mp --predict always user@remote-server.com
+```
 ```
 
 ### moshpit configuration
@@ -454,6 +497,17 @@ max_reconnect_backoff_secs = 3600
 # private_key_path = "/home/alice/.mp/id_ed25519"
 # public_key_path  = "/home/alice/.mp/id_ed25519.pub"
 
+# ── Local echo prediction ─────────────────────────────────────────────────────
+# Control client-side keystroke prediction: adaptive (default), always, or never.
+# Adaptive enables prediction on high-latency connections; 'never' disables it.
+predict = "adaptive"
+
+# ── NAT traversal (optional) ──────────────────────────────────────────────────
+# Send warmup keepalives before UDP session starts to establish NAT bindings.
+# Only useful on NAT paths; adds one round-trip of startup latency.
+nat_warmup = false
+nat_warmup_count = 3  # Number of keepalive frames to send (default: 3)
+
 # ── Tracing (log output) ──────────────────────────────────────────────────────
 [tracing.stdout]
 with_target      = false
@@ -481,6 +535,75 @@ with_level       = true
 1. Environment variables (`MOSHPIT_*`)
 2. Command-line flags
 3. Config file values
+
+---
+
+## Troubleshooting
+
+### "Cannot initialize terminal" errors on systemd servers
+
+**Symptom**: When running moshpits as a systemd service, commands like `htop`, `vim`, or `less` fail with:
+```
+Error opening terminal: unknown.
+```
+
+**Cause**: Systemd services run without a controlling terminal, so the `TERM` environment variable is not set. When moshpits spawns shells, it sets `HOME`, `USER`, `LOGNAME`, and `SHELL` but was missing `TERM`, causing ncurses applications to fail.
+
+**Solution**: Use the `term_type` configuration option (default: `xterm-256color`):
+
+```toml
+# In ~/.config/moshpits/moshpits.toml
+term_type = "xterm-256color"
+```
+
+Or via CLI:
+```bash
+mps --term-type xterm-256color
+```
+
+Or via environment variable:
+```bash
+MOSHPITS_TERM_TYPE=xterm-256color mps
+```
+
+The default `xterm-256color` matches the VT100/VT220 terminal emulation used by libmoshpit and works with most ncurses applications. For specialized environments, you can override it with other values like `screen-256color`, `tmux-256color`, or `linux`.
+
+### NAT traversal issues
+
+**Symptom**: Connection hangs after TCP key exchange, no UDP terminal data flows.
+
+**Solution**: Use the `--nat-warmup` option on the client to send keepalive frames before the UDP session starts:
+
+```bash
+mp --nat-warmup --nat-warmup-count 5 192.168.1.10
+```
+
+On the server, add a warmup delay to give the NAT device time to establish bindings:
+
+```bash
+mps --warmup-delay-ms 100
+```
+
+For stateful NAT devices that drop bursty packets, enable packet pacing:
+
+```bash
+mps --pacing-delay-us 2000
+```
+
+### High packet loss on poor networks
+
+**Symptom**: Terminal updates are sluggish or incomplete.
+
+**Solution**: Increase the pacing delay on the server to spread packets over time:
+
+```bash
+mps --pacing-delay-us 5000
+```
+
+Or in the config file:
+```toml
+pacing_delay_us = 5000
+```
 
 ---
 
