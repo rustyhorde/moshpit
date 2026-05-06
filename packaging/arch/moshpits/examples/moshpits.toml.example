@@ -28,6 +28,22 @@ port = 40404      # TCP port to listen on
 # private_key_path = "/path/to/mps_host_ed25519_key"
 # public_key_path  = "/path/to/mps_host_ed25519_key.pub"
 
+# ── PTY environment ───────────────────────────────────────────────────────────
+# TERM environment variable to set for spawned shells. Default: xterm-256color.
+# Matches the VT100/VT220 emulation used by libmoshpit. Required when running
+# as a systemd service to prevent ncurses application failures (htop, vim, less).
+term_type = "xterm-256color"
+
+# ── NAT device tuning (optional) ──────────────────────────────────────────────
+# Extra delay (ms) after peer discovery before sending bulk terminal data.
+# Provides margin for NAT bindings on slow NAT devices when clients use --nat-warmup.
+# warmup_delay_ms = 100
+
+# Minimum inter-packet delay (µs) between consecutive diff chunks from the same
+# PTY read batch. Spreads back-to-back packets to prevent burst loss on stateful
+# NAT devices. Default: 1000 (1 ms). Set to 0 to disable pacing.
+# pacing_delay_us = 1000
+
 # ── Tracing (log output) ──────────────────────────────────────────────────────
 # stdout layer — controls log line formatting when --enable-std-output is active.
 # NOTE: --enable-std-output should not be used when running as a daemon/service.
