@@ -704,7 +704,7 @@ fn spawn_pty(
     dirty_counter: Arc<AtomicU64>,
     diff_in_flight: Arc<AtomicBool>,
     pacing_delay: Duration,
-    term_type: String,
+    #[cfg_attr(not(unix), allow(unused_variables))] term_type: String,
     port_pool: Arc<Mutex<BTreeSet<u16>>>,
     session_registry: SessionRegistry,
     full_registry: FullSessionRegistry,
