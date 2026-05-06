@@ -13,7 +13,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::{self, sleep},
     time::Duration,
@@ -67,6 +67,9 @@ struct ClientInfo {
     user: String,
     session_uuid: Uuid,
 }
+
+/// Default minimum inter-packet delay between consecutive diff chunks sent to the client.
+const DEFAULT_PACING_DELAY_US: u64 = 1000;
 
 /// Normal screen-sync interval when the terminal is idle.
 const SCREEN_SYNC_IDLE_INTERVAL: Duration = Duration::from_millis(50);
@@ -333,6 +336,7 @@ async fn resolve_session(
     Arc<Mutex<VecDeque<u8>>>,
     Arc<Mutex<vt100::Parser>>,
     Arc<AtomicU64>,
+    Arc<AtomicBool>,
 )> {
     let session_uuid = skex.session_uuid();
     if skex.is_resume() {
@@ -343,7 +347,11 @@ async fn resolve_session(
             let scrollback = record.scrollback.clone();
             let server_emulator = record.server_emulator.clone();
             let dirty_counter = record.dirty_counter.clone();
+            let diff_in_flight = record.diff_in_flight.clone();
             drop(reg);
+            // Give the new connection's screen-sync task a clean slate so the
+            // first tick correctly senses whether diffs are flowing.
+            diff_in_flight.store(false, Ordering::Relaxed);
 
             // Replace the output handle with the new connection's channels.
             {
@@ -382,6 +390,7 @@ async fn resolve_session(
                 scrollback,
                 server_emulator,
                 dirty_counter,
+                diff_in_flight,
             ))
         } else {
             // Session expired; start fresh.
@@ -419,6 +428,8 @@ async fn handle_connection(
     let port_pool = config.port_pool();
     let session_registry = config.session_registry();
     let warmup_delay = config.warmup_delay_ms().map(Duration::from_millis);
+    let pacing_delay =
+        Duration::from_micros(config.pacing_delay_us().unwrap_or(DEFAULT_PACING_DELAY_US));
     let (kex, udp_arc, skex_opt) =
         run_key_exchange(config, sock_read, sock_write, || Ok(None), None, None).await?;
     info!("Key exchange completed with moshpit");
@@ -440,16 +451,23 @@ async fn handle_connection(
     let (peer_discovered_tx, peer_discovered_rx) = oneshot::channel::<()>();
 
     // Resolve channels and decide whether to spawn a new PTY.
-    let (term_tx, maybe_term_rx, output_handle, scrollback, server_emulator, dirty_counter) =
-        resolve_session(
-            &kex,
-            &skex,
-            &conn_token,
-            udp_port,
-            tx.clone(),
-            &full_registry,
-        )
-        .await?;
+    let (
+        term_tx,
+        maybe_term_rx,
+        output_handle,
+        scrollback,
+        server_emulator,
+        dirty_counter,
+        diff_in_flight,
+    ) = resolve_session(
+        &kex,
+        &skex,
+        &conn_token,
+        udp_port,
+        tx.clone(),
+        &full_registry,
+    )
+    .await?;
 
     // Register this connection in the banner; schedule removal when the connection drops.
     banner
@@ -514,10 +532,16 @@ async fn handle_connection(
     // period, the screen is changing quickly: switch to SCREEN_SYNC_BURST_INTERVAL so the
     // client receives a fresh full-screen snapshot faster than the normal 50 ms cadence.
     // Return to SCREEN_SYNC_IDLE_INTERVAL once the delta drops below the threshold.
+    //
+    // Option C: when diff chunks are actively flowing to the client, skip the snapshot
+    // entirely to avoid competing with the diff stream on the same UDP path.  The
+    // diff_in_flight flag is set by spawn_pty_reader on each chunk send and cleared here
+    // each tick.  Explicit client repaint requests are handled by _repaint_on_request.
     let sync_emu = server_emulator.clone();
     let sync_tx = tx.clone();
     let sync_token = conn_token.clone();
     let sync_dirty = dirty_counter.clone();
+    let sync_diff = diff_in_flight.clone();
     let _screen_sync = spawn(async move {
         let mut last_dirty: u64 = 0;
         let mut interval = SCREEN_SYNC_IDLE_INTERVAL;
@@ -535,6 +559,12 @@ async fn handle_connection(
                     };
                     if delta == 0 {
                         // Screen has not changed since last tick — skip expensive formatting.
+                        continue;
+                    }
+                    // Diffs are actively flowing — skip snapshot to avoid contending with
+                    // the diff stream.  Advance last_dirty so we detect when diffs stop.
+                    if sync_diff.swap(false, Ordering::Relaxed) {
+                        last_dirty = current;
                         continue;
                     }
                     last_dirty = current;
@@ -593,6 +623,8 @@ async fn handle_connection(
             scrollback,
             server_emulator,
             dirty_counter,
+            diff_in_flight,
+            pacing_delay,
             port_pool,
             session_registry,
             full_registry,
@@ -654,6 +686,7 @@ async fn new_session(
     Arc<Mutex<VecDeque<u8>>>,
     Arc<Mutex<vt100::Parser>>,
     Arc<AtomicU64>,
+    Arc<AtomicBool>,
 )> {
     let (term_tx, term_rx) = channel::<TerminalMessage>(256);
     let output_handle = Arc::new(Mutex::new(SessionOutputHandle {
@@ -666,6 +699,7 @@ async fn new_session(
     let server_emulator = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
     // Start at 1 so the first sync tick always sends an initial screen state.
     let dirty_counter = Arc::new(AtomicU64::new(1));
+    let diff_in_flight = Arc::new(AtomicBool::new(false));
 
     {
         let mut fr = full_registry.lock().await;
@@ -677,6 +711,7 @@ async fn new_session(
                 scrollback: scrollback.clone(),
                 server_emulator: server_emulator.clone(),
                 dirty_counter: dirty_counter.clone(),
+                diff_in_flight: diff_in_flight.clone(),
             },
         ));
     }
@@ -688,6 +723,7 @@ async fn new_session(
         scrollback,
         server_emulator,
         dirty_counter,
+        diff_in_flight,
     ))
 }
 
@@ -702,6 +738,8 @@ fn spawn_pty_reader(
     scrollback: Arc<Mutex<VecDeque<u8>>>,
     server_emulator: Arc<Mutex<vt100::Parser>>,
     dirty_counter: Arc<AtomicU64>,
+    diff_in_flight: Arc<AtomicBool>,
+    pacing_delay: Duration,
     port_pool: Arc<Mutex<BTreeSet<u16>>>,
     session_registry: SessionRegistry,
     full_registry: FullSessionRegistry,
@@ -718,8 +756,12 @@ fn spawn_pty_reader(
                     let buf = &buffer[..n];
                     let utf8_buf = String::from_utf8_lossy(buf);
 
-                    // Fragment into MTU-safe chunks.
-                    for chunk in buf.chunks(MAX_UDP_PAYLOAD) {
+                    // Fragment into MTU-safe chunks and pace them to prevent burst
+                    // loss on NAT networks (Option B).
+                    let mut chunks = buf.chunks(MAX_UDP_PAYLOAD).peekable();
+                    while let Some(chunk) = chunks.next() {
+                        let more = chunks.peek().is_some();
+
                         // Write to scrollback ring buffer.
                         {
                             let mut sb = scrollback.blocking_lock();
@@ -745,6 +787,8 @@ fn spawn_pty_reader(
                                 let uuid_wrapper = UuidWrapper::new(h.kex_uuid);
                                 let sender_clone = sender.clone();
                                 drop(h);
+                                // Signal the screen-sync task that diffs are flowing.
+                                diff_in_flight.store(true, Ordering::Relaxed);
                                 let frame = EncryptedFrame::Bytes((uuid_wrapper, chunk.to_vec()));
                                 sender_clone.blocking_send(frame).is_ok()
                             } else {
@@ -755,6 +799,13 @@ fn spawn_pty_reader(
                         if !send_ok {
                             // Client dropped; clear tx but keep the PTY running.
                             output_handle.blocking_lock().tx = None;
+                        }
+
+                        // Space out consecutive chunks within the same PTY read to prevent
+                        // burst loss on stateful NAT devices.  The first chunk is never
+                        // delayed; single-chunk outputs (< 1200 B) have zero added latency.
+                        if more && !pacing_delay.is_zero() {
+                            sleep(pacing_delay);
                         }
                     }
 
@@ -819,6 +870,8 @@ fn spawn_pty(
     scrollback: Arc<Mutex<VecDeque<u8>>>,
     server_emulator: Arc<Mutex<vt100::Parser>>,
     dirty_counter: Arc<AtomicU64>,
+    diff_in_flight: Arc<AtomicBool>,
+    pacing_delay: Duration,
     port_pool: Arc<Mutex<BTreeSet<u16>>>,
     session_registry: SessionRegistry,
     full_registry: FullSessionRegistry,
@@ -991,6 +1044,8 @@ fn spawn_pty(
             scrollback,
             server_emulator.clone(),
             dirty_counter.clone(),
+            diff_in_flight,
+            pacing_delay,
             port_pool,
             session_registry,
             full_registry,
@@ -1301,7 +1356,7 @@ mod test {
         let session_uuid = Uuid::new_v4();
         let registry = new_full_registry();
 
-        let (_, maybe_rx, _, _, _, _) =
+        let (_, maybe_rx, _, _, _, _, _) =
             new_session(&kex, &conn_token, 50_000, session_uuid, tx, &registry)
                 .await
                 .unwrap();
@@ -1316,7 +1371,7 @@ mod test {
         let session_uuid = Uuid::new_v4();
         let registry = new_full_registry();
 
-        let (_, _, output_handle, _, _, _) =
+        let (_, _, output_handle, _, _, _, _) =
             new_session(&kex, &conn_token, 50_000, session_uuid, tx, &registry)
                 .await
                 .unwrap();
@@ -1331,7 +1386,7 @@ mod test {
         let session_uuid = Uuid::new_v4();
         let registry = new_full_registry();
 
-        let (_, _, _, scrollback, _, _) =
+        let (_, _, _, scrollback, _, _, _) =
             new_session(&kex, &conn_token, 50_000, session_uuid, tx, &registry)
                 .await
                 .unwrap();
@@ -1346,7 +1401,7 @@ mod test {
         let session_uuid = Uuid::new_v4();
         let registry = new_full_registry();
 
-        let (_, _, _, _, emulator, _) =
+        let (_, _, _, _, emulator, _, _) =
             new_session(&kex, &conn_token, 50_000, session_uuid, tx, &registry)
                 .await
                 .unwrap();
@@ -1441,7 +1496,7 @@ mod test {
         let (tx, _rx) = channel::<EncryptedFrame>(4);
         let registry = new_full_registry();
 
-        let (_, maybe_rx, _, _, _, _) =
+        let (_, maybe_rx, _, _, _, _, _) =
             resolve_session(&kex, &skex, &conn_token, 50_000, tx, &registry)
                 .await
                 .unwrap();
@@ -1480,7 +1535,7 @@ mod test {
         let new_conn_token = CancellationToken::new();
         let (tx2, mut rx2) = channel::<EncryptedFrame>(16);
 
-        let (_, maybe_rx, output_handle, _, _, _) = resolve_session(
+        let (_, maybe_rx, output_handle, _, _, _, _) = resolve_session(
             &new_kex,
             &skex_resume,
             &new_conn_token,
@@ -1524,7 +1579,7 @@ mod test {
         let (tx, _rx) = channel::<EncryptedFrame>(4);
         let registry = new_full_registry();
 
-        let (_, maybe_rx, _, _, _, _) =
+        let (_, maybe_rx, _, _, _, _, _) =
             resolve_session(&kex, &skex, &conn_token, 50_000, tx, &registry)
                 .await
                 .unwrap();

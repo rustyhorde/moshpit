@@ -48,6 +48,12 @@ pub(crate) struct Config {
     #[serde(default)]
     #[getset(get_copy = "pub(crate)")]
     warmup_delay_ms: Option<u64>,
+    /// Minimum delay between consecutive diff packets sent to the client (µs).
+    /// Spreads PTY output bursts to prevent drop cascades on stateful NAT devices.
+    /// Default 1000 µs (1 ms); set to 0 to disable pacing.
+    #[serde(default)]
+    #[getset(get_copy = "pub(crate)")]
+    pacing_delay_us: Option<u64>,
 }
 
 impl Config {

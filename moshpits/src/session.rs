@@ -10,7 +10,7 @@ use std::{
     collections::{HashMap, VecDeque},
     fmt,
     sync::Arc,
-    sync::atomic::AtomicU64,
+    sync::atomic::{AtomicBool, AtomicU64},
 };
 
 use libmoshpit::{EncryptedFrame, TerminalMessage};
@@ -52,6 +52,10 @@ pub(crate) struct SessionRecord {
     /// Counter tracking when the screen state has changed (e.g. PTY output or resize).
     /// Used by the screen-sync task to skip expensive re-rendering when idle.
     pub dirty_counter: Arc<AtomicU64>,
+    /// Set to `true` by `spawn_pty_reader` whenever a diff chunk is forwarded to the
+    /// client. Atomically swapped to `false` by the screen-sync task each tick to
+    /// suppress redundant snapshots while the diff stream is actively delivering content.
+    pub diff_in_flight: Arc<AtomicBool>,
 }
 
 impl fmt::Debug for SessionRecord {
@@ -73,7 +77,11 @@ pub(crate) fn new_full_registry() -> FullSessionRegistry {
 
 #[cfg(test)]
 mod test {
-    use std::{collections::VecDeque, sync::Arc, sync::atomic::AtomicU64};
+    use std::{
+        collections::VecDeque,
+        sync::Arc,
+        sync::atomic::{AtomicBool, AtomicU64},
+    };
 
     use libmoshpit::{EncryptedFrame, TerminalMessage};
     use tokio::sync::{Mutex, mpsc::channel};
@@ -118,12 +126,14 @@ mod test {
         let scrollback = Arc::new(Mutex::new(VecDeque::<u8>::new()));
         let server_emulator = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
         let dirty_counter = Arc::new(AtomicU64::new(1));
+        let diff_in_flight = Arc::new(AtomicBool::new(false));
         let record = SessionRecord {
             term_tx,
             output_handle,
             scrollback,
             server_emulator,
             dirty_counter,
+            diff_in_flight,
         };
         let s = format!("{record:?}");
         assert!(s.contains("SessionRecord"));

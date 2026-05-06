@@ -89,6 +89,16 @@ pub(crate) struct Cli {
     )]
     #[getset(get_copy = "pub(crate)")]
     warmup_delay_ms: Option<u64>,
+    /// Minimum delay in microseconds between consecutive diff packets from the same
+    /// PTY read batch.  Spreads back-to-back packets over time to prevent burst loss
+    /// on stateful NAT devices.  Set to 0 to disable.
+    #[clap(
+        long,
+        value_name = "MICROS",
+        help = "Min inter-packet delay (µs) between diff chunks [default: 1000]"
+    )]
+    #[getset(get_copy = "pub(crate)")]
+    pacing_delay_us: Option<u64>,
 }
 
 impl Source for Cli {
@@ -139,6 +149,12 @@ impl Source for Cli {
             let _old = map.insert(
                 "warmup_delay_ms".to_string(),
                 Value::new(Some(&origin), ValueKind::U64(warmup_delay_ms)),
+            );
+        }
+        if let Some(pacing_delay_us) = self.pacing_delay_us {
+            let _old = map.insert(
+                "pacing_delay_us".to_string(),
+                Value::new(Some(&origin), ValueKind::U64(pacing_delay_us)),
             );
         }
         Ok(map)
