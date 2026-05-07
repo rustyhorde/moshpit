@@ -311,6 +311,7 @@ impl UdpReader {
     /// Buffer an arrived `(frame, seq)` pair and return any frames now ready to deliver
     /// in order. NAK frames are routed to the retransmit channel inline and are not
     /// included in the returned `Vec`; they still participate in sequence tracking.
+    #[cfg_attr(nightly, allow(clippy::too_many_lines))]
     fn handle_arrival(&mut self, frame: EncryptedFrame, seq: u64) -> Vec<EncryptedFrame> {
         // Duplicate or replay
         if seq < self.next_seq {
@@ -418,12 +419,31 @@ impl UdpReader {
             // already in recv_buffer will be delivered automatically once the
             // earlier gap is filled, so NAKing for them wastes bandwidth and
             // generates misleading "giving up" warnings.
+            let now = Instant::now();
+            let mut new_gaps = Vec::new();
             for missing in self.next_seq..seq {
                 if !self.recv_buffer.contains_key(&missing) {
-                    let _entry = self
-                        .gap_first_seen
-                        .entry(missing)
-                        .or_insert_with(Instant::now);
+                    match self.gap_first_seen.entry(missing) {
+                        std::collections::hash_map::Entry::Vacant(e) => {
+                            let _ = e.insert(now);
+                            new_gaps.push(missing);
+                        }
+                        std::collections::hash_map::Entry::Occupied(_) => {}
+                    }
+                }
+            }
+            // Send an immediate NAK for newly-discovered gaps without waiting for the
+            // periodic check interval. Retries and backoff are still managed by
+            // check_nak_timeouts; this only eliminates the first-NAK delay (up to
+            // NAK_CHECK_INTERVAL + nak_timeout ≈ 70 ms on the default config).
+            if !new_gaps.is_empty() {
+                for &s in &new_gaps {
+                    let _prev = self.gap_nak_sent_at.insert(s, now);
+                }
+                if let Some(ref tx) = self.nak_out_tx
+                    && let Err(e) = tx.try_send(EncryptedFrame::Nak(new_gaps))
+                {
+                    warn!("Failed to send immediate NAK for new gaps: {e}");
                 }
             }
             vec![]
@@ -1652,6 +1672,79 @@ mod tests {
         drop(reader.handle_arrival(EncryptedFrame::Keepalive, 0));
         assert!(reader.nak_timeout.is_some(), "nak_timeout must be updated");
         assert!(reader.gap_nak_sent_at.is_empty(), "entry must be consumed");
+    }
+
+    #[tokio::test]
+    async fn handle_arrival_sends_immediate_nak_for_new_gaps() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (nak_tx, mut nak_rx) = tokio::sync::mpsc::channel::<EncryptedFrame>(16);
+        let mut reader = UdpReader::builder()
+            .socket(socket)
+            .id(Uuid::new_v4())
+            .rnk([0u8; 32])
+            .unwrap()
+            .hmac([0u8; 64])
+            .nak_out_tx(nak_tx)
+            .build();
+
+        // seq=2 arrives out of order — gaps 0 and 1 are newly discovered.
+        let ready = reader.handle_arrival(EncryptedFrame::Keepalive, 2);
+        assert!(ready.is_empty(), "out-of-order frame must be buffered");
+        assert_eq!(reader.gap_first_seen.len(), 2);
+
+        // An immediate NAK must fire without waiting for the poll tick.
+        let frame = nak_rx.try_recv().expect("expected immediate NAK");
+        let EncryptedFrame::Nak(mut seqs) = frame else {
+            panic!("expected Nak frame, got {frame:?}");
+        };
+        seqs.sort_unstable();
+        assert_eq!(seqs, vec![0, 1]);
+        assert_eq!(
+            reader.gap_nak_sent_at.len(),
+            2,
+            "RTT timestamps must be set"
+        );
+
+        // seq=4 arrives — gap 3 is new; gaps 0 and 1 are already tracked.
+        let ready2 = reader.handle_arrival(EncryptedFrame::Keepalive, 4);
+        assert!(ready2.is_empty());
+        let frame2 = nak_rx
+            .try_recv()
+            .expect("expected NAK for newly-discovered gap 3");
+        let EncryptedFrame::Nak(seqs2) = frame2 else {
+            panic!("expected Nak frame");
+        };
+        assert_eq!(
+            seqs2,
+            vec![3],
+            "only the newly-discovered gap must be NAKed"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_arrival_no_duplicate_immediate_nak_for_known_gaps() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (nak_tx, mut nak_rx) = tokio::sync::mpsc::channel::<EncryptedFrame>(16);
+        let mut reader = UdpReader::builder()
+            .socket(socket)
+            .id(Uuid::new_v4())
+            .rnk([0u8; 32])
+            .unwrap()
+            .hmac([0u8; 64])
+            .nak_out_tx(nak_tx)
+            .build();
+
+        // seq=2 arrives — creates gaps 0 and 1, immediate NAK fires.
+        drop(reader.handle_arrival(EncryptedFrame::Keepalive, 2));
+        drop(nak_rx.try_recv().expect("first immediate NAK"));
+
+        // seq=3 arrives — gaps 0 and 1 are already known (in gap_first_seen);
+        // gap 2 is in recv_buffer and excluded. No new gaps → no NAK.
+        drop(reader.handle_arrival(EncryptedFrame::Keepalive, 3));
+        assert!(
+            nak_rx.try_recv().is_err(),
+            "no immediate NAK when all gaps are already tracked"
+        );
     }
 
     #[test]
