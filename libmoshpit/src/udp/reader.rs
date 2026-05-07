@@ -162,6 +162,11 @@ impl UdpReader {
 
     /// Feed a NAK→retransmit round-trip sample into the EWMA (α = 1/8) and
     /// clamp the result to [`MIN_NAK_TIMEOUT`]..=[`MAX_NAK_TIMEOUT`].
+    ///
+    /// Also derives an updated [`Self::silence_timeout`] from the new estimate
+    /// when one was previously set (client mode).  Formula:
+    /// `max(nak_timeout × 30, 9 s)` — with a 3 s server keepalive this
+    /// guarantees ≥ 3 keepalives arrive before the silence window closes.
     fn update_rtt_estimate(&mut self, sample: Duration) {
         let current = self.nak_timeout.unwrap_or(NAK_TIMEOUT);
         // 7/8 * current + 1/8 * sample using integer Duration arithmetic.
@@ -169,6 +174,11 @@ impl UdpReader {
         let clamped = updated.clamp(MIN_NAK_TIMEOUT, MAX_NAK_TIMEOUT);
         debug!("NAK RTT sample {:?} → nak_timeout {:?}", sample, clamped);
         self.nak_timeout = Some(clamped);
+        // Only update silence_timeout when it was explicitly initialised
+        // (client mode).  Servers leave it None so this remains a no-op there.
+        if self.silence_timeout.is_some() {
+            self.silence_timeout = Some((clamped * 30).max(Duration::from_secs(9)));
+        }
     }
 
     /// Intercept terminal queries in bytes arriving from the server, respond
@@ -1851,6 +1861,29 @@ mod tests {
         assert!(
             reader.gap_nak_sent_at.is_empty(),
             "give-up must clear gap_nak_sent_at"
+        );
+    }
+
+    #[test]
+    fn update_rtt_estimate_updates_silence_timeout_when_set() {
+        let mut reader = make_reader_sync();
+        // Simulate client mode: silence_timeout was set.
+        reader.silence_timeout = Some(Duration::from_secs(15));
+        reader.update_rtt_estimate(Duration::from_millis(100));
+        let nak = reader.nak_timeout.unwrap();
+        let silence = reader.silence_timeout.unwrap();
+        assert_eq!(silence, (nak * 30).max(Duration::from_secs(9)));
+    }
+
+    #[test]
+    fn update_rtt_estimate_leaves_silence_timeout_none_when_unset() {
+        let mut reader = make_reader_sync();
+        // Simulate server mode: silence_timeout was never set.
+        assert!(reader.silence_timeout.is_none());
+        reader.update_rtt_estimate(Duration::from_millis(100));
+        assert!(
+            reader.silence_timeout.is_none(),
+            "server-mode reader must not acquire a silence_timeout"
         );
     }
 }

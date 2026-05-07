@@ -487,7 +487,10 @@ fn spawn_connection_watchdogs(
     });
 
     let _keepalive = spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_secs(10));
+        // 3 s interval: with a client silence timeout of max(nak_timeout × 30, 9 s),
+        // three keepalives fit within the minimum 9 s window, tolerating one lost
+        // keepalive before a false disconnect would occur.
+        let mut ticker = tokio::time::interval(Duration::from_secs(3));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             select! {

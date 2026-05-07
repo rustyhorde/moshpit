@@ -829,6 +829,12 @@ async fn run_udp_session(
     let (tx, rx) = channel::<EncryptedFrame>(256);
     let (retransmit_tx, retransmit_rx) = channel::<Vec<u64>>(512);
 
+    // Derive silence timeout from path RTT: max(nak_timeout × 30, 9 s).
+    // With a 3 s server keepalive interval this guarantees ≥ 3 keepalives
+    // arrive before the silence window closes.  On LAN (nak_timeout ≈ 20 ms)
+    // this gives 9 s vs the former fixed 15 s; on high-latency paths it scales
+    // up proportionally so a single slow keepalive never causes a false disconnect.
+    let silence_timeout = (nak_timeout * 30).max(Duration::from_secs(9));
     let mut udp_reader = UdpReader::builder()
         .socket(udp_arc.clone())
         .id(kex.uuid())
@@ -836,7 +842,7 @@ async fn run_udp_session(
         .rnk(kex.key())?
         .nak_out_tx(tx.clone())
         .retransmit_tx(retransmit_tx)
-        .silence_timeout(Duration::from_secs(15))
+        .silence_timeout(silence_timeout)
         .nak_timeout(nak_timeout)
         .reconnect_tx(reconnect_tx)
         .query_response_tx(tx.clone())
