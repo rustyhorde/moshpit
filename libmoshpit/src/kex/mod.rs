@@ -20,6 +20,7 @@ use aws_lc_rs::{
 use bon::Builder;
 use getset::{CopyGetters, Getters};
 use serde::{Deserialize, Serialize};
+use socket2::SockRef;
 use tokio::{
     net::{
         UdpSocket,
@@ -449,6 +450,9 @@ async fn run_client_kex<T: KexConfig>(
             SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
         };
         let udp_listener = UdpSocket::bind(bind_addr).await?;
+        let sock = SockRef::from(&udp_listener);
+        drop(sock.set_recv_buffer_size(4 * 1024 * 1024));
+        drop(sock.set_send_buffer_size(4 * 1024 * 1024));
         udp_listener.connect(moshpits_addr).await?;
         Ok((kex, Arc::new(udp_listener), None))
     } else {

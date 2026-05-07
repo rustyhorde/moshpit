@@ -32,6 +32,7 @@ dirs2 = "3.0.1"
 getset = { workspace = true }
 regex = "1.12.3"
 serde = { workspace = true }
+socket2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["process","sync","time"] }
 tokio-util = { workspace = true }

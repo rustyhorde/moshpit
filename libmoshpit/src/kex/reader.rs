@@ -27,6 +27,7 @@ use aws_lc_rs::{
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bon::Builder;
+use socket2::SockRef;
 use tokio::{
     net::UdpSocket,
     process::Command,
@@ -515,6 +516,9 @@ impl KexReader {
         let bind_addr = SocketAddr::new(unspecified, next_port);
         trace!("binding moshpits UDP socket at {bind_addr}");
         let udp_listener = UdpSocket::bind(bind_addr).await?;
+        let sock = SockRef::from(&udp_listener);
+        drop(sock.set_recv_buffer_size(4 * 1024 * 1024));
+        drop(sock.set_send_buffer_size(4 * 1024 * 1024));
         Ok(Arc::new(udp_listener))
     }
 
