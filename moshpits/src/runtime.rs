@@ -16,7 +16,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::{self, sleep},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(unix)]
@@ -493,7 +493,14 @@ fn spawn_connection_watchdogs(
             select! {
                 () = conn_token.cancelled() => break,
                 _ = ticker.tick() => {
-                    if tx.send(EncryptedFrame::Keepalive).await.is_err() {
+                    let ts = u64::try_from(
+                        SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_micros(),
+                    )
+                    .unwrap_or(0);
+                    if tx.send(EncryptedFrame::Keepalive(ts)).await.is_err() {
                         break;
                     }
                 }
@@ -1134,7 +1141,7 @@ mod test {
         let frame = frame
             .expect("timeout waiting for keepalive")
             .expect("channel closed");
-        assert!(matches!(frame, EncryptedFrame::Keepalive));
+        assert!(matches!(frame, EncryptedFrame::Keepalive(_)));
     }
 
     #[tokio::test]

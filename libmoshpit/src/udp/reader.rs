@@ -11,7 +11,7 @@ use std::{
     io::Cursor,
     process,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use ansi_control_codes::{
@@ -137,6 +137,17 @@ pub struct UdpReader {
     /// is held by a task in `moshpits` that responds with an immediate
     /// [`EncryptedFrame::ScreenState`].
     repaint_tx: Option<Sender<()>>,
+}
+
+/// Current time as microseconds since the UNIX epoch, used for keepalive RTT timestamps.
+fn now_micros() -> u64 {
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros(),
+    )
+    .unwrap_or(0)
 }
 
 impl UdpReader {
@@ -649,9 +660,14 @@ impl UdpReader {
                                     warn!("Failed to signal repaint request: {e}");
                                 }
                             }
+                            EncryptedFrame::Keepalive(ts) => {
+                                let rtt_us = now_micros().saturating_sub(ts);
+                                if rtt_us > 0 && rtt_us < 30_000_000 {
+                                    self.update_rtt_estimate(Duration::from_micros(rtt_us));
+                                }
+                            }
                             EncryptedFrame::Nak(_)
                             | EncryptedFrame::Shutdown
-                            | EncryptedFrame::Keepalive
                             | EncryptedFrame::ScrollbackStart
                             | EncryptedFrame::ScrollbackEnd
                             | EncryptedFrame::ScreenState(_)
@@ -686,8 +702,16 @@ impl UdpReader {
                                     warn!("Failed to signal repaint request: {e}");
                                 }
                             }
-                            EncryptedFrame::Nak(_) | EncryptedFrame::Shutdown | EncryptedFrame::Keepalive
-                            | EncryptedFrame::ScrollbackStart | EncryptedFrame::ScrollbackEnd
+                            EncryptedFrame::Keepalive(ts) => {
+                                let rtt_us = now_micros().saturating_sub(ts);
+                                if rtt_us > 0 && rtt_us < 30_000_000 {
+                                    self.update_rtt_estimate(Duration::from_micros(rtt_us));
+                                }
+                            }
+                            EncryptedFrame::Nak(_)
+                            | EncryptedFrame::Shutdown
+                            | EncryptedFrame::ScrollbackStart
+                            | EncryptedFrame::ScrollbackEnd
                             | EncryptedFrame::ScreenState(_)
                             | EncryptedFrame::ScreenStateCompressed(_) => {}
                         }
@@ -711,8 +735,16 @@ impl UdpReader {
                                             warn!("Failed to signal repaint request: {e}");
                                         }
                                     }
-                                    EncryptedFrame::Nak(_) | EncryptedFrame::Shutdown | EncryptedFrame::Keepalive
-                                    | EncryptedFrame::ScrollbackStart | EncryptedFrame::ScrollbackEnd
+                                    EncryptedFrame::Keepalive(ts) => {
+                                        let rtt_us = now_micros().saturating_sub(ts);
+                                        if rtt_us > 0 && rtt_us < 30_000_000 {
+                                            self.update_rtt_estimate(Duration::from_micros(rtt_us));
+                                        }
+                                    }
+                                    EncryptedFrame::Nak(_)
+                                    | EncryptedFrame::Shutdown
+                                    | EncryptedFrame::ScrollbackStart
+                                    | EncryptedFrame::ScrollbackEnd
                                     | EncryptedFrame::ScreenState(_)
                                     | EncryptedFrame::ScreenStateCompressed(_) => {}
                                 }
@@ -790,7 +822,14 @@ impl UdpReader {
                             EncryptedFrame::Resize(_) => {
                                 error!("Received Resize frame on client, which is unexpected");
                             }
-                            EncryptedFrame::Nak(_) | EncryptedFrame::Keepalive | EncryptedFrame::RepaintRequest => {}
+                            EncryptedFrame::Keepalive(ts) => {
+                                if let Some(ref tx) = self.nak_out_tx
+                                    && let Err(e) = tx.try_send(EncryptedFrame::Keepalive(ts))
+                                {
+                                    warn!("Failed to echo keepalive: {e}");
+                                }
+                            }
+                            EncryptedFrame::Nak(_) | EncryptedFrame::RepaintRequest => {}
                             EncryptedFrame::Shutdown => {
                                 info!("Server is shutting down, reconnecting");
                                 self.signal_reconnect_or_exit(0);
@@ -882,7 +921,15 @@ impl UdpReader {
                                     EncryptedFrame::Resize(_) => {
                                         error!("Received Resize frame on client, which is unexpected");
                                     }
-                                    EncryptedFrame::Nak(_) | EncryptedFrame::Keepalive | EncryptedFrame::RepaintRequest => {}
+                                    EncryptedFrame::Keepalive(ts) => {
+                                        if let Some(ref tx) = self.nak_out_tx
+                                            && let Err(e) =
+                                                tx.try_send(EncryptedFrame::Keepalive(ts))
+                                        {
+                                            warn!("Failed to echo keepalive: {e}");
+                                        }
+                                    }
+                                    EncryptedFrame::Nak(_) | EncryptedFrame::RepaintRequest => {}
                                     EncryptedFrame::Shutdown => {
                                         info!("Server is shutting down, reconnecting");
                                         self.signal_reconnect_or_exit(0);
@@ -1167,7 +1214,7 @@ mod tests {
             .build();
 
         // First packet arrives normally
-        let frame1 = EncryptedFrame::Keepalive;
+        let frame1 = EncryptedFrame::Keepalive(0);
         let ready1 = reader.handle_arrival(frame1, 0);
         assert_eq!(ready1.len(), 1);
         assert_eq!(reader.next_seq, 1);
@@ -1175,7 +1222,7 @@ mod tests {
 
         // Massive sequence jump
         let oversized_jump_seq = 1 + MAX_SEQ_JUMP + 10;
-        let frame2 = EncryptedFrame::Keepalive;
+        let frame2 = EncryptedFrame::Keepalive(0);
         let ready2 = reader.handle_arrival(frame2, oversized_jump_seq);
 
         // Should drop the frame
@@ -1184,7 +1231,7 @@ mod tests {
         assert!(reader.gap_first_seen.is_empty()); // No gaps recorded!
 
         // Small sequence jump (within limits)
-        let frame3 = EncryptedFrame::Keepalive;
+        let frame3 = EncryptedFrame::Keepalive(0);
         let ready3 = reader.handle_arrival(frame3, 3);
 
         // Should buffer the frame and record gaps for 1 and 2
@@ -1223,7 +1270,7 @@ mod tests {
             let mut reader = make_reader_sync();
             let mut delivered = Vec::new();
             for seq in 0..n {
-                let ready = reader.handle_arrival(EncryptedFrame::Keepalive, seq);
+                let ready = reader.handle_arrival(EncryptedFrame::Keepalive(0), seq);
                 delivered.extend(ready);
             }
             // All N frames should have been delivered immediately.
@@ -1240,20 +1287,20 @@ mod tests {
             // Deliver base first so next_seq = base+1 is established.
             if base > 0 {
                 for s in 0..base {
-                    drop(reader.handle_arrival(EncryptedFrame::Keepalive, s));
+                    drop(reader.handle_arrival(EncryptedFrame::Keepalive(0), s));
                 }
             }
 
             // Deliver base+1 (out of order — gap at `base` if base==0 else at base).
             // Simplified: just send seq=1 before seq=0 from a fresh reader.
             let mut reader2 = make_reader_sync();
-            let late = reader2.handle_arrival(EncryptedFrame::Keepalive, 1);
+            let late = reader2.handle_arrival(EncryptedFrame::Keepalive(0), 1);
             // seq=1 arrives before seq=0 — buffered, none delivered yet.
             prop_assert!(late.is_empty(), "frame buffered, not delivered yet");
             prop_assert_eq!(reader2.next_seq, 0);
 
             // Now deliver the missing seq=0.
-            let flushed = reader2.handle_arrival(EncryptedFrame::Keepalive, 0);
+            let flushed = reader2.handle_arrival(EncryptedFrame::Keepalive(0), 0);
             // Both seq=0 and the buffered seq=1 should now be delivered.
             prop_assert_eq!(flushed.len(), 2);
             prop_assert_eq!(reader2.next_seq, 2);
@@ -1265,7 +1312,7 @@ mod tests {
         fn prop_seq_jump_rejected(jump in (MAX_SEQ_JUMP + 1)..(MAX_SEQ_JUMP * 4)) {
             let mut reader = make_reader_sync();
             let seq = reader.next_seq + jump;
-            let ready = reader.handle_arrival(EncryptedFrame::Keepalive, seq);
+            let ready = reader.handle_arrival(EncryptedFrame::Keepalive(0), seq);
             prop_assert!(ready.is_empty(), "oversized seq-jump frame must be dropped");
             prop_assert_eq!(reader.next_seq, 0, "next_seq must be unchanged");
             prop_assert!(reader.gap_first_seen.is_empty(), "no gap state must be recorded");
@@ -1278,13 +1325,13 @@ mod tests {
             let mut reader = make_reader_sync();
             // Deliver n frames in order to advance next_seq to n.
             for seq in 0..n {
-                drop(reader.handle_arrival(EncryptedFrame::Keepalive, seq));
+                drop(reader.handle_arrival(EncryptedFrame::Keepalive(0), seq));
             }
             prop_assert_eq!(reader.next_seq, n);
 
             // Now re-deliver any already-seen sequence number.
             for old_seq in 0..n {
-                let ready = reader.handle_arrival(EncryptedFrame::Keepalive, old_seq);
+                let ready = reader.handle_arrival(EncryptedFrame::Keepalive(0), old_seq);
                 prop_assert!(ready.is_empty(), "replayed frame {old_seq} must be discarded");
             }
             prop_assert_eq!(reader.next_seq, n, "next_seq must be unchanged after replays");
@@ -1296,7 +1343,7 @@ mod tests {
         fn prop_recv_buffer_bounded(seqs in proptest::collection::vec(0u64..MAX_SEQ_JUMP, 0..128)) {
             let mut reader = make_reader_sync();
             for seq in seqs {
-                drop(reader.handle_arrival(EncryptedFrame::Keepalive, seq));
+                drop(reader.handle_arrival(EncryptedFrame::Keepalive(0), seq));
                 prop_assert!(
                     reader.recv_buffer.len() as u64 <= MAX_SEQ_JUMP,
                     "recv_buffer must stay bounded: len={}", reader.recv_buffer.len()
@@ -1669,7 +1716,7 @@ mod tests {
             .unwrap();
         let _prev = reader.gap_nak_sent_at.insert(0, sent);
         // Deliver seq=0 in order — gap closes, RTT sample taken.
-        drop(reader.handle_arrival(EncryptedFrame::Keepalive, 0));
+        drop(reader.handle_arrival(EncryptedFrame::Keepalive(0), 0));
         assert!(reader.nak_timeout.is_some(), "nak_timeout must be updated");
         assert!(reader.gap_nak_sent_at.is_empty(), "entry must be consumed");
     }
@@ -1688,7 +1735,7 @@ mod tests {
             .build();
 
         // seq=2 arrives out of order — gaps 0 and 1 are newly discovered.
-        let ready = reader.handle_arrival(EncryptedFrame::Keepalive, 2);
+        let ready = reader.handle_arrival(EncryptedFrame::Keepalive(0), 2);
         assert!(ready.is_empty(), "out-of-order frame must be buffered");
         assert_eq!(reader.gap_first_seen.len(), 2);
 
@@ -1706,7 +1753,7 @@ mod tests {
         );
 
         // seq=4 arrives — gap 3 is new; gaps 0 and 1 are already tracked.
-        let ready2 = reader.handle_arrival(EncryptedFrame::Keepalive, 4);
+        let ready2 = reader.handle_arrival(EncryptedFrame::Keepalive(0), 4);
         assert!(ready2.is_empty());
         let frame2 = nak_rx
             .try_recv()
@@ -1735,12 +1782,12 @@ mod tests {
             .build();
 
         // seq=2 arrives — creates gaps 0 and 1, immediate NAK fires.
-        drop(reader.handle_arrival(EncryptedFrame::Keepalive, 2));
+        drop(reader.handle_arrival(EncryptedFrame::Keepalive(0), 2));
         drop(nak_rx.try_recv().expect("first immediate NAK"));
 
         // seq=3 arrives — gaps 0 and 1 are already known (in gap_first_seen);
         // gap 2 is in recv_buffer and excluded. No new gaps → no NAK.
-        drop(reader.handle_arrival(EncryptedFrame::Keepalive, 3));
+        drop(reader.handle_arrival(EncryptedFrame::Keepalive(0), 3));
         assert!(
             nak_rx.try_recv().is_err(),
             "no immediate NAK when all gaps are already tracked"

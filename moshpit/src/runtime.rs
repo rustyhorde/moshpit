@@ -17,7 +17,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(target_family = "unix")]
@@ -869,7 +869,14 @@ async fn run_udp_session(
             nat_warmup_count
         );
         for _ in 0..nat_warmup_count {
-            tx.send(EncryptedFrame::Keepalive).await?;
+            let ts = u64::try_from(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_micros(),
+            )
+            .unwrap_or(0);
+            tx.send(EncryptedFrame::Keepalive(ts)).await?;
         }
     }
 
