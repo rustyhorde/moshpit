@@ -64,6 +64,11 @@ pub enum EncryptedFrame {
     /// Replaces uncompressed [`EncryptedFrame::ScreenState`] for all normal screen syncs.
     /// Client decompresses before feeding bytes into a temporary [`vt100::Parser`].
     ScreenStateCompressed(Vec<u8>),
+    /// Incremental PTY diff compressed with zstd level 1 for bandwidth efficiency.
+    /// Sent by the server in place of [`EncryptedFrame::Bytes`] when compression reduces
+    /// payload size, fitting bursts into a single datagram and reducing NAK exposure.
+    /// Client decompresses and processes identically to [`EncryptedFrame::Bytes`].
+    CompressedBytes((UuidWrapper, Vec<u8>)),
 }
 
 impl EncryptedFrame {
@@ -81,6 +86,7 @@ impl EncryptedFrame {
             EncryptedFrame::ScreenState(_) => 7,
             EncryptedFrame::RepaintRequest => 8,
             EncryptedFrame::ScreenStateCompressed(_) => 9,
+            EncryptedFrame::CompressedBytes(_) => 10,
         }
     }
 
@@ -214,6 +220,10 @@ mod tests {
         assert_eq!(EncryptedFrame::ScreenState(vec![]).id(), 7);
         assert_eq!(EncryptedFrame::RepaintRequest.id(), 8);
         assert_eq!(EncryptedFrame::ScreenStateCompressed(vec![]).id(), 9);
+        assert_eq!(
+            EncryptedFrame::CompressedBytes((UuidWrapper::new(uuid), vec![])).id(),
+            10
+        );
     }
 
     #[test]

@@ -671,7 +671,8 @@ impl UdpReader {
                             | EncryptedFrame::ScrollbackStart
                             | EncryptedFrame::ScrollbackEnd
                             | EncryptedFrame::ScreenState(_)
-                            | EncryptedFrame::ScreenStateCompressed(_) => {}
+                            | EncryptedFrame::ScreenStateCompressed(_)
+                            | EncryptedFrame::CompressedBytes(_) => {}
                         }
                     }
                 }
@@ -713,7 +714,8 @@ impl UdpReader {
                             | EncryptedFrame::ScrollbackStart
                             | EncryptedFrame::ScrollbackEnd
                             | EncryptedFrame::ScreenState(_)
-                            | EncryptedFrame::ScreenStateCompressed(_) => {}
+                            | EncryptedFrame::ScreenStateCompressed(_)
+                            | EncryptedFrame::CompressedBytes(_) => {}
                         }
                     }
                 },
@@ -746,7 +748,8 @@ impl UdpReader {
                                     | EncryptedFrame::ScrollbackStart
                                     | EncryptedFrame::ScrollbackEnd
                                     | EncryptedFrame::ScreenState(_)
-                                    | EncryptedFrame::ScreenStateCompressed(_) => {}
+                                    | EncryptedFrame::ScreenStateCompressed(_)
+                                    | EncryptedFrame::CompressedBytes(_) => {}
                                 }
                             }
                         }
@@ -895,6 +898,28 @@ impl UdpReader {
                                     }
                                 }
                             }
+                            EncryptedFrame::CompressedBytes((_id, compressed)) => {
+                                match decode_all(compressed.as_slice()) {
+                                    Ok(decompressed) => {
+                                        let message =
+                                            self.intercept_queries(&decompressed, &emulator);
+                                        process_bytes_with_prediction(
+                                            message,
+                                            &mut prev_bytes,
+                                            &mut osc_started,
+                                            &stdout_tx,
+                                            scrollback_mode,
+                                            &token,
+                                            &emulator,
+                                            &prediction,
+                                        )
+                                        .await;
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to decompress CompressedBytes: {e}");
+                                    }
+                                }
+                            }
                         }
                     }
                 },
@@ -992,6 +1017,28 @@ impl UdpReader {
                                             }
                                             Err(e) => {
                                                 error!("Failed to decompress ScreenStateCompressed: {e}");
+                                            }
+                                        }
+                                    }
+                                    EncryptedFrame::CompressedBytes((_id, compressed)) => {
+                                        match decode_all(compressed.as_slice()) {
+                                            Ok(decompressed) => {
+                                                let message = self
+                                                    .intercept_queries(&decompressed, &emulator);
+                                                process_bytes_with_prediction(
+                                                    message,
+                                                    &mut prev_bytes,
+                                                    &mut osc_started,
+                                                    &stdout_tx,
+                                                    scrollback_mode,
+                                                    &token,
+                                                    &emulator,
+                                                    &prediction,
+                                                )
+                                                .await;
+                                            }
+                                            Err(e) => {
+                                                error!("Failed to decompress CompressedBytes: {e}");
                                             }
                                         }
                                     }

@@ -592,60 +592,73 @@ fn spawn_pty_reader(
                     break;
                 }
                 Ok(n) => {
-                    let buf = &buffer[..n];
-                    let utf8_buf = String::from_utf8_lossy(buf);
+                    let buf_slice = &buffer[..n];
+                    let utf8_buf = String::from_utf8_lossy(buf_slice);
 
-                    // Fragment into MTU-safe chunks and pace them to prevent burst
-                    // loss on NAT networks (Option B).
-                    let mut chunks = buf.chunks(MAX_UDP_PAYLOAD).peekable();
-                    while let Some(chunk) = chunks.next() {
-                        let more = chunks.peek().is_some();
-
-                        // Write to scrollback ring buffer.
-                        {
-                            let mut sb = scrollback.blocking_lock();
-                            let available = SCROLLBACK_CAPACITY.saturating_sub(sb.len());
-                            if chunk.len() > available {
-                                for _ in 0..(chunk.len() - available) {
-                                    let _ = sb.pop_front();
-                                }
+                    // Write to scrollback ring buffer.
+                    {
+                        let mut sb = scrollback.blocking_lock();
+                        let available = SCROLLBACK_CAPACITY.saturating_sub(sb.len());
+                        if buf_slice.len() > available {
+                            for _ in 0..(buf_slice.len() - available) {
+                                let _ = sb.pop_front();
                             }
-                            sb.extend(chunk.iter().copied());
                         }
+                        sb.extend(buf_slice.iter().copied());
+                    }
 
-                        // Feed into the server-side emulator for screen-state tracking.
-                        server_emulator.blocking_lock().process(chunk);
+                    // Feed into the server-side emulator for screen-state tracking.
+                    server_emulator.blocking_lock().process(buf_slice);
 
-                        // Signal to the screen-sync task that new content is available.
-                        let _ = dirty_counter.fetch_add(1, Ordering::Relaxed);
+                    // Signal to the screen-sync task that new content is available.
+                    let _ = dirty_counter.fetch_add(1, Ordering::Relaxed);
 
-                        // Send to the currently connected client (if any).
-                        let send_ok = {
-                            let h = output_handle.blocking_lock();
-                            if let Some(ref sender) = h.tx {
-                                let uuid_wrapper = UuidWrapper::new(h.kex_uuid);
-                                let sender_clone = sender.clone();
-                                drop(h);
-                                // Signal the screen-sync task that diffs are flowing.
-                                diff_in_flight.store(true, Ordering::Relaxed);
-                                let frame = EncryptedFrame::Bytes((uuid_wrapper, chunk.to_vec()));
+                    // Send to the currently connected client (if any).
+                    let send_ok = {
+                        let h = output_handle.blocking_lock();
+                        if let Some(ref sender) = h.tx {
+                            let uuid_wrapper = UuidWrapper::new(h.kex_uuid);
+                            let sender_clone = sender.clone();
+                            drop(h);
+                            // Signal the screen-sync task that diffs are flowing.
+                            diff_in_flight.store(true, Ordering::Relaxed);
+                            // Try zstd level-1 compression.  When it reduces payload size,
+                            // the entire PTY read fits in a single datagram — eliminating
+                            // multi-packet bursts and their NAK exposure.  Fall back to
+                            // paced MTU chunks for incompressible binary data.
+                            if let Ok(compressed) = encode_all(buf_slice, 1)
+                                && compressed.len() < buf_slice.len()
+                            {
+                                let frame =
+                                    EncryptedFrame::CompressedBytes((uuid_wrapper, compressed));
                                 sender_clone.blocking_send(frame).is_ok()
                             } else {
-                                drop(h);
-                                true // headless: just buffer
+                                let mut ok = true;
+                                let mut chunks = buf_slice.chunks(MAX_UDP_PAYLOAD).peekable();
+                                while let Some(chunk) = chunks.next() {
+                                    let more = chunks.peek().is_some();
+                                    let frame =
+                                        EncryptedFrame::Bytes((uuid_wrapper, chunk.to_vec()));
+                                    ok = sender_clone.blocking_send(frame).is_ok();
+                                    if !ok {
+                                        break;
+                                    }
+                                    // Space out consecutive chunks to prevent burst loss
+                                    // on stateful NAT devices.
+                                    if more && !pacing_delay.is_zero() {
+                                        sleep(pacing_delay);
+                                    }
+                                }
+                                ok
                             }
-                        };
-                        if !send_ok {
-                            // Client dropped; clear tx but keep the PTY running.
-                            output_handle.blocking_lock().tx = None;
+                        } else {
+                            drop(h);
+                            true // headless: just buffer
                         }
-
-                        // Space out consecutive chunks within the same PTY read to prevent
-                        // burst loss on stateful NAT devices.  The first chunk is never
-                        // delayed; single-chunk outputs (< 1200 B) have zero added latency.
-                        if more && !pacing_delay.is_zero() {
-                            sleep(pacing_delay);
-                        }
+                    };
+                    if !send_ok {
+                        // Client dropped; clear tx but keep the PTY running.
+                        output_handle.blocking_lock().tx = None;
                     }
 
                     if is_exit_title(&utf8_buf, true) {
