@@ -453,6 +453,15 @@ async fn run_client_kex<T: KexConfig>(
         let sock = SockRef::from(&udp_listener);
         drop(sock.set_recv_buffer_size(4 * 1024 * 1024));
         drop(sock.set_send_buffer_size(4 * 1024 * 1024));
+        // DSCP Expedited Forwarding (EF, DSCP 46 = TOS byte 0xB8): give terminal
+        // traffic priority on QoS-aware networks.  Silently ignored on platforms
+        // where the socket option is unavailable.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if bind_addr.is_ipv4() {
+            drop(sock.set_tos(0xB8));
+        } else {
+            drop(sock.set_tclass_v6(0xB8));
+        }
         udp_listener.connect(moshpits_addr).await?;
         Ok((kex, Arc::new(udp_listener), None))
     } else {
