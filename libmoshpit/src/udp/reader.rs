@@ -526,14 +526,28 @@ impl UdpReader {
             // periodic check interval. Retries and backoff are still managed by
             // check_nak_timeouts; this only eliminates the first-NAK delay (up to
             // NAK_CHECK_INTERVAL + nak_timeout ≈ 70 ms on the default config).
+            //
+            // Also send a RepaintRequest alongside the NAK when recv_buffer already
+            // holds frames (len > 1 because we just inserted the current frame):
+            // for high-output programs (htop, top, vim) a single lost chunk blocks
+            // the entire remaining burst in recv_buffer.  Retransmit alone costs
+            // nak_timeout (20–500 ms) before the first retry fires.  The
+            // RepaintRequest lets the server bypass the gap with a fresh
+            // ScreenStateCompressed within one RTT instead.  The recv_buffer guard
+            // avoids triggering on a lone reorder that resolves without intervention.
             if !new_gaps.is_empty() {
                 for &s in &new_gaps {
                     let _prev = self.gap_nak_sent_at.insert(s, now);
                 }
-                if let Some(ref tx) = self.nak_out_tx
-                    && let Err(e) = tx.try_send(EncryptedFrame::Nak(new_gaps))
-                {
-                    warn!("Failed to send immediate NAK for new gaps: {e}");
+                if let Some(ref tx) = self.nak_out_tx {
+                    if let Err(e) = tx.try_send(EncryptedFrame::Nak(new_gaps)) {
+                        warn!("Failed to send immediate NAK for new gaps: {e}");
+                    }
+                    if self.recv_buffer.len() > 1
+                        && let Err(e) = tx.try_send(EncryptedFrame::RepaintRequest)
+                    {
+                        warn!("Failed to send burst-gap RepaintRequest: {e}");
+                    }
                 }
             }
             vec![]
