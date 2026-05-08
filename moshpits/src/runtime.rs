@@ -339,9 +339,10 @@ async fn handle_connection(
 
     let conn_token = CancellationToken::new();
 
-    // Oneshot channel that lets UdpSender wait until UdpReader has discovered
-    // the client's real post-NAT address and connected the shared UDP socket.
-    let (peer_discovered_tx, peer_discovered_rx) = oneshot::channel::<()>();
+    // Oneshot carries the initial peer SocketAddr from UdpReader to UdpSender.
+    let (peer_discovered_tx, peer_discovered_rx) = oneshot::channel::<SocketAddr>();
+    // mpsc carries mid-session NAT roam updates from UdpReader to UdpSender.
+    let (peer_addr_tx, peer_addr_rx) = channel::<SocketAddr>(4);
 
     // Resolve channels and decide whether to spawn a new PTY.
     let (
@@ -375,6 +376,7 @@ async fn handle_connection(
         .nak_out_tx(data_tx.clone())
         .retransmit_tx(retransmit_tx)
         .peer_discovered_tx(peer_discovered_tx)
+        .peer_addr_tx(peer_addr_tx)
         .repaint_tx(repaint_tx)
         .nak_received_count(nak_received_count.clone())
         .build();
@@ -387,6 +389,7 @@ async fn handle_connection(
         .hmac(kex.hmac_key())
         .rnk(kex.key())?
         .peer_discovered_rx(peer_discovered_rx)
+        .peer_addr_rx(peer_addr_rx)
         .maybe_warmup_delay(warmup_delay)
         .build();
 

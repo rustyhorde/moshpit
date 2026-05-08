@@ -9,6 +9,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     io::Cursor,
+    net::SocketAddr,
     process,
     sync::{
         Arc, Mutex,
@@ -141,10 +142,12 @@ pub struct UdpReader {
     /// Format: `rgb:RRRR/GGGG/BBBB`.  Defaults to a dark background when `None`.
     terminal_bg_color: Option<String>,
     /// Oneshot sender fired after the server has discovered the client's real post-NAT
-    /// address via the first `recv_from` and connected the UDP socket to it.  The
-    /// paired [`UdpSender`](crate::UdpSender) awaits this signal before sending any
-    /// packets so it never calls `send()` on an unconnected socket.
-    peer_discovered_tx: Option<oneshot::Sender<()>>,
+    /// address via the first `recv_from`.  Carries the initial peer `SocketAddr` so
+    /// that [`UdpSender`](crate::UdpSender) knows where to send before any roam event.
+    peer_discovered_tx: Option<oneshot::Sender<SocketAddr>>,
+    /// Signals mid-session NAT roam events to [`UdpSender`](crate::UdpSender).
+    /// Sent whenever an authenticated packet arrives from a new source address.
+    peer_addr_tx: Option<Sender<SocketAddr>>,
     /// Fired by the server's [`server_frame_loop`](Self::server_frame_loop) when a
     /// [`EncryptedFrame::RepaintRequest`] arrives from the client.  The paired receiver
     /// is held by a task in `moshpits` that responds with an immediate
@@ -726,16 +729,15 @@ impl UdpReader {
         token: CancellationToken,
         term_tx: Sender<TerminalMessage>,
     ) -> Result<()> {
-        // Wait for the first UDP datagram from the client.  This reveals the
-        // client's real post-NAT address which we then connect the socket to.
-        // The peer_discovered_tx oneshot is fired afterwards so that UdpSender
-        // can start sending once the socket is connected.
-        {
+        // Wait for the first UDP datagram from the client to discover its real
+        // post-NAT address.  The socket is intentionally NOT connected — it stays
+        // unconnected for the session lifetime so that packets arriving from a new
+        // address after a NAT rebind are not silently dropped by the OS.
+        let mut current_peer: SocketAddr = {
             let mut buf = vec![0u8; 65535];
             let (first_len, peer_addr) = self.socket.recv_from(&mut buf).await?;
-            self.socket.connect(peer_addr).await?;
             if let Some(tx) = self.peer_discovered_tx.take() {
-                let _ = tx.send(());
+                let _ = tx.send(peer_addr);
             }
             // Process the first packet through the normal pipeline.
             let mut first_buf = BytesMut::from(&buf[..first_len]);
@@ -779,7 +781,8 @@ impl UdpReader {
                     warn!("Failed to parse first UDP frame from client: {e}");
                 }
             }
-        }
+            peer_addr
+        };
 
         let mut nak_check_deadline = TokioInstant::now() + self.nak_check_interval();
         loop {
@@ -818,9 +821,18 @@ impl UdpReader {
                     }
                     nak_check_deadline = TokioInstant::now() + self.nak_check_interval();
                 },
-                frame_res = self.read_encrypted_frame() => {
+                frame_res = self.recv_frame_from() => {
                     match frame_res {
-                        Ok(Some((frame, seq))) => {
+                        Ok(Some((frame, seq, src_addr))) => {
+                            if src_addr != current_peer {
+                                info!("NAT roam: peer {} → {}", current_peer, src_addr);
+                                current_peer = src_addr;
+                                if let Some(ref tx) = self.peer_addr_tx
+                                    && let Err(e) = tx.try_send(src_addr)
+                                {
+                                    warn!("Failed to signal NAT roam: {e}");
+                                }
+                            }
                             for ready in self.handle_arrival(frame, seq) {
                                 match ready {
                                     EncryptedFrame::Bytes((_id, message)) => {
@@ -1318,6 +1330,28 @@ impl UdpReader {
                 }
                 Err(err) => {
                     warn!("Failed to parse encrypted frame: {err}");
+                }
+            }
+        }
+    }
+
+    /// Receives one UDP datagram via `recv_from`, parses and authenticates it, and
+    /// returns the decoded frame, its sequence number, and the sender's address.
+    /// Used by `server_frame_loop` so that the source address of every packet is
+    /// visible for NAT roam detection without connecting the socket.
+    async fn recv_frame_from(&self) -> Result<Option<(EncryptedFrame, u64, SocketAddr)>> {
+        let mut buf = vec![0u8; 65535];
+        loop {
+            let (len, src) = self.socket.recv_from(&mut buf).await?;
+            if len == 0 {
+                return Ok(None);
+            }
+            let mut buffer = BytesMut::from(&buf[..len]);
+            match self.parse_encrypted_frame(&mut buffer) {
+                Ok(Some((frame, seq))) => return Ok(Some((frame, seq, src))),
+                Ok(None) => {}
+                Err(e) => {
+                    warn!("Failed to parse UDP frame from {src}: {e}");
                 }
             }
         }
