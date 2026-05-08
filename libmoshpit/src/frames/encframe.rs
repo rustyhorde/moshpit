@@ -47,8 +47,9 @@ pub enum EncryptedFrame {
     Nak(Vec<u64>),
     /// Server is shutting down; client should exit cleanly.
     Shutdown,
-    /// Server keepalive; client should reset its silence deadline and discard.
-    Keepalive,
+    /// Server keepalive carrying a microsecond wall-clock timestamp from the sender.
+    /// The receiver echoes this frame unchanged so the sender can measure round-trip time.
+    Keepalive(u64),
     /// Signals the start of a scrollback replay block; client should enter silent-absorb mode.
     ScrollbackStart,
     /// Signals the end of a scrollback replay block; client should repaint from emulator state.
@@ -63,6 +64,11 @@ pub enum EncryptedFrame {
     /// Replaces uncompressed [`EncryptedFrame::ScreenState`] for all normal screen syncs.
     /// Client decompresses before feeding bytes into a temporary [`vt100::Parser`].
     ScreenStateCompressed(Vec<u8>),
+    /// Incremental PTY diff compressed with zstd level 1 for bandwidth efficiency.
+    /// Sent by the server in place of [`EncryptedFrame::Bytes`] when compression reduces
+    /// payload size, fitting bursts into a single datagram and reducing NAK exposure.
+    /// Client decompresses and processes identically to [`EncryptedFrame::Bytes`].
+    CompressedBytes((UuidWrapper, Vec<u8>)),
 }
 
 impl EncryptedFrame {
@@ -74,12 +80,13 @@ impl EncryptedFrame {
             EncryptedFrame::Resize(_) => 1,
             EncryptedFrame::Nak(_) => 2,
             EncryptedFrame::Shutdown => 3,
-            EncryptedFrame::Keepalive => 4,
+            EncryptedFrame::Keepalive(_) => 4,
             EncryptedFrame::ScrollbackStart => 5,
             EncryptedFrame::ScrollbackEnd => 6,
             EncryptedFrame::ScreenState(_) => 7,
             EncryptedFrame::RepaintRequest => 8,
             EncryptedFrame::ScreenStateCompressed(_) => 9,
+            EncryptedFrame::CompressedBytes(_) => 10,
         }
     }
 
@@ -207,23 +214,28 @@ mod tests {
         );
         assert_eq!(EncryptedFrame::Nak(vec![]).id(), 2);
         assert_eq!(EncryptedFrame::Shutdown.id(), 3);
-        assert_eq!(EncryptedFrame::Keepalive.id(), 4);
+        assert_eq!(EncryptedFrame::Keepalive(0).id(), 4);
         assert_eq!(EncryptedFrame::ScrollbackStart.id(), 5);
         assert_eq!(EncryptedFrame::ScrollbackEnd.id(), 6);
         assert_eq!(EncryptedFrame::ScreenState(vec![]).id(), 7);
         assert_eq!(EncryptedFrame::RepaintRequest.id(), 8);
         assert_eq!(EncryptedFrame::ScreenStateCompressed(vec![]).id(), 9);
+        assert_eq!(
+            EncryptedFrame::CompressedBytes((UuidWrapper::new(uuid), vec![])).id(),
+            10
+        );
     }
 
     #[test]
     fn parse_round_trip_keepalive() {
         let (id, rnk, hmac) = make_keys();
-        let packet = encrypt_frame(&EncryptedFrame::Keepalive, 0, id, &rnk, &hmac);
+        let ts = 1_234_567_890_u64;
+        let packet = encrypt_frame(&EncryptedFrame::Keepalive(ts), 0, id, &rnk, &hmac);
         let mut cursor = Cursor::new(packet.as_slice());
         let (parsed_frame, seq) = EncryptedFrame::parse(&mut cursor, id, &hmac, &rnk)
             .unwrap()
             .unwrap();
-        assert_eq!(parsed_frame, EncryptedFrame::Keepalive);
+        assert_eq!(parsed_frame, EncryptedFrame::Keepalive(ts));
         assert_eq!(seq, 0);
     }
 
@@ -251,7 +263,7 @@ mod tests {
     #[test]
     fn parse_wrong_uuid_returns_error() {
         let (id, rnk, hmac) = make_keys();
-        let packet = encrypt_frame(&EncryptedFrame::Keepalive, 0, id, &rnk, &hmac);
+        let packet = encrypt_frame(&EncryptedFrame::Keepalive(0), 0, id, &rnk, &hmac);
         let wrong_id = Uuid::new_v4();
         let mut cursor = Cursor::new(packet.as_slice());
         let result = EncryptedFrame::parse(&mut cursor, wrong_id, &hmac, &rnk);

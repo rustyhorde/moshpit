@@ -13,10 +13,10 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread::{self, sleep},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(unix)]
@@ -63,6 +63,25 @@ use crate::{
 
 /// Default minimum inter-packet delay between consecutive diff chunks sent to the client.
 const DEFAULT_PACING_DELAY_US: u64 = 1000;
+/// Number of client NAK frames received within the 200 ms poll window that triggers a
+/// proactive `ScreenStateCompressed` push without waiting for a `RepaintRequest`.
+/// At the adaptive NAK check interval floor of 5 ms, 10 NAKs ≈ one per 20 ms, which
+/// reliably signals a high-loss condition where the `RepaintRequest` itself may be lost.
+const PROACTIVE_REPAINT_NAK_THRESHOLD: u64 = 10;
+
+/// MTU tier sizes — maximum PTY-chunk payload bytes tried in ascending order.
+/// Wire size ≈ payload + 124 bytes overhead (nonce + seq + HMAC + length + UUID + AEAD tag).
+/// Tier 2 (1348 B payload) produces a ≈ 1472-byte wire frame — the IPv4 maximum
+/// (1500 Ethernet MTU − 20 IP − 8 UDP).  Tier 1 (1300 B) is a safe intermediate.
+const MTU_TIERS: &[usize] = &[1_200, 1_300, 1_348];
+/// 200 ms polling interval shared by the MTU probe task and the proactive-repaint watchdog.
+const MTU_POLL_INTERVAL: Duration = Duration::from_millis(200);
+/// Consecutive 200 ms ticks with zero NAK delta required before probing the next tier (60 s).
+const MTU_PROBE_QUIET_TICKS: u32 = 300;
+/// Consecutive 200 ms probe ticks with low NAK delta required to confirm the upgrade (30 s).
+const MTU_PROBE_SUCCESS_TICKS: u32 = 150;
+/// NAK delta in a single 200 ms window that signals the larger MTU caused a black hole.
+const MTU_PROBE_FAIL_THRESHOLD: u64 = 3;
 
 /// Normal screen-sync interval when the terminal is idle.
 const SCREEN_SYNC_IDLE_INTERVAL: Duration = Duration::from_millis(50);
@@ -188,6 +207,7 @@ async fn resolve_session(
     Arc<Mutex<vt100::Parser>>,
     Arc<AtomicU64>,
     Arc<AtomicBool>,
+    Arc<AtomicUsize>,
 )> {
     let session_uuid = skex.session_uuid();
     if skex.is_resume() {
@@ -199,6 +219,7 @@ async fn resolve_session(
             let server_emulator = record.server_emulator.clone();
             let dirty_counter = record.dirty_counter.clone();
             let diff_in_flight = record.diff_in_flight.clone();
+            let effective_mtu = record.effective_mtu.clone();
             drop(reg);
             // Give the new connection's screen-sync task a clean slate so the
             // first tick correctly senses whether diffs are flowing.
@@ -242,6 +263,7 @@ async fn resolve_session(
                 server_emulator,
                 dirty_counter,
                 diff_in_flight,
+                effective_mtu,
             ))
         } else {
             // Session expired; start fresh.
@@ -309,6 +331,7 @@ async fn handle_connection(
         server_emulator,
         dirty_counter,
         diff_in_flight,
+        effective_mtu,
     ) = resolve_session(
         &kex,
         &skex,
@@ -320,6 +343,8 @@ async fn handle_connection(
     .await?;
 
     let (repaint_tx, mut repaint_rx) = channel::<()>(1);
+    let nak_received_count = Arc::new(AtomicU64::new(0));
+    let nak_received_count_for_mtu = nak_received_count.clone();
     let mut udp_reader = UdpReader::builder()
         .socket(udp_recv)
         .id(kex.uuid())
@@ -329,6 +354,7 @@ async fn handle_connection(
         .retransmit_tx(retransmit_tx)
         .peer_discovered_tx(peer_discovered_tx)
         .repaint_tx(repaint_tx)
+        .nak_received_count(nak_received_count.clone())
         .build();
     let mut udp_sender = UdpSender::builder()
         .socket(udp_send)
@@ -443,6 +469,19 @@ async fn handle_connection(
         }
     });
 
+    spawn_proactive_repaint_watchdog(
+        tx.clone(),
+        conn_token.clone(),
+        nak_received_count,
+        server_emulator.clone(),
+    );
+
+    spawn_mtu_probe_task(
+        conn_token.clone(),
+        nak_received_count_for_mtu,
+        effective_mtu.clone(),
+    );
+
     // For new sessions, spawn the long-lived PTY thread.
     if let Some(term_rx) = maybe_term_rx {
         spawn_pty(
@@ -460,6 +499,7 @@ async fn handle_connection(
             port_pool,
             session_registry,
             full_registry,
+            effective_mtu,
         );
     }
 
@@ -487,14 +527,151 @@ fn spawn_connection_watchdogs(
     });
 
     let _keepalive = spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_secs(10));
+        // 3 s interval: with a client silence timeout of max(nak_timeout × 30, 9 s),
+        // three keepalives fit within the minimum 9 s window, tolerating one lost
+        // keepalive before a false disconnect would occur.
+        let mut ticker = tokio::time::interval(Duration::from_secs(3));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             select! {
                 () = conn_token.cancelled() => break,
                 _ = ticker.tick() => {
-                    if tx.send(EncryptedFrame::Keepalive).await.is_err() {
+                    let ts = u64::try_from(
+                        SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_micros(),
+                    )
+                    .unwrap_or(0);
+                    if tx.send(EncryptedFrame::Keepalive(ts)).await.is_err() {
                         break;
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Single tick of the MTU probe state machine.
+///
+/// Returns `Some(new_mtu)` if the effective MTU tier changed this tick; `None` otherwise.
+/// Extracted from [`spawn_mtu_probe_task`] so the state-transition logic can be tested
+/// without async machinery.
+fn mtu_probe_step(
+    current_nak: u64,
+    last_nak: &mut u64,
+    tier: &mut usize,
+    quiet_ticks: &mut u32,
+    probe_ticks: &mut u32,
+    probing: &mut bool,
+) -> Option<usize> {
+    let delta = current_nak.wrapping_sub(*last_nak);
+    *last_nak = current_nak;
+    let prev_tier = *tier;
+    if *probing {
+        if delta >= MTU_PROBE_FAIL_THRESHOLD {
+            *tier = (*tier).saturating_sub(1);
+            *probing = false;
+            *quiet_ticks = 0;
+            *probe_ticks = 0;
+        } else {
+            *probe_ticks += 1;
+            if *probe_ticks >= MTU_PROBE_SUCCESS_TICKS {
+                *probing = false;
+                *quiet_ticks = 0;
+                *probe_ticks = 0;
+            }
+        }
+    } else if delta == 0 {
+        *quiet_ticks += 1;
+        if *quiet_ticks >= MTU_PROBE_QUIET_TICKS && *tier + 1 < MTU_TIERS.len() {
+            *tier += 1;
+            *probing = true;
+            *probe_ticks = 0;
+            *quiet_ticks = 0;
+        }
+    } else {
+        *quiet_ticks = 0;
+    }
+    (*tier != prev_tier).then_some(MTU_TIERS[*tier])
+}
+
+/// Spawn a watchdog task that adaptively adjusts the maximum PTY-chunk payload size.
+///
+/// Probes successively larger MTU tiers after [`MTU_PROBE_QUIET_TICKS`] × 200 ms of
+/// zero NAK traffic, and reverts on loss spikes (see [`mtu_probe_step`]).
+fn spawn_mtu_probe_task(
+    token: CancellationToken,
+    nak_received_count: Arc<AtomicU64>,
+    effective_mtu: Arc<AtomicUsize>,
+) {
+    let _task = spawn(async move {
+        let mut ticker = tokio::time::interval(MTU_POLL_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut tier: usize = 0;
+        let mut last_nak: u64 = 0;
+        let mut quiet_ticks: u32 = 0;
+        let mut probe_ticks: u32 = 0;
+        let mut probing = false;
+        loop {
+            select! {
+                () = token.cancelled() => break,
+                _ = ticker.tick() => {
+                    let current = nak_received_count.load(Ordering::Relaxed);
+                    if let Some(new_mtu) = mtu_probe_step(
+                        current,
+                        &mut last_nak,
+                        &mut tier,
+                        &mut quiet_ticks,
+                        &mut probe_ticks,
+                        &mut probing,
+                    ) {
+                        effective_mtu.store(new_mtu, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Spawn a watchdog task that proactively pushes a `ScreenStateCompressed` frame when the
+/// server receives an elevated rate of NAK frames from the client.
+///
+/// When NAK delta over a 200 ms window reaches [`PROACTIVE_REPAINT_NAK_THRESHOLD`], a
+/// `RepaintRequest` may itself be lost (the same loss condition that prompted the NAKs can
+/// affect control frames too).  This watchdog breaks the dependency by pushing the screen
+/// state unconditionally, without waiting for the client to ask.
+fn spawn_proactive_repaint_watchdog(
+    tx: Sender<EncryptedFrame>,
+    token: CancellationToken,
+    nak_received_count: Arc<AtomicU64>,
+    server_emulator: Arc<Mutex<vt100::Parser>>,
+) {
+    let _watchdog = spawn(async move {
+        let mut last_count: u64 = 0;
+        let mut ticker = tokio::time::interval(Duration::from_millis(200));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            select! {
+                () = token.cancelled() => break,
+                _ = ticker.tick() => {
+                    let current = nak_received_count.load(Ordering::Relaxed);
+                    let delta = current.wrapping_sub(last_count);
+                    last_count = current;
+                    if delta >= PROACTIVE_REPAINT_NAK_THRESHOLD {
+                        let contents = {
+                            let emu = server_emulator.lock().await;
+                            emu.screen().contents_formatted()
+                        };
+                        let compressed = encode_all(contents.as_slice(), 3)
+                            .unwrap_or_else(|_| contents.clone());
+                        if tx
+                            .send(EncryptedFrame::ScreenStateCompressed(compressed))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
                 }
             }
@@ -519,6 +696,7 @@ async fn new_session(
     Arc<Mutex<vt100::Parser>>,
     Arc<AtomicU64>,
     Arc<AtomicBool>,
+    Arc<AtomicUsize>,
 )> {
     let (term_tx, term_rx) = channel::<TerminalMessage>(256);
     let output_handle = Arc::new(Mutex::new(SessionOutputHandle {
@@ -532,6 +710,7 @@ async fn new_session(
     // Start at 1 so the first sync tick always sends an initial screen state.
     let dirty_counter = Arc::new(AtomicU64::new(1));
     let diff_in_flight = Arc::new(AtomicBool::new(false));
+    let effective_mtu = Arc::new(AtomicUsize::new(MAX_UDP_PAYLOAD));
 
     {
         let mut fr = full_registry.lock().await;
@@ -544,6 +723,7 @@ async fn new_session(
                 server_emulator: server_emulator.clone(),
                 dirty_counter: dirty_counter.clone(),
                 diff_in_flight: diff_in_flight.clone(),
+                effective_mtu: effective_mtu.clone(),
             },
         ));
     }
@@ -556,6 +736,7 @@ async fn new_session(
         server_emulator,
         dirty_counter,
         diff_in_flight,
+        effective_mtu,
     ))
 }
 
@@ -575,6 +756,7 @@ fn spawn_pty_reader(
     port_pool: Arc<Mutex<BTreeSet<u16>>>,
     session_registry: SessionRegistry,
     full_registry: FullSessionRegistry,
+    effective_mtu: Arc<AtomicUsize>,
 ) {
     let _read_handle = thread::spawn(move || {
         loop {
@@ -585,60 +767,74 @@ fn spawn_pty_reader(
                     break;
                 }
                 Ok(n) => {
-                    let buf = &buffer[..n];
-                    let utf8_buf = String::from_utf8_lossy(buf);
+                    let buf_slice = &buffer[..n];
+                    let utf8_buf = String::from_utf8_lossy(buf_slice);
 
-                    // Fragment into MTU-safe chunks and pace them to prevent burst
-                    // loss on NAT networks (Option B).
-                    let mut chunks = buf.chunks(MAX_UDP_PAYLOAD).peekable();
-                    while let Some(chunk) = chunks.next() {
-                        let more = chunks.peek().is_some();
-
-                        // Write to scrollback ring buffer.
-                        {
-                            let mut sb = scrollback.blocking_lock();
-                            let available = SCROLLBACK_CAPACITY.saturating_sub(sb.len());
-                            if chunk.len() > available {
-                                for _ in 0..(chunk.len() - available) {
-                                    let _ = sb.pop_front();
-                                }
+                    // Write to scrollback ring buffer.
+                    {
+                        let mut sb = scrollback.blocking_lock();
+                        let available = SCROLLBACK_CAPACITY.saturating_sub(sb.len());
+                        if buf_slice.len() > available {
+                            for _ in 0..(buf_slice.len() - available) {
+                                let _ = sb.pop_front();
                             }
-                            sb.extend(chunk.iter().copied());
                         }
+                        sb.extend(buf_slice.iter().copied());
+                    }
 
-                        // Feed into the server-side emulator for screen-state tracking.
-                        server_emulator.blocking_lock().process(chunk);
+                    // Feed into the server-side emulator for screen-state tracking.
+                    server_emulator.blocking_lock().process(buf_slice);
 
-                        // Signal to the screen-sync task that new content is available.
-                        let _ = dirty_counter.fetch_add(1, Ordering::Relaxed);
+                    // Signal to the screen-sync task that new content is available.
+                    let _ = dirty_counter.fetch_add(1, Ordering::Relaxed);
 
-                        // Send to the currently connected client (if any).
-                        let send_ok = {
-                            let h = output_handle.blocking_lock();
-                            if let Some(ref sender) = h.tx {
-                                let uuid_wrapper = UuidWrapper::new(h.kex_uuid);
-                                let sender_clone = sender.clone();
-                                drop(h);
-                                // Signal the screen-sync task that diffs are flowing.
-                                diff_in_flight.store(true, Ordering::Relaxed);
-                                let frame = EncryptedFrame::Bytes((uuid_wrapper, chunk.to_vec()));
+                    // Send to the currently connected client (if any).
+                    let send_ok = {
+                        let h = output_handle.blocking_lock();
+                        if let Some(ref sender) = h.tx {
+                            let uuid_wrapper = UuidWrapper::new(h.kex_uuid);
+                            let sender_clone = sender.clone();
+                            drop(h);
+                            // Signal the screen-sync task that diffs are flowing.
+                            diff_in_flight.store(true, Ordering::Relaxed);
+                            // Try zstd level-1 compression.  When it reduces payload size,
+                            // the entire PTY read fits in a single datagram — eliminating
+                            // multi-packet bursts and their NAK exposure.  Fall back to
+                            // paced MTU chunks for incompressible binary data.
+                            if let Ok(compressed) = encode_all(buf_slice, 1)
+                                && compressed.len() < buf_slice.len()
+                            {
+                                let frame =
+                                    EncryptedFrame::CompressedBytes((uuid_wrapper, compressed));
                                 sender_clone.blocking_send(frame).is_ok()
                             } else {
-                                drop(h);
-                                true // headless: just buffer
+                                let mut ok = true;
+                                let mtu = effective_mtu.load(Ordering::Relaxed);
+                                let mut chunks = buf_slice.chunks(mtu).peekable();
+                                while let Some(chunk) = chunks.next() {
+                                    let more = chunks.peek().is_some();
+                                    let frame =
+                                        EncryptedFrame::Bytes((uuid_wrapper, chunk.to_vec()));
+                                    ok = sender_clone.blocking_send(frame).is_ok();
+                                    if !ok {
+                                        break;
+                                    }
+                                    // Space out consecutive chunks to prevent burst loss
+                                    // on stateful NAT devices.
+                                    if more && !pacing_delay.is_zero() {
+                                        sleep(pacing_delay);
+                                    }
+                                }
+                                ok
                             }
-                        };
-                        if !send_ok {
-                            // Client dropped; clear tx but keep the PTY running.
-                            output_handle.blocking_lock().tx = None;
+                        } else {
+                            drop(h);
+                            true // headless: just buffer
                         }
-
-                        // Space out consecutive chunks within the same PTY read to prevent
-                        // burst loss on stateful NAT devices.  The first chunk is never
-                        // delayed; single-chunk outputs (< 1200 B) have zero added latency.
-                        if more && !pacing_delay.is_zero() {
-                            sleep(pacing_delay);
-                        }
+                    };
+                    if !send_ok {
+                        // Client dropped; clear tx but keep the PTY running.
+                        output_handle.blocking_lock().tx = None;
                     }
 
                     if is_exit_title(&utf8_buf, true) {
@@ -708,6 +904,7 @@ fn spawn_pty(
     port_pool: Arc<Mutex<BTreeSet<u16>>>,
     session_registry: SessionRegistry,
     full_registry: FullSessionRegistry,
+    effective_mtu: Arc<AtomicUsize>,
 ) {
     let _term_handle = thread::spawn(move || {
         let pty_system = native_pty_system();
@@ -883,6 +1080,7 @@ fn spawn_pty(
             port_pool,
             session_registry,
             full_registry,
+            effective_mtu,
         );
 
         while let Some(terminal_message) = term_rx.blocking_recv() {
@@ -1004,7 +1202,20 @@ mod test {
 
     #[cfg(unix)]
     use super::{current_daemon_user, resolve_user_account};
-    use super::{new_full_registry, new_session, resolve_session, spawn_connection_watchdogs};
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicU64, AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+
+    use super::{
+        MTU_PROBE_FAIL_THRESHOLD, MTU_PROBE_QUIET_TICKS, MTU_PROBE_SUCCESS_TICKS, MTU_TIERS,
+        PROACTIVE_REPAINT_NAK_THRESHOLD, mtu_probe_step, new_full_registry, new_session,
+        resolve_session, spawn_connection_watchdogs, spawn_mtu_probe_task,
+        spawn_proactive_repaint_watchdog,
+    };
 
     #[cfg(unix)]
     #[test]
@@ -1060,7 +1271,7 @@ mod test {
         let session_uuid = Uuid::new_v4();
         let registry = new_full_registry();
 
-        let (_, maybe_rx, _, _, _, _, _) =
+        let (_, maybe_rx, _, _, _, _, _, _) =
             new_session(&kex, &conn_token, 50_000, session_uuid, tx, &registry)
                 .await
                 .unwrap();
@@ -1075,7 +1286,7 @@ mod test {
         let session_uuid = Uuid::new_v4();
         let registry = new_full_registry();
 
-        let (_, _, output_handle, _, _, _, _) =
+        let (_, _, output_handle, _, _, _, _, _) =
             new_session(&kex, &conn_token, 50_000, session_uuid, tx, &registry)
                 .await
                 .unwrap();
@@ -1090,7 +1301,7 @@ mod test {
         let session_uuid = Uuid::new_v4();
         let registry = new_full_registry();
 
-        let (_, _, _, scrollback, _, _, _) =
+        let (_, _, _, scrollback, _, _, _, _) =
             new_session(&kex, &conn_token, 50_000, session_uuid, tx, &registry)
                 .await
                 .unwrap();
@@ -1105,7 +1316,7 @@ mod test {
         let session_uuid = Uuid::new_v4();
         let registry = new_full_registry();
 
-        let (_, _, _, _, emulator, _, _) =
+        let (_, _, _, _, emulator, _, _, _) =
             new_session(&kex, &conn_token, 50_000, session_uuid, tx, &registry)
                 .await
                 .unwrap();
@@ -1125,7 +1336,7 @@ mod test {
 
         // The keepalive fires every 10 s — wait for the first tick (immediate on start)
         // or drain until we see a Keepalive within a short timeout.
-        let frame = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await;
+        let frame = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
         // Either we got a frame or the channel is still open; cancel to clean up
         conn_token.cancel();
         // We just verify the channel was not closed (tasks are alive)
@@ -1134,7 +1345,7 @@ mod test {
         let frame = frame
             .expect("timeout waiting for keepalive")
             .expect("channel closed");
-        assert!(matches!(frame, EncryptedFrame::Keepalive));
+        assert!(matches!(frame, EncryptedFrame::Keepalive(_)));
     }
 
     #[tokio::test]
@@ -1147,7 +1358,7 @@ mod test {
         server_token.cancel();
 
         // Allow the watcher task to run
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Drain frames looking for Shutdown
         let mut saw_shutdown = false;
@@ -1162,7 +1373,7 @@ mod test {
             "expected Shutdown frame after server_token cancel"
         );
         // After another short wait, conn_token should be cancelled
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(conn_token.is_cancelled());
     }
 
@@ -1175,12 +1386,12 @@ mod test {
 
         // Cancel immediately — keepalive loop should stop
         conn_token.cancel();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Drain any already-queued frames
         while rx.try_recv().is_ok() {}
         // No further Keepalive frames should arrive
-        let result = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
+        let result = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await;
         // Either timeout (no frame) or channel closed — both are acceptable
         assert!(result.is_err() || result.unwrap().is_none());
     }
@@ -1200,7 +1411,7 @@ mod test {
         let (tx, _rx) = channel::<EncryptedFrame>(4);
         let registry = new_full_registry();
 
-        let (_, maybe_rx, _, _, _, _, _) =
+        let (_, maybe_rx, _, _, _, _, _, _) =
             resolve_session(&kex, &skex, &conn_token, 50_000, tx, &registry)
                 .await
                 .unwrap();
@@ -1239,7 +1450,7 @@ mod test {
         let new_conn_token = CancellationToken::new();
         let (tx2, mut rx2) = channel::<EncryptedFrame>(16);
 
-        let (_, maybe_rx, output_handle, _, _, _, _) = resolve_session(
+        let (_, maybe_rx, output_handle, _, _, _, _, _) = resolve_session(
             &new_kex,
             &skex_resume,
             &new_conn_token,
@@ -1283,7 +1494,7 @@ mod test {
         let (tx, _rx) = channel::<EncryptedFrame>(4);
         let registry = new_full_registry();
 
-        let (_, maybe_rx, _, _, _, _, _) =
+        let (_, maybe_rx, _, _, _, _, _, _) =
             resolve_session(&kex, &skex, &conn_token, 50_000, tx, &registry)
                 .await
                 .unwrap();
@@ -1310,5 +1521,178 @@ mod test {
         assert_eq!(initgroups_base_group(42), 42);
         assert_eq!(initgroups_base_group(0), 0);
         assert_eq!(initgroups_base_group(u32::MAX), u32::MAX);
+    }
+
+    // ── Phase 9: mtu_probe_step (state machine unit tests) ────────────────────
+
+    fn make_probe_state() -> (usize, u64, u32, u32, bool) {
+        (0usize, 0u64, 0u32, 0u32, false)
+    }
+
+    #[test]
+    fn mtu_probe_step_starts_at_base_mtu() {
+        let (mut tier, mut last_nak, mut qt, mut pt, mut probing) = make_probe_state();
+        let result = mtu_probe_step(0, &mut last_nak, &mut tier, &mut qt, &mut pt, &mut probing);
+        assert!(result.is_none(), "no tier change on first quiet tick");
+        assert_eq!(tier, 0);
+    }
+
+    #[test]
+    fn mtu_probe_step_advances_tier_after_quiet_period() {
+        let (mut tier, mut last_nak, mut qt, mut pt, mut probing) = make_probe_state();
+        let mut changed = None;
+        for _ in 0..MTU_PROBE_QUIET_TICKS {
+            changed = mtu_probe_step(0, &mut last_nak, &mut tier, &mut qt, &mut pt, &mut probing);
+        }
+        assert_eq!(
+            changed,
+            Some(MTU_TIERS[1]),
+            "tier upgrades on Nth quiet tick"
+        );
+        assert_eq!(tier, 1);
+        assert!(probing);
+    }
+
+    #[test]
+    fn mtu_probe_step_reverts_on_nak_spike_during_probe() {
+        let (mut tier, mut last_nak, mut qt, mut pt, mut probing) = make_probe_state();
+        // Advance to probing state.
+        for _ in 0..MTU_PROBE_QUIET_TICKS {
+            let _ = mtu_probe_step(0, &mut last_nak, &mut tier, &mut qt, &mut pt, &mut probing);
+        }
+        assert_eq!(tier, 1);
+        assert!(probing);
+        // Spike above the failure threshold.
+        let nak = MTU_PROBE_FAIL_THRESHOLD;
+        let result = mtu_probe_step(
+            nak,
+            &mut last_nak,
+            &mut tier,
+            &mut qt,
+            &mut pt,
+            &mut probing,
+        );
+        assert_eq!(result, Some(MTU_TIERS[0]), "tier reverts on NAK spike");
+        assert_eq!(tier, 0);
+        assert!(!probing);
+    }
+
+    #[test]
+    fn mtu_probe_step_confirms_upgrade_after_success_ticks() {
+        let (mut tier, mut last_nak, mut qt, mut pt, mut probing) = make_probe_state();
+        for _ in 0..MTU_PROBE_QUIET_TICKS {
+            let _ = mtu_probe_step(0, &mut last_nak, &mut tier, &mut qt, &mut pt, &mut probing);
+        }
+        assert!(probing, "should be probing after quiet period");
+        // Run through all success ticks with zero NAK delta.
+        for _ in 0..MTU_PROBE_SUCCESS_TICKS {
+            let _ = mtu_probe_step(0, &mut last_nak, &mut tier, &mut qt, &mut pt, &mut probing);
+        }
+        assert!(!probing, "probe confirmed — no longer probing");
+        assert_eq!(tier, 1, "tier stays at 1 after confirmation");
+    }
+
+    #[test]
+    fn mtu_probe_step_no_upgrade_below_threshold() {
+        let (mut tier, mut last_nak, mut qt, mut pt, mut probing) = make_probe_state();
+        // Run one tick short of the upgrade threshold.
+        for _ in 0..MTU_PROBE_QUIET_TICKS - 1 {
+            let _ = mtu_probe_step(0, &mut last_nak, &mut tier, &mut qt, &mut pt, &mut probing);
+        }
+        assert_eq!(tier, 0, "no upgrade before quiet threshold");
+        assert!(!probing);
+    }
+
+    #[test]
+    fn mtu_probe_step_resets_quiet_on_any_nak() {
+        let (mut tier, mut last_nak, mut qt, mut pt, mut probing) = make_probe_state();
+        for _ in 0..MTU_PROBE_QUIET_TICKS - 1 {
+            let _ = mtu_probe_step(0, &mut last_nak, &mut tier, &mut qt, &mut pt, &mut probing);
+        }
+        // One NAK resets quiet counter.
+        let _ = mtu_probe_step(1, &mut last_nak, &mut tier, &mut qt, &mut pt, &mut probing);
+        // Need a full quiet period again before upgrade.
+        for _ in 0..MTU_PROBE_QUIET_TICKS - 1 {
+            let _ = mtu_probe_step(1, &mut last_nak, &mut tier, &mut qt, &mut pt, &mut probing);
+        }
+        assert_eq!(tier, 0, "quiet counter reset — no upgrade yet");
+    }
+
+    #[tokio::test]
+    async fn mtu_probe_task_starts_at_base_mtu() {
+        let token = CancellationToken::new();
+        let nak_count = Arc::new(AtomicU64::new(0));
+        let effective_mtu = Arc::new(AtomicUsize::new(MTU_TIERS[0]));
+        spawn_mtu_probe_task(token.clone(), nak_count, effective_mtu.clone());
+        token.cancel();
+        assert_eq!(effective_mtu.load(Ordering::Relaxed), MTU_TIERS[0]);
+    }
+
+    // ── Phase 8: spawn_proactive_repaint_watchdog ──────────────────────────────
+
+    #[tokio::test]
+    async fn proactive_repaint_fires_on_nak_saturation() {
+        let (tx, mut rx) = channel::<EncryptedFrame>(4);
+        let token = CancellationToken::new();
+        let nak_count = Arc::new(AtomicU64::new(0));
+        let emulator = Arc::new(tokio::sync::Mutex::new(vt100::Parser::new(24, 80, 0)));
+
+        spawn_proactive_repaint_watchdog(tx, token.clone(), nak_count.clone(), emulator);
+
+        // Bump the counter above the threshold so the first watchdog tick triggers a push.
+        nak_count.store(PROACTIVE_REPAINT_NAK_THRESHOLD, Ordering::Relaxed);
+
+        // The watchdog polls every 200 ms — give it up to 500 ms to fire.
+        let frame = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await;
+        token.cancel();
+
+        let frame = frame
+            .expect("timeout: proactive repaint did not fire within 500 ms")
+            .expect("channel closed before proactive repaint");
+        assert!(matches!(frame, EncryptedFrame::ScreenStateCompressed(_)));
+    }
+
+    #[tokio::test]
+    async fn proactive_repaint_does_not_fire_below_threshold() {
+        let (tx, mut rx) = channel::<EncryptedFrame>(4);
+        let token = CancellationToken::new();
+        let nak_count = Arc::new(AtomicU64::new(0));
+        let emulator = Arc::new(tokio::sync::Mutex::new(vt100::Parser::new(24, 80, 0)));
+
+        spawn_proactive_repaint_watchdog(tx, token.clone(), nak_count.clone(), emulator);
+
+        // Set count one below the threshold.
+        nak_count.store(PROACTIVE_REPAINT_NAK_THRESHOLD - 1, Ordering::Relaxed);
+
+        // Wait for at least one poll cycle — no frame should arrive.
+        let result = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await;
+        token.cancel();
+
+        assert!(
+            result.is_err(),
+            "expected no proactive repaint below threshold, but got a frame"
+        );
+    }
+
+    #[tokio::test]
+    async fn proactive_repaint_stops_on_cancel() {
+        let (tx, mut rx) = channel::<EncryptedFrame>(4);
+        let token = CancellationToken::new();
+        let nak_count = Arc::new(AtomicU64::new(PROACTIVE_REPAINT_NAK_THRESHOLD));
+        let emulator = Arc::new(tokio::sync::Mutex::new(vt100::Parser::new(24, 80, 0)));
+
+        spawn_proactive_repaint_watchdog(tx, token.clone(), nak_count, emulator);
+
+        // Cancel immediately before any tick fires.
+        token.cancel();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        // Channel should be drained and no further frames arrive.
+        while rx.try_recv().is_ok() {}
+        let result = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await;
+        assert!(
+            result.is_err() || result.unwrap().is_none(),
+            "watchdog kept sending after cancellation"
+        );
     }
 }

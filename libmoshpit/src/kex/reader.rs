@@ -27,6 +27,7 @@ use aws_lc_rs::{
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bon::Builder;
+use socket2::SockRef;
 use tokio::{
     net::UdpSocket,
     process::Command,
@@ -515,6 +516,18 @@ impl KexReader {
         let bind_addr = SocketAddr::new(unspecified, next_port);
         trace!("binding moshpits UDP socket at {bind_addr}");
         let udp_listener = UdpSocket::bind(bind_addr).await?;
+        let sock = SockRef::from(&udp_listener);
+        drop(sock.set_recv_buffer_size(4 * 1024 * 1024));
+        drop(sock.set_send_buffer_size(4 * 1024 * 1024));
+        // DSCP Expedited Forwarding (EF, DSCP 46 = TOS byte 0xB8): give terminal
+        // traffic priority on QoS-aware networks.  Silently ignored on platforms
+        // where the socket option is unavailable.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if bind_addr.is_ipv4() {
+            drop(sock.set_tos(0xB8));
+        } else {
+            drop(sock.set_tclass_v6(0xB8));
+        }
         Ok(Arc::new(udp_listener))
     }
 
