@@ -34,7 +34,7 @@ moshpit draws its core motivation from [Mosh (Mobile Shell)](https://mosh.org/),
 |---------|------|---------|
 | **Language** | C++ | Rust |
 | **Authentication** | Delegated to SSH for the initial handshake; a one-time secret is passed back over SSH | Standalone ed25519 key-pair authentication — no SSH dependency |
-| **Transport model** | Pure UDP after setup; Mosh's *State Synchronization Protocol* (SSP) keeps a diff of the full terminal screen state and sends only the latest snapshot | TCP is used solely for the ed25519 key exchange; all terminal I/O runs over UDP after the exchange completes.  NAK-based selective retransmission ensures reliable, ordered delivery of the raw byte stream |
+| **Transport model** | Pure UDP after setup; Mosh's *State Synchronization Protocol* (SSP) keeps a diff of the full terminal screen state and sends only the latest snapshot | TCP is used solely for the ed25519 key exchange; all terminal I/O runs over UDP after the exchange completes.  NAK-based selective retransmission with an adaptive RTT estimator ensures reliable, ordered delivery; a split data/control channel prevents control frames from being delayed by PTY data backlogs |
 | **Reconnect display sync** | SSP sends the latest screen snapshot; client repaints from the diff immediately | Server maintains a `vt100::Parser` tracking the live PTY screen; on reconnect a single `ScreenState` frame delivers `contents_formatted()` bytes for an instant clean repaint.  A 50 ms periodic task also sends `ScreenState` diffs during normal use so the client stays in sync even across network hiccups. |
 | **Client-side prediction** | Mosh echoes keystrokes locally and predicts cursor movement to hide latency, underlining characters that have not yet been confirmed by the server | Same — keystrokes are echoed locally, cursor movement is predicted, and unconfirmed characters are underlined until the server output arrives |
 | **Encryption** | AES-128-OCB authenticated encryption using a symmetric session key | Key exchange via an ed25519-based handshake; symmetric AES-256-GCM-SIV on the UDP channel with per-packet HMAC-SHA-512 authentication |
@@ -59,11 +59,13 @@ All subsequent communication happens exclusively over UDP (server-side port rang
 
 Reliable, ordered delivery is provided at the application layer using **NAK-based selective retransmission**:
 
-- The **receiver** (`UdpReader`) tracks the highest sequence number seen and maintains a reorder buffer.  Any gap that persists beyond a 50 ms timeout triggers a `Nak` frame — a compact list of missing sequence numbers — sent back to the sender over the same UDP channel.
-- The **sender** (`UdpSender`) keeps a sliding retransmit buffer of the 512 most-recently transmitted wire-encoded packets.  When a `Nak` arrives the missing packets are looked up and resent immediately.
-- Each gap is retried up to 10 times (with the 50 ms floor doubling each attempt); after the limit is exceeded the gap is abandoned and the session proceeds.
+- The **receiver** (`UdpReader`) tracks the highest sequence number seen and maintains a reorder buffer.  Any gap that persists beyond a 20–500 ms adaptive NAK timeout triggers a `Nak` frame — a compact list of missing sequence numbers — sent back to the sender over the same UDP channel.  When a gap opens mid-burst, a `RepaintRequest` is also sent immediately (rather than waiting for the first NAK retry cycle) so the server can deliver a fresh screen snapshot within one RTT.
+- The **sender** (`UdpSender`) keeps a sliding retransmit buffer of the 512 most-recently transmitted wire-encoded packets.  When a `Nak` arrives the missing packets are looked up and resent immediately.  The sender uses **two separate outbound channels** — a high-priority control channel (capacity 16) for `Keepalive` and `Shutdown` frames, and a data channel (capacity 256) for PTY diffs and screen states — so control frames are always polled first and bypass any data backlog.
+- Each gap is retried up to 4 times (with exponential backoff capped at 800 ms); after the limit is exceeded the gap is abandoned and the session proceeds.
+- The NAK timeout adapts to the measured round-trip time using a Jacobson-Karels estimator.  Outlier RTT spikes are clamped to 8× the current estimate rather than discarded, preventing a self-reinforcing loop where aggressive 20 ms NAKs worsen congestion on slow NAT paths.
+- Large PTY bursts (more than 10 MTU-sized chunks from a single PTY read, e.g. a full-screen `htop` redraw) are sent with **3× the configured inter-packet pacing delay** to reduce burst loss on stateful NAT devices.
 
-Because retransmission is handled entirely within the UDP layer there is no head-of-line blocking from TCP: a lost packet delays only the frames that depend on it, not the rest of the stream.
+Because retransmission is handled entirely within the UDP layer there is no head-of-line blocking from TCP: a lost packet delays only the frames that depend on it, not the rest of the stream.  Control frames are additionally isolated from data backpressure via the split channel design.
 
 ### Reconnection
 
@@ -592,7 +594,7 @@ mps --pacing-delay-us 2000
 
 ### High packet loss on poor networks
 
-**Symptom**: Terminal updates are sluggish or incomplete.
+**Symptom**: Terminal updates are sluggish or incomplete, especially during full-screen redraws (e.g. `htop`, `vim`).
 
 **Solution**: Increase the pacing delay on the server to spread packets over time:
 
@@ -603,6 +605,20 @@ mps --pacing-delay-us 5000
 Or in the config file:
 ```toml
 pacing_delay_us = 5000
+```
+
+Note: the server automatically applies **3× the configured pacing delay** for large PTY bursts (more than 10 MTU-sized chunks from a single PTY read), so `htop`-style full-screen redraws are paced more aggressively than small incremental updates without any extra configuration.
+
+### Terminal stalls on high-latency or congested NAT paths
+
+**Symptom**: Occasional multi-second freezes in terminal output, particularly when running high-output programs over a congested or high-latency NAT connection.
+
+**Cause**: If the adaptive NAK timeout converges to its minimum (20 ms) and the connection then experiences a real congestion spike, the aggressive NAK rate can worsen congestion, which in turn appears as more packet loss — a self-reinforcing loop.  The adaptive estimator now clamps outlier RTT spikes rather than discarding them, so the timeout self-heals within a few keepalive intervals, but the symptom may still appear briefly.
+
+**Solution**: If stalls persist, enable packet pacing to reduce burst pressure on the NAT device:
+
+```bash
+mps --pacing-delay-us 2000
 ```
 
 ---

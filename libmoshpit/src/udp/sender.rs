@@ -69,7 +69,10 @@ pub struct UdpSender {
     hmac: Key,
     /// Underlying UDP socket
     socket: Arc<UdpSocket>,
-    /// Channel receiver for outgoing packets
+    /// Channel receiver for high-priority control frames (Keepalive, Shutdown).
+    /// Polled before `rx` so control frames bypass PTY data backlogs.
+    control_rx: Receiver<EncryptedFrame>,
+    /// Channel receiver for outgoing data packets
     rx: Receiver<EncryptedFrame>,
     /// Channel receiver for retransmit requests from the local reader
     retransmit_rx: Receiver<Vec<u64>>,
@@ -116,13 +119,36 @@ impl UdpSender {
             sleep(delay).await;
         }
         let mut retransmit_active = true;
+        let mut control_active = true;
         // Drain pending_retransmit at the same cadence as NAK_CHECK_INTERVAL on the
         // reader side, so retransmits are coalesced across multiple NAK messages that
         // arrived for the same sequence number before it could be re-sent.
         let mut retransmit_tick = interval(Duration::from_millis(20));
         loop {
             select! {
+                // biased poll order: cancel > control > retransmit > data.
+                // This guarantees Keepalive and Shutdown bypass PTY data backlogs.
+                biased;
                 () = token.cancelled() => break,
+                // Control frames (Keepalive, Shutdown) skip the retransmit buffer —
+                // retransmitting a stale keepalive is counterproductive.
+                frame_opt = self.control_rx.recv(), if control_active => {
+                    match frame_opt {
+                        Some(frame) => {
+                            let frame = match frame {
+                                EncryptedFrame::Keepalive(_) => {
+                                    EncryptedFrame::Keepalive(now_micros())
+                                }
+                                other => other,
+                            };
+                            let seq = self.send_seq;
+                            self.send_seq += 1;
+                            let wire = self.encrypt(&frame, seq)?;
+                            let _bytes_sent = self.socket.send(&wire).await?;
+                        }
+                        None => control_active = false,
+                    }
+                },
                 // Collect incoming retransmit requests into a HashSet, deduplicating
                 // repeated NAKs for the same sequence number before we actually send.
                 seqs = self.retransmit_rx.recv(), if retransmit_active => {
@@ -143,15 +169,6 @@ impl UdpSender {
                 frame_opt = self.rx.recv() => {
                     match frame_opt {
                         Some(frame) => {
-                            // Re-stamp Keepalive at actual send time so the RTT
-                            // measurement reflects wire latency, not the time the
-                            // frame spent waiting in the outbound channel.
-                            let frame = match frame {
-                                EncryptedFrame::Keepalive(_) => {
-                                    EncryptedFrame::Keepalive(now_micros())
-                                }
-                                other => other,
-                            };
                             let seq = self.send_seq;
                             self.send_seq += 1;
                             let wire = self.encrypt(&frame, seq)?;
@@ -204,6 +221,7 @@ mod tests {
 
     fn make_sender(
         socket: Arc<UdpSocket>,
+        control_rx: Receiver<EncryptedFrame>,
         rx: Receiver<EncryptedFrame>,
         retransmit_rx: Receiver<Vec<u64>>,
     ) -> UdpSender {
@@ -213,6 +231,7 @@ mod tests {
             .unwrap()
             .hmac([0u8; 64])
             .socket(socket)
+            .control_rx(control_rx)
             .rx(rx)
             .retransmit_rx(retransmit_rx)
             .build()
@@ -227,6 +246,7 @@ mod tests {
         let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let server_addr = server.local_addr().unwrap();
 
+        let (_ctrl_tx, ctrl_rx) = channel::<EncryptedFrame>(4);
         let (frame_tx, frame_rx) = channel::<EncryptedFrame>(4);
         let (_retransmit_tx, retransmit_rx) = channel::<Vec<u64>>(4);
         let token = CancellationToken::new();
@@ -247,7 +267,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut sender = make_sender(send_socket, frame_rx, retransmit_rx);
+        let mut sender = make_sender(send_socket, ctrl_rx, frame_rx, retransmit_rx);
         let token2 = token.clone();
         let handle = tokio::spawn(async move {
             drop(sender.frame_loop(token2).await);
@@ -271,5 +291,54 @@ mod tests {
             t_after_send >= t_before_send,
             "monotonic clock must advance"
         );
+    }
+
+    /// When the control channel closes but the data channel is still open,
+    /// `frame_loop` must continue running — `control_active` guards the branch.
+    #[tokio::test]
+    async fn control_channel_close_does_not_break_loop() {
+        let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = server.local_addr().unwrap();
+
+        let (ctrl_tx, ctrl_rx) = channel::<EncryptedFrame>(4);
+        let (frame_tx, frame_rx) = channel::<EncryptedFrame>(4);
+        let (_retransmit_tx, retransmit_rx) = channel::<Vec<u64>>(4);
+        let token = CancellationToken::new();
+
+        let send_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        send_socket.connect(server_addr).await.unwrap();
+        server
+            .connect(send_socket.local_addr().unwrap())
+            .await
+            .unwrap();
+
+        // Send a Keepalive via control, then close the control channel.
+        let ts = now_micros();
+        ctrl_tx.send(EncryptedFrame::Keepalive(ts)).await.unwrap();
+        drop(ctrl_tx);
+
+        // Send a data frame after the control channel is closed.
+        frame_tx.send(EncryptedFrame::Shutdown).await.unwrap();
+        drop(frame_tx);
+
+        let mut sender = make_sender(send_socket, ctrl_rx, frame_rx, retransmit_rx);
+        let token2 = token.clone();
+        let handle = tokio::spawn(async move {
+            drop(sender.frame_loop(token2).await);
+        });
+
+        // The sender should drain both frames and exit cleanly (data channel closed).
+        let mut count = 0usize;
+        let mut buf = vec![0u8; 65535];
+        while let Ok(Ok(_)) =
+            tokio::time::timeout(Duration::from_millis(200), server.recv(&mut buf)).await
+        {
+            count += 1;
+        }
+        token.cancel();
+        drop(handle.await);
+
+        // Two wire packets: one Keepalive (control) + one Shutdown (data).
+        assert_eq!(count, 2, "expected exactly 2 wire packets");
     }
 }

@@ -524,7 +524,7 @@ impl KexReader {
         // where the socket option is unavailable.
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         if bind_addr.is_ipv4() {
-            drop(sock.set_tos(0xB8));
+            drop(sock.set_tos_v4(0xB8));
         } else {
             drop(sock.set_tclass_v6(0xB8));
         }

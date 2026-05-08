@@ -63,7 +63,9 @@ const REPAINT_REQUEST_THRESHOLD: u32 = 1;
 /// Number of frames buffered out-of-order before an immediate [`EncryptedFrame::RepaintRequest`]
 /// is sent.  A large `recv_buffer` means many gaps exist simultaneously — the display is
 /// stalled.  Firing early skips waiting for the first NAK retry cycle (~50 ms).
-const RECV_BUFFER_REPAINT_THRESHOLD: usize = 25;
+/// Set to 5 so that high-output programs (htop, vim) trigger fast repaint recovery
+/// before a large backlog accumulates; at 1200 bytes/frame, 5 frames ≈ 6 KB of stall.
+const RECV_BUFFER_REPAINT_THRESHOLD: usize = 5;
 /// Maximum sequence jump allowed before dropping the frame to prevent `DoS`.
 const MAX_SEQ_JUMP: u64 = 1024;
 /// Floor for the adaptive NAK timeout EWMA estimate.
@@ -197,17 +199,23 @@ impl UdpReader {
     /// `max(rto × 30, 9 s)` — with a 3 s server keepalive this guarantees ≥ 3
     /// keepalives arrive before the silence window closes.
     fn update_rtt_estimate(&mut self, sample: Duration) {
-        // Discard samples more than 8× the current RTO — these are almost certainly
-        // channel-queuing artefacts (stale timestamps), clock jumps, or process
-        // scheduling hangs rather than genuine network RTT measurements.
+        // Clamp samples that exceed 8× the current RTO to the ceiling value rather
+        // than discarding them outright.  Pure discard causes a death spiral when
+        // nak_timeout has converged to MIN_NAK_TIMEOUT (20 ms → ceiling = 160 ms):
+        // every congestion-induced RTT spike is rejected, the estimator stays stuck at
+        // the minimum, and aggressive 20 ms NAKs worsen NAT congestion indefinitely.
+        // Clamping feeds a bounded signal into the estimator so nak_timeout can grow
+        // upward and the system self-heals within 2–3 keepalive intervals.
         let ceiling = self.nak_timeout.unwrap_or(NAK_TIMEOUT) * 8;
-        if sample > ceiling {
+        let sample = if sample > ceiling {
             debug!(
-                "NAK RTT sample {:?} exceeds outlier ceiling {:?} — discarding",
+                "NAK RTT sample {:?} exceeds outlier ceiling {:?} — clamping",
                 sample, ceiling
             );
-            return;
-        }
+            ceiling
+        } else {
+            sample
+        };
         let (new_srtt, new_rttvar) = match (self.srtt, self.rttvar) {
             // First measurement (RFC 6298 §2.2).
             (None, _) | (_, None) => (sample, sample / 2),
@@ -520,14 +528,28 @@ impl UdpReader {
             // periodic check interval. Retries and backoff are still managed by
             // check_nak_timeouts; this only eliminates the first-NAK delay (up to
             // NAK_CHECK_INTERVAL + nak_timeout ≈ 70 ms on the default config).
+            //
+            // Also send a RepaintRequest alongside the NAK when recv_buffer already
+            // holds frames (len > 1 because we just inserted the current frame):
+            // for high-output programs (htop, top, vim) a single lost chunk blocks
+            // the entire remaining burst in recv_buffer.  Retransmit alone costs
+            // nak_timeout (20–500 ms) before the first retry fires.  The
+            // RepaintRequest lets the server bypass the gap with a fresh
+            // ScreenStateCompressed within one RTT instead.  The recv_buffer guard
+            // avoids triggering on a lone reorder that resolves without intervention.
             if !new_gaps.is_empty() {
                 for &s in &new_gaps {
                     let _prev = self.gap_nak_sent_at.insert(s, now);
                 }
-                if let Some(ref tx) = self.nak_out_tx
-                    && let Err(e) = tx.try_send(EncryptedFrame::Nak(new_gaps))
-                {
-                    warn!("Failed to send immediate NAK for new gaps: {e}");
+                if let Some(ref tx) = self.nak_out_tx {
+                    if let Err(e) = tx.try_send(EncryptedFrame::Nak(new_gaps)) {
+                        warn!("Failed to send immediate NAK for new gaps: {e}");
+                    }
+                    if self.recv_buffer.len() > 1
+                        && let Err(e) = tx.try_send(EncryptedFrame::RepaintRequest)
+                    {
+                        warn!("Failed to send burst-gap RepaintRequest: {e}");
+                    }
                 }
             }
             vec![]
@@ -2072,29 +2094,29 @@ mod tests {
         assert_eq!(reader.nak_check_interval(), MIN_NAK_CHECK_INTERVAL);
     }
 
-    // ── Outlier RTT rejection (Option B fix) ──────────────────────────────────
+    // ── Outlier RTT clamping ──────────────────────────────────────────────────
 
     #[test]
-    fn update_rtt_estimate_rejects_outlier_sample() {
+    fn update_rtt_estimate_clamps_outlier_to_ceiling() {
         let mut reader = make_reader_sync();
         // Default ceiling = NAK_TIMEOUT × 8 = 50 ms × 8 = 400 ms.
-        // A 7-second sample is far beyond the ceiling and must be discarded.
+        // A 7-second sample is clamped to 400 ms, which IS fed into the estimator.
+        // This breaks the "stuck at MIN" death spiral: the clamped value raises
+        // nak_timeout so the next real spike can pass through the larger ceiling.
         reader.update_rtt_estimate(Duration::from_secs(7));
         assert!(
-            reader.nak_timeout.is_none(),
-            "outlier sample must not update nak_timeout"
+            reader.nak_timeout.is_some(),
+            "clamped outlier must still update nak_timeout"
         );
-        assert!(reader.srtt.is_none(), "outlier sample must not update srtt");
-        assert!(
-            reader.rttvar.is_none(),
-            "outlier sample must not update rttvar"
-        );
+        // The effective sample was 400 ms (ceiling), not 7 s.
+        // First measurement: SRTT=400ms, RTTVAR=200ms, RTO=400+800=1200ms → MAX=500ms.
+        assert_eq!(reader.nak_timeout.unwrap(), MAX_NAK_TIMEOUT);
     }
 
     #[test]
     fn update_rtt_estimate_accepts_sample_just_within_ceiling() {
         let mut reader = make_reader_sync();
-        // Ceiling = 50 ms × 8 = 400 ms. A 399 ms sample must be accepted.
+        // Ceiling = 50 ms × 8 = 400 ms. A 399 ms sample is below ceiling, no clamp.
         reader.update_rtt_estimate(Duration::from_millis(399));
         assert!(
             reader.nak_timeout.is_some(),
@@ -2105,19 +2127,41 @@ mod tests {
     #[test]
     fn update_rtt_estimate_ceiling_scales_with_current_nak_timeout() {
         let mut reader = make_reader_sync();
-        // Set nak_timeout to 200 ms → ceiling = 200 × 8 = 1600 ms.
-        reader.nak_timeout = Some(Duration::from_millis(200));
-        reader.srtt = Some(Duration::from_millis(200));
-        reader.rttvar = Some(Duration::from_millis(100));
-        // 1.5 s is below ceiling (1.6 s) → accepted.
-        reader.update_rtt_estimate(Duration::from_millis(1500));
-        assert!(reader.nak_timeout.is_some());
-        // 2 s is above ceiling → rejected; nak_timeout stays at 200 ms.
-        let before = reader.nak_timeout;
-        reader.update_rtt_estimate(Duration::from_secs(2));
+        // Set nak_timeout to 25 ms → ceiling = 25 × 8 = 200 ms.
+        reader.nak_timeout = Some(Duration::from_millis(25));
+        reader.srtt = Some(Duration::from_millis(25));
+        reader.rttvar = Some(Duration::from_millis(12));
+        // 300 ms exceeds ceiling (200 ms) → clamped to 200 ms, not discarded.
+        // nak_timeout must grow upward (out of the MIN neighbourhood).
+        reader.update_rtt_estimate(Duration::from_millis(300));
+        assert!(
+            reader.nak_timeout.unwrap() > Duration::from_millis(25),
+            "clamped sample must grow nak_timeout above the prior value"
+        );
+    }
+
+    /// Regression test for the "stuck at MIN" NAT death spiral.
+    /// When `nak_timeout` converges to MIN (20 ms), ceiling = 160 ms.
+    /// A 7 s congestion spike must be clamped — not discarded — so the estimator
+    /// can grow `nak_timeout` upward and break the death spiral.
+    #[test]
+    fn update_rtt_estimate_nat_death_spiral_self_heals() {
+        let mut reader = make_reader_sync();
+        // Drive the estimator to MIN by feeding repeated fast samples.
+        for _ in 0..64 {
+            reader.update_rtt_estimate(Duration::from_millis(5));
+        }
         assert_eq!(
-            reader.nak_timeout, before,
-            "nak_timeout must be unchanged after outlier rejection"
+            reader.nak_timeout.unwrap(),
+            MIN_NAK_TIMEOUT,
+            "setup: nak_timeout must be at MIN before the spike"
+        );
+        // Inject a 7 s NAT congestion spike. With pure discard this would leave
+        // nak_timeout stuck at 20 ms. With clamping it must grow.
+        reader.update_rtt_estimate(Duration::from_secs(7));
+        assert!(
+            reader.nak_timeout.unwrap() > MIN_NAK_TIMEOUT,
+            "clamped spike must grow nak_timeout above MIN — death spiral broken"
         );
     }
 }

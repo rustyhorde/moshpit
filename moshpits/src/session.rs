@@ -26,9 +26,12 @@ pub(crate) const SCROLLBACK_CAPACITY: usize = 65_536;
 pub(crate) struct SessionOutputHandle {
     /// Per-connection UUID used to tag outbound [`EncryptedFrame::Bytes`] datagrams.
     pub kex_uuid: Uuid,
-    /// Channel to the live [`crate::UdpSender`].  Set to `None` when the client has
-    /// disconnected and the PTY is running headless.
-    pub tx: Option<Sender<EncryptedFrame>>,
+    /// Data channel to the live [`crate::UdpSender`] (PTY diffs, screen state).
+    /// Set to `None` when the client has disconnected and the PTY is running headless.
+    pub data_tx: Option<Sender<EncryptedFrame>>,
+    /// Control channel to the live [`crate::UdpSender`] (Keepalive, Shutdown).
+    /// Polled before the data channel inside `UdpSender` to prevent HOL-blocking.
+    pub control_tx: Option<Sender<EncryptedFrame>>,
     /// Cancellation token for the current connection's UDP tasks.  Cancelled on resume
     /// to shut down the stale reader/sender pair.
     pub conn_token: Option<CancellationToken>,
@@ -110,7 +113,8 @@ mod test {
     fn session_output_handle_debug() {
         let handle = SessionOutputHandle {
             kex_uuid: Uuid::nil(),
-            tx: None::<tokio::sync::mpsc::Sender<EncryptedFrame>>,
+            data_tx: None::<tokio::sync::mpsc::Sender<EncryptedFrame>>,
+            control_tx: None::<tokio::sync::mpsc::Sender<EncryptedFrame>>,
             conn_token: None,
             udp_port: None,
         };
@@ -122,10 +126,12 @@ mod test {
     #[tokio::test]
     async fn session_record_debug() {
         let (term_tx, _term_rx) = channel::<TerminalMessage>(1);
-        let (frame_tx, _frame_rx) = channel::<EncryptedFrame>(1);
+        let (data_tx, _data_rx) = channel::<EncryptedFrame>(1);
+        let (_ctrl_tx, _ctrl_rx) = channel::<EncryptedFrame>(1);
         let output_handle = Arc::new(Mutex::new(SessionOutputHandle {
             kex_uuid: Uuid::nil(),
-            tx: Some(frame_tx),
+            data_tx: Some(data_tx),
+            control_tx: None,
             conn_token: None,
             udp_port: None,
         }));
