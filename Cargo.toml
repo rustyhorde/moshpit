@@ -14,7 +14,7 @@ getset = "0.1.6"
 rustversion = "1.0.22"
 serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.18"
-tokio = { version = "1.52.2", features = [
+tokio = { version = "1.52.3", features = [
   "io-util",
   "macros",
   "net",
@@ -35,6 +35,6 @@ vergen-gix = { version = "10.0.0-beta.8", features = [
 ] }
 vergen-pretty = { version = "10.0.0-beta.8", features = ["color", "tracing", "rkyv", "serde"] }
 vt100 = "0.16.2"
-socket2 = { version = "0.5", features = ["all"] }
+socket2 = { version = "0.6.3", features = ["all"] }
 zeroize = { version = "1.8.2", features = ["zeroize_derive"] }
 zstd = "0.13.3"
