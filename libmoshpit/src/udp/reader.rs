@@ -63,7 +63,9 @@ const REPAINT_REQUEST_THRESHOLD: u32 = 1;
 /// Number of frames buffered out-of-order before an immediate [`EncryptedFrame::RepaintRequest`]
 /// is sent.  A large `recv_buffer` means many gaps exist simultaneously — the display is
 /// stalled.  Firing early skips waiting for the first NAK retry cycle (~50 ms).
-const RECV_BUFFER_REPAINT_THRESHOLD: usize = 25;
+/// Set to 5 so that high-output programs (htop, vim) trigger fast repaint recovery
+/// before a large backlog accumulates; at 1200 bytes/frame, 5 frames ≈ 6 KB of stall.
+const RECV_BUFFER_REPAINT_THRESHOLD: usize = 5;
 /// Maximum sequence jump allowed before dropping the frame to prevent `DoS`.
 const MAX_SEQ_JUMP: u64 = 1024;
 /// Floor for the adaptive NAK timeout EWMA estimate.
