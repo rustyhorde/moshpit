@@ -111,10 +111,15 @@ pub struct UdpReader {
     /// [`MAX_NAK_RETRIES`] retries.
     #[builder(default)]
     highest_seq_seen: u64,
-    /// Base NAK timeout derived from the measured TCP key-exchange round-trip time.
-    /// When set, replaces the hardcoded [`NAK_TIMEOUT`] constant as the base for
-    /// the exponential backoff schedule, adapting retransmit requests to the
-    /// observed network latency.  `None` falls back to [`NAK_TIMEOUT`] (50 ms).
+    /// Jacobson-Karels smoothed RTT (SRTT), RFC 6298 §2.
+    /// `None` until the first NAK round-trip sample is observed.
+    srtt: Option<Duration>,
+    /// Jacobson-Karels RTT variance (RTTVAR), RFC 6298 §2.
+    /// `None` until the first NAK round-trip sample is observed.
+    rttvar: Option<Duration>,
+    /// Retransmission timeout (RTO) derived from the Jacobson-Karels estimator:
+    /// `RTO = SRTT + 4 × RTTVAR`, clamped to [`MIN_NAK_TIMEOUT`]..=[`MAX_NAK_TIMEOUT`].
+    /// `None` falls back to [`NAK_TIMEOUT`] (50 ms).
     nak_timeout: Option<Duration>,
     /// If no frame is received within this duration the server is assumed unreachable.
     /// Triggers reconnect via [`reconnect_tx`](Self::reconnect_tx) when set, otherwise calls
@@ -172,24 +177,52 @@ impl UdpReader {
         }
     }
 
-    /// Feed a NAK→retransmit round-trip sample into the EWMA (α = 1/8) and
-    /// clamp the result to [`MIN_NAK_TIMEOUT`]..=[`MAX_NAK_TIMEOUT`].
+    /// Feed a NAK→retransmit round-trip sample into the Jacobson-Karels estimator
+    /// (RFC 6298 §2) and update the derived RTO.
     ///
-    /// Also derives an updated [`Self::silence_timeout`] from the new estimate
-    /// when one was previously set (client mode).  Formula:
-    /// `max(nak_timeout × 30, 9 s)` — with a 3 s server keepalive this
-    /// guarantees ≥ 3 keepalives arrive before the silence window closes.
+    /// **First measurement:**
+    /// - `SRTT   = sample`
+    /// - `RTTVAR = sample / 2`
+    ///
+    /// **Subsequent measurements:**
+    /// - `RTTVAR = (3/4) × RTTVAR + (1/4) × |SRTT − sample|`
+    /// - `SRTT   = (7/8) × SRTT   + (1/8) × sample`
+    ///
+    /// **RTO** (stored as `nak_timeout`):
+    /// - `RTO = SRTT + 4 × RTTVAR`, clamped to
+    ///   [`MIN_NAK_TIMEOUT`]..=[`MAX_NAK_TIMEOUT`].
+    ///
+    /// Also derives an updated [`Self::silence_timeout`] from the new RTO when
+    /// one was previously set (client mode).  Formula:
+    /// `max(rto × 30, 9 s)` — with a 3 s server keepalive this guarantees ≥ 3
+    /// keepalives arrive before the silence window closes.
     fn update_rtt_estimate(&mut self, sample: Duration) {
-        let current = self.nak_timeout.unwrap_or(NAK_TIMEOUT);
-        // 7/8 * current + 1/8 * sample using integer Duration arithmetic.
-        let updated = current.saturating_sub(current / 8) + sample / 8;
-        let clamped = updated.clamp(MIN_NAK_TIMEOUT, MAX_NAK_TIMEOUT);
-        debug!("NAK RTT sample {:?} → nak_timeout {:?}", sample, clamped);
-        self.nak_timeout = Some(clamped);
+        let (new_srtt, new_rttvar) = match (self.srtt, self.rttvar) {
+            // First measurement (RFC 6298 §2.2).
+            (None, _) | (_, None) => (sample, sample / 2),
+            // Subsequent measurements (RFC 6298 §2.3).
+            (Some(srtt), Some(rttvar)) => {
+                let diff = srtt
+                    .checked_sub(sample)
+                    .unwrap_or_else(|| sample.checked_sub(srtt).unwrap_or_default());
+                let new_rttvar = rttvar.saturating_sub(rttvar / 4) + diff / 4;
+                let new_srtt = srtt.saturating_sub(srtt / 8) + sample / 8;
+                (new_srtt, new_rttvar)
+            }
+        };
+        // RTO = SRTT + 4 × RTTVAR, clamped to the allowed range.
+        let rto = (new_srtt + new_rttvar * 4).clamp(MIN_NAK_TIMEOUT, MAX_NAK_TIMEOUT);
+        debug!(
+            "NAK RTT sample {:?} → srtt {:?} rttvar {:?} rto {:?}",
+            sample, new_srtt, new_rttvar, rto
+        );
+        self.srtt = Some(new_srtt);
+        self.rttvar = Some(new_rttvar);
+        self.nak_timeout = Some(rto);
         // Only update silence_timeout when it was explicitly initialised
         // (client mode).  Servers leave it None so this remains a no-op there.
         if self.silence_timeout.is_some() {
-            self.silence_timeout = Some((clamped * 30).max(Duration::from_secs(9)));
+            self.silence_timeout = Some((rto * 30).max(Duration::from_secs(9)));
         }
     }
 
@@ -1760,15 +1793,68 @@ mod tests {
     }
 
     #[test]
-    fn update_rtt_estimate_ewma_basic() {
+    fn update_rtt_estimate_first_sample_jacobson_karels() {
         let mut reader = make_reader_sync();
-        // Start from NAK_TIMEOUT (50 ms); 100 ms sample:
-        // new = 7/8*50 + 1/8*100 = 43 + 12 = 55 ms (integer arithmetic)
+        // First measurement: SRTT = 100ms, RTTVAR = 50ms, RTO = 100 + 4*50 = 300ms.
         reader.update_rtt_estimate(Duration::from_millis(100));
-        let t = reader.nak_timeout.unwrap();
+        assert_eq!(reader.srtt, Some(Duration::from_millis(100)));
+        assert_eq!(reader.rttvar, Some(Duration::from_millis(50)));
+        let rto = reader.nak_timeout.unwrap();
+        assert_eq!(
+            rto,
+            Duration::from_millis(300),
+            "first-sample RTO = srtt + 4*rttvar"
+        );
+    }
+
+    #[test]
+    fn update_rtt_estimate_second_sample_updates_variance() {
+        let mut reader = make_reader_sync();
+        // First: SRTT=100ms, RTTVAR=50ms, RTO=300ms.
+        reader.update_rtt_estimate(Duration::from_millis(100));
+        // Second: sample=200ms, |SRTT - sample| = 100ms.
+        // Duration arithmetic uses nanosecond precision:
+        // RTTVAR = 50ms - 50ms/4 + 100ms/4 = 50 - 12.5 + 25 = 62.5ms.
+        // SRTT   = 100ms - 100ms/8 + 200ms/8 = 100 - 12.5 + 25 = 112.5ms.
+        // RTO    = 112.5 + 4*62.5 = 112.5 + 250 = 362.5ms.
+        reader.update_rtt_estimate(Duration::from_millis(200));
+        let srtt = reader.srtt.unwrap();
+        let rttvar = reader.rttvar.unwrap();
+        let rto = reader.nak_timeout.unwrap();
+        assert_eq!(srtt, Duration::from_micros(112_500), "SRTT after second sample");
+        assert_eq!(rttvar, Duration::from_micros(62_500), "RTTVAR after second sample");
+        assert_eq!(rto, Duration::from_micros(362_500), "RTO = srtt + 4*rttvar");
+    }
+
+    #[test]
+    fn update_rtt_estimate_low_jitter_path_converges_rto_down() {
+        let mut reader = make_reader_sync();
+        // Drive the estimator with repeated 20ms samples (LAN path).
+        // RTTVAR should converge to near-zero and RTO should converge toward
+        // MIN_NAK_TIMEOUT (20ms).
+        for _ in 0..64 {
+            reader.update_rtt_estimate(Duration::from_millis(20));
+        }
+        let rto = reader.nak_timeout.unwrap();
         assert!(
-            t >= Duration::from_millis(50) && t <= Duration::from_millis(65),
-            "expected ~55ms, got {t:?}"
+            rto <= Duration::from_millis(60),
+            "low-jitter LAN path RTO must converge toward MIN: got {rto:?}"
+        );
+    }
+
+    #[test]
+    fn update_rtt_estimate_high_jitter_inflates_rto() {
+        let mut reader = make_reader_sync();
+        // Alternate between 10ms and 200ms to simulate high jitter.
+        for i in 0..8 {
+            let sample = if i % 2 == 0 { 10 } else { 200 };
+            reader.update_rtt_estimate(Duration::from_millis(sample));
+        }
+        let rto = reader.nak_timeout.unwrap();
+        // With high jitter, RTTVAR grows large, pushing RTO up.
+        assert!(
+            rto > Duration::from_millis(100),
+            "high-jitter path RTO must be inflated: got {rto:?}"
         );
     }
 
