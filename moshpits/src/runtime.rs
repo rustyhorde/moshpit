@@ -63,6 +63,11 @@ use crate::{
 
 /// Default minimum inter-packet delay between consecutive diff chunks sent to the client.
 const DEFAULT_PACING_DELAY_US: u64 = 1000;
+/// Number of client NAK frames received within the 200 ms poll window that triggers a
+/// proactive `ScreenStateCompressed` push without waiting for a `RepaintRequest`.
+/// At the adaptive NAK check interval floor of 5 ms, 10 NAKs ≈ one per 20 ms, which
+/// reliably signals a high-loss condition where the `RepaintRequest` itself may be lost.
+const PROACTIVE_REPAINT_NAK_THRESHOLD: u64 = 10;
 
 /// Normal screen-sync interval when the terminal is idle.
 const SCREEN_SYNC_IDLE_INTERVAL: Duration = Duration::from_millis(50);
@@ -320,6 +325,7 @@ async fn handle_connection(
     .await?;
 
     let (repaint_tx, mut repaint_rx) = channel::<()>(1);
+    let nak_received_count = Arc::new(AtomicU64::new(0));
     let mut udp_reader = UdpReader::builder()
         .socket(udp_recv)
         .id(kex.uuid())
@@ -329,6 +335,7 @@ async fn handle_connection(
         .retransmit_tx(retransmit_tx)
         .peer_discovered_tx(peer_discovered_tx)
         .repaint_tx(repaint_tx)
+        .nak_received_count(nak_received_count.clone())
         .build();
     let mut udp_sender = UdpSender::builder()
         .socket(udp_send)
@@ -443,6 +450,13 @@ async fn handle_connection(
         }
     });
 
+    spawn_proactive_repaint_watchdog(
+        tx.clone(),
+        conn_token.clone(),
+        nak_received_count,
+        server_emulator.clone(),
+    );
+
     // For new sessions, spawn the long-lived PTY thread.
     if let Some(term_rx) = maybe_term_rx {
         spawn_pty(
@@ -505,6 +519,51 @@ fn spawn_connection_watchdogs(
                     .unwrap_or(0);
                     if tx.send(EncryptedFrame::Keepalive(ts)).await.is_err() {
                         break;
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Spawn a watchdog task that proactively pushes a `ScreenStateCompressed` frame when the
+/// server receives an elevated rate of NAK frames from the client.
+///
+/// When NAK delta over a 200 ms window reaches [`PROACTIVE_REPAINT_NAK_THRESHOLD`], a
+/// `RepaintRequest` may itself be lost (the same loss condition that prompted the NAKs can
+/// affect control frames too).  This watchdog breaks the dependency by pushing the screen
+/// state unconditionally, without waiting for the client to ask.
+fn spawn_proactive_repaint_watchdog(
+    tx: Sender<EncryptedFrame>,
+    token: CancellationToken,
+    nak_received_count: Arc<AtomicU64>,
+    server_emulator: Arc<Mutex<vt100::Parser>>,
+) {
+    let _watchdog = spawn(async move {
+        let mut last_count: u64 = 0;
+        let mut ticker = tokio::time::interval(Duration::from_millis(200));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            select! {
+                () = token.cancelled() => break,
+                _ = ticker.tick() => {
+                    let current = nak_received_count.load(Ordering::Relaxed);
+                    let delta = current.wrapping_sub(last_count);
+                    last_count = current;
+                    if delta >= PROACTIVE_REPAINT_NAK_THRESHOLD {
+                        let contents = {
+                            let emu = server_emulator.lock().await;
+                            emu.screen().contents_formatted()
+                        };
+                        let compressed = encode_all(contents.as_slice(), 3)
+                            .unwrap_or_else(|_| contents.clone());
+                        if tx
+                            .send(EncryptedFrame::ScreenStateCompressed(compressed))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
                 }
             }
@@ -1027,7 +1086,15 @@ mod test {
 
     #[cfg(unix)]
     use super::{current_daemon_user, resolve_user_account};
-    use super::{new_full_registry, new_session, resolve_session, spawn_connection_watchdogs};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+
+    use super::{
+        PROACTIVE_REPAINT_NAK_THRESHOLD, new_full_registry, new_session, resolve_session,
+        spawn_connection_watchdogs, spawn_proactive_repaint_watchdog,
+    };
 
     #[cfg(unix)]
     #[test]
@@ -1333,5 +1400,73 @@ mod test {
         assert_eq!(initgroups_base_group(42), 42);
         assert_eq!(initgroups_base_group(0), 0);
         assert_eq!(initgroups_base_group(u32::MAX), u32::MAX);
+    }
+
+    // ── Phase 8: spawn_proactive_repaint_watchdog ──────────────────────────────
+
+    #[tokio::test]
+    async fn proactive_repaint_fires_on_nak_saturation() {
+        let (tx, mut rx) = channel::<EncryptedFrame>(4);
+        let token = CancellationToken::new();
+        let nak_count = Arc::new(AtomicU64::new(0));
+        let emulator = Arc::new(tokio::sync::Mutex::new(vt100::Parser::new(24, 80, 0)));
+
+        spawn_proactive_repaint_watchdog(tx, token.clone(), nak_count.clone(), emulator);
+
+        // Bump the counter above the threshold so the first watchdog tick triggers a push.
+        nak_count.store(PROACTIVE_REPAINT_NAK_THRESHOLD, Ordering::Relaxed);
+
+        // The watchdog polls every 200 ms — give it up to 500 ms to fire.
+        let frame = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await;
+        token.cancel();
+
+        let frame = frame
+            .expect("timeout: proactive repaint did not fire within 500 ms")
+            .expect("channel closed before proactive repaint");
+        assert!(matches!(frame, EncryptedFrame::ScreenStateCompressed(_)));
+    }
+
+    #[tokio::test]
+    async fn proactive_repaint_does_not_fire_below_threshold() {
+        let (tx, mut rx) = channel::<EncryptedFrame>(4);
+        let token = CancellationToken::new();
+        let nak_count = Arc::new(AtomicU64::new(0));
+        let emulator = Arc::new(tokio::sync::Mutex::new(vt100::Parser::new(24, 80, 0)));
+
+        spawn_proactive_repaint_watchdog(tx, token.clone(), nak_count.clone(), emulator);
+
+        // Set count one below the threshold.
+        nak_count.store(PROACTIVE_REPAINT_NAK_THRESHOLD - 1, Ordering::Relaxed);
+
+        // Wait for at least one poll cycle — no frame should arrive.
+        let result = tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv()).await;
+        token.cancel();
+
+        assert!(
+            result.is_err(),
+            "expected no proactive repaint below threshold, but got a frame"
+        );
+    }
+
+    #[tokio::test]
+    async fn proactive_repaint_stops_on_cancel() {
+        let (tx, mut rx) = channel::<EncryptedFrame>(4);
+        let token = CancellationToken::new();
+        let nak_count = Arc::new(AtomicU64::new(PROACTIVE_REPAINT_NAK_THRESHOLD));
+        let emulator = Arc::new(tokio::sync::Mutex::new(vt100::Parser::new(24, 80, 0)));
+
+        spawn_proactive_repaint_watchdog(tx, token.clone(), nak_count, emulator);
+
+        // Cancel immediately before any tick fires.
+        token.cancel();
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+        // Channel should be drained and no further frames arrive.
+        while rx.try_recv().is_ok() {}
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv()).await;
+        assert!(
+            result.is_err() || result.unwrap().is_none(),
+            "watchdog kept sending after cancellation"
+        );
     }
 }

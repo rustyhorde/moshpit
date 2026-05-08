@@ -10,7 +10,10 @@ use std::{
     collections::{BTreeMap, HashMap},
     io::Cursor,
     process,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -140,6 +143,12 @@ pub struct UdpReader {
     /// is held by a task in `moshpits` that responds with an immediate
     /// [`EncryptedFrame::ScreenState`].
     repaint_tx: Option<Sender<()>>,
+    /// Running count of [`EncryptedFrame::Nak`] frames received from the client
+    /// (server mode only).  The proactive-repaint watchdog in `moshpits` polls this
+    /// counter every 200 ms; when the delta exceeds the saturation threshold a full
+    /// [`EncryptedFrame::ScreenStateCompressed`] is pushed without waiting for an
+    /// explicit [`EncryptedFrame::RepaintRequest`] that might itself be lost.
+    nak_received_count: Option<Arc<AtomicU64>>,
 }
 
 /// Current time as microseconds since the UNIX epoch, used for keepalive RTT timestamps.
@@ -494,6 +503,9 @@ impl UdpReader {
                 && let Err(e) = tx.try_send(seqs.clone())
             {
                 warn!("Failed to forward retransmit request: {e}");
+            }
+            if let Some(ref counter) = self.nak_received_count {
+                let _ = counter.fetch_add(1, Ordering::Relaxed);
             }
             return None;
         }
@@ -1913,6 +1925,39 @@ mod tests {
         let mut reader = make_reader_sync();
         reader.nak_timeout = Some(MAX_NAK_TIMEOUT); // 500 ms → interval = max(125, 5) = 125 ms
         assert_eq!(reader.nak_check_interval(), Duration::from_millis(125));
+    }
+
+    #[tokio::test]
+    async fn route_or_deliver_nak_increments_received_count() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let counter = Arc::new(AtomicU64::new(0));
+        let mut reader = UdpReader::builder()
+            .socket(socket)
+            .id(Uuid::new_v4())
+            .rnk([0u8; 32])
+            .unwrap()
+            .hmac([0u8; 64])
+            .nak_received_count(counter.clone())
+            .build();
+
+        // Deliver a NAK frame — the counter must be incremented exactly once.
+        let nak = EncryptedFrame::Nak(vec![0, 1]);
+        let result = reader.handle_arrival(nak, 0);
+        assert!(result.is_empty(), "NAK frames must not be returned");
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            1,
+            "counter must be incremented when a NAK is routed"
+        );
+
+        // Non-NAK frames must not increment.
+        let keepalive = EncryptedFrame::Keepalive(0);
+        drop(reader.handle_arrival(keepalive, 1));
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            1,
+            "non-NAK frames must not increment the counter"
+        );
     }
 
     #[test]
