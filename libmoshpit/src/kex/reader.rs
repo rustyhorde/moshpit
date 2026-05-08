@@ -1156,7 +1156,7 @@ mod tests {
     };
     use tokio::sync::Mutex as TokioMutex;
     use tokio::{
-        net::{TcpListener, TcpStream},
+        net::{TcpListener, TcpStream, UdpSocket},
         sync::mpsc::unbounded_channel,
     };
 
@@ -1216,8 +1216,16 @@ mod tests {
             make_bidirectional_loopback().await;
         let (mut kex_reader, mut rx_frames, _rx_events) = make_test_kex_reader(client_reader);
 
+        // Ask the OS for a free port so the test doesn't conflict with a running
+        // moshpit server that may already hold a port in the 50000-59999 range.
+        let free_port = {
+            let probe = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+            probe.local_addr().unwrap().port()
+            // probe drops here, releasing the port before handle_udp_setup re-binds it
+        };
+
         let mut pool = BTreeSet::new();
-        let _ = pool.insert(50001u16);
+        let _ = pool.insert(free_port);
         let port_pool = StdArc::new(TokioMutex::new(pool));
         let socket_addr: std::net::SocketAddr = "127.0.0.1:9000".parse().unwrap();
 
@@ -1231,7 +1239,7 @@ mod tests {
             Frame::MoshpitsAddr(a) => a.port(),
             other => panic!("expected MoshpitsAddr, got {other:?}"),
         };
-        assert_eq!(advertised_port, 50001);
+        assert_eq!(advertised_port, free_port);
         // Socket should be bound (local_addr succeeds)
         assert!(udp_arc.local_addr().is_ok());
     }
