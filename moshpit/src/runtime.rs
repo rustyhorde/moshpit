@@ -827,6 +827,7 @@ async fn run_udp_session(
     let (reconnect_tx, mut reconnect_rx) = channel::<()>(1);
     let token = CancellationToken::new();
     let (tx, rx) = channel::<EncryptedFrame>(256);
+    let (_control_tx, control_rx) = channel::<EncryptedFrame>(16);
     let (retransmit_tx, retransmit_rx) = channel::<Vec<u64>>(512);
 
     // Derive silence timeout from path RTT: max(nak_timeout × 30, 9 s).
@@ -850,6 +851,7 @@ async fn run_udp_session(
 
     let mut udp_sender = UdpSender::builder()
         .socket(udp_arc)
+        .control_rx(control_rx)
         .rx(rx)
         .retransmit_rx(retransmit_rx)
         .id(kex.uuid())

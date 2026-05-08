@@ -197,7 +197,8 @@ async fn resolve_session(
     skex: &libmoshpit::ServerKex,
     conn_token: &CancellationToken,
     udp_port: u16,
-    tx: Sender<EncryptedFrame>,
+    data_tx: Sender<EncryptedFrame>,
+    control_tx: Sender<EncryptedFrame>,
     full_registry: &FullSessionRegistry,
 ) -> Result<(
     Sender<TerminalMessage>,
@@ -233,7 +234,8 @@ async fn resolve_session(
                     old_token.cancel();
                 }
                 h.kex_uuid = kex.uuid();
-                h.tx = Some(tx.clone());
+                h.data_tx = Some(data_tx.clone());
+                h.control_tx = Some(control_tx.clone());
                 h.conn_token = Some(conn_token.clone());
                 h.udp_port = Some(udp_port);
             }
@@ -246,7 +248,8 @@ async fn resolve_session(
             let screen_state_bytes = screen_state.len();
             let compressed =
                 encode_all(screen_state.as_slice(), 3).unwrap_or_else(|_| screen_state.clone());
-            tx.send(EncryptedFrame::ScreenStateCompressed(compressed))
+            data_tx
+                .send(EncryptedFrame::ScreenStateCompressed(compressed))
                 .await?;
             info!(
                 user = skex.user(),
@@ -273,11 +276,28 @@ async fn resolve_session(
                 session = %session_uuid,
                 "previous session expired, starting new session"
             );
-            new_session(kex, conn_token, udp_port, session_uuid, tx, full_registry).await
+            new_session(
+                kex,
+                conn_token,
+                udp_port,
+                session_uuid,
+                data_tx,
+                control_tx,
+                full_registry,
+            )
+            .await
         }
     } else {
-        let result =
-            new_session(kex, conn_token, udp_port, session_uuid, tx, full_registry).await?;
+        let result = new_session(
+            kex,
+            conn_token,
+            udp_port,
+            session_uuid,
+            data_tx,
+            control_tx,
+            full_registry,
+        )
+        .await?;
         info!(
             user = skex.user(),
             session = %session_uuid,
@@ -311,7 +331,8 @@ async fn handle_connection(
 
     let udp_port = udp_arc.local_addr()?.port();
 
-    let (tx, rx) = channel::<EncryptedFrame>(256);
+    let (data_tx, data_rx) = channel::<EncryptedFrame>(256);
+    let (control_tx, control_rx) = channel::<EncryptedFrame>(16);
     let (retransmit_tx, retransmit_rx) = channel::<Vec<u64>>(512);
     let udp_recv = udp_arc.clone();
     let udp_send = udp_arc.clone();
@@ -337,7 +358,8 @@ async fn handle_connection(
         &skex,
         &conn_token,
         udp_port,
-        tx.clone(),
+        data_tx.clone(),
+        control_tx.clone(),
         &full_registry,
     )
     .await?;
@@ -350,7 +372,7 @@ async fn handle_connection(
         .id(kex.uuid())
         .hmac(kex.hmac_key())
         .rnk(kex.key())?
-        .nak_out_tx(tx.clone())
+        .nak_out_tx(data_tx.clone())
         .retransmit_tx(retransmit_tx)
         .peer_discovered_tx(peer_discovered_tx)
         .repaint_tx(repaint_tx)
@@ -358,7 +380,8 @@ async fn handle_connection(
         .build();
     let mut udp_sender = UdpSender::builder()
         .socket(udp_send)
-        .rx(rx)
+        .control_rx(control_rx)
+        .rx(data_rx)
         .retransmit_rx(retransmit_rx)
         .id(kex.uuid())
         .hmac(kex.hmac_key())
@@ -378,7 +401,7 @@ async fn handle_connection(
     let sender_token = conn_token.clone();
     let _udp_handle = spawn(async move { udp_sender.frame_loop(sender_token).await });
 
-    spawn_connection_watchdogs(tx.clone(), conn_token.clone(), server_token);
+    spawn_connection_watchdogs(control_tx.clone(), conn_token.clone(), server_token);
 
     // Periodic screen-state sync: normally every 50 ms, but drops to 10 ms during rapid
     // bursts (Option H — adaptive tick rate).  The dirty_counter is incremented by
@@ -395,7 +418,7 @@ async fn handle_connection(
     // diff_in_flight flag is set by spawn_pty_reader on each chunk send and cleared here
     // each tick.  Explicit client repaint requests are handled by _repaint_on_request.
     let sync_emu = server_emulator.clone();
-    let sync_tx = tx.clone();
+    let sync_tx = data_tx.clone();
     let sync_token = conn_token.clone();
     let sync_dirty = dirty_counter.clone();
     let sync_diff = diff_in_flight.clone();
@@ -443,7 +466,7 @@ async fn handle_connection(
     // The repaint_rx channel has capacity 1; bursts of requests are coalesced naturally
     // since the channel is drained before each response is sent.
     let repaint_emu = server_emulator.clone();
-    let repaint_tx_out = tx.clone();
+    let repaint_tx_out = data_tx.clone();
     let repaint_token = conn_token.clone();
     let _repaint_on_request = spawn(async move {
         loop {
@@ -470,7 +493,7 @@ async fn handle_connection(
     });
 
     spawn_proactive_repaint_watchdog(
-        tx.clone(),
+        data_tx.clone(),
         conn_token.clone(),
         nak_received_count,
         server_emulator.clone(),
@@ -513,11 +536,11 @@ async fn handle_connection(
 /// - Keepalive: sends `Keepalive` every 10 s so the client's 15 s silence timeout
 ///   never fires during idle sessions.
 fn spawn_connection_watchdogs(
-    tx: Sender<EncryptedFrame>,
+    control_tx: Sender<EncryptedFrame>,
     conn_token: CancellationToken,
     server_token: CancellationToken,
 ) {
-    let watcher_tx = tx.clone();
+    let watcher_tx = control_tx.clone();
     let watcher_conn_token = conn_token.clone();
     let _shutdown_watcher = spawn(async move {
         server_token.cancelled().await;
@@ -543,7 +566,7 @@ fn spawn_connection_watchdogs(
                             .as_micros(),
                     )
                     .unwrap_or(0);
-                    if tx.send(EncryptedFrame::Keepalive(ts)).await.is_err() {
+                    if control_tx.send(EncryptedFrame::Keepalive(ts)).await.is_err() {
                         break;
                     }
                 }
@@ -686,7 +709,8 @@ async fn new_session(
     conn_token: &CancellationToken,
     udp_port: u16,
     session_uuid: Uuid,
-    tx: Sender<EncryptedFrame>,
+    data_tx: Sender<EncryptedFrame>,
+    control_tx: Sender<EncryptedFrame>,
     full_registry: &FullSessionRegistry,
 ) -> Result<(
     Sender<TerminalMessage>,
@@ -701,7 +725,8 @@ async fn new_session(
     let (term_tx, term_rx) = channel::<TerminalMessage>(256);
     let output_handle = Arc::new(Mutex::new(SessionOutputHandle {
         kex_uuid: kex.uuid(),
-        tx: Some(tx),
+        data_tx: Some(data_tx),
+        control_tx: Some(control_tx),
         conn_token: Some(conn_token.clone()),
         udp_port: Some(udp_port),
     }));
@@ -791,7 +816,7 @@ fn spawn_pty_reader(
                     // Send to the currently connected client (if any).
                     let send_ok = {
                         let h = output_handle.blocking_lock();
-                        if let Some(ref sender) = h.tx {
+                        if let Some(ref sender) = h.data_tx {
                             let uuid_wrapper = UuidWrapper::new(h.kex_uuid);
                             let sender_clone = sender.clone();
                             drop(h);
@@ -833,8 +858,10 @@ fn spawn_pty_reader(
                         }
                     };
                     if !send_ok {
-                        // Client dropped; clear tx but keep the PTY running.
-                        output_handle.blocking_lock().tx = None;
+                        // Client dropped; clear both channels but keep the PTY running.
+                        let mut h = output_handle.blocking_lock();
+                        h.data_tx = None;
+                        h.control_tx = None;
                     }
 
                     if is_exit_title(&utf8_buf, true) {
@@ -860,7 +887,8 @@ fn spawn_pty_reader(
                 let mut pool = port_pool.blocking_lock();
                 let _ = pool.insert(port);
             }
-            h.tx = None;
+            h.data_tx = None;
+            h.control_tx = None;
         }
         {
             let mut sr = session_registry.blocking_lock();
@@ -1252,13 +1280,22 @@ mod test {
     async fn new_session_registers_in_full_registry() {
         let kex = Kex::default();
         let conn_token = CancellationToken::new();
-        let (tx, _rx) = channel::<EncryptedFrame>(4);
+        let (data_tx, _data_rx) = channel::<EncryptedFrame>(4);
+        let (control_tx, _control_rx) = channel::<EncryptedFrame>(4);
         let session_uuid = Uuid::new_v4();
         let registry = new_full_registry();
 
-        let _reg_result = new_session(&kex, &conn_token, 50_000, session_uuid, tx, &registry)
-            .await
-            .unwrap();
+        let _reg_result = new_session(
+            &kex,
+            &conn_token,
+            50_000,
+            session_uuid,
+            data_tx,
+            control_tx,
+            &registry,
+        )
+        .await
+        .unwrap();
 
         assert!(registry.lock().await.contains_key(&session_uuid));
     }
@@ -1267,14 +1304,22 @@ mod test {
     async fn new_session_returns_some_term_rx() {
         let kex = Kex::default();
         let conn_token = CancellationToken::new();
-        let (tx, _rx) = channel::<EncryptedFrame>(4);
+        let (data_tx, _data_rx) = channel::<EncryptedFrame>(4);
+        let (control_tx, _control_rx) = channel::<EncryptedFrame>(4);
         let session_uuid = Uuid::new_v4();
         let registry = new_full_registry();
 
-        let (_, maybe_rx, _, _, _, _, _, _) =
-            new_session(&kex, &conn_token, 50_000, session_uuid, tx, &registry)
-                .await
-                .unwrap();
+        let (_, maybe_rx, _, _, _, _, _, _) = new_session(
+            &kex,
+            &conn_token,
+            50_000,
+            session_uuid,
+            data_tx,
+            control_tx,
+            &registry,
+        )
+        .await
+        .unwrap();
         assert!(maybe_rx.is_some());
     }
 
@@ -1282,14 +1327,22 @@ mod test {
     async fn new_session_output_handle_has_correct_kex_uuid() {
         let kex = Kex::default();
         let conn_token = CancellationToken::new();
-        let (tx, _rx) = channel::<EncryptedFrame>(4);
+        let (data_tx, _data_rx) = channel::<EncryptedFrame>(4);
+        let (control_tx, _control_rx) = channel::<EncryptedFrame>(4);
         let session_uuid = Uuid::new_v4();
         let registry = new_full_registry();
 
-        let (_, _, output_handle, _, _, _, _, _) =
-            new_session(&kex, &conn_token, 50_000, session_uuid, tx, &registry)
-                .await
-                .unwrap();
+        let (_, _, output_handle, _, _, _, _, _) = new_session(
+            &kex,
+            &conn_token,
+            50_000,
+            session_uuid,
+            data_tx,
+            control_tx,
+            &registry,
+        )
+        .await
+        .unwrap();
         assert_eq!(output_handle.lock().await.kex_uuid, kex.uuid());
     }
 
@@ -1297,14 +1350,22 @@ mod test {
     async fn new_session_scrollback_initially_empty() {
         let kex = Kex::default();
         let conn_token = CancellationToken::new();
-        let (tx, _rx) = channel::<EncryptedFrame>(4);
+        let (data_tx, _data_rx) = channel::<EncryptedFrame>(4);
+        let (control_tx, _control_rx) = channel::<EncryptedFrame>(4);
         let session_uuid = Uuid::new_v4();
         let registry = new_full_registry();
 
-        let (_, _, _, scrollback, _, _, _, _) =
-            new_session(&kex, &conn_token, 50_000, session_uuid, tx, &registry)
-                .await
-                .unwrap();
+        let (_, _, _, scrollback, _, _, _, _) = new_session(
+            &kex,
+            &conn_token,
+            50_000,
+            session_uuid,
+            data_tx,
+            control_tx,
+            &registry,
+        )
+        .await
+        .unwrap();
         assert!(scrollback.lock().await.is_empty());
     }
 
@@ -1312,14 +1373,22 @@ mod test {
     async fn new_session_emulator_default_size() {
         let kex = Kex::default();
         let conn_token = CancellationToken::new();
-        let (tx, _rx) = channel::<EncryptedFrame>(4);
+        let (data_tx, _data_rx) = channel::<EncryptedFrame>(4);
+        let (control_tx, _control_rx) = channel::<EncryptedFrame>(4);
         let session_uuid = Uuid::new_v4();
         let registry = new_full_registry();
 
-        let (_, _, _, _, emulator, _, _, _) =
-            new_session(&kex, &conn_token, 50_000, session_uuid, tx, &registry)
-                .await
-                .unwrap();
+        let (_, _, _, _, emulator, _, _, _) = new_session(
+            &kex,
+            &conn_token,
+            50_000,
+            session_uuid,
+            data_tx,
+            control_tx,
+            &registry,
+        )
+        .await
+        .unwrap();
         let emu = emulator.lock().await;
         let screen = emu.screen();
         assert_eq!(screen.size(), (24, 80));
@@ -1329,19 +1398,14 @@ mod test {
 
     #[tokio::test]
     async fn watchdogs_keepalive_sends_frame() {
-        let (tx, mut rx) = channel::<EncryptedFrame>(4);
+        let (control_tx, mut control_rx) = channel::<EncryptedFrame>(4);
         let conn_token = CancellationToken::new();
         let server_token = CancellationToken::new();
-        spawn_connection_watchdogs(tx, conn_token.clone(), server_token);
+        spawn_connection_watchdogs(control_tx, conn_token.clone(), server_token);
 
-        // The keepalive fires every 10 s — wait for the first tick (immediate on start)
-        // or drain until we see a Keepalive within a short timeout.
-        let frame = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await;
-        // Either we got a frame or the channel is still open; cancel to clean up
+        // The keepalive fires every 3 s with an immediate first tick.
+        let frame = tokio::time::timeout(Duration::from_millis(200), control_rx.recv()).await;
         conn_token.cancel();
-        // We just verify the channel was not closed (tasks are alive)
-        // A Keepalive arrives on the first tick; the tick interval starts with an
-        // immediate first tick so we expect it promptly.
         let frame = frame
             .expect("timeout waiting for keepalive")
             .expect("channel closed");
@@ -1350,10 +1414,10 @@ mod test {
 
     #[tokio::test]
     async fn watchdogs_server_cancel_sends_shutdown_then_cancels_conn() {
-        let (tx, mut rx) = channel::<EncryptedFrame>(4);
+        let (control_tx, mut control_rx) = channel::<EncryptedFrame>(4);
         let conn_token = CancellationToken::new();
         let server_token = CancellationToken::new();
-        spawn_connection_watchdogs(tx, conn_token.clone(), server_token.clone());
+        spawn_connection_watchdogs(control_tx, conn_token.clone(), server_token.clone());
 
         server_token.cancel();
 
@@ -1362,7 +1426,7 @@ mod test {
 
         // Drain frames looking for Shutdown
         let mut saw_shutdown = false;
-        while let Ok(frame) = rx.try_recv() {
+        while let Ok(frame) = control_rx.try_recv() {
             if matches!(frame, EncryptedFrame::Shutdown) {
                 saw_shutdown = true;
                 break;
@@ -1379,19 +1443,19 @@ mod test {
 
     #[tokio::test]
     async fn watchdogs_conn_cancel_stops_keepalive() {
-        let (tx, mut rx) = channel::<EncryptedFrame>(4);
+        let (control_tx, mut control_rx) = channel::<EncryptedFrame>(4);
         let conn_token = CancellationToken::new();
         let server_token = CancellationToken::new();
-        spawn_connection_watchdogs(tx, conn_token.clone(), server_token);
+        spawn_connection_watchdogs(control_tx, conn_token.clone(), server_token);
 
         // Cancel immediately — keepalive loop should stop
         conn_token.cancel();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Drain any already-queued frames
-        while rx.try_recv().is_ok() {}
+        while control_rx.try_recv().is_ok() {}
         // No further Keepalive frames should arrive
-        let result = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await;
+        let result = tokio::time::timeout(Duration::from_millis(100), control_rx.recv()).await;
         // Either timeout (no frame) or channel closed — both are acceptable
         assert!(result.is_err() || result.unwrap().is_none());
     }
@@ -1408,13 +1472,21 @@ mod test {
             .session_uuid(session_uuid)
             .build();
         let conn_token = CancellationToken::new();
-        let (tx, _rx) = channel::<EncryptedFrame>(4);
+        let (data_tx, _data_rx) = channel::<EncryptedFrame>(4);
+        let (control_tx, _control_rx) = channel::<EncryptedFrame>(4);
         let registry = new_full_registry();
 
-        let (_, maybe_rx, _, _, _, _, _, _) =
-            resolve_session(&kex, &skex, &conn_token, 50_000, tx, &registry)
-                .await
-                .unwrap();
+        let (_, maybe_rx, _, _, _, _, _, _) = resolve_session(
+            &kex,
+            &skex,
+            &conn_token,
+            50_000,
+            data_tx,
+            control_tx,
+            &registry,
+        )
+        .await
+        .unwrap();
         // New session → PTY needs to be spawned → Some(term_rx)
         assert!(maybe_rx.is_some());
     }
@@ -1424,7 +1496,8 @@ mod test {
         let kex = Kex::default();
         let session_uuid = Uuid::new_v4();
         let conn_token = CancellationToken::new();
-        let (tx, _rx) = channel::<EncryptedFrame>(16);
+        let (data_tx, _data_rx) = channel::<EncryptedFrame>(16);
+        let (control_tx, _control_rx) = channel::<EncryptedFrame>(4);
         let registry = new_full_registry();
 
         // First connection: create a session
@@ -1433,7 +1506,8 @@ mod test {
             &conn_token,
             50_000,
             session_uuid,
-            tx.clone(),
+            data_tx.clone(),
+            control_tx.clone(),
             &registry,
         )
         .await
@@ -1448,14 +1522,16 @@ mod test {
             .is_resume(true)
             .build();
         let new_conn_token = CancellationToken::new();
-        let (tx2, mut rx2) = channel::<EncryptedFrame>(16);
+        let (resume_data_tx, mut resume_data_rx) = channel::<EncryptedFrame>(16);
+        let (resume_ctrl_tx, _resume_ctrl_rx) = channel::<EncryptedFrame>(4);
 
         let (_, maybe_rx, output_handle, _, _, _, _, _) = resolve_session(
             &new_kex,
             &skex_resume,
             &new_conn_token,
             50_001,
-            tx2,
+            resume_data_tx,
+            resume_ctrl_tx,
             &registry,
         )
         .await
@@ -1465,9 +1541,9 @@ mod test {
         assert!(maybe_rx.is_none());
         // Output handle should be updated with the new kex uuid
         assert_eq!(output_handle.lock().await.kex_uuid, new_kex.uuid());
-        // A ScreenState frame should have been sent on the *new* connection's tx
+        // A ScreenState frame should have been sent on the *new* connection's data channel
         let mut saw_screen_state = false;
-        while let Ok(frame) = rx2.try_recv() {
+        while let Ok(frame) = resume_data_rx.try_recv() {
             if matches!(
                 frame,
                 EncryptedFrame::ScreenState(_) | EncryptedFrame::ScreenStateCompressed(_)
@@ -1491,13 +1567,21 @@ mod test {
             .is_resume(true)
             .build();
         let conn_token = CancellationToken::new();
-        let (tx, _rx) = channel::<EncryptedFrame>(4);
+        let (data_tx, _data_rx) = channel::<EncryptedFrame>(4);
+        let (control_tx, _control_rx) = channel::<EncryptedFrame>(4);
         let registry = new_full_registry();
 
-        let (_, maybe_rx, _, _, _, _, _, _) =
-            resolve_session(&kex, &skex, &conn_token, 50_000, tx, &registry)
-                .await
-                .unwrap();
+        let (_, maybe_rx, _, _, _, _, _, _) = resolve_session(
+            &kex,
+            &skex,
+            &conn_token,
+            50_000,
+            data_tx,
+            control_tx,
+            &registry,
+        )
+        .await
+        .unwrap();
         // Falls back to new session → Some(term_rx)
         assert!(maybe_rx.is_some());
     }
