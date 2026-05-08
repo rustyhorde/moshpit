@@ -29,7 +29,7 @@ use tokio::{
     net::UdpSocket,
     select,
     sync::{mpsc::Sender, oneshot},
-    time::{Instant as TokioInstant, interval, sleep, sleep_until},
+    time::{Instant as TokioInstant, sleep, sleep_until},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -41,8 +41,11 @@ use crate::{
     UuidWrapper, paint_overlays_to_ansi, udp::sender::RETRANSMIT_WINDOW, utils::is_exit_title,
 };
 
-/// Interval between NAK timeout checks.
-const NAK_CHECK_INTERVAL: Duration = Duration::from_millis(20);
+/// Floor for the adaptive NAK check interval.  On LAN paths where `nak_timeout`
+/// converges to [`MIN_NAK_TIMEOUT`] (20 ms), the check fires every 5 ms; on
+/// high-latency paths (500 ms) it fires every 125 ms, saving CPU and state-machine
+/// churn.  Formula: `max(nak_timeout / 4, MIN_NAK_CHECK_INTERVAL)`.
+const MIN_NAK_CHECK_INTERVAL: Duration = Duration::from_millis(5);
 /// Minimum delay before requesting retransmission of a missing packet.
 const NAK_TIMEOUT: Duration = Duration::from_millis(50);
 /// Maximum backoff cap for repeated NAK retries (50 * 2^4 = 800 ms).
@@ -179,6 +182,13 @@ impl UdpReader {
         if self.silence_timeout.is_some() {
             self.silence_timeout = Some((clamped * 30).max(Duration::from_secs(9)));
         }
+    }
+
+    /// Compute the adaptive NAK check interval from the current RTT estimate.
+    ///
+    /// Formula: `max(nak_timeout / 4, MIN_NAK_CHECK_INTERVAL)`.
+    fn nak_check_interval(&self) -> Duration {
+        (self.nak_timeout.unwrap_or(NAK_TIMEOUT) / 4).max(MIN_NAK_CHECK_INTERVAL)
     }
 
     /// Intercept terminal queries in bytes arriving from the server, respond
@@ -693,11 +703,11 @@ impl UdpReader {
             }
         }
 
-        let mut nak_check = interval(NAK_CHECK_INTERVAL);
+        let mut nak_check_deadline = TokioInstant::now() + self.nak_check_interval();
         loop {
             select! {
                 () = token.cancelled() => break,
-                _ = nak_check.tick() => {
+                () = sleep_until(nak_check_deadline) => {
                     for ready in self.check_nak_timeouts() {
                         match ready {
                             EncryptedFrame::Bytes((_id, message)) => {
@@ -728,6 +738,7 @@ impl UdpReader {
                             | EncryptedFrame::CompressedBytes(_) => {}
                         }
                     }
+                    nak_check_deadline = TokioInstant::now() + self.nak_check_interval();
                 },
                 frame_res = self.read_encrypted_frame() => {
                     match frame_res {
@@ -804,7 +815,7 @@ impl UdpReader {
     ) {
         let mut prev_bytes = BytesMut::with_capacity(1024);
         let mut osc_started = false;
-        let mut nak_check = interval(NAK_CHECK_INTERVAL);
+        let mut nak_check_deadline = TokioInstant::now() + self.nak_check_interval();
         // When true, raw bytes are fed into the emulator only — not sent to
         // stdout.  Set by ScrollbackStart, cleared by ScrollbackEnd.
         let mut scrollback_mode = false;
@@ -815,7 +826,7 @@ impl UdpReader {
         'session: loop {
             select! {
                 () = token.cancelled() => process::exit(0),
-                _ = nak_check.tick() => {
+                () = sleep_until(nak_check_deadline) => {
                     for ready in self.check_nak_timeouts() {
                         match ready {
                             EncryptedFrame::Bytes((_id, message)) => {
@@ -932,6 +943,7 @@ impl UdpReader {
                             }
                         }
                     }
+                    nak_check_deadline = TokioInstant::now() + self.nak_check_interval();
                 },
                 // Silence timeout: no frame received within `silence_timeout`.
                 () = async {
@@ -1885,5 +1897,28 @@ mod tests {
             reader.silence_timeout.is_none(),
             "server-mode reader must not acquire a silence_timeout"
         );
+    }
+
+    #[test]
+    fn nak_check_interval_default_uses_nak_timeout_quarter() {
+        let reader = make_reader_sync();
+        // nak_timeout = None → falls back to NAK_TIMEOUT (50 ms); interval = max(50/4, 5) = 12.5 ms
+        // Duration division truncates to nanoseconds: 50_000_000 ns / 4 = 12_500_000 ns = 12.5 ms.
+        let interval = reader.nak_check_interval();
+        assert_eq!(interval, Duration::from_micros(12_500));
+    }
+
+    #[test]
+    fn nak_check_interval_scales_with_nak_timeout() {
+        let mut reader = make_reader_sync();
+        reader.nak_timeout = Some(MAX_NAK_TIMEOUT); // 500 ms → interval = max(125, 5) = 125 ms
+        assert_eq!(reader.nak_check_interval(), Duration::from_millis(125));
+    }
+
+    #[test]
+    fn nak_check_interval_clamped_to_min() {
+        let mut reader = make_reader_sync();
+        reader.nak_timeout = Some(MIN_NAK_TIMEOUT); // 20 ms → 20/4 = 5 ms = MIN_NAK_CHECK_INTERVAL
+        assert_eq!(reader.nak_check_interval(), MIN_NAK_CHECK_INTERVAL);
     }
 }
