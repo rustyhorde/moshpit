@@ -62,10 +62,10 @@ pub struct KexReader {
     tofu_fn: Option<TofuFn>,
     /// Callback for known-host key mismatch replacement prompt.
     host_key_mismatch_fn: Option<HostKeyMismatchFn>,
-    /// UDP diff transport mode requested by this client.  When `Datagram`, the
-    /// client sends a `Frame::ClientOptions(1)` before the `Check` frame so the
-    /// server can enable the fire-and-forget path for this session.
-    /// Defaults to `Reliable` (no `ClientOptions` frame sent).
+    /// UDP diff transport mode requested by this client.  When `Datagram` or
+    /// `StateSync`, the client sends a `Frame::ClientOptions(1)` or `(2)` before
+    /// the `Check` frame so the server can enable the appropriate delivery path
+    /// for this session.  Defaults to `Reliable` (no `ClientOptions` frame sent).
     #[builder(default)]
     diff_mode: DiffMode,
 }
@@ -173,10 +173,16 @@ impl KexReader {
                     let rnk = RandomizedNonceKey::new(&AES_256_GCM_SIV, &key_bytes)?;
                     let nonce = rnk.seal_in_place_append_tag(Aad::empty(), &mut check)?;
 
-                    if self.diff_mode == DiffMode::Datagram {
-                        self.tx
+                    match self.diff_mode {
+                        DiffMode::Datagram => self
+                            .tx
                             .send(Frame::ClientOptions(1))
-                            .map_err(|_| Unspecified)?;
+                            .map_err(|_| Unspecified)?,
+                        DiffMode::StateSync => self
+                            .tx
+                            .send(Frame::ClientOptions(2))
+                            .map_err(|_| Unspecified)?,
+                        DiffMode::Reliable => {}
                     }
                     self.tx
                         .send(Frame::Check(*nonce.as_ref(), check))
@@ -362,12 +368,19 @@ impl KexReader {
         trace!("server_kex: waiting for ClientOptions or Check frame");
         let negotiated_diff_mode = match self.reader.read_frame().await? {
             Some(Frame::ClientOptions(mode_byte)) => {
-                let mode = if mode_byte == 1 {
-                    trace!("server_kex: client requested DiffMode::Datagram");
-                    DiffMode::Datagram
-                } else {
-                    trace!("server_kex: ClientOptions mode_byte={mode_byte}, using Reliable");
-                    DiffMode::Reliable
+                let mode = match mode_byte {
+                    1 => {
+                        trace!("server_kex: client requested DiffMode::Datagram");
+                        DiffMode::Datagram
+                    }
+                    2 => {
+                        trace!("server_kex: client requested DiffMode::StateSync");
+                        DiffMode::StateSync
+                    }
+                    other => {
+                        trace!("server_kex: ClientOptions mode_byte={other}, using Reliable");
+                        DiffMode::Reliable
+                    }
                 };
                 // Now read the Check frame
                 match self.reader.read_frame().await? {

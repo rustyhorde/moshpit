@@ -126,11 +126,15 @@ pub(crate) struct Cli {
     /// `datagram`: fire-and-forget diffs with no retransmission; the server
     /// sends a periodic full-screen snapshot for recovery instead.  Eliminates
     /// head-of-line blocking on flaky or high-loss connections.
+    ///
+    /// `statesync`: Mosh-style ack-based diffs; the server always sends
+    /// `contents_diff(ack_state → current)` so each packet is self-contained.
+    /// No NAKs, no reorder buffer.  Best for moderate-loss, low-bandwidth links.
     #[clap(
         long,
         value_name = "MODE",
         default_value = "reliable",
-        help = "UDP diff transport mode: reliable (default) or datagram"
+        help = "UDP diff transport mode: reliable (default), datagram, or statesync"
     )]
     #[getset(get = "pub(crate)")]
     diff_mode: String,

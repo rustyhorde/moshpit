@@ -101,8 +101,9 @@ pub struct UdpSender {
     /// before bulk terminal data starts flowing.
     warmup_delay: Option<Duration>,
     /// UDP diff transport mode for this session.
-    /// In `Datagram` mode the retransmit buffer is disabled — packets are never
-    /// stored for re-send, and incoming retransmit requests are silently drained.
+    /// In `Datagram` or `StateSync` mode the retransmit buffer is disabled —
+    /// packets are never stored for re-send, and incoming retransmit requests
+    /// are silently drained.
     #[builder(default)]
     diff_mode: DiffMode,
 }

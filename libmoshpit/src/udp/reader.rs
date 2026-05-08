@@ -161,11 +161,27 @@ pub struct UdpReader {
     /// explicit [`EncryptedFrame::RepaintRequest`] that might itself be lost.
     nak_received_count: Option<Arc<AtomicU64>>,
     /// UDP diff transport mode for this session.
-    /// In `Datagram` mode the reorder buffer, gap tracking, and NAK sending are all
-    /// disabled — frames are delivered immediately in arrival order and lost packets
-    /// are recovered by the server's periodic `ScreenStateCompressed` push.
+    /// In `Datagram` or `StateSync` mode the reorder buffer, gap tracking, and NAK
+    /// sending are all disabled — frames are delivered immediately in arrival order.
     #[builder(default)]
     diff_mode: DiffMode,
+    /// Client-mode `StateSync` state: the `contents_formatted()` snapshot of the
+    /// client's screen at the point the last `StateSyncDiff` was applied.
+    /// Empty before any diff is applied.
+    #[builder(default)]
+    ack_state: Vec<u8>,
+    /// The `diff_id` of the last `StateSyncDiff` the client successfully applied.
+    /// Zero before any diff is applied.  Used to validate incoming `base_id` fields.
+    #[builder(default)]
+    ack_state_seq: u64,
+    /// Count of consecutive `StateSyncDiff` frames discarded due to `base_id` mismatch.
+    /// When this reaches 3, the client sends a `RepaintRequest` and the counter resets.
+    #[builder(default)]
+    statesync_mismatch_count: u32,
+    /// Server-mode: channel for forwarding `ClientAck(diff_id)` values from the UDP
+    /// receive loop to the state-sync task in `moshpits/src/runtime.rs`, which uses
+    /// them to advance the server's ack baseline.
+    client_ack_tx: Option<Sender<u64>>,
 }
 
 /// Current time as microseconds since the UNIX epoch, used for keepalive RTT timestamps.
@@ -420,11 +436,11 @@ impl UdpReader {
             return vec![];
         }
 
-        // In Datagram mode: skip reorder buffering and gap tracking entirely.
-        // Deliver the frame immediately regardless of arrival order, advance
-        // next_seq past any gap, and never send NAKs or RepaintRequests.
+        // In Datagram or StateSync mode: skip reorder buffering and gap tracking
+        // entirely.  Deliver the frame immediately regardless of arrival order,
+        // advance next_seq past any gap, and never send NAKs or RepaintRequests.
         // ScreenState frames are still delivered through the fast path below.
-        if self.diff_mode == DiffMode::Datagram {
+        if self.diff_mode == DiffMode::Datagram || self.diff_mode == DiffMode::StateSync {
             self.next_seq = seq + 1;
             return self.route_or_deliver(frame).into_iter().collect();
         }
@@ -659,7 +675,7 @@ impl UdpReader {
     /// window. Returns frames from `recv_buffer` that become deliverable after skipping
     /// permanently lost packets.
     fn check_nak_timeouts(&mut self) -> Vec<EncryptedFrame> {
-        if self.diff_mode == DiffMode::Datagram {
+        if self.diff_mode != DiffMode::Reliable {
             return vec![];
         }
         let now = Instant::now();
@@ -764,7 +780,15 @@ impl UdpReader {
                             | EncryptedFrame::ScrollbackEnd
                             | EncryptedFrame::ScreenState(_)
                             | EncryptedFrame::ScreenStateCompressed(_)
-                            | EncryptedFrame::CompressedBytes(_) => {}
+                            | EncryptedFrame::CompressedBytes(_)
+                            | EncryptedFrame::StateSyncDiff(_) => {}
+                            EncryptedFrame::ClientAck(diff_id) => {
+                                if let Some(ref tx) = self.client_ack_tx
+                                    && let Err(e) = tx.try_send(diff_id)
+                                {
+                                    warn!("Failed to forward ClientAck: {e}");
+                                }
+                            }
                         }
                     }
                 }
@@ -808,7 +832,9 @@ impl UdpReader {
                             | EncryptedFrame::ScrollbackEnd
                             | EncryptedFrame::ScreenState(_)
                             | EncryptedFrame::ScreenStateCompressed(_)
-                            | EncryptedFrame::CompressedBytes(_) => {}
+                            | EncryptedFrame::CompressedBytes(_)
+                            | EncryptedFrame::StateSyncDiff(_)
+                            | EncryptedFrame::ClientAck(_) => {}
                         }
                     }
                     nak_check_deadline = TokioInstant::now() + self.nak_check_interval();
@@ -852,7 +878,15 @@ impl UdpReader {
                                     | EncryptedFrame::ScrollbackEnd
                                     | EncryptedFrame::ScreenState(_)
                                     | EncryptedFrame::ScreenStateCompressed(_)
-                                    | EncryptedFrame::CompressedBytes(_) => {}
+                                    | EncryptedFrame::CompressedBytes(_)
+                                    | EncryptedFrame::StateSyncDiff(_) => {}
+                                    EncryptedFrame::ClientAck(diff_id) => {
+                                        if let Some(ref tx) = self.client_ack_tx
+                                            && let Err(e) = tx.try_send(diff_id)
+                                        {
+                                            warn!("Failed to forward ClientAck: {e}");
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -897,15 +931,15 @@ impl UdpReader {
     ) {
         let mut prev_bytes = BytesMut::with_capacity(1024);
         let mut osc_started = false;
-        // In Datagram mode the NAK timer is never actually used (check_nak_timeouts
-        // returns immediately), so we park the deadline far in the future to keep
-        // the select! branch from firing on every loop iteration.
+        // In Datagram and StateSync modes the NAK timer is never actually used
+        // (check_nak_timeouts returns immediately), so we park the deadline far in
+        // the future to keep the select! branch from firing on every loop iteration.
         let nak_park = Duration::from_hours(24);
         let mut nak_check_deadline = TokioInstant::now()
-            + if self.diff_mode == DiffMode::Datagram {
-                nak_park
-            } else {
+            + if self.diff_mode == DiffMode::Reliable {
                 self.nak_check_interval()
+            } else {
+                nak_park
             };
         // When true, raw bytes are fed into the emulator only — not sent to
         // stdout.  Set by ScrollbackStart, cleared by ScrollbackEnd.
@@ -944,7 +978,10 @@ impl UdpReader {
                                     warn!("Failed to echo keepalive: {e}");
                                 }
                             }
-                            EncryptedFrame::Nak(_) | EncryptedFrame::RepaintRequest => {}
+                            EncryptedFrame::Nak(_)
+                            | EncryptedFrame::RepaintRequest
+                            | EncryptedFrame::StateSyncDiff(_)
+                            | EncryptedFrame::ClientAck(_) => {}
                             EncryptedFrame::Shutdown => {
                                 info!("Server is shutting down, reconnecting");
                                 self.signal_reconnect_or_exit(0);
@@ -994,6 +1031,11 @@ impl UdpReader {
                                         };
                                         let mut tmp = vt100::Parser::new(rows, cols, 0);
                                         tmp.process(&payload);
+                                        if self.diff_mode == DiffMode::StateSync {
+                                            self.ack_state = tmp.screen().contents_formatted();
+                                            self.ack_state_seq = 0;
+                                            self.statesync_mismatch_count = 0;
+                                        }
                                         let repaint = {
                                             let mut rend = renderer.lock().unwrap();
                                             rend.invalidate();
@@ -1035,10 +1077,10 @@ impl UdpReader {
                         }
                     }
                     nak_check_deadline = TokioInstant::now()
-                        + if self.diff_mode == DiffMode::Datagram {
-                            nak_park
-                        } else {
+                        + if self.diff_mode == DiffMode::Reliable {
                             self.nak_check_interval()
+                        } else {
+                            nak_park
                         };
                 },
                 // Silence timeout: no frame received within `silence_timeout`.
@@ -1072,7 +1114,9 @@ impl UdpReader {
                                             warn!("Failed to echo keepalive: {e}");
                                         }
                                     }
-                                    EncryptedFrame::Nak(_) | EncryptedFrame::RepaintRequest => {}
+                                    EncryptedFrame::Nak(_)
+                                    | EncryptedFrame::RepaintRequest
+                                    | EncryptedFrame::ClientAck(_) => {}
                                     EncryptedFrame::Shutdown => {
                                         info!("Server is shutting down, reconnecting");
                                         self.signal_reconnect_or_exit(0);
@@ -1122,6 +1166,11 @@ impl UdpReader {
                                                 };
                                                 let mut tmp = vt100::Parser::new(rows, cols, 0);
                                                 tmp.process(&payload);
+                                                if self.diff_mode == DiffMode::StateSync {
+                                                    self.ack_state = tmp.screen().contents_formatted();
+                                                    self.ack_state_seq = 0;
+                                                    self.statesync_mismatch_count = 0;
+                                                }
                                                 let repaint = {
                                                     let mut rend = renderer.lock().unwrap();
                                                     rend.invalidate();
@@ -1174,6 +1223,53 @@ impl UdpReader {
                                             &prediction,
                                         )
                                         .await;
+                                    }
+                                    EncryptedFrame::StateSyncDiff((base_id, diff_id, compressed)) => {
+                                        if base_id == self.ack_state_seq {
+                                            self.statesync_mismatch_count = 0;
+                                            match decode_all(compressed.as_slice()) {
+                                                Ok(diff_bytes) => {
+                                                    let (rows, cols) = {
+                                                        let emu = emulator.lock().unwrap();
+                                                        emu.screen().size()
+                                                    };
+                                                    let mut tmp = vt100::Parser::new(rows, cols, 0);
+                                                    if !self.ack_state.is_empty() {
+                                                        tmp.process(&self.ack_state);
+                                                    }
+                                                    tmp.process(&diff_bytes);
+                                                    self.ack_state = tmp.screen().contents_formatted();
+                                                    self.ack_state_seq = diff_id;
+                                                    let repaint = {
+                                                        let mut rend = renderer.lock().unwrap();
+                                                        rend.render(tmp.screen(), &[], None)
+                                                    };
+                                                    if !repaint.is_empty()
+                                                        && let Err(e) = stdout_tx.send(repaint).await
+                                                    {
+                                                        error!("Error sending StateSyncDiff repaint to stdout channel: {e}");
+                                                    }
+                                                    if let Some(ref tx) = self.nak_out_tx
+                                                        && let Err(e) = tx.try_send(EncryptedFrame::ClientAck(diff_id))
+                                                    {
+                                                        warn!("Failed to send ClientAck: {e}");
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    error!("Failed to decompress StateSyncDiff: {e}");
+                                                }
+                                            }
+                                        } else {
+                                            self.statesync_mismatch_count += 1;
+                                            if self.statesync_mismatch_count >= 3 {
+                                                self.statesync_mismatch_count = 0;
+                                                if let Some(ref tx) = self.nak_out_tx
+                                                    && let Err(e) = tx.try_send(EncryptedFrame::RepaintRequest)
+                                                {
+                                                    warn!("Failed to send StateSync desync RepaintRequest: {e}");
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }

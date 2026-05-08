@@ -95,6 +95,13 @@ const SCREEN_SYNC_BURST_DIRTY_THRESHOLD: u64 = 5;
 /// bandwidth: at a 40 KB/s average compressed screen size of ~3 KB, the overhead
 /// is ~20 KB/s — negligible on any modern link.
 const DATAGRAM_REPAINT_INTERVAL: Duration = Duration::from_millis(150);
+/// Tick interval for the state-sync task in `StateSync` mode.  Each tick computes
+/// `contents_diff(ack_state, current)` and sends the result if non-empty.
+const STATESYNC_INTERVAL: Duration = Duration::from_millis(10);
+/// Maximum number of `(diff_id, contents_formatted)` entries kept in the server's
+/// sent-states ring buffer.  When `ClientAck(diff_id)` arrives, the server looks up
+/// this entry to advance its ack baseline.
+const STATESYNC_HISTORY_LEN: usize = 32;
 
 #[allow(unsafe_code)]
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -373,6 +380,7 @@ async fn handle_connection(
     .await?;
 
     let (repaint_tx, mut repaint_rx) = channel::<()>(1);
+    let (client_ack_tx, mut client_ack_rx) = channel::<u64>(16);
     let nak_received_count = Arc::new(AtomicU64::new(0));
     let nak_received_count_for_mtu = nak_received_count.clone();
     let mut udp_reader = UdpReader::builder()
@@ -387,6 +395,7 @@ async fn handle_connection(
         .repaint_tx(repaint_tx)
         .nak_received_count(nak_received_count.clone())
         .diff_mode(diff_mode)
+        .client_ack_tx(client_ack_tx)
         .build();
     let mut udp_sender = UdpSender::builder()
         .socket(udp_send)
@@ -415,122 +424,187 @@ async fn handle_connection(
 
     spawn_connection_watchdogs(control_tx.clone(), conn_token.clone(), server_token);
 
-    // Periodic screen-state sync: normally every 50 ms, but drops to 10 ms during rapid
-    // bursts (Option H — adaptive tick rate).  The dirty_counter is incremented by
-    // spawn_pty_reader on every PTY output chunk and by spawn_pty on every Resize event,
-    // so the load is a pure atomic read — essentially free — when the terminal is idle.
-    //
-    // When the counter advances by SCREEN_SYNC_BURST_DIRTY_THRESHOLD or more in a single tick
-    // period, the screen is changing quickly: switch to SCREEN_SYNC_BURST_INTERVAL so the
-    // client receives a fresh full-screen snapshot faster than the normal 50 ms cadence.
-    // Return to SCREEN_SYNC_IDLE_INTERVAL once the delta drops below the threshold.
-    //
-    // Option C: when diff chunks are actively flowing to the client, skip the snapshot
-    // entirely to avoid competing with the diff stream on the same UDP path.  The
-    // diff_in_flight flag is set by spawn_pty_reader on each chunk send and cleared here
-    // each tick.  Explicit client repaint requests are handled by _repaint_on_request.
-    let sync_emu = server_emulator.clone();
-    let sync_tx = data_tx.clone();
-    let sync_token = conn_token.clone();
-    let sync_dirty = dirty_counter.clone();
-    let sync_diff = diff_in_flight.clone();
-    let _screen_sync = spawn(async move {
-        let mut last_dirty: u64 = 0;
-        let mut interval = SCREEN_SYNC_IDLE_INTERVAL;
-        loop {
-            select! {
-                () = sync_token.cancelled() => break,
-                () = tokio::time::sleep(interval) => {
-                    let current = sync_dirty.load(Ordering::Relaxed);
-                    let delta = current.wrapping_sub(last_dirty);
-                    // Adapt tick rate based on how active the screen has been.
-                    interval = if delta >= SCREEN_SYNC_BURST_DIRTY_THRESHOLD {
-                        SCREEN_SYNC_BURST_INTERVAL
-                    } else {
-                        SCREEN_SYNC_IDLE_INTERVAL
-                    };
-                    if delta == 0 {
-                        // Screen has not changed since last tick — skip expensive formatting.
-                        continue;
-                    }
-                    // Diffs are actively flowing — skip snapshot to avoid contending with
-                    // the diff stream.  Advance last_dirty so we detect when diffs stop.
-                    if sync_diff.swap(false, Ordering::Relaxed) {
-                        last_dirty = current;
-                        continue;
-                    }
-                    last_dirty = current;
-                    let contents = {
-                        let emu = sync_emu.lock().await;
-                        emu.screen().contents_formatted()
-                    };
-                    let compressed = encode_all(contents.as_slice(), 3)
-                        .unwrap_or_else(|_| contents.clone());
-                    if sync_tx.send(EncryptedFrame::ScreenStateCompressed(compressed)).await.is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-    });
-
-    // Respond to RepaintRequest frames from the client with an immediate ScreenState.
-    // The repaint_rx channel has capacity 1; bursts of requests are coalesced naturally
-    // since the channel is drained before each response is sent.
-    let repaint_emu = server_emulator.clone();
-    let repaint_tx_out = data_tx.clone();
-    let repaint_token = conn_token.clone();
-    let _repaint_on_request = spawn(async move {
-        loop {
-            select! {
-                () = repaint_token.cancelled() => break,
-                msg = repaint_rx.recv() => {
-                    if msg.is_none() {
-                        break;
-                    }
-                    // Drain any additional queued requests — one ScreenState covers them all.
-                    while repaint_rx.try_recv().is_ok() {}
-                    let contents = {
-                        let emu = repaint_emu.lock().await;
-                        emu.screen().contents_formatted()
-                    };
-                    let compressed = encode_all(contents.as_slice(), 3)
-                        .unwrap_or_else(|_| contents.clone());
-                    if repaint_tx_out.send(EncryptedFrame::ScreenStateCompressed(compressed)).await.is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-    });
-
-    // In Datagram mode the client never sends NAKs or RepaintRequests, so the
-    // proactive-repaint watchdog and repaint-on-request tasks never fire.
-    // Instead, spawn a fixed-interval ScreenState pusher that gives the client
-    // a fresh full-screen snapshot every DATAGRAM_REPAINT_INTERVAL ms.  This is
-    // the sole loss-recovery mechanism in datagram mode.
-    if diff_mode == DiffMode::Datagram {
-        let datagram_emu = server_emulator.clone();
-        let datagram_tx = data_tx.clone();
-        let datagram_token = conn_token.clone();
-        let _datagram_repaint = spawn(async move {
+    if diff_mode == DiffMode::StateSync {
+        // Mosh-style ack-based diff delivery.  Each tick computes
+        // contents_diff(ack_state → current) and sends it if non-empty.
+        // Repaint requests (desync recovery) are handled here instead of by
+        // _repaint_on_request.  ClientAck frames advance the ack baseline.
+        let ss_emu = server_emulator.clone();
+        let ss_tx = data_tx.clone();
+        let ss_token = conn_token.clone();
+        let _state_sync = spawn(async move {
+            let mut ticker = tokio::time::interval(STATESYNC_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut sent_states: VecDeque<(u64, Vec<u8>)> = VecDeque::new();
+            let mut ack_diff_id: u64 = 0;
+            let mut ack_state: Vec<u8> = Vec::new();
+            let mut diff_counter: u64 = 0;
             loop {
                 select! {
-                    () = datagram_token.cancelled() => break,
-                    () = tokio::time::sleep(DATAGRAM_REPAINT_INTERVAL) => {
+                    () = ss_token.cancelled() => break,
+                    msg = repaint_rx.recv() => {
+                        if msg.is_none() {
+                            break;
+                        }
+                        while repaint_rx.try_recv().is_ok() {}
                         let contents = {
-                            let emu = datagram_emu.lock().await;
+                            let emu = ss_emu.lock().await;
                             emu.screen().contents_formatted()
                         };
                         let compressed = encode_all(contents.as_slice(), 3)
                             .unwrap_or_else(|_| contents.clone());
-                        if datagram_tx.send(EncryptedFrame::ScreenStateCompressed(compressed)).await.is_err() {
+                        if ss_tx.send(EncryptedFrame::ScreenStateCompressed(compressed)).await.is_err() {
+                            break;
+                        }
+                        // Reset ack baseline to match client's reset after ScreenStateCompressed.
+                        ack_state = contents;
+                        ack_diff_id = 0;
+                        sent_states.clear();
+                    }
+                    diff_id = client_ack_rx.recv() => {
+                        let Some(diff_id) = diff_id else { break; };
+                        if let Some(pos) = sent_states.iter().position(|(id, _)| *id == diff_id) {
+                            let snapshot = sent_states[pos].1.clone();
+                            ack_state = snapshot;
+                            ack_diff_id = diff_id;
+                            drop(sent_states.drain(..=pos));
+                        }
+                    }
+                    _ = ticker.tick() => {
+                        let (current, rows, cols) = {
+                            let emu = ss_emu.lock().await;
+                            let screen = emu.screen();
+                            let formatted = screen.contents_formatted();
+                            let (r, c) = screen.size();
+                            (formatted, r, c)
+                        };
+                        let mut ack_parser = vt100::Parser::new(rows, cols, 0);
+                        if !ack_state.is_empty() {
+                            ack_parser.process(&ack_state);
+                        }
+                        let mut cur_parser = vt100::Parser::new(rows, cols, 0);
+                        cur_parser.process(&current);
+                        let diff_bytes = cur_parser.screen().contents_diff(ack_parser.screen());
+                        if diff_bytes.is_empty() {
+                            continue;
+                        }
+                        let compressed = encode_all(diff_bytes.as_slice(), 1)
+                            .unwrap_or_else(|_| diff_bytes.clone());
+                        diff_counter += 1;
+                        if ss_tx
+                            .send(EncryptedFrame::StateSyncDiff((ack_diff_id, diff_counter, compressed)))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        sent_states.push_back((diff_counter, current));
+                        if sent_states.len() > STATESYNC_HISTORY_LEN {
+                            drop(sent_states.pop_front());
+                        }
+                    }
+                }
+            }
+        });
+    } else {
+        // Reliable and Datagram modes: periodic screen-state sync.
+        //
+        // Normally every 50 ms, but drops to 10 ms during rapid bursts (Option H).
+        // Option C: skip the snapshot when diff chunks are actively flowing to avoid
+        // competing with the diff stream; the diff_in_flight flag handles detection.
+        let sync_emu = server_emulator.clone();
+        let sync_tx = data_tx.clone();
+        let sync_token = conn_token.clone();
+        let sync_dirty = dirty_counter.clone();
+        let sync_diff = diff_in_flight.clone();
+        let _screen_sync = spawn(async move {
+            let mut last_dirty: u64 = 0;
+            let mut interval = SCREEN_SYNC_IDLE_INTERVAL;
+            loop {
+                select! {
+                    () = sync_token.cancelled() => break,
+                    () = tokio::time::sleep(interval) => {
+                        let current = sync_dirty.load(Ordering::Relaxed);
+                        let delta = current.wrapping_sub(last_dirty);
+                        interval = if delta >= SCREEN_SYNC_BURST_DIRTY_THRESHOLD {
+                            SCREEN_SYNC_BURST_INTERVAL
+                        } else {
+                            SCREEN_SYNC_IDLE_INTERVAL
+                        };
+                        if delta == 0 {
+                            continue;
+                        }
+                        if sync_diff.swap(false, Ordering::Relaxed) {
+                            last_dirty = current;
+                            continue;
+                        }
+                        last_dirty = current;
+                        let contents = {
+                            let emu = sync_emu.lock().await;
+                            emu.screen().contents_formatted()
+                        };
+                        let compressed = encode_all(contents.as_slice(), 3)
+                            .unwrap_or_else(|_| contents.clone());
+                        if sync_tx.send(EncryptedFrame::ScreenStateCompressed(compressed)).await.is_err() {
                             break;
                         }
                     }
                 }
             }
         });
+
+        // Respond to RepaintRequest frames with an immediate ScreenStateCompressed.
+        // Channel capacity 1 coalesces bursts naturally.
+        let repaint_emu = server_emulator.clone();
+        let repaint_tx_out = data_tx.clone();
+        let repaint_token = conn_token.clone();
+        let _repaint_on_request = spawn(async move {
+            loop {
+                select! {
+                    () = repaint_token.cancelled() => break,
+                    msg = repaint_rx.recv() => {
+                        if msg.is_none() {
+                            break;
+                        }
+                        while repaint_rx.try_recv().is_ok() {}
+                        let contents = {
+                            let emu = repaint_emu.lock().await;
+                            emu.screen().contents_formatted()
+                        };
+                        let compressed = encode_all(contents.as_slice(), 3)
+                            .unwrap_or_else(|_| contents.clone());
+                        if repaint_tx_out.send(EncryptedFrame::ScreenStateCompressed(compressed)).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        // Datagram mode: fixed-interval full-screen push as the sole loss-recovery mechanism.
+        if diff_mode == DiffMode::Datagram {
+            let datagram_emu = server_emulator.clone();
+            let datagram_tx = data_tx.clone();
+            let datagram_token = conn_token.clone();
+            let _datagram_repaint = spawn(async move {
+                loop {
+                    select! {
+                        () = datagram_token.cancelled() => break,
+                        () = tokio::time::sleep(DATAGRAM_REPAINT_INTERVAL) => {
+                            let contents = {
+                                let emu = datagram_emu.lock().await;
+                                emu.screen().contents_formatted()
+                            };
+                            let compressed = encode_all(contents.as_slice(), 3)
+                                .unwrap_or_else(|_| contents.clone());
+                            if datagram_tx.send(EncryptedFrame::ScreenStateCompressed(compressed)).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
     }
 
     spawn_proactive_repaint_watchdog(
@@ -564,6 +638,7 @@ async fn handle_connection(
             session_registry,
             full_registry,
             effective_mtu,
+            diff_mode,
         );
     }
 
@@ -808,7 +883,7 @@ async fn new_session(
 
 /// Spawn the background thread that reads PTY output, writes scrollback, and forwards
 /// frames to the currently connected client.  Cleans up session state when the shell exits.
-#[cfg_attr(nightly, allow(clippy::too_many_arguments))]
+#[cfg_attr(nightly, allow(clippy::too_many_arguments, clippy::too_many_lines))]
 #[cfg_attr(coverage_nightly, coverage(off))]
 fn spawn_pty_reader(
     session_uuid: Uuid,
@@ -823,6 +898,7 @@ fn spawn_pty_reader(
     session_registry: SessionRegistry,
     full_registry: FullSessionRegistry,
     effective_mtu: Arc<AtomicUsize>,
+    diff_mode: DiffMode,
 ) {
     let _read_handle = thread::spawn(move || {
         loop {
@@ -852,7 +928,11 @@ fn spawn_pty_reader(
 
                     let send_ok = {
                         let h = output_handle.blocking_lock();
-                        if let Some(ref sender) = h.data_tx {
+                        if diff_mode == DiffMode::StateSync {
+                            // StateSync: statesync task handles delivery; only feed emulator.
+                            drop(h);
+                            true
+                        } else if let Some(ref sender) = h.data_tx {
                             let uuid_wrapper = UuidWrapper::new(h.kex_uuid);
                             let sender_clone = sender.clone();
                             drop(h);
@@ -968,6 +1048,7 @@ fn spawn_pty(
     session_registry: SessionRegistry,
     full_registry: FullSessionRegistry,
     effective_mtu: Arc<AtomicUsize>,
+    diff_mode: DiffMode,
 ) {
     let _term_handle = thread::spawn(move || {
         let pty_system = native_pty_system();
@@ -1144,6 +1225,7 @@ fn spawn_pty(
             session_registry,
             full_registry,
             effective_mtu,
+            diff_mode,
         );
 
         while let Some(terminal_message) = term_rx.blocking_recv() {
