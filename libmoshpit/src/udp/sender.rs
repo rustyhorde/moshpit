@@ -242,7 +242,10 @@ mod tests {
 
         let send_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         send_socket.connect(server_addr).await.unwrap();
-        server.connect(send_socket.local_addr().unwrap()).await.unwrap();
+        server
+            .connect(send_socket.local_addr().unwrap())
+            .await
+            .unwrap();
 
         let mut sender = make_sender(send_socket, frame_rx, retransmit_rx);
         let token2 = token.clone();
@@ -251,9 +254,7 @@ mod tests {
         });
 
         let mut buf = vec![0u8; 65535];
-        drop(
-            tokio::time::timeout(Duration::from_millis(500), server.recv(&mut buf)).await,
-        );
+        drop(tokio::time::timeout(Duration::from_millis(500), server.recv(&mut buf)).await);
 
         token.cancel();
         drop(handle.await);
@@ -266,6 +267,9 @@ mod tests {
             "stale_ts must be at least 4 s before send"
         );
         // The clock must have advanced by the time we finished.
-        assert!(t_after_send >= t_before_send, "monotonic clock must advance");
+        assert!(
+            t_after_send >= t_before_send,
+            "monotonic clock must advance"
+        );
     }
 }
