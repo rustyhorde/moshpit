@@ -795,7 +795,6 @@ fn spawn_pty_reader(
                     let buf_slice = &buffer[..n];
                     let utf8_buf = String::from_utf8_lossy(buf_slice);
 
-                    // Write to scrollback ring buffer.
                     {
                         let mut sb = scrollback.blocking_lock();
                         let available = SCROLLBACK_CAPACITY.saturating_sub(sb.len());
@@ -807,13 +806,9 @@ fn spawn_pty_reader(
                         sb.extend(buf_slice.iter().copied());
                     }
 
-                    // Feed into the server-side emulator for screen-state tracking.
                     server_emulator.blocking_lock().process(buf_slice);
-
-                    // Signal to the screen-sync task that new content is available.
                     let _ = dirty_counter.fetch_add(1, Ordering::Relaxed);
 
-                    // Send to the currently connected client (if any).
                     let send_ok = {
                         let h = output_handle.blocking_lock();
                         if let Some(ref sender) = h.data_tx {
@@ -822,10 +817,8 @@ fn spawn_pty_reader(
                             drop(h);
                             // Signal the screen-sync task that diffs are flowing.
                             diff_in_flight.store(true, Ordering::Relaxed);
-                            // Try zstd level-1 compression.  When it reduces payload size,
-                            // the entire PTY read fits in a single datagram — eliminating
-                            // multi-packet bursts and their NAK exposure.  Fall back to
-                            // paced MTU chunks for incompressible binary data.
+                            // zstd level-1: if smaller, fits in one datagram (no burst).
+                            // Otherwise chunk by MTU with adaptive inter-packet pacing.
                             if let Ok(compressed) = encode_all(buf_slice, 1)
                                 && compressed.len() < buf_slice.len()
                             {
@@ -835,6 +828,9 @@ fn spawn_pty_reader(
                             } else {
                                 let mut ok = true;
                                 let mtu = effective_mtu.load(Ordering::Relaxed);
+                                // Bursts > 10 chunks (e.g. htop redraws) get 3× pacing.
+                                let n = buf_slice.len().div_ceil(mtu);
+                                let burst_pacing = pacing_delay * if n > 10 { 3 } else { 1 };
                                 let mut chunks = buf_slice.chunks(mtu).peekable();
                                 while let Some(chunk) = chunks.next() {
                                     let more = chunks.peek().is_some();
@@ -844,10 +840,8 @@ fn spawn_pty_reader(
                                     if !ok {
                                         break;
                                     }
-                                    // Space out consecutive chunks to prevent burst loss
-                                    // on stateful NAT devices.
-                                    if more && !pacing_delay.is_zero() {
-                                        sleep(pacing_delay);
+                                    if more && !burst_pacing.is_zero() {
+                                        sleep(burst_pacing);
                                     }
                                 }
                                 ok
