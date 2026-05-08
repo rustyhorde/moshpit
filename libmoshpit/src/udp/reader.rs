@@ -197,6 +197,17 @@ impl UdpReader {
     /// `max(rto × 30, 9 s)` — with a 3 s server keepalive this guarantees ≥ 3
     /// keepalives arrive before the silence window closes.
     fn update_rtt_estimate(&mut self, sample: Duration) {
+        // Discard samples more than 8× the current RTO — these are almost certainly
+        // channel-queuing artefacts (stale timestamps), clock jumps, or process
+        // scheduling hangs rather than genuine network RTT measurements.
+        let ceiling = self.nak_timeout.unwrap_or(NAK_TIMEOUT) * 8;
+        if sample > ceiling {
+            debug!(
+                "NAK RTT sample {:?} exceeds outlier ceiling {:?} — discarding",
+                sample, ceiling
+            );
+            return;
+        }
         let (new_srtt, new_rttvar) = match (self.srtt, self.rttvar) {
             // First measurement (RFC 6298 §2.2).
             (None, _) | (_, None) => (sample, sample / 2),
@@ -1821,8 +1832,16 @@ mod tests {
         let srtt = reader.srtt.unwrap();
         let rttvar = reader.rttvar.unwrap();
         let rto = reader.nak_timeout.unwrap();
-        assert_eq!(srtt, Duration::from_micros(112_500), "SRTT after second sample");
-        assert_eq!(rttvar, Duration::from_micros(62_500), "RTTVAR after second sample");
+        assert_eq!(
+            srtt,
+            Duration::from_micros(112_500),
+            "SRTT after second sample"
+        );
+        assert_eq!(
+            rttvar,
+            Duration::from_micros(62_500),
+            "RTTVAR after second sample"
+        );
         assert_eq!(rto, Duration::from_micros(362_500), "RTO = srtt + 4*rttvar");
     }
 
@@ -2051,5 +2070,54 @@ mod tests {
         let mut reader = make_reader_sync();
         reader.nak_timeout = Some(MIN_NAK_TIMEOUT); // 20 ms → 20/4 = 5 ms = MIN_NAK_CHECK_INTERVAL
         assert_eq!(reader.nak_check_interval(), MIN_NAK_CHECK_INTERVAL);
+    }
+
+    // ── Outlier RTT rejection (Option B fix) ──────────────────────────────────
+
+    #[test]
+    fn update_rtt_estimate_rejects_outlier_sample() {
+        let mut reader = make_reader_sync();
+        // Default ceiling = NAK_TIMEOUT × 8 = 50 ms × 8 = 400 ms.
+        // A 7-second sample is far beyond the ceiling and must be discarded.
+        reader.update_rtt_estimate(Duration::from_secs(7));
+        assert!(
+            reader.nak_timeout.is_none(),
+            "outlier sample must not update nak_timeout"
+        );
+        assert!(reader.srtt.is_none(), "outlier sample must not update srtt");
+        assert!(
+            reader.rttvar.is_none(),
+            "outlier sample must not update rttvar"
+        );
+    }
+
+    #[test]
+    fn update_rtt_estimate_accepts_sample_just_within_ceiling() {
+        let mut reader = make_reader_sync();
+        // Ceiling = 50 ms × 8 = 400 ms. A 399 ms sample must be accepted.
+        reader.update_rtt_estimate(Duration::from_millis(399));
+        assert!(
+            reader.nak_timeout.is_some(),
+            "sample within ceiling must update nak_timeout"
+        );
+    }
+
+    #[test]
+    fn update_rtt_estimate_ceiling_scales_with_current_nak_timeout() {
+        let mut reader = make_reader_sync();
+        // Set nak_timeout to 200 ms → ceiling = 200 × 8 = 1600 ms.
+        reader.nak_timeout = Some(Duration::from_millis(200));
+        reader.srtt = Some(Duration::from_millis(200));
+        reader.rttvar = Some(Duration::from_millis(100));
+        // 1.5 s is below ceiling (1.6 s) → accepted.
+        reader.update_rtt_estimate(Duration::from_millis(1500));
+        assert!(reader.nak_timeout.is_some());
+        // 2 s is above ceiling → rejected; nak_timeout stays at 200 ms.
+        let before = reader.nak_timeout;
+        reader.update_rtt_estimate(Duration::from_secs(2));
+        assert_eq!(
+            reader.nak_timeout, before,
+            "nak_timeout must be unchanged after outlier rejection"
+        );
     }
 }

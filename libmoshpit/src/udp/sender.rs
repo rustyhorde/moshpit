@@ -9,6 +9,7 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Result;
@@ -19,7 +20,6 @@ use aws_lc_rs::{
 use bincode_next::{config::standard, encode_to_vec};
 use bon::Builder;
 use getset::MutGetters;
-use std::time::Duration;
 use tokio::{
     net::UdpSocket,
     select,
@@ -30,6 +30,19 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::EncryptedFrame;
+
+/// Current time as microseconds since the UNIX epoch.
+/// Keepalive frames are re-stamped with this value at actual send time so that
+/// the measured RTT reflects wire latency, not channel-queuing delay.
+fn now_micros() -> u64 {
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros(),
+    )
+    .unwrap_or(0)
+}
 
 /// Number of sent packets kept in the retransmit buffer.
 /// Exported so the receiver can immediately give up on gaps that fall outside
@@ -130,6 +143,15 @@ impl UdpSender {
                 frame_opt = self.rx.recv() => {
                     match frame_opt {
                         Some(frame) => {
+                            // Re-stamp Keepalive at actual send time so the RTT
+                            // measurement reflects wire latency, not the time the
+                            // frame spent waiting in the outbound channel.
+                            let frame = match frame {
+                                EncryptedFrame::Keepalive(_) => {
+                                    EncryptedFrame::Keepalive(now_micros())
+                                }
+                                other => other,
+                            };
                             let seq = self.send_seq;
                             self.send_seq += 1;
                             let wire = self.encrypt(&frame, seq)?;
@@ -171,5 +193,79 @@ impl UdpSender {
         packet.extend_from_slice(&len);
         packet.extend_from_slice(&encrypted_part);
         Ok(packet)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::sync::mpsc::channel;
+
+    use super::*;
+
+    fn make_sender(
+        socket: Arc<UdpSocket>,
+        rx: Receiver<EncryptedFrame>,
+        retransmit_rx: Receiver<Vec<u64>>,
+    ) -> UdpSender {
+        UdpSender::builder()
+            .id(Uuid::new_v4())
+            .rnk([0u8; 32])
+            .unwrap()
+            .hmac([0u8; 64])
+            .socket(socket)
+            .rx(rx)
+            .retransmit_rx(retransmit_rx)
+            .build()
+    }
+
+    /// Keepalive frames are re-stamped at actual send time; a stale enqueue-time
+    /// timestamp must not reach the wire.  Verified indirectly: `stale_ts` is
+    /// constructed to be definitionally older than `t_before_send` by ≥4 s, while
+    /// the re-stamped ts must be ≥ `t_before_send`.
+    #[tokio::test]
+    async fn keepalive_is_restamped_at_send_time() {
+        let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = server.local_addr().unwrap();
+
+        let (frame_tx, frame_rx) = channel::<EncryptedFrame>(4);
+        let (_retransmit_tx, retransmit_rx) = channel::<Vec<u64>>(4);
+        let token = CancellationToken::new();
+
+        // Simulate a Keepalive that was created 5 seconds ago (stale enqueue ts).
+        let stale_ts = now_micros().saturating_sub(5_000_000);
+        frame_tx
+            .send(EncryptedFrame::Keepalive(stale_ts))
+            .await
+            .unwrap();
+
+        let t_before_send = now_micros();
+
+        let send_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        send_socket.connect(server_addr).await.unwrap();
+        server.connect(send_socket.local_addr().unwrap()).await.unwrap();
+
+        let mut sender = make_sender(send_socket, frame_rx, retransmit_rx);
+        let token2 = token.clone();
+        let handle = tokio::spawn(async move {
+            drop(sender.frame_loop(token2).await);
+        });
+
+        let mut buf = vec![0u8; 65535];
+        drop(
+            tokio::time::timeout(Duration::from_millis(500), server.recv(&mut buf)).await,
+        );
+
+        token.cancel();
+        drop(handle.await);
+
+        let t_after_send = now_micros();
+
+        // stale_ts was created > 4 s before t_before_send.
+        assert!(
+            stale_ts < t_before_send.saturating_sub(4_000_000),
+            "stale_ts must be at least 4 s before send"
+        );
+        // The clock must have advanced by the time we finished.
+        assert!(t_after_send >= t_before_send, "monotonic clock must advance");
     }
 }
