@@ -30,9 +30,9 @@ use anyhow::{Context as _, Result};
 use bytes::{Buf as _, BytesMut};
 use clap::Parser as _;
 use libmoshpit::{
-    EncryptedFrame, KexMode, MAX_UDP_PAYLOAD, MoshpitError, SessionRegistry, TerminalMessage,
-    UdpReader, UdpSender, UuidWrapper, init_tracing, is_exit_title, load, new_session_registry,
-    run_key_exchange,
+    DiffMode, EncryptedFrame, KexMode, MAX_UDP_PAYLOAD, MoshpitError, SessionRegistry,
+    TerminalMessage, UdpReader, UdpSender, UuidWrapper, init_tracing, is_exit_title, load,
+    new_session_registry, run_key_exchange,
 };
 #[cfg(windows)]
 use portable_pty::CommandBuilder;
@@ -89,6 +89,12 @@ const SCREEN_SYNC_IDLE_INTERVAL: Duration = Duration::from_millis(50);
 const SCREEN_SYNC_BURST_INTERVAL: Duration = Duration::from_millis(10);
 /// Dirty-counter delta threshold above which a tick is classified as a burst.
 const SCREEN_SYNC_BURST_DIRTY_THRESHOLD: u64 = 5;
+/// Interval between periodic full `ScreenStateCompressed` pushes in datagram mode.
+/// Since the client never sends NAKs, this push is the only recovery mechanism for
+/// lost diff packets.  150 ms gives a good balance between recovery latency and
+/// bandwidth: at a 40 KB/s average compressed screen size of ~3 KB, the overhead
+/// is ~20 KB/s — negligible on any modern link.
+const DATAGRAM_REPAINT_INTERVAL: Duration = Duration::from_millis(150);
 
 #[allow(unsafe_code)]
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -328,6 +334,7 @@ async fn handle_connection(
 
     let skex = skex_opt.ok_or_else(|| anyhow::anyhow!("missing server kex info"))?;
     let session_uuid = skex.session_uuid();
+    let diff_mode = skex.diff_mode();
 
     let udp_port = udp_arc.local_addr()?.port();
 
@@ -379,6 +386,7 @@ async fn handle_connection(
         .peer_addr_tx(peer_addr_tx)
         .repaint_tx(repaint_tx)
         .nak_received_count(nak_received_count.clone())
+        .diff_mode(diff_mode)
         .build();
     let mut udp_sender = UdpSender::builder()
         .socket(udp_send)
@@ -391,6 +399,7 @@ async fn handle_connection(
         .peer_discovered_rx(peer_discovered_rx)
         .peer_addr_rx(peer_addr_rx)
         .maybe_warmup_delay(warmup_delay)
+        .diff_mode(diff_mode)
         .build();
 
     let reader_token = conn_token.clone();
@@ -494,6 +503,35 @@ async fn handle_connection(
             }
         }
     });
+
+    // In Datagram mode the client never sends NAKs or RepaintRequests, so the
+    // proactive-repaint watchdog and repaint-on-request tasks never fire.
+    // Instead, spawn a fixed-interval ScreenState pusher that gives the client
+    // a fresh full-screen snapshot every DATAGRAM_REPAINT_INTERVAL ms.  This is
+    // the sole loss-recovery mechanism in datagram mode.
+    if diff_mode == DiffMode::Datagram {
+        let datagram_emu = server_emulator.clone();
+        let datagram_tx = data_tx.clone();
+        let datagram_token = conn_token.clone();
+        let _datagram_repaint = spawn(async move {
+            loop {
+                select! {
+                    () = datagram_token.cancelled() => break,
+                    () = tokio::time::sleep(DATAGRAM_REPAINT_INTERVAL) => {
+                        let contents = {
+                            let emu = datagram_emu.lock().await;
+                            emu.screen().contents_formatted()
+                        };
+                        let compressed = encode_all(contents.as_slice(), 3)
+                            .unwrap_or_else(|_| contents.clone());
+                        if datagram_tx.send(EncryptedFrame::ScreenStateCompressed(compressed)).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     spawn_proactive_repaint_watchdog(
         data_tx.clone(),

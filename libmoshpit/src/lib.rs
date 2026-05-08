@@ -292,6 +292,7 @@ pub use self::term::{
     paint_overlays_to_ansi,
 };
 pub use self::tracing::{TracingConfigExt, init_tracing};
+pub use self::udp::DiffMode;
 pub use self::udp::UdpClient;
 pub use self::udp::reader::UdpReader;
 pub use self::udp::sender::MAX_UDP_PAYLOAD;

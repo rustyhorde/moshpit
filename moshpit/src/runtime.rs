@@ -28,7 +28,7 @@ use clap::Parser as _;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use dialoguer::{Confirm, Password};
 use libmoshpit::{
-    DisplayPreference, Emulator, EncryptedFrame, Kex, KexConfig as _, KexMode, KeyPair,
+    DiffMode, DisplayPreference, Emulator, EncryptedFrame, Kex, KexConfig as _, KexMode, KeyPair,
     MoshpitError, PredictionEngine, Renderer, UdpReader, UdpSender, UuidWrapper, init_tracing,
     load, paint_overlays_to_ansi, parse_server_destination, run_key_exchange,
 };
@@ -599,6 +599,7 @@ async fn run_session_loop(
                     config.nat_warmup_count(),
                     stdout_tx.clone(),
                     config.predict(),
+                    config.diff_mode(),
                     exit_token.clone(),
                 )
                 .await;
@@ -822,6 +823,7 @@ async fn run_udp_session(
     nat_warmup_count: u32,
     stdout_tx: Sender<Vec<u8>>,
     display_preference: DisplayPreference,
+    diff_mode: DiffMode,
     exit_token: CancellationToken,
 ) -> Result<()> {
     let (reconnect_tx, mut reconnect_rx) = channel::<()>(1);
@@ -847,6 +849,7 @@ async fn run_udp_session(
         .nak_timeout(nak_timeout)
         .reconnect_tx(reconnect_tx)
         .query_response_tx(tx.clone())
+        .diff_mode(diff_mode)
         .build();
 
     let mut udp_sender = UdpSender::builder()
@@ -857,6 +860,7 @@ async fn run_udp_session(
         .id(kex.uuid())
         .hmac(kex.hmac_key())
         .rnk(kex.key())?
+        .diff_mode(diff_mode)
         .build();
 
     let sender_token = token.clone();

@@ -42,6 +42,15 @@ pub enum Frame {
     /// A request from moshpit to resume a previous session.
     /// Contains (`session_uuid`, `user_bytes`, `ephemeral_public_key`, `full_public_key`).
     ResumeRequest(UuidWrapper, Vec<u8>, Vec<u8>, Vec<u8>),
+    /// Transport options sent by the client immediately after `Initialize` or
+    /// `ResumeRequest` and before `Check`.  Allows the client to request a
+    /// specific [`DiffMode`](crate::udp::DiffMode) without a separate negotiation round-trip.
+    /// The payload byte encodes the mode: `0` = Reliable (default), `1` = Datagram.
+    /// Servers that recognise this frame adapt per-session; older servers that
+    /// do not know ID 8 will treat it as an unknown frame — clients MUST only
+    /// send this frame when connecting to a server that supports it (i.e. same
+    /// version or newer).
+    ClientOptions(u8),
 }
 
 impl Frame {
@@ -57,6 +66,7 @@ impl Frame {
             Frame::KexFailure => 5,
             Frame::SessionToken(_) => 6,
             Frame::ResumeRequest(_, _, _, _) => 7,
+            Frame::ClientOptions(_) => 8,
         }
     }
 
@@ -67,7 +77,7 @@ impl Frame {
     ///
     pub fn parse(src: &mut Cursor<&[u8]>) -> Result<Option<Self>> {
         match get_u8(src) {
-            Some(0..=7) => {
+            Some(0..=8) => {
                 if let Some(length_slice) = get_usize(src)? {
                     let length = usize::from_be_bytes(length_slice.try_into()?);
                     if length > MAX_FRAME_LENGTH {
@@ -126,6 +136,7 @@ impl Display for Frame {
                 epk.len(),
                 fpk.len()
             ),
+            Frame::ClientOptions(mode) => write!(f, "ClientOptions({mode})"),
         }
     }
 }

@@ -40,6 +40,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 use zstd::decode_all;
 
+use super::DiffMode;
 use crate::{
     Emulator, EncryptedFrame, MoshpitError, PredictionEngine, Renderer, TerminalMessage,
     UuidWrapper, paint_overlays_to_ansi, udp::sender::RETRANSMIT_WINDOW, utils::is_exit_title,
@@ -159,6 +160,12 @@ pub struct UdpReader {
     /// [`EncryptedFrame::ScreenStateCompressed`] is pushed without waiting for an
     /// explicit [`EncryptedFrame::RepaintRequest`] that might itself be lost.
     nak_received_count: Option<Arc<AtomicU64>>,
+    /// UDP diff transport mode for this session.
+    /// In `Datagram` mode the reorder buffer, gap tracking, and NAK sending are all
+    /// disabled — frames are delivered immediately in arrival order and lost packets
+    /// are recovered by the server's periodic `ScreenStateCompressed` push.
+    #[builder(default)]
+    diff_mode: DiffMode,
 }
 
 /// Current time as microseconds since the UNIX epoch, used for keepalive RTT timestamps.
@@ -413,6 +420,15 @@ impl UdpReader {
             return vec![];
         }
 
+        // In Datagram mode: skip reorder buffering and gap tracking entirely.
+        // Deliver the frame immediately regardless of arrival order, advance
+        // next_seq past any gap, and never send NAKs or RepaintRequests.
+        // ScreenState frames are still delivered through the fast path below.
+        if self.diff_mode == DiffMode::Datagram {
+            self.next_seq = seq + 1;
+            return self.route_or_deliver(frame).into_iter().collect();
+        }
+
         // Prevent DoS memory exhaustion from an adversarial massive sequence jump.
         if seq > self.next_seq + MAX_SEQ_JUMP {
             warn!(
@@ -581,92 +597,76 @@ impl UdpReader {
         Some(frame)
     }
 
+    /// Collect sequences to give up on (exceeded retries or outside retransmit window),
+    /// remove their tracking state, advance `next_seq` past them, and return any frames
+    /// that become deliverable as a result.
+    fn drain_given_up_seqs(&mut self) -> Vec<EncryptedFrame> {
+        let retry_give_up = self
+            .gap_nak_count
+            .iter()
+            .filter_map(|(&seq, &count)| (count >= MAX_NAK_RETRIES).then_some(seq));
+        // When the server has sent RETRANSMIT_WINDOW more packets past a gap it has
+        // already evicted the lost packet; retransmit requests will silently fail.
+        let window_give_up = self
+            .gap_first_seen
+            .keys()
+            .filter(|&&seq| self.highest_seq_seen.saturating_sub(seq) > RETRANSMIT_WINDOW)
+            .copied();
+        let give_up_set: std::collections::HashSet<u64> =
+            retry_give_up.chain(window_give_up).collect();
+        if give_up_set.is_empty() {
+            return vec![];
+        }
+        for &seq in &give_up_set {
+            if self
+                .gap_nak_count
+                .get(&seq)
+                .is_some_and(|&c| c >= MAX_NAK_RETRIES)
+            {
+                warn!("Giving up on packet {seq} after {MAX_NAK_RETRIES} NAK retries");
+            } else {
+                warn!(
+                    "Giving up on packet {seq}: outside sender retransmit window \
+                     (highest_seen={})",
+                    self.highest_seq_seen
+                );
+            }
+            let _r = self.gap_first_seen.remove(&seq);
+            let _r = self.gap_nak_count.remove(&seq);
+            let _r = self.gap_nak_sent_at.remove(&seq);
+        }
+        let mut delivered = vec![];
+        loop {
+            if give_up_set.contains(&self.next_seq) {
+                self.next_seq += 1;
+            } else if let Some(buffered) = self.recv_buffer.remove(&self.next_seq) {
+                let _r = self.gap_first_seen.remove(&self.next_seq);
+                let _r = self.gap_nak_count.remove(&self.next_seq);
+                let _r = self.gap_nak_sent_at.remove(&self.next_seq);
+                self.next_seq += 1;
+                if let Some(f) = self.route_or_deliver(buffered) {
+                    delivered.push(f);
+                }
+            } else {
+                break;
+            }
+        }
+        delivered
+    }
+
     /// Send NAKs for gaps whose timeout has elapsed, reset their timer for potential re-NAK,
     /// and skip any gaps that have exceeded the maximum retry count or the sender's retransmit
     /// window. Returns frames from `recv_buffer` that become deliverable after skipping
     /// permanently lost packets.
     fn check_nak_timeouts(&mut self) -> Vec<EncryptedFrame> {
+        if self.diff_mode == DiffMode::Datagram {
+            return vec![];
+        }
         let now = Instant::now();
+        let delivered = self.drain_given_up_seqs();
 
-        // 1a. Gaps that have exceeded the retry limit.
-        let retry_give_up: Vec<u64> = self
-            .gap_nak_count
-            .iter()
-            .filter_map(|(&seq, &count)| {
-                if count >= MAX_NAK_RETRIES {
-                    Some(seq)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        // 1b. Gaps that have fallen outside the sender's retransmit window.
-        //
-        // When the server has sent RETRANSMIT_WINDOW more packets past a gap,
-        // it has already evicted the lost packet from its buffer and retransmit
-        // requests for it will silently fail.  Giving up immediately avoids the
-        // full MAX_NAK_RETRIES × backoff wait (≈750 ms) during which all
-        // subsequent output is stalled in recv_buffer.
-        let window_give_up: Vec<u64> = self
-            .gap_first_seen
-            .keys()
-            .filter(|&&seq| self.highest_seq_seen.saturating_sub(seq) > RETRANSMIT_WINDOW)
-            .copied()
-            .collect();
-
-        // Merge both give-up sources, deduplicated.
-        let mut give_up_set = std::collections::HashSet::new();
-        for seq in retry_give_up.iter().chain(window_give_up.iter()) {
-            let _inserted = give_up_set.insert(*seq);
-        }
-
-        let mut delivered = vec![];
-
-        if !give_up_set.is_empty() {
-            for &seq in &give_up_set {
-                if self
-                    .gap_nak_count
-                    .get(&seq)
-                    .is_some_and(|&c| c >= MAX_NAK_RETRIES)
-                {
-                    warn!("Giving up on packet {seq} after {MAX_NAK_RETRIES} NAK retries");
-                } else {
-                    warn!(
-                        "Giving up on packet {seq}: outside sender retransmit window \
-                         (highest_seen={})",
-                        self.highest_seq_seen
-                    );
-                }
-                let _removed = self.gap_first_seen.remove(&seq);
-                let _removed = self.gap_nak_count.remove(&seq);
-                let _removed = self.gap_nak_sent_at.remove(&seq);
-            }
-
-            // Advance next_seq past given-up and buffered frames.
-            loop {
-                if give_up_set.contains(&self.next_seq) {
-                    self.next_seq += 1;
-                } else if let Some(buffered) = self.recv_buffer.remove(&self.next_seq) {
-                    let _removed = self.gap_first_seen.remove(&self.next_seq);
-                    let _removed = self.gap_nak_count.remove(&self.next_seq);
-                    let _removed = self.gap_nak_sent_at.remove(&self.next_seq);
-                    self.next_seq += 1;
-                    if let Some(f) = self.route_or_deliver(buffered) {
-                        delivered.push(f);
-                    }
-                } else {
-                    break;
-                }
-            }
-        }
-
-        // 2. Normal NAK logic — request retransmission for recent gaps.
-        // Each gap uses an exponentially backed-off timeout based on how many
-        // times it has already been NAKed: timeout = base * 2^retry_count
-        // (capped at base * 2^NAK_BACKOFF_MAX_SHIFT), so repeated misses
-        // back off rather than flooding the sender with duplicate retransmit requests.
-        // The base is the RTT-derived nak_timeout when available, else NAK_TIMEOUT.
+        // Request retransmission for recent gaps using exponential backoff:
+        // timeout = base * 2^retry_count (capped at base * 2^NAK_BACKOFF_MAX_SHIFT).
         let base_nak_timeout = self.nak_timeout.unwrap_or(NAK_TIMEOUT);
         let timed_out: Vec<u64> = self
             .gap_first_seen
@@ -675,16 +675,10 @@ impl UdpReader {
                 let retries = self.gap_nak_count.get(&seq).copied().unwrap_or(0);
                 let shift = retries.min(NAK_BACKOFF_MAX_SHIFT);
                 let backoff = base_nak_timeout * (1u32 << shift);
-                if now.duration_since(t) >= backoff {
-                    Some(seq)
-                } else {
-                    None
-                }
+                (now.duration_since(t) >= backoff).then_some(seq)
             })
             .collect();
         if !timed_out.is_empty() {
-            // Reset each gap's timer so the next backoff interval starts from now.
-            // Track whether any gap just hit the RepaintRequest threshold.
             let mut send_repaint_request = false;
             for &seq in &timed_out {
                 if let Some(t) = self.gap_first_seen.get_mut(&seq) {
@@ -695,7 +689,6 @@ impl UdpReader {
                 if *count == REPAINT_REQUEST_THRESHOLD {
                     send_repaint_request = true;
                 }
-                // Record when we sent this NAK so handle_arrival can measure RTT.
                 let _prev = self.gap_nak_sent_at.insert(seq, now);
             }
             if let Some(ref tx) = self.nak_out_tx
@@ -704,8 +697,7 @@ impl UdpReader {
                 warn!("Failed to send NAK: {e}");
             }
             // When any gap reaches the repaint threshold, ask the server for an immediate
-            // full-screen snapshot.  This unblocks the display without waiting for
-            // retransmit to succeed or retries to be exhausted.
+            // full-screen snapshot.
             if send_repaint_request
                 && let Some(ref tx) = self.nak_out_tx
                 && let Err(e) = tx.try_send(EncryptedFrame::RepaintRequest)
@@ -905,7 +897,16 @@ impl UdpReader {
     ) {
         let mut prev_bytes = BytesMut::with_capacity(1024);
         let mut osc_started = false;
-        let mut nak_check_deadline = TokioInstant::now() + self.nak_check_interval();
+        // In Datagram mode the NAK timer is never actually used (check_nak_timeouts
+        // returns immediately), so we park the deadline far in the future to keep
+        // the select! branch from firing on every loop iteration.
+        let nak_park = Duration::from_hours(24);
+        let mut nak_check_deadline = TokioInstant::now()
+            + if self.diff_mode == DiffMode::Datagram {
+                nak_park
+            } else {
+                self.nak_check_interval()
+            };
         // When true, raw bytes are fed into the emulator only — not sent to
         // stdout.  Set by ScrollbackStart, cleared by ScrollbackEnd.
         let mut scrollback_mode = false;
@@ -1033,7 +1034,12 @@ impl UdpReader {
                             }
                         }
                     }
-                    nak_check_deadline = TokioInstant::now() + self.nak_check_interval();
+                    nak_check_deadline = TokioInstant::now()
+                        + if self.diff_mode == DiffMode::Datagram {
+                            nak_park
+                        } else {
+                            self.nak_check_interval()
+                        };
                 },
                 // Silence timeout: no frame received within `silence_timeout`.
                 () = async {

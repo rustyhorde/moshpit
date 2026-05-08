@@ -118,6 +118,22 @@ pub(crate) struct Cli {
     )]
     #[getset(get_copy = "pub(crate)")]
     nat_warmup_count: u32,
+    /// UDP diff transport mode.
+    ///
+    /// `reliable` (default): NAK-based selective retransmission — best for
+    /// low-loss networks where retransmit rarely fires.
+    ///
+    /// `datagram`: fire-and-forget diffs with no retransmission; the server
+    /// sends a periodic full-screen snapshot for recovery instead.  Eliminates
+    /// head-of-line blocking on flaky or high-loss connections.
+    #[clap(
+        long,
+        value_name = "MODE",
+        default_value = "reliable",
+        help = "UDP diff transport mode: reliable (default) or datagram"
+    )]
+    #[getset(get = "pub(crate)")]
+    diff_mode: String,
 }
 
 impl Source for Cli {
@@ -185,6 +201,10 @@ impl Source for Cli {
                 Some(&origin),
                 ValueKind::U64(u32::into(self.nat_warmup_count)),
             ),
+        );
+        let _old = map.insert(
+            "diff_mode".to_string(),
+            Value::new(Some(&origin), ValueKind::String(self.diff_mode.clone())),
         );
         Ok(map)
     }

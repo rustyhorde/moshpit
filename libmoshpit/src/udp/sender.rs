@@ -30,6 +30,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use super::DiffMode;
 use crate::EncryptedFrame;
 
 /// Current time as microseconds since the UNIX epoch.
@@ -99,6 +100,11 @@ pub struct UdpSender {
     /// confirmed, giving slow NAT devices extra time to stabilise the binding
     /// before bulk terminal data starts flowing.
     warmup_delay: Option<Duration>,
+    /// UDP diff transport mode for this session.
+    /// In `Datagram` mode the retransmit buffer is disabled — packets are never
+    /// stored for re-send, and incoming retransmit requests are silently drained.
+    #[builder(default)]
+    diff_mode: DiffMode,
 }
 
 impl UdpSender {
@@ -156,9 +162,15 @@ impl UdpSender {
                 },
                 // Collect incoming retransmit requests into a HashSet, deduplicating
                 // repeated NAKs for the same sequence number before we actually send.
+                // In Datagram mode the client never sends NAKs, so this branch
+                // drains the channel without acting on the requests.
                 seqs = self.retransmit_rx.recv(), if retransmit_active => {
                     match seqs {
-                        Some(seqs) => self.pending_retransmit.extend(seqs),
+                        Some(seqs) => {
+                            if self.diff_mode == DiffMode::Reliable {
+                                self.pending_retransmit.extend(seqs);
+                            }
+                        }
                         None => retransmit_active = false,
                     }
                 },
@@ -179,10 +191,12 @@ impl UdpSender {
                             let seq = self.send_seq;
                             self.send_seq += 1;
                             let wire = self.encrypt(&frame, seq)?;
-                            let _prev = self.retransmit_buffer.insert(seq, wire.clone());
-                            // Evict packets that fell outside the retransmit window
-                            let cutoff = seq.saturating_sub(RETRANSMIT_WINDOW);
-                            self.retransmit_buffer.retain(|&s, _| s >= cutoff);
+                            if self.diff_mode == DiffMode::Reliable {
+                                let _prev = self.retransmit_buffer.insert(seq, wire.clone());
+                                // Evict packets that fell outside the retransmit window
+                                let cutoff = seq.saturating_sub(RETRANSMIT_WINDOW);
+                                self.retransmit_buffer.retain(|&s, _| s >= cutoff);
+                            }
                             self.drain_roam_updates(&mut current_peer);
                             self.send_wire(&wire, current_peer).await?;
                         }

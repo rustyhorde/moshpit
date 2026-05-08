@@ -39,7 +39,7 @@ use uuid::Uuid;
 use crate::kex::HostKeyMismatchFn;
 use crate::{
     ConnectionReader, Frame, KexEvent, MoshpitError, ServerKex, UuidWrapper, kex::TofuFn,
-    load_private_key, load_public_key, session::SessionRegistry,
+    load_private_key, load_public_key, session::SessionRegistry, udp::DiffMode,
 };
 
 const AEAD_KEY_INFO: &[u8] = b"AEAD KEY";
@@ -62,6 +62,12 @@ pub struct KexReader {
     tofu_fn: Option<TofuFn>,
     /// Callback for known-host key mismatch replacement prompt.
     host_key_mismatch_fn: Option<HostKeyMismatchFn>,
+    /// UDP diff transport mode requested by this client.  When `Datagram`, the
+    /// client sends a `Frame::ClientOptions(1)` before the `Check` frame so the
+    /// server can enable the fire-and-forget path for this session.
+    /// Defaults to `Reliable` (no `ClientOptions` frame sent).
+    #[builder(default)]
+    diff_mode: DiffMode,
 }
 
 impl std::fmt::Debug for KexReader {
@@ -88,6 +94,7 @@ impl std::fmt::Debug for KexReader {
                     "None"
                 },
             )
+            .field("diff_mode", &self.diff_mode)
             .finish()
     }
 }
@@ -166,6 +173,11 @@ impl KexReader {
                     let rnk = RandomizedNonceKey::new(&AES_256_GCM_SIV, &key_bytes)?;
                     let nonce = rnk.seal_in_place_append_tag(Aad::empty(), &mut check)?;
 
+                    if self.diff_mode == DiffMode::Datagram {
+                        self.tx
+                            .send(Frame::ClientOptions(1))
+                            .map_err(|_| Unspecified)?;
+                    }
                     self.tx
                         .send(Frame::Check(*nonce.as_ref(), check))
                         .map_err(|_| Unspecified)?;
@@ -344,22 +356,58 @@ impl KexReader {
                 }
             };
 
-        trace!("server_kex: waiting for Check frame");
-        match self.reader.read_frame().await? {
+        // Read the next frame: clients that requested datagram mode send
+        // `ClientOptions` before `Check`; older/reliable clients send `Check`
+        // directly.  Any other frame type is a protocol error.
+        trace!("server_kex: waiting for ClientOptions or Check frame");
+        let negotiated_diff_mode = match self.reader.read_frame().await? {
+            Some(Frame::ClientOptions(mode_byte)) => {
+                let mode = if mode_byte == 1 {
+                    trace!("server_kex: client requested DiffMode::Datagram");
+                    DiffMode::Datagram
+                } else {
+                    trace!("server_kex: ClientOptions mode_byte={mode_byte}, using Reliable");
+                    DiffMode::Reliable
+                };
+                // Now read the Check frame
+                match self.reader.read_frame().await? {
+                    Some(Frame::Check(nonce, enc)) => {
+                        trace!("server_kex: received Check frame after ClientOptions, verifying");
+                        self.handle_check(&rnk, nonce, enc, &self.tx_event.clone())?;
+                        trace!("server_kex: Check verified, KeyAgreement sent");
+                    }
+                    Some(other) => {
+                        error!(
+                            "server_kex: expected Check after ClientOptions but got frame id={}",
+                            other.id()
+                        );
+                        return Err(MoshpitError::InvalidFrame.into());
+                    }
+                    None => {
+                        error!("server_kex: client closed connection after ClientOptions");
+                        return Err(MoshpitError::InvalidFrame.into());
+                    }
+                }
+                mode
+            }
             Some(Frame::Check(nonce, enc)) => {
-                trace!("server_kex: received Check frame, verifying");
+                trace!("server_kex: received Check frame (no ClientOptions), verifying");
                 self.handle_check(&rnk, nonce, enc, &self.tx_event.clone())?;
                 trace!("server_kex: Check verified, KeyAgreement sent");
+                DiffMode::Reliable
             }
             Some(other) => {
-                error!("server_kex: expected Check but got frame id={}", other.id());
+                error!(
+                    "server_kex: expected ClientOptions or Check but got frame id={}",
+                    other.id()
+                );
                 return Err(MoshpitError::InvalidFrame.into());
             }
             None => {
                 error!("server_kex: client closed connection before sending Check");
                 return Err(MoshpitError::InvalidFrame.into());
             }
-        }
+        };
 
         // Determine session UUID: reuse the requested session if user matches,
         // else create new.  Any live connection on the same session will be
@@ -397,6 +445,7 @@ impl KexReader {
             .shell(shell)
             .session_uuid(session_uuid)
             .is_resume(is_resume)
+            .diff_mode(negotiated_diff_mode)
             .build();
 
         Ok((skex, udp_arc))

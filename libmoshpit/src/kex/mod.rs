@@ -35,7 +35,7 @@ use uuid::Uuid;
 
 use crate::{
     ConnectionReader, ConnectionWriter, Frame, KexConfig, KexReader, KexSender, MoshpitError,
-    UuidWrapper, decrypt_private_key, load_private_key, load_public_key,
+    UuidWrapper, decrypt_private_key, load_private_key, load_public_key, udp::DiffMode,
 };
 
 /// The callback type for TOFU (Trust-On-First-Use) interactive host key validation.
@@ -161,6 +161,11 @@ pub struct ServerKex {
     #[getset(get_copy = "pub")]
     #[builder(default)]
     is_resume: bool,
+    /// UDP diff transport mode negotiated during key exchange.
+    /// Set from the client's `ClientOptions` frame; defaults to `Reliable`.
+    #[getset(get_copy = "pub")]
+    #[builder(default)]
+    diff_mode: DiffMode,
 }
 
 impl KexStateMachine {
@@ -398,6 +403,7 @@ async fn run_client_kex<T: KexConfig>(
         host_key_mismatch_fn,
     } = callbacks;
 
+    let diff_mode = config.diff_mode();
     let _read_handle = spawn(async move {
         let mut frame_reader = KexReader::builder()
             .reader(reader)
@@ -407,6 +413,7 @@ async fn run_client_kex<T: KexConfig>(
             .maybe_server_destination(server_id)
             .maybe_tofu_fn(tofu_fn)
             .maybe_host_key_mismatch_fn(host_key_mismatch_fn)
+            .diff_mode(diff_mode)
             .build();
         if let Err(e) = frame_reader.client_kex(&pk).await {
             error!("client_kex failed: {e}");
