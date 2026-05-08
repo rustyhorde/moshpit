@@ -10,7 +10,7 @@ use std::{
     collections::{HashMap, VecDeque},
     fmt,
     sync::Arc,
-    sync::atomic::{AtomicBool, AtomicU64},
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize},
 };
 
 use libmoshpit::{EncryptedFrame, TerminalMessage};
@@ -56,6 +56,12 @@ pub(crate) struct SessionRecord {
     /// client. Atomically swapped to `false` by the screen-sync task each tick to
     /// suppress redundant snapshots while the diff stream is actively delivering content.
     pub diff_in_flight: Arc<AtomicBool>,
+    /// Current effective maximum PTY-chunk payload size (bytes) used by `spawn_pty_reader`
+    /// when splitting large PTY reads into UDP datagrams.  Starts at the conservative
+    /// baseline (`MAX_UDP_PAYLOAD` = 1200 B) and is updated upward by the MTU probe
+    /// watchdog when the path proves it can handle larger datagrams without loss.
+    /// Stored in `SessionRecord` so reconnects reuse the already-probed value.
+    pub effective_mtu: Arc<AtomicUsize>,
 }
 
 impl fmt::Debug for SessionRecord {
@@ -80,7 +86,7 @@ mod test {
     use std::{
         collections::VecDeque,
         sync::Arc,
-        sync::atomic::{AtomicBool, AtomicU64},
+        sync::atomic::{AtomicBool, AtomicU64, AtomicUsize},
     };
 
     use libmoshpit::{EncryptedFrame, TerminalMessage};
@@ -127,6 +133,7 @@ mod test {
         let server_emulator = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
         let dirty_counter = Arc::new(AtomicU64::new(1));
         let diff_in_flight = Arc::new(AtomicBool::new(false));
+        let effective_mtu = Arc::new(AtomicUsize::new(1200));
         let record = SessionRecord {
             term_tx,
             output_handle,
@@ -134,6 +141,7 @@ mod test {
             server_emulator,
             dirty_counter,
             diff_in_flight,
+            effective_mtu,
         };
         let s = format!("{record:?}");
         assert!(s.contains("SessionRecord"));
