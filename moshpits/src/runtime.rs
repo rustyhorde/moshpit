@@ -447,9 +447,10 @@ async fn handle_connection(
                             break;
                         }
                         while repaint_rx.try_recv().is_ok() {}
-                        let contents = {
+                        let (contents, is_alt) = {
                             let emu = ss_emu.lock().await;
-                            emu.screen().contents_formatted()
+                            let screen = emu.screen();
+                            (screen.contents_formatted(), screen.alternate_screen())
                         };
                         let compressed = encode_all(contents.as_slice(), 3)
                             .unwrap_or_else(|_| contents.clone());
@@ -457,7 +458,15 @@ async fn handle_connection(
                             break;
                         }
                         // Reset ack baseline to match client's reset after ScreenStateCompressed.
-                        ack_state = contents;
+                        // Store alt-screen-aware: prefix \033[?1049h so a fresh parser reconstructs
+                        // the correct screen mode when computing future diffs.
+                        let mut ack = contents;
+                        if is_alt {
+                            let mut prefixed = b"\x1b[?1049h".to_vec();
+                            prefixed.extend_from_slice(&ack);
+                            ack = prefixed;
+                        }
+                        ack_state = ack;
                         ack_diff_id = 0;
                         sent_states.clear();
                     }
@@ -471,25 +480,36 @@ async fn handle_connection(
                         }
                     }
                     _ = ticker.tick() => {
-                        let (current, rows, cols) = {
+                        let (current, rows, cols, is_alt) = {
                             let emu = ss_emu.lock().await;
                             let screen = emu.screen();
                             let formatted = screen.contents_formatted();
                             let (r, c) = screen.size();
-                            (formatted, r, c)
+                            let alt = screen.alternate_screen();
+                            (formatted, r, c, alt)
                         };
                         let mut ack_parser = vt100::Parser::new(rows, cols, 0);
                         if !ack_state.is_empty() {
+                            // ack_state may be prefixed with \033[?1049h — process as-is so the
+                            // parser reconstructs the correct screen mode before diffing.
                             ack_parser.process(&ack_state);
                         }
+                        let ack_is_alt = ack_parser.screen().alternate_screen();
                         let mut cur_parser = vt100::Parser::new(rows, cols, 0);
                         cur_parser.process(&current);
-                        let diff_bytes = cur_parser.screen().contents_diff(ack_parser.screen());
-                        if diff_bytes.is_empty() {
+                        let mut diff = Vec::new();
+                        if is_alt && !ack_is_alt {
+                            diff.extend_from_slice(b"\x1b[?1049h");
+                        } else if !is_alt && ack_is_alt {
+                            diff.extend_from_slice(b"\x1b[?1049l");
+                        }
+                        let content_diff = cur_parser.screen().contents_diff(ack_parser.screen());
+                        if content_diff.is_empty() && diff.is_empty() {
                             continue;
                         }
-                        let compressed = encode_all(diff_bytes.as_slice(), 1)
-                            .unwrap_or_else(|_| diff_bytes.clone());
+                        diff.extend_from_slice(&content_diff);
+                        let compressed = encode_all(diff.as_slice(), 1)
+                            .unwrap_or_else(|_| diff.clone());
                         diff_counter += 1;
                         if ss_tx
                             .send(EncryptedFrame::StateSyncDiff((ack_diff_id, diff_counter, compressed)))
@@ -498,7 +518,14 @@ async fn handle_connection(
                         {
                             break;
                         }
-                        sent_states.push_back((diff_counter, current));
+                        // Store alt-screen-aware snapshot so ack-state reconstruction is correct.
+                        let mut snapshot = current;
+                        if is_alt {
+                            let mut prefixed = b"\x1b[?1049h".to_vec();
+                            prefixed.extend_from_slice(&snapshot);
+                            snapshot = prefixed;
+                        }
+                        sent_states.push_back((diff_counter, snapshot));
                         if sent_states.len() > STATESYNC_HISTORY_LEN {
                             drop(sent_states.pop_front());
                         }
@@ -627,6 +654,7 @@ async fn handle_connection(
             skex.user().to_owned(),
             skex.shell().to_owned(),
             term_rx,
+            term_tx.clone(),
             output_handle,
             scrollback,
             server_emulator,
@@ -881,6 +909,46 @@ async fn new_session(
     ))
 }
 
+/// Scan a byte slice for Primary / Secondary DA query sequences (`ESC [ c` / `ESC [ > c`)
+/// emitted by the shell, and return the appropriate response bytes.  Used in `StateSync` mode
+/// so the server answers terminal queries locally instead of forwarding them to the client.
+fn server_intercept_queries(buf: &[u8]) -> Vec<u8> {
+    if !buf.contains(&0x1b) {
+        return Vec::new();
+    }
+    let mut resp = Vec::new();
+    let mut i = 0;
+    while i < buf.len() {
+        if buf[i] == 0x1b && i + 1 < buf.len() && buf[i + 1] == b'[' {
+            i += 2;
+            let marker = if i < buf.len() && matches!(buf[i], b'?' | b'>' | b'=') {
+                let m = buf[i];
+                i += 1;
+                Some(m)
+            } else {
+                None
+            };
+            let p0 = i;
+            while i < buf.len() && (buf[i].is_ascii_digit() || buf[i] == b';') {
+                i += 1;
+            }
+            let params = &buf[p0..i];
+            if i < buf.len() {
+                let term = buf[i];
+                i += 1;
+                match (marker, params, term) {
+                    (None, b"" | b"0", b'c') => resp.extend_from_slice(b"\x1b[?62c"),
+                    (Some(b'>'), b"" | b"0", b'c') => resp.extend_from_slice(b"\x1b[>1;10;0c"),
+                    _ => {}
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    resp
+}
+
 /// Spawn the background thread that reads PTY output, writes scrollback, and forwards
 /// frames to the currently connected client.  Cleans up session state when the shell exits.
 #[cfg_attr(nightly, allow(clippy::too_many_arguments, clippy::too_many_lines))]
@@ -888,6 +956,7 @@ async fn new_session(
 fn spawn_pty_reader(
     session_uuid: Uuid,
     mut term_out: Box<dyn std::io::Read + Send>,
+    term_tx: Sender<TerminalMessage>,
     output_handle: Arc<Mutex<SessionOutputHandle>>,
     scrollback: Arc<Mutex<VecDeque<u8>>>,
     server_emulator: Arc<Mutex<vt100::Parser>>,
@@ -930,6 +999,12 @@ fn spawn_pty_reader(
                         let h = output_handle.blocking_lock();
                         if diff_mode == DiffMode::StateSync {
                             // StateSync: statesync task handles delivery; only feed emulator.
+                            // Intercept terminal queries and respond locally so the shell
+                            // (e.g. fish) does not time out waiting for a DA response.
+                            let resp = server_intercept_queries(buf_slice);
+                            if !resp.is_empty() {
+                                drop(term_tx.try_send(TerminalMessage::Input(resp)));
+                            }
                             drop(h);
                             true
                         } else if let Some(ref sender) = h.data_tx {
@@ -992,6 +1067,18 @@ fn spawn_pty_reader(
             }
         }
 
+        // Notify the connected client that the PTY process has exited so it can exit
+        // immediately instead of waiting for the silence timeout and entering the retry loop.
+        {
+            let h = output_handle.blocking_lock();
+            if let Some(ref tx) = h.control_tx {
+                drop(tx.blocking_send(EncryptedFrame::PtyExit));
+            }
+        }
+        // Give the UdpSender one select! tick to deliver PtyExit before the token cancel
+        // races with the send.
+        sleep(Duration::from_millis(50));
+
         // PTY process has exited — clean up the session.
         {
             let mut h = output_handle.blocking_lock();
@@ -1037,6 +1124,7 @@ fn spawn_pty(
     #[cfg_attr(not(unix), allow(unused_variables))] user: String,
     shell: String,
     mut term_rx: Receiver<TerminalMessage>,
+    term_tx: Sender<TerminalMessage>,
     output_handle: Arc<Mutex<SessionOutputHandle>>,
     scrollback: Arc<Mutex<VecDeque<u8>>>,
     server_emulator: Arc<Mutex<vt100::Parser>>,
@@ -1215,6 +1303,7 @@ fn spawn_pty(
         spawn_pty_reader(
             session_uuid,
             term_out,
+            term_tx,
             output_handle,
             scrollback,
             server_emulator.clone(),

@@ -781,7 +781,8 @@ impl UdpReader {
                             | EncryptedFrame::ScreenState(_)
                             | EncryptedFrame::ScreenStateCompressed(_)
                             | EncryptedFrame::CompressedBytes(_)
-                            | EncryptedFrame::StateSyncDiff(_) => {}
+                            | EncryptedFrame::StateSyncDiff(_)
+                            | EncryptedFrame::PtyExit => {}
                             EncryptedFrame::ClientAck(diff_id) => {
                                 if let Some(ref tx) = self.client_ack_tx
                                     && let Err(e) = tx.try_send(diff_id)
@@ -834,6 +835,7 @@ impl UdpReader {
                             | EncryptedFrame::ScreenStateCompressed(_)
                             | EncryptedFrame::CompressedBytes(_)
                             | EncryptedFrame::StateSyncDiff(_)
+                            | EncryptedFrame::PtyExit
                             | EncryptedFrame::ClientAck(_) => {}
                         }
                     }
@@ -879,7 +881,8 @@ impl UdpReader {
                                     | EncryptedFrame::ScreenState(_)
                                     | EncryptedFrame::ScreenStateCompressed(_)
                                     | EncryptedFrame::CompressedBytes(_)
-                                    | EncryptedFrame::StateSyncDiff(_) => {}
+                                    | EncryptedFrame::StateSyncDiff(_)
+                                    | EncryptedFrame::PtyExit => {}
                                     EncryptedFrame::ClientAck(diff_id) => {
                                         if let Some(ref tx) = self.client_ack_tx
                                             && let Err(e) = tx.try_send(diff_id)
@@ -924,6 +927,7 @@ impl UdpReader {
     pub async fn client_frame_loop(
         &mut self,
         token: CancellationToken,
+        exit_token: CancellationToken,
         stdout_tx: Sender<Vec<u8>>,
         emulator: Arc<Mutex<Emulator>>,
         prediction: Arc<Mutex<PredictionEngine>>,
@@ -1032,7 +1036,14 @@ impl UdpReader {
                                         let mut tmp = vt100::Parser::new(rows, cols, 0);
                                         tmp.process(&payload);
                                         if self.diff_mode == DiffMode::StateSync {
-                                            self.ack_state = tmp.screen().contents_formatted();
+                                            let is_alt = tmp.screen().alternate_screen();
+                                            let mut ack = tmp.screen().contents_formatted();
+                                            if is_alt {
+                                                let mut prefixed = b"\x1b[?1049h".to_vec();
+                                                prefixed.extend_from_slice(&ack);
+                                                ack = prefixed;
+                                            }
+                                            self.ack_state = ack;
                                             self.ack_state_seq = 0;
                                             self.statesync_mismatch_count = 0;
                                         }
@@ -1051,6 +1062,12 @@ impl UdpReader {
                                         error!("Failed to decompress ScreenStateCompressed: {e}");
                                     }
                                 }
+                            }
+                            EncryptedFrame::PtyExit => {
+                                let msg = b"\r\n\x1b[0m[moshpit] Remote session ended.\r\n";
+                                drop(stdout_tx.send(msg.to_vec()).await);
+                                exit_token.cancel();
+                                break 'session;
                             }
                             EncryptedFrame::CompressedBytes((_id, compressed)) => {
                                 match decode_all(compressed.as_slice()) {
@@ -1167,7 +1184,14 @@ impl UdpReader {
                                                 let mut tmp = vt100::Parser::new(rows, cols, 0);
                                                 tmp.process(&payload);
                                                 if self.diff_mode == DiffMode::StateSync {
-                                                    self.ack_state = tmp.screen().contents_formatted();
+                                                    let is_alt = tmp.screen().alternate_screen();
+                                                    let mut ack = tmp.screen().contents_formatted();
+                                                    if is_alt {
+                                                        let mut prefixed = b"\x1b[?1049h".to_vec();
+                                                        prefixed.extend_from_slice(&ack);
+                                                        ack = prefixed;
+                                                    }
+                                                    self.ack_state = ack;
                                                     self.ack_state_seq = 0;
                                                     self.statesync_mismatch_count = 0;
                                                 }
@@ -1238,16 +1262,20 @@ impl UdpReader {
                                                         tmp.process(&self.ack_state);
                                                     }
                                                     tmp.process(&diff_bytes);
-                                                    self.ack_state = tmp.screen().contents_formatted();
+                                                    let is_alt = tmp.screen().alternate_screen();
+                                                    let mut new_ack = tmp.screen().contents_formatted();
+                                                    if is_alt {
+                                                        let mut prefixed = b"\x1b[?1049h".to_vec();
+                                                        prefixed.extend_from_slice(&new_ack);
+                                                        new_ack = prefixed;
+                                                    }
+                                                    self.ack_state = new_ack;
                                                     self.ack_state_seq = diff_id;
-                                                    let repaint = {
-                                                        let mut rend = renderer.lock().unwrap();
-                                                        rend.render(tmp.screen(), &[], None)
-                                                    };
-                                                    if !repaint.is_empty()
-                                                        && let Err(e) = stdout_tx.send(repaint).await
-                                                    {
-                                                        error!("Error sending StateSyncDiff repaint to stdout channel: {e}");
+                                                    // Write diff bytes directly — they are valid ANSI
+                                                    // sequences (including any alt-screen prefix) that
+                                                    // the client terminal must execute as-is.
+                                                    if let Err(e) = stdout_tx.send(diff_bytes).await {
+                                                        error!("Error sending StateSyncDiff to stdout channel: {e}");
                                                     }
                                                     if let Some(ref tx) = self.nak_out_tx
                                                         && let Err(e) = tx.try_send(EncryptedFrame::ClientAck(diff_id))
@@ -1270,6 +1298,12 @@ impl UdpReader {
                                                 }
                                             }
                                         }
+                                    }
+                                    EncryptedFrame::PtyExit => {
+                                        let msg = b"\r\n\x1b[0m[moshpit] Remote session ended.\r\n";
+                                        drop(stdout_tx.send(msg.to_vec()).await);
+                                        exit_token.cancel();
+                                        break 'session;
                                     }
                                 }
                             }

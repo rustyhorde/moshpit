@@ -83,6 +83,9 @@ pub enum EncryptedFrame {
     /// Server looks up the matching `contents_formatted()` snapshot and advances its ack
     /// baseline, so future diffs start from the confirmed client state.
     ClientAck(u64),
+    /// Server → client: the remote PTY process has exited.
+    /// Client should exit cleanly without entering the reconnect loop.
+    PtyExit,
 }
 
 impl EncryptedFrame {
@@ -103,6 +106,7 @@ impl EncryptedFrame {
             EncryptedFrame::CompressedBytes(_) => 10,
             EncryptedFrame::StateSyncDiff(_) => 11,
             EncryptedFrame::ClientAck(_) => 12,
+            EncryptedFrame::PtyExit => 13,
         }
     }
 
@@ -242,6 +246,7 @@ mod tests {
         );
         assert_eq!(EncryptedFrame::StateSyncDiff((0, 0, vec![])).id(), 11);
         assert_eq!(EncryptedFrame::ClientAck(0).id(), 12);
+        assert_eq!(EncryptedFrame::PtyExit.id(), 13);
     }
 
     #[test]

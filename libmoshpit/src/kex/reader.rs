@@ -559,25 +559,52 @@ impl KexReader {
         socket_addr: SocketAddr,
         port_pool: Arc<Mutex<BTreeSet<u16>>>,
     ) -> Result<Arc<UdpSocket>> {
-        let mut port_p = port_pool.lock().await;
-        let next_port = port_p.pop_first().unwrap_or(49999);
-
-        // Advertise the IP that the client used to reach us (the TCP connection's
-        // local address).  This is the IP the client can actually route UDP packets
-        // to, regardless of which bind address the listener was configured with.
-        let udp_addr_for_client = SocketAddr::new(socket_addr.ip(), next_port);
-        trace!("advertising moshpits UDP socket at {udp_addr_for_client}");
-        self.tx.send(Frame::MoshpitsAddr(udp_addr_for_client))?;
-
         // Bind to all interfaces so we can receive from the client regardless of
         // NAT, multi-homing, or routing asymmetry.
         let unspecified = match socket_addr {
             SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
         };
-        let bind_addr = SocketAddr::new(unspecified, next_port);
-        trace!("binding moshpits UDP socket at {bind_addr}");
-        let udp_listener = UdpSocket::bind(bind_addr).await?;
+
+        // Snapshot pool candidates without holding the lock during async bind attempts
+        // so concurrent connections do not block each other.
+        let candidates: Vec<u16> = {
+            let port_p = port_pool.lock().await;
+            port_p.iter().copied().collect()
+        };
+
+        // Try ports in ascending order; use the first one the OS accepts.
+        let mut bound: Option<(u16, UdpSocket)> = None;
+        for port in candidates {
+            let bind_addr = SocketAddr::new(unspecified, port);
+            trace!("trying moshpits UDP bind at {bind_addr}");
+            match UdpSocket::bind(bind_addr).await {
+                Ok(sock) => {
+                    bound = Some((port, sock));
+                    break;
+                }
+                Err(e) => {
+                    trace!("port {port} unavailable: {e}");
+                }
+            }
+        }
+
+        let (next_port, udp_listener) = bound.ok_or_else(|| {
+            anyhow::anyhow!("no available UDP port in pool (50000–59999 exhausted)")
+        })?;
+
+        // Remove the successfully-bound port from the pool.
+        {
+            let mut port_p = port_pool.lock().await;
+            let _ = port_p.remove(&next_port);
+        }
+
+        // Advertise after confirming the bind succeeded — avoids pointing the
+        // client at a port that subsequently fails to open.
+        let udp_addr_for_client = SocketAddr::new(socket_addr.ip(), next_port);
+        trace!("advertising moshpits UDP socket at {udp_addr_for_client}");
+        self.tx.send(Frame::MoshpitsAddr(udp_addr_for_client))?;
+
         let sock = SockRef::from(&udp_listener);
         drop(sock.set_recv_buffer_size(4 * 1024 * 1024));
         drop(sock.set_send_buffer_size(4 * 1024 * 1024));
@@ -585,7 +612,7 @@ impl KexReader {
         // traffic priority on QoS-aware networks.  Silently ignored on platforms
         // where the socket option is unavailable.
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        if bind_addr.is_ipv4() {
+        if socket_addr.is_ipv4() {
             drop(sock.set_tos_v4(0xB8));
         } else {
             drop(sock.set_tclass_v6(0xB8));
@@ -1273,13 +1300,13 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn handle_udp_setup_pops_first_port_from_pool() {
+    async fn handle_udp_setup_uses_first_available_port() {
         let (client_reader, _client_writer, _server_reader, _server_writer) =
             make_bidirectional_loopback().await;
         let (mut kex_reader, mut rx_frames, _rx_events) = make_test_kex_reader(client_reader);
 
         // Ask the OS for a free port so the test doesn't conflict with a running
-        // moshpit server that may already hold a port in the 50000-59999 range.
+        // moshpit server that may already hold a port in the 50000–59999 range.
         let free_port = {
             let probe = UdpSocket::bind("0.0.0.0:0").await.unwrap();
             probe.local_addr().unwrap().port()
@@ -1302,31 +1329,73 @@ mod tests {
             other => panic!("expected MoshpitsAddr, got {other:?}"),
         };
         assert_eq!(advertised_port, free_port);
-        // Socket should be bound (local_addr succeeds)
         assert!(udp_arc.local_addr().is_ok());
     }
 
     #[tokio::test]
-    async fn handle_udp_setup_empty_pool_falls_back_to_port_49999() {
+    async fn handle_udp_setup_empty_pool_returns_error() {
         let (client_reader, _client_writer, _server_reader, _server_writer) =
             make_bidirectional_loopback().await;
-        let (mut kex_reader, mut rx_frames, _rx_events) = make_test_kex_reader(client_reader);
+        let (mut kex_reader, _rx_frames, _rx_events) = make_test_kex_reader(client_reader);
 
         let pool: BTreeSet<u16> = BTreeSet::new();
         let port_pool = StdArc::new(TokioMutex::new(pool));
         let socket_addr: std::net::SocketAddr = "127.0.0.1:9000".parse().unwrap();
 
-        let _udp_arc = kex_reader
-            .handle_udp_setup(socket_addr, port_pool)
+        let result = kex_reader.handle_udp_setup(socket_addr, port_pool).await;
+        assert!(result.is_err(), "expected error when pool is empty");
+    }
+
+    #[tokio::test]
+    async fn handle_udp_setup_skips_in_use_port() {
+        let (client_reader, _client_writer, _server_reader, _server_writer) =
+            make_bidirectional_loopback().await;
+        let (mut kex_reader, mut rx_frames, _rx_events) = make_test_kex_reader(client_reader);
+
+        // Get two OS-assigned free ports.
+        let sock_a = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        let sock_b = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        let port_a = sock_a.local_addr().unwrap().port();
+        let port_b = sock_b.local_addr().unwrap().port();
+
+        // Ensure the lower-numbered port (tried first by BTreeSet iteration) stays
+        // occupied; drop the higher-numbered socket so handle_udp_setup can bind it.
+        let (occupied_port, occupied_sock, free_port) = if port_a < port_b {
+            drop(sock_b);
+            (port_a, sock_a, port_b)
+        } else {
+            drop(sock_a);
+            (port_b, sock_b, port_a)
+        };
+
+        let mut pool = BTreeSet::new();
+        let _ = pool.insert(occupied_port);
+        let _ = pool.insert(free_port);
+        let port_pool = StdArc::new(TokioMutex::new(pool));
+        let socket_addr: std::net::SocketAddr = "127.0.0.1:9000".parse().unwrap();
+
+        // occupied_sock is still alive — occupied_port is held at the OS level.
+        let udp_arc = kex_reader
+            .handle_udp_setup(socket_addr, port_pool.clone())
             .await
             .unwrap();
+        drop(occupied_sock); // explicit: ensure it outlives handle_udp_setup
 
         let frame = rx_frames.recv().await.unwrap();
         let advertised_port = match frame {
             Frame::MoshpitsAddr(a) => a.port(),
             other => panic!("expected MoshpitsAddr, got {other:?}"),
         };
-        assert_eq!(advertised_port, 49999);
+        assert_eq!(
+            advertised_port, free_port,
+            "should have skipped the in-use port"
+        );
+        assert!(udp_arc.local_addr().is_ok());
+        // The occupied port was never successfully bound — it must remain in the pool.
+        assert!(
+            port_pool.lock().await.contains(&occupied_port),
+            "in-use port should remain in pool"
+        );
     }
 
     // -----------------------------------------------------------------------

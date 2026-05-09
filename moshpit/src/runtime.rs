@@ -904,10 +904,12 @@ async fn run_udp_session(
     let pred_reader = prediction.clone();
     let rend_reader = renderer.clone();
     let stdout_tx_reader = stdout_tx.clone();
+    let exit_token_reader = exit_token.clone();
     let _reader = spawn(async move {
         udp_reader
             .client_frame_loop(
                 reader_token,
+                exit_token_reader,
                 stdout_tx_reader,
                 emu_reader,
                 pred_reader,
