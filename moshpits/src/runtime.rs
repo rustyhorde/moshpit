@@ -107,6 +107,9 @@ const STATESYNC_HISTORY_LEN: usize = 32;
 /// Diffs exceeding this are replaced with a `ScreenStateCompressed` full-state push so
 /// fragmented (and NAT-dropped) packets cannot stall the ack pipeline.
 const MAX_STATESYNC_DIFF_BYTES: usize = 900;
+/// Maximum payload bytes per `StateChunk` frame.  Each chunk plus ~149 bytes of
+/// wire/crypto/bincode overhead produces a datagram well within `MAX_UDP_PAYLOAD` (1200 B).
+const STATE_CHUNK_SIZE: usize = 800;
 /// How long with no UDP frame received from the client before the server cancels the connection.
 const CLIENT_SILENCE_TIMEOUT_US: u64 = 30_000_000;
 
@@ -479,7 +482,7 @@ async fn handle_connection(
                         };
                         let compressed = encode_all(contents.as_slice(), 3)
                             .unwrap_or_else(|_| contents.clone());
-                        if ss_tx.send(EncryptedFrame::ScreenStateCompressed(compressed)).await.is_err() {
+                        if !send_state_chunked(&ss_tx, compressed).await {
                             break;
                         }
                         // Reset ack baseline to match client's reset after ScreenStateCompressed.
@@ -548,15 +551,11 @@ async fn handle_connection(
                             .unwrap_or_else(|_| diff.clone());
                         if compressed.len() > MAX_STATESYNC_DIFF_BYTES {
                             // Diff too large for a single UDP datagram (e.g., full alt-screen
-                            // repaint from htop over NAT).  Fall back to a full-state push so
-                            // fragmented/dropped packets cannot stall the ack pipeline.
+                            // repaint from htop over NAT).  Fall back to a chunked full-state push
+                            // so fragmented/dropped packets cannot stall the ack pipeline.
                             let full_compressed = encode_all(current.as_slice(), 3)
                                 .unwrap_or_else(|_| current.clone());
-                            if ss_tx
-                                .send(EncryptedFrame::ScreenStateCompressed(full_compressed))
-                                .await
-                                .is_err()
-                            {
+                            if !send_state_chunked(&ss_tx, full_compressed).await {
                                 break;
                             }
                             let mut ack = current;
@@ -782,6 +781,40 @@ fn spawn_connection_watchdogs(
 }
 
 /// Cancel the connection token if no UDP frame has been received from the client within
+/// Send `compressed` as [`EncryptedFrame::ScreenStateCompressed`] if it fits within
+/// [`MAX_STATESYNC_DIFF_BYTES`], otherwise split it into [`EncryptedFrame::StateChunk`]
+/// frames of at most [`STATE_CHUNK_SIZE`] bytes so every datagram fits within the UDP MTU
+/// even over NAT connections that drop IP fragments.
+///
+/// Returns `false` if the sender channel has closed.
+async fn send_state_chunked(ss_tx: &Sender<EncryptedFrame>, compressed: Vec<u8>) -> bool {
+    if compressed.len() <= MAX_STATESYNC_DIFF_BYTES {
+        ss_tx
+            .send(EncryptedFrame::ScreenStateCompressed(compressed))
+            .await
+            .is_ok()
+    } else {
+        let chunks: Vec<Vec<u8>> = compressed
+            .chunks(STATE_CHUNK_SIZE)
+            .map(<[u8]>::to_vec)
+            .collect();
+        // Max compressed size is MAX_ENCFRAME_LENGTH (64 KiB) / STATE_CHUNK_SIZE (800 B) = 82
+        // chunks, well within u16 range.
+        let total = u16::try_from(chunks.len()).unwrap_or(u16::MAX);
+        for (seq, chunk) in chunks.into_iter().enumerate() {
+            let seq_u16 = u16::try_from(seq).unwrap_or(u16::MAX);
+            if ss_tx
+                .send(EncryptedFrame::StateChunk((seq_u16, total, chunk)))
+                .await
+                .is_err()
+            {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 /// [`CLIENT_SILENCE_TIMEOUT_US`] microseconds.  Fires every 5 s; low overhead.
 fn spawn_silence_watchdog(token: CancellationToken, last_rx_us: Arc<AtomicU64>) {
     let _watchdog = spawn(async move {

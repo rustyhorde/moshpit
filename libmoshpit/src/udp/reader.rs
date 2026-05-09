@@ -178,6 +178,21 @@ pub struct UdpReader {
     /// When this reaches 3, the client sends a `RepaintRequest` and the counter resets.
     #[builder(default)]
     statesync_mismatch_count: u32,
+    /// True once the client has received and processed the first complete full-state push
+    /// (`ScreenStateCompressed` or a complete `StateChunk` assembly) in `StateSync` mode.
+    /// Guards `StateSyncDiff` from being applied to a blank initial state when the initial
+    /// full-state push is dropped by a NAT device.
+    #[builder(default)]
+    initial_state_received: bool,
+    /// Total chunk count for the in-progress `StateChunk` assembly.  Zero = no assembly active.
+    #[builder(default)]
+    pending_chunk_total: u16,
+    /// Next expected `seq` value for the in-progress `StateChunk` assembly.
+    #[builder(default)]
+    pending_chunk_seq: u16,
+    /// Accumulated payload bytes from the in-progress `StateChunk` assembly.
+    #[builder(default)]
+    pending_chunk_data: Vec<u8>,
     /// Server-mode: channel for forwarding `ClientAck(diff_id)` values from the UDP
     /// receive loop to the state-sync task in `moshpits/src/runtime.rs`, which uses
     /// them to advance the server's ack baseline.
@@ -796,7 +811,8 @@ impl UdpReader {
                             | EncryptedFrame::ScreenStateCompressed(_)
                             | EncryptedFrame::CompressedBytes(_)
                             | EncryptedFrame::StateSyncDiff(_)
-                            | EncryptedFrame::PtyExit => {}
+                            | EncryptedFrame::PtyExit
+                            | EncryptedFrame::StateChunk(_) => {}
                             EncryptedFrame::ClientAck(diff_id) => {
                                 if let Some(ref tx) = self.client_ack_tx
                                     && let Err(e) = tx.try_send(diff_id)
@@ -850,6 +866,7 @@ impl UdpReader {
                             | EncryptedFrame::CompressedBytes(_)
                             | EncryptedFrame::StateSyncDiff(_)
                             | EncryptedFrame::PtyExit
+                            | EncryptedFrame::StateChunk(_)
                             | EncryptedFrame::ClientAck(_) => {}
                         }
                     }
@@ -899,7 +916,8 @@ impl UdpReader {
                                     | EncryptedFrame::ScreenStateCompressed(_)
                                     | EncryptedFrame::CompressedBytes(_)
                                     | EncryptedFrame::StateSyncDiff(_)
-                                    | EncryptedFrame::PtyExit => {}
+                                    | EncryptedFrame::PtyExit
+                                    | EncryptedFrame::StateChunk(_) => {}
                                     EncryptedFrame::ClientAck(diff_id) => {
                                         if let Some(ref tx) = self.client_ack_tx
                                             && let Err(e) = tx.try_send(diff_id)
@@ -920,6 +938,82 @@ impl UdpReader {
             }
         }
         Ok(())
+    }
+
+    /// Process one `StateChunk` frame in `StateSync` client mode.
+    ///
+    /// Accumulates chunks in order.  When the assembly is complete the combined payload
+    /// is processed identically to a [`EncryptedFrame::ScreenStateCompressed`] frame:
+    /// decompressed, fed into a scratch [`vt100::Parser`], ack state reset, and rendered
+    /// via the shared renderer.  Out-of-order chunks trigger a [`EncryptedFrame::RepaintRequest`].
+    async fn handle_state_chunk(
+        &mut self,
+        seq: u16,
+        total: u16,
+        data: Vec<u8>,
+        emulator: &Arc<Mutex<Emulator>>,
+        renderer: &Arc<Mutex<Renderer>>,
+        stdout_tx: &Sender<Vec<u8>>,
+    ) {
+        if seq == 0 {
+            self.pending_chunk_total = total;
+            self.pending_chunk_seq = 0;
+            self.pending_chunk_data = data;
+        } else if seq == self.pending_chunk_seq && total == self.pending_chunk_total {
+            self.pending_chunk_data.extend_from_slice(&data);
+        } else {
+            // Out-of-order or stale chunk — discard assembly and request a fresh push.
+            self.pending_chunk_total = 0;
+            self.pending_chunk_seq = 0;
+            self.pending_chunk_data.clear();
+            if let Some(ref tx) = self.nak_out_tx {
+                drop(tx.try_send(EncryptedFrame::RepaintRequest));
+            }
+            return;
+        }
+        self.pending_chunk_seq += 1;
+        if self.pending_chunk_seq == self.pending_chunk_total {
+            // Assembly complete — process as ScreenStateCompressed.
+            let payload_compressed = std::mem::take(&mut self.pending_chunk_data);
+            self.pending_chunk_seq = 0;
+            self.pending_chunk_total = 0;
+            match decode_all(payload_compressed.as_slice()) {
+                Ok(payload) => {
+                    let (rows, cols) = {
+                        let emu = emulator.lock().unwrap();
+                        emu.screen().size()
+                    };
+                    let mut tmp = vt100::Parser::new(rows, cols, 0);
+                    tmp.process(&payload);
+                    if self.diff_mode == DiffMode::StateSync {
+                        let is_alt = tmp.screen().alternate_screen();
+                        let mut ack = tmp.screen().contents_formatted();
+                        if is_alt {
+                            let mut prefixed = b"\x1b[?1049h".to_vec();
+                            prefixed.extend_from_slice(&ack);
+                            ack = prefixed;
+                        }
+                        self.ack_state = ack;
+                        self.ack_state_seq = 0;
+                        self.statesync_mismatch_count = 0;
+                        self.initial_state_received = true;
+                    }
+                    let repaint = {
+                        let mut rend = renderer.lock().unwrap();
+                        rend.invalidate();
+                        rend.render(tmp.screen(), &[], None)
+                    };
+                    if !repaint.is_empty()
+                        && let Err(e) = stdout_tx.send(repaint).await
+                    {
+                        error!("Error sending StateChunk repaint to stdout channel: {e}");
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to decompress StateChunk assembly: {e}");
+                }
+            }
+        }
     }
 
     /// Run the client frame reading loop
@@ -1063,6 +1157,7 @@ impl UdpReader {
                                             self.ack_state = ack;
                                             self.ack_state_seq = 0;
                                             self.statesync_mismatch_count = 0;
+                                            self.initial_state_received = true;
                                         }
                                         let repaint = {
                                             let mut rend = renderer.lock().unwrap();
@@ -1085,6 +1180,17 @@ impl UdpReader {
                                 drop(stdout_tx.send(msg.to_vec()).await);
                                 exit_token.cancel();
                                 break 'session;
+                            }
+                            EncryptedFrame::StateChunk((seq, total, data)) => {
+                                self.handle_state_chunk(
+                                    seq,
+                                    total,
+                                    data,
+                                    &emulator,
+                                    &renderer,
+                                    &stdout_tx,
+                                )
+                                .await;
                             }
                             EncryptedFrame::CompressedBytes((_id, compressed)) => {
                                 match decode_all(compressed.as_slice()) {
@@ -1211,6 +1317,7 @@ impl UdpReader {
                                                     self.ack_state = ack;
                                                     self.ack_state_seq = 0;
                                                     self.statesync_mismatch_count = 0;
+                                                    self.initial_state_received = true;
                                                 }
                                                 let repaint = {
                                                     let mut rend = renderer.lock().unwrap();
@@ -1266,7 +1373,12 @@ impl UdpReader {
                                         .await;
                                     }
                                     EncryptedFrame::StateSyncDiff((base_id, diff_id, compressed)) => {
-                                        if base_id == self.ack_state_seq {
+                                        if !self.initial_state_received {
+                                            // Full state not yet received — discard and trigger a push.
+                                            if let Some(ref tx) = self.nak_out_tx {
+                                                drop(tx.try_send(EncryptedFrame::RepaintRequest));
+                                            }
+                                        } else if base_id == self.ack_state_seq {
                                             self.statesync_mismatch_count = 0;
                                             match decode_all(compressed.as_slice()) {
                                                 Ok(diff_bytes) => {
@@ -1288,10 +1400,14 @@ impl UdpReader {
                                                     }
                                                     self.ack_state = new_ack;
                                                     self.ack_state_seq = diff_id;
-                                                    // Write diff bytes directly — they are valid ANSI
-                                                    // sequences (including any alt-screen prefix) that
-                                                    // the client terminal must execute as-is.
-                                                    if let Err(e) = stdout_tx.send(diff_bytes).await {
+                                                    // Route through the renderer so displayed tracks
+                                                    // alt-screen state and ScreenStateCompressed
+                                                    // repaints compute correct diffs afterward.
+                                                    let repaint = {
+                                                        let mut rend = renderer.lock().unwrap();
+                                                        rend.render(tmp.screen(), &[], None)
+                                                    };
+                                                    if let Err(e) = stdout_tx.send(repaint).await {
                                                         error!("Error sending StateSyncDiff to stdout channel: {e}");
                                                     }
                                                     if let Some(ref tx) = self.nak_out_tx
@@ -1321,6 +1437,17 @@ impl UdpReader {
                                         drop(stdout_tx.send(msg.to_vec()).await);
                                         exit_token.cancel();
                                         break 'session;
+                                    }
+                                    EncryptedFrame::StateChunk((seq, total, data)) => {
+                                        self.handle_state_chunk(
+                                            seq,
+                                            total,
+                                            data,
+                                            &emulator,
+                                            &renderer,
+                                            &stdout_tx,
+                                        )
+                                        .await;
                                     }
                                 }
                             }

@@ -86,6 +86,11 @@ pub enum EncryptedFrame {
     /// Server → client: the remote PTY process has exited.
     /// Client should exit cleanly without entering the reconnect loop.
     PtyExit,
+    /// Server → client: one chunk of a multi-part full-state push too large for a single UDP
+    /// datagram.  `seq` is 0-based; `total` is the total chunk count.  Client buffers until
+    /// `seq == total - 1`, then concatenates in order and processes the assembled bytes
+    /// identically to a [`EncryptedFrame::ScreenStateCompressed`] payload.
+    StateChunk((u16, u16, Vec<u8>)),
 }
 
 impl EncryptedFrame {
@@ -107,6 +112,7 @@ impl EncryptedFrame {
             EncryptedFrame::StateSyncDiff(_) => 11,
             EncryptedFrame::ClientAck(_) => 12,
             EncryptedFrame::PtyExit => 13,
+            EncryptedFrame::StateChunk(_) => 14,
         }
     }
 
@@ -247,6 +253,7 @@ mod tests {
         assert_eq!(EncryptedFrame::StateSyncDiff((0, 0, vec![])).id(), 11);
         assert_eq!(EncryptedFrame::ClientAck(0).id(), 12);
         assert_eq!(EncryptedFrame::PtyExit.id(), 13);
+        assert_eq!(EncryptedFrame::StateChunk((0, 1, vec![])).id(), 14);
     }
 
     #[test]
