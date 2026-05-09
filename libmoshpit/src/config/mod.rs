@@ -135,7 +135,10 @@ mod tests {
     use tokio::sync::Mutex;
     use uuid::Uuid;
 
-    use super::{KexConfig, KexMode, PathDefaults, SessionRegistry, default_config_file_path};
+    use super::{
+        KexConfig, KexMode, PathDefaults, SessionRegistry, config_file_path,
+        default_config_file_path,
+    };
 
     // ── minimal KexConfig implementor ─────────────────────────────────────────
 
@@ -220,5 +223,43 @@ mod tests {
                 "path must contain the default file path component"
             );
         }
+    }
+
+    struct AbsolutePathDefaults;
+
+    impl PathDefaults for AbsolutePathDefaults {
+        fn env_prefix(&self) -> String {
+            "TEST".to_string()
+        }
+        fn config_absolute_path(&self) -> Option<String> {
+            Some("/tmp/my-moshpit-config.toml".to_string())
+        }
+        fn default_file_path(&self) -> String {
+            "unused".to_string()
+        }
+        fn default_file_name(&self) -> String {
+            "unused".to_string()
+        }
+        fn tracing_absolute_path(&self) -> Option<String> {
+            None
+        }
+        fn default_tracing_path(&self) -> String {
+            "unused".to_string()
+        }
+        fn default_tracing_file_name(&self) -> String {
+            "unused".to_string()
+        }
+    }
+
+    #[test]
+    fn config_file_path_uses_absolute_path_when_provided() {
+        let defaults = AbsolutePathDefaults;
+        let path =
+            config_file_path(&defaults).expect("config_file_path must succeed with absolute path");
+        assert_eq!(
+            path,
+            PathBuf::from("/tmp/my-moshpit-config.toml"),
+            "config_file_path must return the exact absolute path from config_absolute_path()"
+        );
     }
 }

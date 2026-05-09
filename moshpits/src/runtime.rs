@@ -1562,10 +1562,11 @@ mod test {
     };
 
     use super::{
-        MTU_PROBE_FAIL_THRESHOLD, MTU_PROBE_QUIET_TICKS, MTU_PROBE_SUCCESS_TICKS, MTU_TIERS,
-        PROACTIVE_REPAINT_NAK_THRESHOLD, mtu_probe_step, new_full_registry, new_session,
-        resolve_session, spawn_connection_watchdogs, spawn_mtu_probe_task,
-        spawn_proactive_repaint_watchdog,
+        MAX_STATESYNC_DIFF_BYTES, MTU_PROBE_FAIL_THRESHOLD, MTU_PROBE_QUIET_TICKS,
+        MTU_PROBE_SUCCESS_TICKS, MTU_TIERS, PROACTIVE_REPAINT_NAK_THRESHOLD, STATE_CHUNK_SIZE,
+        mtu_probe_step, new_full_registry, new_session, now_micros, resolve_session,
+        send_state_chunked, server_intercept_queries, spawn_connection_watchdogs,
+        spawn_mtu_probe_task, spawn_proactive_repaint_watchdog, spawn_silence_watchdog,
     };
 
     #[cfg(unix)]
@@ -2101,5 +2102,147 @@ mod test {
             result.is_err() || result.unwrap().is_none(),
             "watchdog kept sending after cancellation"
         );
+    }
+
+    // ── send_state_chunked ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn send_state_chunked_small_payload_sends_screen_state_compressed() {
+        let (tx, mut rx) = channel::<EncryptedFrame>(8);
+        let payload = vec![0u8; MAX_STATESYNC_DIFF_BYTES];
+        let sent = send_state_chunked(&tx, payload.clone()).await;
+        assert!(sent);
+        let frame = rx.try_recv().expect("expected a frame");
+        assert!(
+            matches!(frame, EncryptedFrame::ScreenStateCompressed(ref d) if *d == payload),
+            "expected ScreenStateCompressed, got {frame:?}"
+        );
+        assert!(rx.try_recv().is_err(), "expected exactly one frame");
+    }
+
+    #[tokio::test]
+    async fn send_state_chunked_large_payload_sends_state_chunks() {
+        let (tx, mut rx) = channel::<EncryptedFrame>(128);
+        let payload = vec![0xABu8; MAX_STATESYNC_DIFF_BYTES + STATE_CHUNK_SIZE + 1];
+        let sent = send_state_chunked(&tx, payload.clone()).await;
+        assert!(sent);
+
+        let expected_chunks = payload.chunks(STATE_CHUNK_SIZE).count();
+        let total = u16::try_from(expected_chunks).unwrap();
+        let mut received = 0usize;
+        while let Ok(frame) = rx.try_recv() {
+            let EncryptedFrame::StateChunk((seq, t, data)) = frame else {
+                panic!("expected StateChunk, got {frame:?}");
+            };
+            assert_eq!(seq, u16::try_from(received).unwrap());
+            assert_eq!(t, total);
+            let expected_slice = &payload[received * STATE_CHUNK_SIZE
+                ..((received + 1) * STATE_CHUNK_SIZE).min(payload.len())];
+            assert_eq!(data, expected_slice);
+            received += 1;
+        }
+        assert_eq!(received, expected_chunks);
+    }
+
+    #[tokio::test]
+    async fn send_state_chunked_closed_channel_returns_false() {
+        let (tx, rx) = channel::<EncryptedFrame>(8);
+        drop(rx);
+        let payload = vec![0u8; MAX_STATESYNC_DIFF_BYTES + 1];
+        let sent = send_state_chunked(&tx, payload).await;
+        assert!(!sent);
+    }
+
+    // ── server_intercept_queries ──────────────────────────────────────────────
+
+    #[test]
+    fn server_intercept_queries_no_escape_returns_empty() {
+        assert!(server_intercept_queries(b"hello world").is_empty());
+    }
+
+    #[test]
+    fn server_intercept_queries_primary_da_returns_vt220() {
+        assert_eq!(server_intercept_queries(b"\x1b[c"), b"\x1b[?62c");
+        assert_eq!(server_intercept_queries(b"\x1b[0c"), b"\x1b[?62c");
+    }
+
+    #[test]
+    fn server_intercept_queries_secondary_da_returns_response() {
+        assert_eq!(server_intercept_queries(b"\x1b[>c"), b"\x1b[>1;10;0c");
+        assert_eq!(server_intercept_queries(b"\x1b[>0c"), b"\x1b[>1;10;0c");
+    }
+
+    #[test]
+    fn server_intercept_queries_unknown_sequence_returns_empty() {
+        // Mode set — not a DA query
+        assert!(server_intercept_queries(b"\x1b[?25h").is_empty());
+        // Cursor position report — not a DA query
+        assert!(server_intercept_queries(b"\x1b[6n").is_empty());
+    }
+
+    #[test]
+    fn server_intercept_queries_multiple_queries_returns_both_responses() {
+        let input = b"\x1b[c\x1b[>c";
+        let resp = server_intercept_queries(input);
+        assert!(
+            resp.starts_with(b"\x1b[?62c"),
+            "missing primary DA response"
+        );
+        assert!(
+            resp.ends_with(b"\x1b[>1;10;0c"),
+            "missing secondary DA response"
+        );
+    }
+
+    // ── spawn_silence_watchdog ────────────────────────────────────────────────
+
+    #[tokio::test(start_paused = true)]
+    async fn silence_watchdog_fires_on_stale_timestamp() {
+        let token = CancellationToken::new();
+        let last_rx_us = Arc::new(AtomicU64::new(0));
+        spawn_silence_watchdog(token.clone(), last_rx_us);
+
+        // Advance past two 5-second ticker intervals + the 30-second silence threshold.
+        tokio::time::advance(Duration::from_secs(35)).await;
+        // Yield so the spawned task can run.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            token.is_cancelled(),
+            "watchdog should have cancelled the token"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silence_watchdog_does_not_fire_when_recently_active() {
+        let token = CancellationToken::new();
+        let last_rx_us = Arc::new(AtomicU64::new(now_micros()));
+        spawn_silence_watchdog(token.clone(), last_rx_us.clone());
+
+        // Advance one tick (5s) — well within the 30s silence threshold.
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            !token.is_cancelled(),
+            "watchdog should not fire within 30s silence threshold"
+        );
+        token.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silence_watchdog_stops_on_explicit_cancel() {
+        let token = CancellationToken::new();
+        let last_rx_us = Arc::new(AtomicU64::new(0));
+        spawn_silence_watchdog(token.clone(), last_rx_us);
+
+        token.cancel();
+        // Even with a stale timestamp the watchdog should not panic or loop.
+        tokio::time::advance(Duration::from_mins(1)).await;
+        tokio::task::yield_now().await;
+        // Token is cancelled — just verify no crash.
+        assert!(token.is_cancelled());
     }
 }

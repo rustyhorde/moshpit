@@ -349,4 +349,17 @@ mod tests {
             crate::error::Error::FrameTooLarge.to_string()
         );
     }
+
+    #[test]
+    fn test_parse_unknown_frame_id_returns_none() {
+        // Frame IDs 0–8 are known; anything above 8 must be silently ignored (Ok(None)).
+        let all_data = [9u8, 0, 0, 0, 0, 0, 0, 0, 0]; // id=9, length=0, no payload
+        let mut cursor = Cursor::new(&all_data[..]);
+        let result = Frame::parse(&mut cursor);
+        assert!(result.is_ok(), "unknown frame id must not be an error");
+        assert!(
+            result.unwrap().is_none(),
+            "unknown frame id must return Ok(None)"
+        );
+    }
 }

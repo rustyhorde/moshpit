@@ -1621,4 +1621,99 @@ mod tests {
         assert!(matches!(events[3], KexEvent::SessionInfo(_, false)));
         assert!(matches!(events[4], KexEvent::MoshpitsAddr(_)));
     }
+
+    #[tokio::test]
+    async fn client_kex_server_closes_before_session_token_returns_error() {
+        let (client_reader, _client_writer, _server_reader, mut server_writer) =
+            make_bidirectional_loopback().await;
+        let (mut kex_reader, _rx_frames, _rx_events) = make_test_kex_reader(client_reader);
+
+        let server_epk = PrivateKey::generate(&X25519).unwrap();
+        let server_pub = server_epk.compute_public_key().unwrap();
+        let salt = vec![0u8; 32];
+        server_writer
+            .write_frame(&Frame::PeerInitialize(server_pub.as_ref().to_vec(), salt))
+            .await
+            .unwrap();
+        server_writer
+            .write_frame(&Frame::KeyAgreement(UuidWrapper::new(uuid::Uuid::new_v4())))
+            .await
+            .unwrap();
+        // Close without sending SessionToken
+        drop(server_writer);
+
+        let epk = PrivateKey::generate(&X25519).unwrap();
+        let result = kex_reader.client_kex(&epk).await;
+        assert!(
+            result.is_err(),
+            "expected error when server closes before SessionToken"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_kex_server_closes_before_moshpits_addr_returns_error() {
+        let (client_reader, _client_writer, _server_reader, mut server_writer) =
+            make_bidirectional_loopback().await;
+        let (mut kex_reader, _rx_frames, _rx_events) = make_test_kex_reader(client_reader);
+
+        let server_epk = PrivateKey::generate(&X25519).unwrap();
+        let server_pub = server_epk.compute_public_key().unwrap();
+        let salt = vec![0u8; 32];
+        server_writer
+            .write_frame(&Frame::PeerInitialize(server_pub.as_ref().to_vec(), salt))
+            .await
+            .unwrap();
+        server_writer
+            .write_frame(&Frame::KeyAgreement(UuidWrapper::new(uuid::Uuid::new_v4())))
+            .await
+            .unwrap();
+        server_writer
+            .write_frame(&Frame::SessionToken(UuidWrapper::new(uuid::Uuid::new_v4())))
+            .await
+            .unwrap();
+        // Close without sending MoshpitsAddr
+        drop(server_writer);
+
+        let epk = PrivateKey::generate(&X25519).unwrap();
+        let result = kex_reader.client_kex(&epk).await;
+        assert!(
+            result.is_err(),
+            "expected error when server closes before MoshpitsAddr"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_kex_wrong_frame_instead_of_session_token_returns_key_not_established() {
+        use crate::MoshpitError;
+
+        let (client_reader, _client_writer, _server_reader, mut server_writer) =
+            make_bidirectional_loopback().await;
+        let (mut kex_reader, _rx_frames, _rx_events) = make_test_kex_reader(client_reader);
+
+        let server_epk = PrivateKey::generate(&X25519).unwrap();
+        let server_pub = server_epk.compute_public_key().unwrap();
+        let salt = vec![0u8; 32];
+        server_writer
+            .write_frame(&Frame::PeerInitialize(server_pub.as_ref().to_vec(), salt))
+            .await
+            .unwrap();
+        server_writer
+            .write_frame(&Frame::KeyAgreement(UuidWrapper::new(uuid::Uuid::new_v4())))
+            .await
+            .unwrap();
+        // Send wrong frame instead of SessionToken
+        server_writer.write_frame(&Frame::KexFailure).await.unwrap();
+        drop(server_writer);
+
+        let epk = PrivateKey::generate(&X25519).unwrap();
+        let result = kex_reader.client_kex(&epk).await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .downcast_ref::<MoshpitError>()
+                .is_some_and(|e| *e == MoshpitError::KeyNotEstablished),
+            "expected KeyNotEstablished error"
+        );
+    }
 }

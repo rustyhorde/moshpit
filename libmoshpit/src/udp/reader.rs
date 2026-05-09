@@ -2478,4 +2478,313 @@ mod tests {
             "clamped spike must grow nak_timeout above MIN — death spiral broken"
         );
     }
+
+    // ── handle_arrival: ScreenState obsoletes prior gaps ─────────────────────
+
+    #[tokio::test]
+    async fn handle_arrival_screen_state_obsoletes_gaps() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let mut reader = UdpReader::builder()
+            .socket(socket)
+            .id(Uuid::new_v4())
+            .rnk([0u8; 32])
+            .unwrap()
+            .hmac([0u8; 64])
+            .build();
+
+        // seq 0 delivered normally
+        drop(reader.handle_arrival(EncryptedFrame::Keepalive(0), 0));
+        // Seq 3 arrives out-of-order → gaps 1 and 2 recorded
+        drop(reader.handle_arrival(EncryptedFrame::Keepalive(0), 3));
+        assert_eq!(reader.gap_first_seen.len(), 2);
+
+        // ScreenState at seq 5 must discard gaps 1, 2, 3 and deliver itself
+        let ready = reader.handle_arrival(EncryptedFrame::ScreenState(vec![]), 5);
+        assert!(
+            ready
+                .iter()
+                .any(|f| matches!(f, EncryptedFrame::ScreenState(_))),
+            "ScreenState must be in the returned ready list"
+        );
+        assert!(
+            reader.gap_first_seen.is_empty(),
+            "all gaps must be discarded after ScreenState"
+        );
+        assert_eq!(reader.next_seq, 6);
+    }
+
+    #[tokio::test]
+    async fn handle_arrival_screen_state_drains_following_buffered_frames() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let mut reader = UdpReader::builder()
+            .socket(socket)
+            .id(Uuid::new_v4())
+            .rnk([0u8; 32])
+            .unwrap()
+            .hmac([0u8; 64])
+            .build();
+
+        // seq 0 delivered
+        drop(reader.handle_arrival(EncryptedFrame::Keepalive(0), 0));
+        // Pre-buffer seq 6 (next after the upcoming ScreenState at 5)
+        drop(reader.handle_arrival(EncryptedFrame::Keepalive(0), 6));
+
+        // ScreenState at seq 5 — should deliver itself AND drain buffered seq 6
+        let ready = reader.handle_arrival(EncryptedFrame::ScreenState(vec![]), 5);
+        assert_eq!(
+            ready.len(),
+            2,
+            "ready must contain the ScreenState and the following buffered frame"
+        );
+        assert_eq!(reader.next_seq, 7);
+        assert!(reader.recv_buffer.is_empty());
+    }
+
+    #[tokio::test]
+    async fn handle_arrival_screen_state_compressed_also_obsoletes_gaps() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let mut reader = UdpReader::builder()
+            .socket(socket)
+            .id(Uuid::new_v4())
+            .rnk([0u8; 32])
+            .unwrap()
+            .hmac([0u8; 64])
+            .build();
+
+        drop(reader.handle_arrival(EncryptedFrame::Keepalive(0), 0));
+        drop(reader.handle_arrival(EncryptedFrame::Keepalive(0), 3));
+        assert!(!reader.gap_first_seen.is_empty());
+
+        let ready = reader.handle_arrival(EncryptedFrame::ScreenStateCompressed(vec![]), 5);
+        assert!(
+            ready
+                .iter()
+                .any(|f| matches!(f, EncryptedFrame::ScreenStateCompressed(_))),
+        );
+        assert!(reader.gap_first_seen.is_empty());
+    }
+
+    // ── handle_arrival: burst gap threshold + immediate NAK ──────────────────
+
+    #[tokio::test]
+    async fn handle_arrival_burst_triggers_repaint_request_at_threshold() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (nak_tx, mut nak_rx) = tokio::sync::mpsc::channel::<EncryptedFrame>(32);
+        let mut reader = UdpReader::builder()
+            .socket(socket)
+            .id(Uuid::new_v4())
+            .rnk([0u8; 32])
+            .unwrap()
+            .hmac([0u8; 64])
+            .nak_out_tx(nak_tx)
+            .build();
+
+        // Deliver frames out-of-order to fill recv_buffer to RECV_BUFFER_REPAINT_THRESHOLD.
+        // next_seq starts at 0; deliver seq RECV_BUFFER_REPAINT_THRESHOLD through
+        // RECV_BUFFER_REPAINT_THRESHOLD * 2 so there are that many frames in the buffer.
+        let threshold = RECV_BUFFER_REPAINT_THRESHOLD;
+        for i in 0..=threshold {
+            let seq = u64::try_from(threshold + 1 + i).unwrap();
+            drop(reader.handle_arrival(EncryptedFrame::Keepalive(0), seq));
+        }
+
+        // Drain NAK frames; verify at least one RepaintRequest was sent.
+        let mut saw_repaint = false;
+        while let Ok(frame) = nak_rx.try_recv() {
+            if matches!(frame, EncryptedFrame::RepaintRequest) {
+                saw_repaint = true;
+            }
+        }
+        assert!(
+            saw_repaint,
+            "expected RepaintRequest when recv_buffer reaches threshold"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_arrival_new_gap_triggers_immediate_nak() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (nak_tx, mut nak_rx) = tokio::sync::mpsc::channel::<EncryptedFrame>(32);
+        let mut reader = UdpReader::builder()
+            .socket(socket)
+            .id(Uuid::new_v4())
+            .rnk([0u8; 32])
+            .unwrap()
+            .hmac([0u8; 64])
+            .nak_out_tx(nak_tx)
+            .build();
+
+        // seq=5 arrives when next_seq=0 → gaps 0..4 are new → immediate NAK
+        drop(reader.handle_arrival(EncryptedFrame::Keepalive(0), 5));
+
+        let frame = nak_rx.try_recv().expect("expected an immediate NAK frame");
+        let EncryptedFrame::Nak(seqs) = frame else {
+            panic!("expected Nak frame, got {frame:?}");
+        };
+        assert_eq!(seqs.len(), 5, "expected gaps 0..4 in NAK");
+        for i in 0u64..5 {
+            assert!(seqs.contains(&i), "gap {i} missing from NAK");
+        }
+    }
+
+    // ── drain_given_up_seqs: consecutive give-ups with buffered frames ────────
+
+    #[test]
+    fn drain_given_up_seqs_consecutive_give_ups_with_buffered_frames() {
+        let mut reader = make_reader_sync();
+
+        // Set up: seq 0 and seq 2 are given up (retry count at MAX), seq 1 is buffered.
+        let past = Instant::now().checked_sub(Duration::from_mins(1)).unwrap();
+        let _r = reader.gap_first_seen.insert(0, past);
+        let _r = reader.gap_nak_count.insert(0, MAX_NAK_RETRIES);
+        let _r = reader.recv_buffer.insert(1, EncryptedFrame::Keepalive(0));
+        let _r = reader.gap_first_seen.insert(2, past);
+        let _r = reader.gap_nak_count.insert(2, MAX_NAK_RETRIES);
+        let _r = reader.recv_buffer.insert(3, EncryptedFrame::Keepalive(0));
+
+        let delivered = reader.drain_given_up_seqs();
+
+        // seq 1 and 3 (buffered after the give-ups) should be delivered
+        assert_eq!(
+            delivered.len(),
+            2,
+            "buffered frames after give-ups should be delivered"
+        );
+        assert_eq!(reader.next_seq, 4);
+        assert!(reader.gap_first_seen.is_empty());
+        assert!(reader.gap_nak_count.is_empty());
+    }
+
+    // ── check_nak_timeouts: multiple timed-out gaps send a single Nak ─────────
+
+    #[tokio::test]
+    async fn check_nak_timeouts_multiple_gaps_sends_single_nak() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (nak_tx, mut nak_rx) = tokio::sync::mpsc::channel::<EncryptedFrame>(16);
+        let mut reader = UdpReader::builder()
+            .socket(socket)
+            .id(Uuid::new_v4())
+            .rnk([0u8; 32])
+            .unwrap()
+            .hmac([0u8; 64])
+            .nak_out_tx(nak_tx)
+            .build();
+
+        // Insert 3 gaps with an old timestamp so they all time out immediately.
+        let past = Instant::now().checked_sub(Duration::from_secs(10)).unwrap();
+        for seq in [1u64, 3, 5] {
+            let _r = reader.gap_first_seen.insert(seq, past);
+            let _r = reader.gap_nak_count.insert(seq, 0);
+        }
+
+        drop(reader.check_nak_timeouts());
+
+        // Collect all frames sent by check_nak_timeouts (Nak + optional RepaintRequest).
+        let mut frames = Vec::new();
+        while let Ok(f) = nak_rx.try_recv() {
+            frames.push(f);
+        }
+        let nak_frame = frames
+            .into_iter()
+            .find(|f| matches!(f, EncryptedFrame::Nak(_)))
+            .expect("expected a Nak frame");
+        let EncryptedFrame::Nak(seqs) = nak_frame else {
+            unreachable!()
+        };
+        assert_eq!(seqs.len(), 3, "all 3 gaps should appear in a single NAK");
+        for s in [1u64, 3, 5] {
+            assert!(seqs.contains(&s), "gap {s} missing from NAK");
+        }
+    }
+
+    // ── RTT: ceiling exact boundary ───────────────────────────────────────────
+
+    #[test]
+    fn update_rtt_estimate_sample_at_exact_ceiling_is_not_clamped() {
+        let mut reader = make_reader_sync();
+        // Default ceiling = NAK_TIMEOUT (50ms) × 8 = 400ms.
+        // A sample exactly at 400ms must NOT be clamped (condition is `> ceiling`).
+        reader.update_rtt_estimate(Duration::from_millis(400));
+        // The estimator should have used 400ms directly (not clamped), producing
+        // SRTT=400ms → nak_timeout = MAX (500ms).
+        assert_eq!(
+            reader.nak_timeout.unwrap(),
+            MAX_NAK_TIMEOUT,
+            "sample equal to ceiling should not be clamped and should raise nak_timeout"
+        );
+    }
+
+    // ── handle_state_chunk ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn handle_state_chunk_single_chunk_completes_assembly() {
+        use std::sync::Mutex as StdMutex;
+        use zstd::encode_all;
+
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let mut reader = UdpReader::builder()
+            .socket(socket)
+            .id(Uuid::new_v4())
+            .rnk([0u8; 32])
+            .unwrap()
+            .hmac([0u8; 64])
+            .build();
+
+        let emulator = Arc::new(StdMutex::new(Emulator::new(24, 80)));
+        let renderer = Arc::new(StdMutex::new(Renderer::new(24, 80)));
+        let (stdout_tx, _stdout_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+
+        let raw = b"hello";
+        let compressed = encode_all(raw.as_slice(), 0).unwrap();
+
+        // Single-chunk assembly: seq=0, total=1
+        reader
+            .handle_state_chunk(0, 1, compressed, &emulator, &renderer, &stdout_tx)
+            .await;
+
+        // After completion the assembly state must be reset
+        assert_eq!(reader.pending_chunk_seq, 0);
+        assert_eq!(reader.pending_chunk_total, 0);
+        assert!(reader.pending_chunk_data.is_empty());
+    }
+
+    #[tokio::test]
+    async fn handle_state_chunk_out_of_order_clears_and_requests_repaint() {
+        use std::sync::Mutex as StdMutex;
+
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (nak_tx, mut nak_rx) = tokio::sync::mpsc::channel::<EncryptedFrame>(8);
+        let mut reader = UdpReader::builder()
+            .socket(socket)
+            .id(Uuid::new_v4())
+            .rnk([0u8; 32])
+            .unwrap()
+            .hmac([0u8; 64])
+            .nak_out_tx(nak_tx)
+            .build();
+
+        let emulator = Arc::new(StdMutex::new(Emulator::new(24, 80)));
+        let renderer = Arc::new(StdMutex::new(Renderer::new(24, 80)));
+        let (stdout_tx, _stdout_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+
+        // Start assembly: seq=0, total=3
+        reader
+            .handle_state_chunk(0, 3, vec![0xAA; 10], &emulator, &renderer, &stdout_tx)
+            .await;
+
+        // Out-of-order: seq=2 (skipping seq=1) → discard and send RepaintRequest
+        reader
+            .handle_state_chunk(2, 3, vec![0xBB; 10], &emulator, &renderer, &stdout_tx)
+            .await;
+
+        assert!(
+            reader.pending_chunk_data.is_empty(),
+            "assembly must be cleared"
+        );
+        let frame = nak_rx.try_recv().expect("expected RepaintRequest");
+        assert!(
+            matches!(frame, EncryptedFrame::RepaintRequest),
+            "expected RepaintRequest after out-of-order chunk"
+        );
+    }
 }
