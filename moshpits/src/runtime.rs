@@ -97,11 +97,29 @@ const SCREEN_SYNC_BURST_DIRTY_THRESHOLD: u64 = 5;
 const DATAGRAM_REPAINT_INTERVAL: Duration = Duration::from_millis(150);
 /// Tick interval for the state-sync task in `StateSync` mode.  Each tick computes
 /// `contents_diff(ack_state, current)` and sends the result if non-empty.
-const STATESYNC_INTERVAL: Duration = Duration::from_millis(10);
+const STATESYNC_INTERVAL: Duration = Duration::from_millis(50);
 /// Maximum number of `(diff_id, contents_formatted)` entries kept in the server's
 /// sent-states ring buffer.  When `ClientAck(diff_id)` arrives, the server looks up
 /// this entry to advance its ack baseline.
 const STATESYNC_HISTORY_LEN: usize = 32;
+/// Maximum compressed byte count for a `StateSyncDiff` payload that fits in a single UDP
+/// datagram.  `MAX_UDP_PAYLOAD` (1200) minus ~149 bytes of wire/crypto/bincode overhead.
+/// Diffs exceeding this are replaced with a `ScreenStateCompressed` full-state push so
+/// fragmented (and NAT-dropped) packets cannot stall the ack pipeline.
+const MAX_STATESYNC_DIFF_BYTES: usize = 900;
+/// How long with no UDP frame received from the client before the server cancels the connection.
+const CLIENT_SILENCE_TIMEOUT_US: u64 = 30_000_000;
+
+/// Current time as microseconds since the UNIX epoch.
+fn now_micros() -> u64 {
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros(),
+    )
+    .unwrap_or(0)
+}
 
 #[allow(unsafe_code)]
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -383,6 +401,7 @@ async fn handle_connection(
     let (client_ack_tx, mut client_ack_rx) = channel::<u64>(16);
     let nak_received_count = Arc::new(AtomicU64::new(0));
     let nak_received_count_for_mtu = nak_received_count.clone();
+    let last_rx_us = Arc::new(AtomicU64::new(now_micros()));
     let mut udp_reader = UdpReader::builder()
         .socket(udp_recv)
         .id(kex.uuid())
@@ -396,6 +415,7 @@ async fn handle_connection(
         .nak_received_count(nak_received_count.clone())
         .diff_mode(diff_mode)
         .client_ack_tx(client_ack_tx)
+        .last_rx_us(last_rx_us.clone())
         .build();
     let mut udp_sender = UdpSender::builder()
         .socket(udp_send)
@@ -423,6 +443,7 @@ async fn handle_connection(
     let _udp_handle = spawn(async move { udp_sender.frame_loop(sender_token).await });
 
     spawn_connection_watchdogs(control_tx.clone(), conn_token.clone(), server_token);
+    spawn_silence_watchdog(conn_token.clone(), last_rx_us);
 
     if diff_mode == DiffMode::StateSync {
         // Mosh-style ack-based diff delivery.  Each tick computes
@@ -439,6 +460,10 @@ async fn handle_connection(
             let mut ack_diff_id: u64 = 0;
             let mut ack_state: Vec<u8> = Vec::new();
             let mut diff_counter: u64 = 0;
+            // CPU optimisation: skip parser creation when neither the screen content
+            // nor the ack baseline has changed since the last tick.
+            let mut last_current: Vec<u8> = Vec::new();
+            let mut ack_dirty = true;
             loop {
                 select! {
                     () = ss_token.cancelled() => break,
@@ -469,6 +494,7 @@ async fn handle_connection(
                         ack_state = ack;
                         ack_diff_id = 0;
                         sent_states.clear();
+                        ack_dirty = true;
                     }
                     diff_id = client_ack_rx.recv() => {
                         let Some(diff_id) = diff_id else { break; };
@@ -477,6 +503,7 @@ async fn handle_connection(
                             ack_state = snapshot;
                             ack_diff_id = diff_id;
                             drop(sent_states.drain(..=pos));
+                            ack_dirty = true;
                         }
                     }
                     _ = ticker.tick() => {
@@ -488,6 +515,13 @@ async fn handle_connection(
                             let alt = screen.alternate_screen();
                             (formatted, r, c, alt)
                         };
+                        // Skip expensive parser work when client is fully caught up and
+                        // the screen hasn't changed since the last tick.
+                        if current == last_current && !ack_dirty && ack_diff_id == diff_counter {
+                            continue;
+                        }
+                        // Clone for cache update; used after `current` may be moved below.
+                        let current_for_cache = current.clone();
                         let mut ack_parser = vt100::Parser::new(rows, cols, 0);
                         if !ack_state.is_empty() {
                             // ack_state may be prefixed with \033[?1049h — process as-is so the
@@ -505,30 +539,58 @@ async fn handle_connection(
                         }
                         let content_diff = cur_parser.screen().contents_diff(ack_parser.screen());
                         if content_diff.is_empty() && diff.is_empty() {
+                            last_current = current_for_cache;
+                            ack_dirty = false;
                             continue;
                         }
                         diff.extend_from_slice(&content_diff);
                         let compressed = encode_all(diff.as_slice(), 1)
                             .unwrap_or_else(|_| diff.clone());
-                        diff_counter += 1;
-                        if ss_tx
-                            .send(EncryptedFrame::StateSyncDiff((ack_diff_id, diff_counter, compressed)))
-                            .await
-                            .is_err()
-                        {
-                            break;
+                        if compressed.len() > MAX_STATESYNC_DIFF_BYTES {
+                            // Diff too large for a single UDP datagram (e.g., full alt-screen
+                            // repaint from htop over NAT).  Fall back to a full-state push so
+                            // fragmented/dropped packets cannot stall the ack pipeline.
+                            let full_compressed = encode_all(current.as_slice(), 3)
+                                .unwrap_or_else(|_| current.clone());
+                            if ss_tx
+                                .send(EncryptedFrame::ScreenStateCompressed(full_compressed))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                            let mut ack = current;
+                            if is_alt {
+                                let mut prefixed = b"\x1b[?1049h".to_vec();
+                                prefixed.extend_from_slice(&ack);
+                                ack = prefixed;
+                            }
+                            ack_state = ack;
+                            ack_diff_id = 0;
+                            sent_states.clear();
+                        } else {
+                            diff_counter += 1;
+                            if ss_tx
+                                .send(EncryptedFrame::StateSyncDiff((ack_diff_id, diff_counter, compressed)))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                            // Store alt-screen-aware snapshot so ack-state reconstruction is correct.
+                            let mut snapshot = current;
+                            if is_alt {
+                                let mut prefixed = b"\x1b[?1049h".to_vec();
+                                prefixed.extend_from_slice(&snapshot);
+                                snapshot = prefixed;
+                            }
+                            sent_states.push_back((diff_counter, snapshot));
+                            if sent_states.len() > STATESYNC_HISTORY_LEN {
+                                drop(sent_states.pop_front());
+                            }
                         }
-                        // Store alt-screen-aware snapshot so ack-state reconstruction is correct.
-                        let mut snapshot = current;
-                        if is_alt {
-                            let mut prefixed = b"\x1b[?1049h".to_vec();
-                            prefixed.extend_from_slice(&snapshot);
-                            snapshot = prefixed;
-                        }
-                        sent_states.push_back((diff_counter, snapshot));
-                        if sent_states.len() > STATESYNC_HISTORY_LEN {
-                            drop(sent_states.pop_front());
-                        }
+                        last_current = current_for_cache;
+                        ack_dirty = false;
                     }
                 }
             }
@@ -711,6 +773,28 @@ fn spawn_connection_watchdogs(
                     )
                     .unwrap_or(0);
                     if control_tx.send(EncryptedFrame::Keepalive(ts)).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Cancel the connection token if no UDP frame has been received from the client within
+/// [`CLIENT_SILENCE_TIMEOUT_US`] microseconds.  Fires every 5 s; low overhead.
+fn spawn_silence_watchdog(token: CancellationToken, last_rx_us: Arc<AtomicU64>) {
+    let _watchdog = spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(5));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            select! {
+                () = token.cancelled() => break,
+                _ = ticker.tick() => {
+                    let elapsed_us = now_micros().saturating_sub(last_rx_us.load(Ordering::Relaxed));
+                    if elapsed_us > CLIENT_SILENCE_TIMEOUT_US {
+                        info!("Client silence timeout (30 s): cancelling connection");
+                        token.cancel();
                         break;
                     }
                 }

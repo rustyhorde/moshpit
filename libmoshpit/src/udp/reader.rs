@@ -182,6 +182,11 @@ pub struct UdpReader {
     /// receive loop to the state-sync task in `moshpits/src/runtime.rs`, which uses
     /// them to advance the server's ack baseline.
     client_ack_tx: Option<Sender<u64>>,
+    /// Timestamp (µs since UNIX epoch) of the last authenticated UDP frame received from
+    /// the peer.  Updated on every successful parse in server mode.  The server-side silence
+    /// watchdog in `moshpits` polls this counter and cancels zombie connections after 30 s
+    /// of client silence.
+    last_rx_us: Option<Arc<AtomicU64>>,
 }
 
 /// Current time as microseconds since the UNIX epoch, used for keepalive RTT timestamps.
@@ -196,6 +201,12 @@ fn now_micros() -> u64 {
 }
 
 impl UdpReader {
+    /// Return a clone of the shared last-receive-time counter, if set.
+    #[must_use]
+    pub fn last_rx_us(&self) -> Option<Arc<AtomicU64>> {
+        self.last_rx_us.clone()
+    }
+
     /// Signal the reconnect channel if set; otherwise exit the process.
     fn signal_reconnect_or_exit(&self, code: i32) {
         if let Some(ref tx) = self.reconnect_tx {
@@ -751,6 +762,9 @@ impl UdpReader {
             let mut first_buf = BytesMut::from(&buf[..first_len]);
             match self.parse_encrypted_frame(&mut first_buf) {
                 Ok(Some((frame, seq))) => {
+                    if let Some(ref counter) = self.last_rx_us {
+                        counter.store(now_micros(), Ordering::Relaxed);
+                    }
                     for ready in self.handle_arrival(frame, seq) {
                         match ready {
                             EncryptedFrame::Bytes((_id, message)) => {
@@ -844,6 +858,9 @@ impl UdpReader {
                 frame_res = self.recv_frame_from() => {
                     match frame_res {
                         Ok(Some((frame, seq, src_addr))) => {
+                            if let Some(ref counter) = self.last_rx_us {
+                                counter.store(now_micros(), Ordering::Relaxed);
+                            }
                             if src_addr != current_peer {
                                 info!("NAT roam: peer {} → {}", current_peer, src_addr);
                                 current_peer = src_addr;
