@@ -10,7 +10,9 @@ use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use getset::{CopyGetters, Getters, Setters};
-use libmoshpit::{DisplayPreference, KexConfig, KexMode, KeyPair, Tracing, TracingConfigExt};
+use libmoshpit::{
+    DiffMode, DisplayPreference, KexConfig, KexMode, KeyPair, Tracing, TracingConfigExt,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::Level;
@@ -61,6 +63,11 @@ pub(crate) struct Config {
     #[serde(default = "Config::default_nat_warmup_count")]
     #[getset(get_copy = "pub(crate)")]
     nat_warmup_count: u32,
+    /// UDP diff transport mode.  Defaults to `Reliable`; set to `Datagram`
+    /// via `--diff-mode datagram` / `MOSHPIT_DIFF_MODE=datagram`.
+    #[serde(default)]
+    #[getset(get_copy = "pub(crate)")]
+    diff_mode: DiffMode,
 }
 
 impl Config {
@@ -104,6 +111,7 @@ impl Default for Config {
             predict: DisplayPreference::default(),
             nat_warmup: false,
             nat_warmup_count: Self::default_nat_warmup_count(),
+            diff_mode: DiffMode::default(),
         }
     }
 }
@@ -131,6 +139,10 @@ impl KexConfig for Config {
 
     fn server_id(&self) -> Option<String> {
         Some(self.server_destination().clone())
+    }
+
+    fn diff_mode(&self) -> DiffMode {
+        self.diff_mode
     }
 }
 

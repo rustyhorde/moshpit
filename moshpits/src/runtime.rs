@@ -30,9 +30,9 @@ use anyhow::{Context as _, Result};
 use bytes::{Buf as _, BytesMut};
 use clap::Parser as _;
 use libmoshpit::{
-    EncryptedFrame, KexMode, MAX_UDP_PAYLOAD, MoshpitError, SessionRegistry, TerminalMessage,
-    UdpReader, UdpSender, UuidWrapper, init_tracing, is_exit_title, load, new_session_registry,
-    run_key_exchange,
+    DiffMode, EncryptedFrame, KexMode, MAX_UDP_PAYLOAD, MoshpitError, SessionRegistry,
+    TerminalMessage, UdpReader, UdpSender, UuidWrapper, init_tracing, is_exit_title, load,
+    new_session_registry, run_key_exchange,
 };
 #[cfg(windows)]
 use portable_pty::CommandBuilder;
@@ -89,6 +89,40 @@ const SCREEN_SYNC_IDLE_INTERVAL: Duration = Duration::from_millis(50);
 const SCREEN_SYNC_BURST_INTERVAL: Duration = Duration::from_millis(10);
 /// Dirty-counter delta threshold above which a tick is classified as a burst.
 const SCREEN_SYNC_BURST_DIRTY_THRESHOLD: u64 = 5;
+/// Interval between periodic full `ScreenStateCompressed` pushes in datagram mode.
+/// Since the client never sends NAKs, this push is the only recovery mechanism for
+/// lost diff packets.  150 ms gives a good balance between recovery latency and
+/// bandwidth: at a 40 KB/s average compressed screen size of ~3 KB, the overhead
+/// is ~20 KB/s — negligible on any modern link.
+const DATAGRAM_REPAINT_INTERVAL: Duration = Duration::from_millis(150);
+/// Tick interval for the state-sync task in `StateSync` mode.  Each tick computes
+/// `contents_diff(ack_state, current)` and sends the result if non-empty.
+const STATESYNC_INTERVAL: Duration = Duration::from_millis(50);
+/// Maximum number of `(diff_id, contents_formatted)` entries kept in the server's
+/// sent-states ring buffer.  When `ClientAck(diff_id)` arrives, the server looks up
+/// this entry to advance its ack baseline.
+const STATESYNC_HISTORY_LEN: usize = 32;
+/// Maximum compressed byte count for a `StateSyncDiff` payload that fits in a single UDP
+/// datagram.  `MAX_UDP_PAYLOAD` (1200) minus ~149 bytes of wire/crypto/bincode overhead.
+/// Diffs exceeding this are replaced with a `ScreenStateCompressed` full-state push so
+/// fragmented (and NAT-dropped) packets cannot stall the ack pipeline.
+const MAX_STATESYNC_DIFF_BYTES: usize = 900;
+/// Maximum payload bytes per `StateChunk` frame.  Each chunk plus ~149 bytes of
+/// wire/crypto/bincode overhead produces a datagram well within `MAX_UDP_PAYLOAD` (1200 B).
+const STATE_CHUNK_SIZE: usize = 800;
+/// How long with no UDP frame received from the client before the server cancels the connection.
+const CLIENT_SILENCE_TIMEOUT_US: u64 = 30_000_000;
+
+/// Current time as microseconds since the UNIX epoch.
+fn now_micros() -> u64 {
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros(),
+    )
+    .unwrap_or(0)
+}
 
 #[allow(unsafe_code)]
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -328,6 +362,7 @@ async fn handle_connection(
 
     let skex = skex_opt.ok_or_else(|| anyhow::anyhow!("missing server kex info"))?;
     let session_uuid = skex.session_uuid();
+    let diff_mode = skex.diff_mode();
 
     let udp_port = udp_arc.local_addr()?.port();
 
@@ -339,9 +374,10 @@ async fn handle_connection(
 
     let conn_token = CancellationToken::new();
 
-    // Oneshot channel that lets UdpSender wait until UdpReader has discovered
-    // the client's real post-NAT address and connected the shared UDP socket.
-    let (peer_discovered_tx, peer_discovered_rx) = oneshot::channel::<()>();
+    // Oneshot carries the initial peer SocketAddr from UdpReader to UdpSender.
+    let (peer_discovered_tx, peer_discovered_rx) = oneshot::channel::<SocketAddr>();
+    // mpsc carries mid-session NAT roam updates from UdpReader to UdpSender.
+    let (peer_addr_tx, peer_addr_rx) = channel::<SocketAddr>(4);
 
     // Resolve channels and decide whether to spawn a new PTY.
     let (
@@ -365,8 +401,10 @@ async fn handle_connection(
     .await?;
 
     let (repaint_tx, mut repaint_rx) = channel::<()>(1);
+    let (client_ack_tx, mut client_ack_rx) = channel::<u64>(16);
     let nak_received_count = Arc::new(AtomicU64::new(0));
     let nak_received_count_for_mtu = nak_received_count.clone();
+    let last_rx_us = Arc::new(AtomicU64::new(now_micros()));
     let mut udp_reader = UdpReader::builder()
         .socket(udp_recv)
         .id(kex.uuid())
@@ -375,8 +413,12 @@ async fn handle_connection(
         .nak_out_tx(data_tx.clone())
         .retransmit_tx(retransmit_tx)
         .peer_discovered_tx(peer_discovered_tx)
+        .peer_addr_tx(peer_addr_tx)
         .repaint_tx(repaint_tx)
         .nak_received_count(nak_received_count.clone())
+        .diff_mode(diff_mode)
+        .client_ack_tx(client_ack_tx)
+        .last_rx_us(last_rx_us.clone())
         .build();
     let mut udp_sender = UdpSender::builder()
         .socket(udp_send)
@@ -387,7 +429,9 @@ async fn handle_connection(
         .hmac(kex.hmac_key())
         .rnk(kex.key())?
         .peer_discovered_rx(peer_discovered_rx)
+        .peer_addr_rx(peer_addr_rx)
         .maybe_warmup_delay(warmup_delay)
+        .diff_mode(diff_mode)
         .build();
 
     let reader_token = conn_token.clone();
@@ -402,95 +446,254 @@ async fn handle_connection(
     let _udp_handle = spawn(async move { udp_sender.frame_loop(sender_token).await });
 
     spawn_connection_watchdogs(control_tx.clone(), conn_token.clone(), server_token);
+    spawn_silence_watchdog(conn_token.clone(), last_rx_us);
 
-    // Periodic screen-state sync: normally every 50 ms, but drops to 10 ms during rapid
-    // bursts (Option H — adaptive tick rate).  The dirty_counter is incremented by
-    // spawn_pty_reader on every PTY output chunk and by spawn_pty on every Resize event,
-    // so the load is a pure atomic read — essentially free — when the terminal is idle.
-    //
-    // When the counter advances by SCREEN_SYNC_BURST_DIRTY_THRESHOLD or more in a single tick
-    // period, the screen is changing quickly: switch to SCREEN_SYNC_BURST_INTERVAL so the
-    // client receives a fresh full-screen snapshot faster than the normal 50 ms cadence.
-    // Return to SCREEN_SYNC_IDLE_INTERVAL once the delta drops below the threshold.
-    //
-    // Option C: when diff chunks are actively flowing to the client, skip the snapshot
-    // entirely to avoid competing with the diff stream on the same UDP path.  The
-    // diff_in_flight flag is set by spawn_pty_reader on each chunk send and cleared here
-    // each tick.  Explicit client repaint requests are handled by _repaint_on_request.
-    let sync_emu = server_emulator.clone();
-    let sync_tx = data_tx.clone();
-    let sync_token = conn_token.clone();
-    let sync_dirty = dirty_counter.clone();
-    let sync_diff = diff_in_flight.clone();
-    let _screen_sync = spawn(async move {
-        let mut last_dirty: u64 = 0;
-        let mut interval = SCREEN_SYNC_IDLE_INTERVAL;
-        loop {
-            select! {
-                () = sync_token.cancelled() => break,
-                () = tokio::time::sleep(interval) => {
-                    let current = sync_dirty.load(Ordering::Relaxed);
-                    let delta = current.wrapping_sub(last_dirty);
-                    // Adapt tick rate based on how active the screen has been.
-                    interval = if delta >= SCREEN_SYNC_BURST_DIRTY_THRESHOLD {
-                        SCREEN_SYNC_BURST_INTERVAL
-                    } else {
-                        SCREEN_SYNC_IDLE_INTERVAL
-                    };
-                    if delta == 0 {
-                        // Screen has not changed since last tick — skip expensive formatting.
-                        continue;
+    if diff_mode == DiffMode::StateSync {
+        // Mosh-style ack-based diff delivery.  Each tick computes
+        // contents_diff(ack_state → current) and sends it if non-empty.
+        // Repaint requests (desync recovery) are handled here instead of by
+        // _repaint_on_request.  ClientAck frames advance the ack baseline.
+        let ss_emu = server_emulator.clone();
+        let ss_tx = data_tx.clone();
+        let ss_token = conn_token.clone();
+        let _state_sync = spawn(async move {
+            let mut ticker = tokio::time::interval(STATESYNC_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut sent_states: VecDeque<(u64, Vec<u8>)> = VecDeque::new();
+            let mut ack_diff_id: u64 = 0;
+            let mut ack_state: Vec<u8> = Vec::new();
+            let mut diff_counter: u64 = 0;
+            // CPU optimisation: skip parser creation when neither the screen content
+            // nor the ack baseline has changed since the last tick.
+            let mut last_current: Vec<u8> = Vec::new();
+            let mut ack_dirty = true;
+            loop {
+                select! {
+                    () = ss_token.cancelled() => break,
+                    msg = repaint_rx.recv() => {
+                        if msg.is_none() {
+                            break;
+                        }
+                        while repaint_rx.try_recv().is_ok() {}
+                        let (contents, is_alt) = {
+                            let emu = ss_emu.lock().await;
+                            let screen = emu.screen();
+                            (screen.contents_formatted(), screen.alternate_screen())
+                        };
+                        let compressed = encode_all(contents.as_slice(), 3)
+                            .unwrap_or_else(|_| contents.clone());
+                        if !send_state_chunked(&ss_tx, compressed).await {
+                            break;
+                        }
+                        // Reset ack baseline to match client's reset after ScreenStateCompressed.
+                        // Store alt-screen-aware: prefix \033[?1049h so a fresh parser reconstructs
+                        // the correct screen mode when computing future diffs.
+                        let mut ack = contents;
+                        if is_alt {
+                            let mut prefixed = b"\x1b[?1049h".to_vec();
+                            prefixed.extend_from_slice(&ack);
+                            ack = prefixed;
+                        }
+                        ack_state = ack;
+                        ack_diff_id = 0;
+                        sent_states.clear();
+                        ack_dirty = true;
                     }
-                    // Diffs are actively flowing — skip snapshot to avoid contending with
-                    // the diff stream.  Advance last_dirty so we detect when diffs stop.
-                    if sync_diff.swap(false, Ordering::Relaxed) {
+                    diff_id = client_ack_rx.recv() => {
+                        let Some(diff_id) = diff_id else { break; };
+                        if let Some(pos) = sent_states.iter().position(|(id, _)| *id == diff_id) {
+                            let snapshot = sent_states[pos].1.clone();
+                            ack_state = snapshot;
+                            ack_diff_id = diff_id;
+                            drop(sent_states.drain(..=pos));
+                            ack_dirty = true;
+                        }
+                    }
+                    _ = ticker.tick() => {
+                        let (current, rows, cols, is_alt) = {
+                            let emu = ss_emu.lock().await;
+                            let screen = emu.screen();
+                            let formatted = screen.contents_formatted();
+                            let (r, c) = screen.size();
+                            let alt = screen.alternate_screen();
+                            (formatted, r, c, alt)
+                        };
+                        // Skip expensive parser work when client is fully caught up and
+                        // the screen hasn't changed since the last tick.
+                        if current == last_current && !ack_dirty && ack_diff_id == diff_counter {
+                            continue;
+                        }
+                        // Clone for cache update; used after `current` may be moved below.
+                        let current_for_cache = current.clone();
+                        let mut ack_parser = vt100::Parser::new(rows, cols, 0);
+                        if !ack_state.is_empty() {
+                            // ack_state may be prefixed with \033[?1049h — process as-is so the
+                            // parser reconstructs the correct screen mode before diffing.
+                            ack_parser.process(&ack_state);
+                        }
+                        let ack_is_alt = ack_parser.screen().alternate_screen();
+                        let mut cur_parser = vt100::Parser::new(rows, cols, 0);
+                        cur_parser.process(&current);
+                        let mut diff = Vec::new();
+                        if is_alt && !ack_is_alt {
+                            diff.extend_from_slice(b"\x1b[?1049h");
+                        } else if !is_alt && ack_is_alt {
+                            diff.extend_from_slice(b"\x1b[?1049l");
+                        }
+                        let content_diff = cur_parser.screen().contents_diff(ack_parser.screen());
+                        if content_diff.is_empty() && diff.is_empty() {
+                            last_current = current_for_cache;
+                            ack_dirty = false;
+                            continue;
+                        }
+                        diff.extend_from_slice(&content_diff);
+                        let compressed = encode_all(diff.as_slice(), 1)
+                            .unwrap_or_else(|_| diff.clone());
+                        if compressed.len() > MAX_STATESYNC_DIFF_BYTES {
+                            // Diff too large for a single UDP datagram (e.g., full alt-screen
+                            // repaint from htop over NAT).  Fall back to a chunked full-state push
+                            // so fragmented/dropped packets cannot stall the ack pipeline.
+                            let full_compressed = encode_all(current.as_slice(), 3)
+                                .unwrap_or_else(|_| current.clone());
+                            if !send_state_chunked(&ss_tx, full_compressed).await {
+                                break;
+                            }
+                            let mut ack = current;
+                            if is_alt {
+                                let mut prefixed = b"\x1b[?1049h".to_vec();
+                                prefixed.extend_from_slice(&ack);
+                                ack = prefixed;
+                            }
+                            ack_state = ack;
+                            ack_diff_id = 0;
+                            sent_states.clear();
+                        } else {
+                            diff_counter += 1;
+                            if ss_tx
+                                .send(EncryptedFrame::StateSyncDiff((ack_diff_id, diff_counter, compressed)))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                            // Store alt-screen-aware snapshot so ack-state reconstruction is correct.
+                            let mut snapshot = current;
+                            if is_alt {
+                                let mut prefixed = b"\x1b[?1049h".to_vec();
+                                prefixed.extend_from_slice(&snapshot);
+                                snapshot = prefixed;
+                            }
+                            sent_states.push_back((diff_counter, snapshot));
+                            if sent_states.len() > STATESYNC_HISTORY_LEN {
+                                drop(sent_states.pop_front());
+                            }
+                        }
+                        last_current = current_for_cache;
+                        ack_dirty = false;
+                    }
+                }
+            }
+        });
+    } else {
+        // Reliable and Datagram modes: periodic screen-state sync.
+        //
+        // Normally every 50 ms, but drops to 10 ms during rapid bursts (Option H).
+        // Option C: skip the snapshot when diff chunks are actively flowing to avoid
+        // competing with the diff stream; the diff_in_flight flag handles detection.
+        let sync_emu = server_emulator.clone();
+        let sync_tx = data_tx.clone();
+        let sync_token = conn_token.clone();
+        let sync_dirty = dirty_counter.clone();
+        let sync_diff = diff_in_flight.clone();
+        let _screen_sync = spawn(async move {
+            let mut last_dirty: u64 = 0;
+            let mut interval = SCREEN_SYNC_IDLE_INTERVAL;
+            loop {
+                select! {
+                    () = sync_token.cancelled() => break,
+                    () = tokio::time::sleep(interval) => {
+                        let current = sync_dirty.load(Ordering::Relaxed);
+                        let delta = current.wrapping_sub(last_dirty);
+                        interval = if delta >= SCREEN_SYNC_BURST_DIRTY_THRESHOLD {
+                            SCREEN_SYNC_BURST_INTERVAL
+                        } else {
+                            SCREEN_SYNC_IDLE_INTERVAL
+                        };
+                        if delta == 0 {
+                            continue;
+                        }
+                        if sync_diff.swap(false, Ordering::Relaxed) {
+                            last_dirty = current;
+                            continue;
+                        }
                         last_dirty = current;
-                        continue;
-                    }
-                    last_dirty = current;
-                    let contents = {
-                        let emu = sync_emu.lock().await;
-                        emu.screen().contents_formatted()
-                    };
-                    let compressed = encode_all(contents.as_slice(), 3)
-                        .unwrap_or_else(|_| contents.clone());
-                    if sync_tx.send(EncryptedFrame::ScreenStateCompressed(compressed)).await.is_err() {
-                        break;
+                        let contents = {
+                            let emu = sync_emu.lock().await;
+                            emu.screen().contents_formatted()
+                        };
+                        let compressed = encode_all(contents.as_slice(), 3)
+                            .unwrap_or_else(|_| contents.clone());
+                        if sync_tx.send(EncryptedFrame::ScreenStateCompressed(compressed)).await.is_err() {
+                            break;
+                        }
                     }
                 }
             }
-        }
-    });
+        });
 
-    // Respond to RepaintRequest frames from the client with an immediate ScreenState.
-    // The repaint_rx channel has capacity 1; bursts of requests are coalesced naturally
-    // since the channel is drained before each response is sent.
-    let repaint_emu = server_emulator.clone();
-    let repaint_tx_out = data_tx.clone();
-    let repaint_token = conn_token.clone();
-    let _repaint_on_request = spawn(async move {
-        loop {
-            select! {
-                () = repaint_token.cancelled() => break,
-                msg = repaint_rx.recv() => {
-                    if msg.is_none() {
-                        break;
-                    }
-                    // Drain any additional queued requests — one ScreenState covers them all.
-                    while repaint_rx.try_recv().is_ok() {}
-                    let contents = {
-                        let emu = repaint_emu.lock().await;
-                        emu.screen().contents_formatted()
-                    };
-                    let compressed = encode_all(contents.as_slice(), 3)
-                        .unwrap_or_else(|_| contents.clone());
-                    if repaint_tx_out.send(EncryptedFrame::ScreenStateCompressed(compressed)).await.is_err() {
-                        break;
+        // Respond to RepaintRequest frames with an immediate ScreenStateCompressed.
+        // Channel capacity 1 coalesces bursts naturally.
+        let repaint_emu = server_emulator.clone();
+        let repaint_tx_out = data_tx.clone();
+        let repaint_token = conn_token.clone();
+        let _repaint_on_request = spawn(async move {
+            loop {
+                select! {
+                    () = repaint_token.cancelled() => break,
+                    msg = repaint_rx.recv() => {
+                        if msg.is_none() {
+                            break;
+                        }
+                        while repaint_rx.try_recv().is_ok() {}
+                        let contents = {
+                            let emu = repaint_emu.lock().await;
+                            emu.screen().contents_formatted()
+                        };
+                        let compressed = encode_all(contents.as_slice(), 3)
+                            .unwrap_or_else(|_| contents.clone());
+                        if repaint_tx_out.send(EncryptedFrame::ScreenStateCompressed(compressed)).await.is_err() {
+                            break;
+                        }
                     }
                 }
             }
+        });
+
+        // Datagram mode: fixed-interval full-screen push as the sole loss-recovery mechanism.
+        if diff_mode == DiffMode::Datagram {
+            let datagram_emu = server_emulator.clone();
+            let datagram_tx = data_tx.clone();
+            let datagram_token = conn_token.clone();
+            let _datagram_repaint = spawn(async move {
+                loop {
+                    select! {
+                        () = datagram_token.cancelled() => break,
+                        () = tokio::time::sleep(DATAGRAM_REPAINT_INTERVAL) => {
+                            let contents = {
+                                let emu = datagram_emu.lock().await;
+                                emu.screen().contents_formatted()
+                            };
+                            let compressed = encode_all(contents.as_slice(), 3)
+                                .unwrap_or_else(|_| contents.clone());
+                            if datagram_tx.send(EncryptedFrame::ScreenStateCompressed(compressed)).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
         }
-    });
+    }
 
     spawn_proactive_repaint_watchdog(
         data_tx.clone(),
@@ -512,6 +715,7 @@ async fn handle_connection(
             skex.user().to_owned(),
             skex.shell().to_owned(),
             term_rx,
+            term_tx.clone(),
             output_handle,
             scrollback,
             server_emulator,
@@ -523,6 +727,7 @@ async fn handle_connection(
             session_registry,
             full_registry,
             effective_mtu,
+            diff_mode,
         );
     }
 
@@ -567,6 +772,62 @@ fn spawn_connection_watchdogs(
                     )
                     .unwrap_or(0);
                     if control_tx.send(EncryptedFrame::Keepalive(ts)).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Cancel the connection token if no UDP frame has been received from the client within
+/// Send `compressed` as [`EncryptedFrame::ScreenStateCompressed`] if it fits within
+/// [`MAX_STATESYNC_DIFF_BYTES`], otherwise split it into [`EncryptedFrame::StateChunk`]
+/// frames of at most [`STATE_CHUNK_SIZE`] bytes so every datagram fits within the UDP MTU
+/// even over NAT connections that drop IP fragments.
+///
+/// Returns `false` if the sender channel has closed.
+async fn send_state_chunked(ss_tx: &Sender<EncryptedFrame>, compressed: Vec<u8>) -> bool {
+    if compressed.len() <= MAX_STATESYNC_DIFF_BYTES {
+        ss_tx
+            .send(EncryptedFrame::ScreenStateCompressed(compressed))
+            .await
+            .is_ok()
+    } else {
+        let chunks: Vec<Vec<u8>> = compressed
+            .chunks(STATE_CHUNK_SIZE)
+            .map(<[u8]>::to_vec)
+            .collect();
+        // Max compressed size is MAX_ENCFRAME_LENGTH (64 KiB) / STATE_CHUNK_SIZE (800 B) = 82
+        // chunks, well within u16 range.
+        let total = u16::try_from(chunks.len()).unwrap_or(u16::MAX);
+        for (seq, chunk) in chunks.into_iter().enumerate() {
+            let seq_u16 = u16::try_from(seq).unwrap_or(u16::MAX);
+            if ss_tx
+                .send(EncryptedFrame::StateChunk((seq_u16, total, chunk)))
+                .await
+                .is_err()
+            {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// [`CLIENT_SILENCE_TIMEOUT_US`] microseconds.  Fires every 5 s; low overhead.
+fn spawn_silence_watchdog(token: CancellationToken, last_rx_us: Arc<AtomicU64>) {
+    let _watchdog = spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(5));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            select! {
+                () = token.cancelled() => break,
+                _ = ticker.tick() => {
+                    let elapsed_us = now_micros().saturating_sub(last_rx_us.load(Ordering::Relaxed));
+                    if elapsed_us > CLIENT_SILENCE_TIMEOUT_US {
+                        info!("Client silence timeout (30 s): cancelling connection");
+                        token.cancel();
                         break;
                     }
                 }
@@ -765,13 +1026,54 @@ async fn new_session(
     ))
 }
 
+/// Scan a byte slice for Primary / Secondary DA query sequences (`ESC [ c` / `ESC [ > c`)
+/// emitted by the shell, and return the appropriate response bytes.  Used in `StateSync` mode
+/// so the server answers terminal queries locally instead of forwarding them to the client.
+fn server_intercept_queries(buf: &[u8]) -> Vec<u8> {
+    if !buf.contains(&0x1b) {
+        return Vec::new();
+    }
+    let mut resp = Vec::new();
+    let mut i = 0;
+    while i < buf.len() {
+        if buf[i] == 0x1b && i + 1 < buf.len() && buf[i + 1] == b'[' {
+            i += 2;
+            let marker = if i < buf.len() && matches!(buf[i], b'?' | b'>' | b'=') {
+                let m = buf[i];
+                i += 1;
+                Some(m)
+            } else {
+                None
+            };
+            let p0 = i;
+            while i < buf.len() && (buf[i].is_ascii_digit() || buf[i] == b';') {
+                i += 1;
+            }
+            let params = &buf[p0..i];
+            if i < buf.len() {
+                let term = buf[i];
+                i += 1;
+                match (marker, params, term) {
+                    (None, b"" | b"0", b'c') => resp.extend_from_slice(b"\x1b[?62c"),
+                    (Some(b'>'), b"" | b"0", b'c') => resp.extend_from_slice(b"\x1b[>1;10;0c"),
+                    _ => {}
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    resp
+}
+
 /// Spawn the background thread that reads PTY output, writes scrollback, and forwards
 /// frames to the currently connected client.  Cleans up session state when the shell exits.
-#[cfg_attr(nightly, allow(clippy::too_many_arguments))]
+#[cfg_attr(nightly, allow(clippy::too_many_arguments, clippy::too_many_lines))]
 #[cfg_attr(coverage_nightly, coverage(off))]
 fn spawn_pty_reader(
     session_uuid: Uuid,
     mut term_out: Box<dyn std::io::Read + Send>,
+    term_tx: Sender<TerminalMessage>,
     output_handle: Arc<Mutex<SessionOutputHandle>>,
     scrollback: Arc<Mutex<VecDeque<u8>>>,
     server_emulator: Arc<Mutex<vt100::Parser>>,
@@ -782,6 +1084,7 @@ fn spawn_pty_reader(
     session_registry: SessionRegistry,
     full_registry: FullSessionRegistry,
     effective_mtu: Arc<AtomicUsize>,
+    diff_mode: DiffMode,
 ) {
     let _read_handle = thread::spawn(move || {
         loop {
@@ -811,7 +1114,17 @@ fn spawn_pty_reader(
 
                     let send_ok = {
                         let h = output_handle.blocking_lock();
-                        if let Some(ref sender) = h.data_tx {
+                        if diff_mode == DiffMode::StateSync {
+                            // StateSync: statesync task handles delivery; only feed emulator.
+                            // Intercept terminal queries and respond locally so the shell
+                            // (e.g. fish) does not time out waiting for a DA response.
+                            let resp = server_intercept_queries(buf_slice);
+                            if !resp.is_empty() {
+                                drop(term_tx.try_send(TerminalMessage::Input(resp)));
+                            }
+                            drop(h);
+                            true
+                        } else if let Some(ref sender) = h.data_tx {
                             let uuid_wrapper = UuidWrapper::new(h.kex_uuid);
                             let sender_clone = sender.clone();
                             drop(h);
@@ -871,6 +1184,18 @@ fn spawn_pty_reader(
             }
         }
 
+        // Notify the connected client that the PTY process has exited so it can exit
+        // immediately instead of waiting for the silence timeout and entering the retry loop.
+        {
+            let h = output_handle.blocking_lock();
+            if let Some(ref tx) = h.control_tx {
+                drop(tx.blocking_send(EncryptedFrame::PtyExit));
+            }
+        }
+        // Give the UdpSender one select! tick to deliver PtyExit before the token cancel
+        // races with the send.
+        sleep(Duration::from_millis(50));
+
         // PTY process has exited — clean up the session.
         {
             let mut h = output_handle.blocking_lock();
@@ -916,6 +1241,7 @@ fn spawn_pty(
     #[cfg_attr(not(unix), allow(unused_variables))] user: String,
     shell: String,
     mut term_rx: Receiver<TerminalMessage>,
+    term_tx: Sender<TerminalMessage>,
     output_handle: Arc<Mutex<SessionOutputHandle>>,
     scrollback: Arc<Mutex<VecDeque<u8>>>,
     server_emulator: Arc<Mutex<vt100::Parser>>,
@@ -927,6 +1253,7 @@ fn spawn_pty(
     session_registry: SessionRegistry,
     full_registry: FullSessionRegistry,
     effective_mtu: Arc<AtomicUsize>,
+    diff_mode: DiffMode,
 ) {
     let _term_handle = thread::spawn(move || {
         let pty_system = native_pty_system();
@@ -1093,6 +1420,7 @@ fn spawn_pty(
         spawn_pty_reader(
             session_uuid,
             term_out,
+            term_tx,
             output_handle,
             scrollback,
             server_emulator.clone(),
@@ -1103,6 +1431,7 @@ fn spawn_pty(
             session_registry,
             full_registry,
             effective_mtu,
+            diff_mode,
         );
 
         while let Some(terminal_message) = term_rx.blocking_recv() {
@@ -1233,10 +1562,11 @@ mod test {
     };
 
     use super::{
-        MTU_PROBE_FAIL_THRESHOLD, MTU_PROBE_QUIET_TICKS, MTU_PROBE_SUCCESS_TICKS, MTU_TIERS,
-        PROACTIVE_REPAINT_NAK_THRESHOLD, mtu_probe_step, new_full_registry, new_session,
-        resolve_session, spawn_connection_watchdogs, spawn_mtu_probe_task,
-        spawn_proactive_repaint_watchdog,
+        MAX_STATESYNC_DIFF_BYTES, MTU_PROBE_FAIL_THRESHOLD, MTU_PROBE_QUIET_TICKS,
+        MTU_PROBE_SUCCESS_TICKS, MTU_TIERS, PROACTIVE_REPAINT_NAK_THRESHOLD, STATE_CHUNK_SIZE,
+        mtu_probe_step, new_full_registry, new_session, now_micros, resolve_session,
+        send_state_chunked, server_intercept_queries, spawn_connection_watchdogs,
+        spawn_mtu_probe_task, spawn_proactive_repaint_watchdog, spawn_silence_watchdog,
     };
 
     #[cfg(unix)]
@@ -1772,5 +2102,147 @@ mod test {
             result.is_err() || result.unwrap().is_none(),
             "watchdog kept sending after cancellation"
         );
+    }
+
+    // ── send_state_chunked ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn send_state_chunked_small_payload_sends_screen_state_compressed() {
+        let (tx, mut rx) = channel::<EncryptedFrame>(8);
+        let payload = vec![0u8; MAX_STATESYNC_DIFF_BYTES];
+        let sent = send_state_chunked(&tx, payload.clone()).await;
+        assert!(sent);
+        let frame = rx.try_recv().expect("expected a frame");
+        assert!(
+            matches!(frame, EncryptedFrame::ScreenStateCompressed(ref d) if *d == payload),
+            "expected ScreenStateCompressed, got {frame:?}"
+        );
+        assert!(rx.try_recv().is_err(), "expected exactly one frame");
+    }
+
+    #[tokio::test]
+    async fn send_state_chunked_large_payload_sends_state_chunks() {
+        let (tx, mut rx) = channel::<EncryptedFrame>(128);
+        let payload = vec![0xABu8; MAX_STATESYNC_DIFF_BYTES + STATE_CHUNK_SIZE + 1];
+        let sent = send_state_chunked(&tx, payload.clone()).await;
+        assert!(sent);
+
+        let expected_chunks = payload.chunks(STATE_CHUNK_SIZE).count();
+        let total = u16::try_from(expected_chunks).unwrap();
+        let mut received = 0usize;
+        while let Ok(frame) = rx.try_recv() {
+            let EncryptedFrame::StateChunk((seq, t, data)) = frame else {
+                panic!("expected StateChunk, got {frame:?}");
+            };
+            assert_eq!(seq, u16::try_from(received).unwrap());
+            assert_eq!(t, total);
+            let expected_slice = &payload[received * STATE_CHUNK_SIZE
+                ..((received + 1) * STATE_CHUNK_SIZE).min(payload.len())];
+            assert_eq!(data, expected_slice);
+            received += 1;
+        }
+        assert_eq!(received, expected_chunks);
+    }
+
+    #[tokio::test]
+    async fn send_state_chunked_closed_channel_returns_false() {
+        let (tx, rx) = channel::<EncryptedFrame>(8);
+        drop(rx);
+        let payload = vec![0u8; MAX_STATESYNC_DIFF_BYTES + 1];
+        let sent = send_state_chunked(&tx, payload).await;
+        assert!(!sent);
+    }
+
+    // ── server_intercept_queries ──────────────────────────────────────────────
+
+    #[test]
+    fn server_intercept_queries_no_escape_returns_empty() {
+        assert!(server_intercept_queries(b"hello world").is_empty());
+    }
+
+    #[test]
+    fn server_intercept_queries_primary_da_returns_vt220() {
+        assert_eq!(server_intercept_queries(b"\x1b[c"), b"\x1b[?62c");
+        assert_eq!(server_intercept_queries(b"\x1b[0c"), b"\x1b[?62c");
+    }
+
+    #[test]
+    fn server_intercept_queries_secondary_da_returns_response() {
+        assert_eq!(server_intercept_queries(b"\x1b[>c"), b"\x1b[>1;10;0c");
+        assert_eq!(server_intercept_queries(b"\x1b[>0c"), b"\x1b[>1;10;0c");
+    }
+
+    #[test]
+    fn server_intercept_queries_unknown_sequence_returns_empty() {
+        // Mode set — not a DA query
+        assert!(server_intercept_queries(b"\x1b[?25h").is_empty());
+        // Cursor position report — not a DA query
+        assert!(server_intercept_queries(b"\x1b[6n").is_empty());
+    }
+
+    #[test]
+    fn server_intercept_queries_multiple_queries_returns_both_responses() {
+        let input = b"\x1b[c\x1b[>c";
+        let resp = server_intercept_queries(input);
+        assert!(
+            resp.starts_with(b"\x1b[?62c"),
+            "missing primary DA response"
+        );
+        assert!(
+            resp.ends_with(b"\x1b[>1;10;0c"),
+            "missing secondary DA response"
+        );
+    }
+
+    // ── spawn_silence_watchdog ────────────────────────────────────────────────
+
+    #[tokio::test(start_paused = true)]
+    async fn silence_watchdog_fires_on_stale_timestamp() {
+        let token = CancellationToken::new();
+        let last_rx_us = Arc::new(AtomicU64::new(0));
+        spawn_silence_watchdog(token.clone(), last_rx_us);
+
+        // Advance past two 5-second ticker intervals + the 30-second silence threshold.
+        tokio::time::advance(Duration::from_secs(35)).await;
+        // Yield so the spawned task can run.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            token.is_cancelled(),
+            "watchdog should have cancelled the token"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silence_watchdog_does_not_fire_when_recently_active() {
+        let token = CancellationToken::new();
+        let last_rx_us = Arc::new(AtomicU64::new(now_micros()));
+        spawn_silence_watchdog(token.clone(), last_rx_us.clone());
+
+        // Advance one tick (5s) — well within the 30s silence threshold.
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            !token.is_cancelled(),
+            "watchdog should not fire within 30s silence threshold"
+        );
+        token.cancel();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silence_watchdog_stops_on_explicit_cancel() {
+        let token = CancellationToken::new();
+        let last_rx_us = Arc::new(AtomicU64::new(0));
+        spawn_silence_watchdog(token.clone(), last_rx_us);
+
+        token.cancel();
+        // Even with a stale timestamp the watchdog should not panic or loop.
+        tokio::time::advance(Duration::from_mins(1)).await;
+        tokio::task::yield_now().await;
+        // Token is cancelled — just verify no crash.
+        assert!(token.is_cancelled());
     }
 }

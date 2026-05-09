@@ -9,6 +9,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     io::Cursor,
+    net::SocketAddr,
     process,
     sync::{
         Arc, Mutex,
@@ -39,6 +40,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 use zstd::decode_all;
 
+use super::DiffMode;
 use crate::{
     Emulator, EncryptedFrame, MoshpitError, PredictionEngine, Renderer, TerminalMessage,
     UuidWrapper, paint_overlays_to_ansi, udp::sender::RETRANSMIT_WINDOW, utils::is_exit_title,
@@ -141,10 +143,12 @@ pub struct UdpReader {
     /// Format: `rgb:RRRR/GGGG/BBBB`.  Defaults to a dark background when `None`.
     terminal_bg_color: Option<String>,
     /// Oneshot sender fired after the server has discovered the client's real post-NAT
-    /// address via the first `recv_from` and connected the UDP socket to it.  The
-    /// paired [`UdpSender`](crate::UdpSender) awaits this signal before sending any
-    /// packets so it never calls `send()` on an unconnected socket.
-    peer_discovered_tx: Option<oneshot::Sender<()>>,
+    /// address via the first `recv_from`.  Carries the initial peer `SocketAddr` so
+    /// that [`UdpSender`](crate::UdpSender) knows where to send before any roam event.
+    peer_discovered_tx: Option<oneshot::Sender<SocketAddr>>,
+    /// Signals mid-session NAT roam events to [`UdpSender`](crate::UdpSender).
+    /// Sent whenever an authenticated packet arrives from a new source address.
+    peer_addr_tx: Option<Sender<SocketAddr>>,
     /// Fired by the server's [`server_frame_loop`](Self::server_frame_loop) when a
     /// [`EncryptedFrame::RepaintRequest`] arrives from the client.  The paired receiver
     /// is held by a task in `moshpits` that responds with an immediate
@@ -156,6 +160,48 @@ pub struct UdpReader {
     /// [`EncryptedFrame::ScreenStateCompressed`] is pushed without waiting for an
     /// explicit [`EncryptedFrame::RepaintRequest`] that might itself be lost.
     nak_received_count: Option<Arc<AtomicU64>>,
+    /// UDP diff transport mode for this session.
+    /// In `Datagram` or `StateSync` mode the reorder buffer, gap tracking, and NAK
+    /// sending are all disabled — frames are delivered immediately in arrival order.
+    #[builder(default)]
+    diff_mode: DiffMode,
+    /// Client-mode `StateSync` state: the `contents_formatted()` snapshot of the
+    /// client's screen at the point the last `StateSyncDiff` was applied.
+    /// Empty before any diff is applied.
+    #[builder(default)]
+    ack_state: Vec<u8>,
+    /// The `diff_id` of the last `StateSyncDiff` the client successfully applied.
+    /// Zero before any diff is applied.  Used to validate incoming `base_id` fields.
+    #[builder(default)]
+    ack_state_seq: u64,
+    /// Count of consecutive `StateSyncDiff` frames discarded due to `base_id` mismatch.
+    /// When this reaches 3, the client sends a `RepaintRequest` and the counter resets.
+    #[builder(default)]
+    statesync_mismatch_count: u32,
+    /// True once the client has received and processed the first complete full-state push
+    /// (`ScreenStateCompressed` or a complete `StateChunk` assembly) in `StateSync` mode.
+    /// Guards `StateSyncDiff` from being applied to a blank initial state when the initial
+    /// full-state push is dropped by a NAT device.
+    #[builder(default)]
+    initial_state_received: bool,
+    /// Total chunk count for the in-progress `StateChunk` assembly.  Zero = no assembly active.
+    #[builder(default)]
+    pending_chunk_total: u16,
+    /// Next expected `seq` value for the in-progress `StateChunk` assembly.
+    #[builder(default)]
+    pending_chunk_seq: u16,
+    /// Accumulated payload bytes from the in-progress `StateChunk` assembly.
+    #[builder(default)]
+    pending_chunk_data: Vec<u8>,
+    /// Server-mode: channel for forwarding `ClientAck(diff_id)` values from the UDP
+    /// receive loop to the state-sync task in `moshpits/src/runtime.rs`, which uses
+    /// them to advance the server's ack baseline.
+    client_ack_tx: Option<Sender<u64>>,
+    /// Timestamp (µs since UNIX epoch) of the last authenticated UDP frame received from
+    /// the peer.  Updated on every successful parse in server mode.  The server-side silence
+    /// watchdog in `moshpits` polls this counter and cancels zombie connections after 30 s
+    /// of client silence.
+    last_rx_us: Option<Arc<AtomicU64>>,
 }
 
 /// Current time as microseconds since the UNIX epoch, used for keepalive RTT timestamps.
@@ -170,6 +216,12 @@ fn now_micros() -> u64 {
 }
 
 impl UdpReader {
+    /// Return a clone of the shared last-receive-time counter, if set.
+    #[must_use]
+    pub fn last_rx_us(&self) -> Option<Arc<AtomicU64>> {
+        self.last_rx_us.clone()
+    }
+
     /// Signal the reconnect channel if set; otherwise exit the process.
     fn signal_reconnect_or_exit(&self, code: i32) {
         if let Some(ref tx) = self.reconnect_tx {
@@ -410,6 +462,15 @@ impl UdpReader {
             return vec![];
         }
 
+        // In Datagram or StateSync mode: skip reorder buffering and gap tracking
+        // entirely.  Deliver the frame immediately regardless of arrival order,
+        // advance next_seq past any gap, and never send NAKs or RepaintRequests.
+        // ScreenState frames are still delivered through the fast path below.
+        if self.diff_mode == DiffMode::Datagram || self.diff_mode == DiffMode::StateSync {
+            self.next_seq = seq + 1;
+            return self.route_or_deliver(frame).into_iter().collect();
+        }
+
         // Prevent DoS memory exhaustion from an adversarial massive sequence jump.
         if seq > self.next_seq + MAX_SEQ_JUMP {
             warn!(
@@ -578,92 +639,76 @@ impl UdpReader {
         Some(frame)
     }
 
+    /// Collect sequences to give up on (exceeded retries or outside retransmit window),
+    /// remove their tracking state, advance `next_seq` past them, and return any frames
+    /// that become deliverable as a result.
+    fn drain_given_up_seqs(&mut self) -> Vec<EncryptedFrame> {
+        let retry_give_up = self
+            .gap_nak_count
+            .iter()
+            .filter_map(|(&seq, &count)| (count >= MAX_NAK_RETRIES).then_some(seq));
+        // When the server has sent RETRANSMIT_WINDOW more packets past a gap it has
+        // already evicted the lost packet; retransmit requests will silently fail.
+        let window_give_up = self
+            .gap_first_seen
+            .keys()
+            .filter(|&&seq| self.highest_seq_seen.saturating_sub(seq) > RETRANSMIT_WINDOW)
+            .copied();
+        let give_up_set: std::collections::HashSet<u64> =
+            retry_give_up.chain(window_give_up).collect();
+        if give_up_set.is_empty() {
+            return vec![];
+        }
+        for &seq in &give_up_set {
+            if self
+                .gap_nak_count
+                .get(&seq)
+                .is_some_and(|&c| c >= MAX_NAK_RETRIES)
+            {
+                warn!("Giving up on packet {seq} after {MAX_NAK_RETRIES} NAK retries");
+            } else {
+                warn!(
+                    "Giving up on packet {seq}: outside sender retransmit window \
+                     (highest_seen={})",
+                    self.highest_seq_seen
+                );
+            }
+            let _r = self.gap_first_seen.remove(&seq);
+            let _r = self.gap_nak_count.remove(&seq);
+            let _r = self.gap_nak_sent_at.remove(&seq);
+        }
+        let mut delivered = vec![];
+        loop {
+            if give_up_set.contains(&self.next_seq) {
+                self.next_seq += 1;
+            } else if let Some(buffered) = self.recv_buffer.remove(&self.next_seq) {
+                let _r = self.gap_first_seen.remove(&self.next_seq);
+                let _r = self.gap_nak_count.remove(&self.next_seq);
+                let _r = self.gap_nak_sent_at.remove(&self.next_seq);
+                self.next_seq += 1;
+                if let Some(f) = self.route_or_deliver(buffered) {
+                    delivered.push(f);
+                }
+            } else {
+                break;
+            }
+        }
+        delivered
+    }
+
     /// Send NAKs for gaps whose timeout has elapsed, reset their timer for potential re-NAK,
     /// and skip any gaps that have exceeded the maximum retry count or the sender's retransmit
     /// window. Returns frames from `recv_buffer` that become deliverable after skipping
     /// permanently lost packets.
     fn check_nak_timeouts(&mut self) -> Vec<EncryptedFrame> {
+        if self.diff_mode != DiffMode::Reliable {
+            return vec![];
+        }
         let now = Instant::now();
+        let delivered = self.drain_given_up_seqs();
 
-        // 1a. Gaps that have exceeded the retry limit.
-        let retry_give_up: Vec<u64> = self
-            .gap_nak_count
-            .iter()
-            .filter_map(|(&seq, &count)| {
-                if count >= MAX_NAK_RETRIES {
-                    Some(seq)
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        // 1b. Gaps that have fallen outside the sender's retransmit window.
-        //
-        // When the server has sent RETRANSMIT_WINDOW more packets past a gap,
-        // it has already evicted the lost packet from its buffer and retransmit
-        // requests for it will silently fail.  Giving up immediately avoids the
-        // full MAX_NAK_RETRIES × backoff wait (≈750 ms) during which all
-        // subsequent output is stalled in recv_buffer.
-        let window_give_up: Vec<u64> = self
-            .gap_first_seen
-            .keys()
-            .filter(|&&seq| self.highest_seq_seen.saturating_sub(seq) > RETRANSMIT_WINDOW)
-            .copied()
-            .collect();
-
-        // Merge both give-up sources, deduplicated.
-        let mut give_up_set = std::collections::HashSet::new();
-        for seq in retry_give_up.iter().chain(window_give_up.iter()) {
-            let _inserted = give_up_set.insert(*seq);
-        }
-
-        let mut delivered = vec![];
-
-        if !give_up_set.is_empty() {
-            for &seq in &give_up_set {
-                if self
-                    .gap_nak_count
-                    .get(&seq)
-                    .is_some_and(|&c| c >= MAX_NAK_RETRIES)
-                {
-                    warn!("Giving up on packet {seq} after {MAX_NAK_RETRIES} NAK retries");
-                } else {
-                    warn!(
-                        "Giving up on packet {seq}: outside sender retransmit window \
-                         (highest_seen={})",
-                        self.highest_seq_seen
-                    );
-                }
-                let _removed = self.gap_first_seen.remove(&seq);
-                let _removed = self.gap_nak_count.remove(&seq);
-                let _removed = self.gap_nak_sent_at.remove(&seq);
-            }
-
-            // Advance next_seq past given-up and buffered frames.
-            loop {
-                if give_up_set.contains(&self.next_seq) {
-                    self.next_seq += 1;
-                } else if let Some(buffered) = self.recv_buffer.remove(&self.next_seq) {
-                    let _removed = self.gap_first_seen.remove(&self.next_seq);
-                    let _removed = self.gap_nak_count.remove(&self.next_seq);
-                    let _removed = self.gap_nak_sent_at.remove(&self.next_seq);
-                    self.next_seq += 1;
-                    if let Some(f) = self.route_or_deliver(buffered) {
-                        delivered.push(f);
-                    }
-                } else {
-                    break;
-                }
-            }
-        }
-
-        // 2. Normal NAK logic — request retransmission for recent gaps.
-        // Each gap uses an exponentially backed-off timeout based on how many
-        // times it has already been NAKed: timeout = base * 2^retry_count
-        // (capped at base * 2^NAK_BACKOFF_MAX_SHIFT), so repeated misses
-        // back off rather than flooding the sender with duplicate retransmit requests.
-        // The base is the RTT-derived nak_timeout when available, else NAK_TIMEOUT.
+        // Request retransmission for recent gaps using exponential backoff:
+        // timeout = base * 2^retry_count (capped at base * 2^NAK_BACKOFF_MAX_SHIFT).
         let base_nak_timeout = self.nak_timeout.unwrap_or(NAK_TIMEOUT);
         let timed_out: Vec<u64> = self
             .gap_first_seen
@@ -672,16 +717,10 @@ impl UdpReader {
                 let retries = self.gap_nak_count.get(&seq).copied().unwrap_or(0);
                 let shift = retries.min(NAK_BACKOFF_MAX_SHIFT);
                 let backoff = base_nak_timeout * (1u32 << shift);
-                if now.duration_since(t) >= backoff {
-                    Some(seq)
-                } else {
-                    None
-                }
+                (now.duration_since(t) >= backoff).then_some(seq)
             })
             .collect();
         if !timed_out.is_empty() {
-            // Reset each gap's timer so the next backoff interval starts from now.
-            // Track whether any gap just hit the RepaintRequest threshold.
             let mut send_repaint_request = false;
             for &seq in &timed_out {
                 if let Some(t) = self.gap_first_seen.get_mut(&seq) {
@@ -692,7 +731,6 @@ impl UdpReader {
                 if *count == REPAINT_REQUEST_THRESHOLD {
                     send_repaint_request = true;
                 }
-                // Record when we sent this NAK so handle_arrival can measure RTT.
                 let _prev = self.gap_nak_sent_at.insert(seq, now);
             }
             if let Some(ref tx) = self.nak_out_tx
@@ -701,8 +739,7 @@ impl UdpReader {
                 warn!("Failed to send NAK: {e}");
             }
             // When any gap reaches the repaint threshold, ask the server for an immediate
-            // full-screen snapshot.  This unblocks the display without waiting for
-            // retransmit to succeed or retries to be exhausted.
+            // full-screen snapshot.
             if send_repaint_request
                 && let Some(ref tx) = self.nak_out_tx
                 && let Err(e) = tx.try_send(EncryptedFrame::RepaintRequest)
@@ -726,21 +763,23 @@ impl UdpReader {
         token: CancellationToken,
         term_tx: Sender<TerminalMessage>,
     ) -> Result<()> {
-        // Wait for the first UDP datagram from the client.  This reveals the
-        // client's real post-NAT address which we then connect the socket to.
-        // The peer_discovered_tx oneshot is fired afterwards so that UdpSender
-        // can start sending once the socket is connected.
-        {
+        // Wait for the first UDP datagram from the client to discover its real
+        // post-NAT address.  The socket is intentionally NOT connected — it stays
+        // unconnected for the session lifetime so that packets arriving from a new
+        // address after a NAT rebind are not silently dropped by the OS.
+        let mut current_peer: SocketAddr = {
             let mut buf = vec![0u8; 65535];
             let (first_len, peer_addr) = self.socket.recv_from(&mut buf).await?;
-            self.socket.connect(peer_addr).await?;
             if let Some(tx) = self.peer_discovered_tx.take() {
-                let _ = tx.send(());
+                let _ = tx.send(peer_addr);
             }
             // Process the first packet through the normal pipeline.
             let mut first_buf = BytesMut::from(&buf[..first_len]);
             match self.parse_encrypted_frame(&mut first_buf) {
                 Ok(Some((frame, seq))) => {
+                    if let Some(ref counter) = self.last_rx_us {
+                        counter.store(now_micros(), Ordering::Relaxed);
+                    }
                     for ready in self.handle_arrival(frame, seq) {
                         match ready {
                             EncryptedFrame::Bytes((_id, message)) => {
@@ -770,7 +809,17 @@ impl UdpReader {
                             | EncryptedFrame::ScrollbackEnd
                             | EncryptedFrame::ScreenState(_)
                             | EncryptedFrame::ScreenStateCompressed(_)
-                            | EncryptedFrame::CompressedBytes(_) => {}
+                            | EncryptedFrame::CompressedBytes(_)
+                            | EncryptedFrame::StateSyncDiff(_)
+                            | EncryptedFrame::PtyExit
+                            | EncryptedFrame::StateChunk(_) => {}
+                            EncryptedFrame::ClientAck(diff_id) => {
+                                if let Some(ref tx) = self.client_ack_tx
+                                    && let Err(e) = tx.try_send(diff_id)
+                                {
+                                    warn!("Failed to forward ClientAck: {e}");
+                                }
+                            }
                         }
                     }
                 }
@@ -779,7 +828,8 @@ impl UdpReader {
                     warn!("Failed to parse first UDP frame from client: {e}");
                 }
             }
-        }
+            peer_addr
+        };
 
         let mut nak_check_deadline = TokioInstant::now() + self.nak_check_interval();
         loop {
@@ -813,14 +863,30 @@ impl UdpReader {
                             | EncryptedFrame::ScrollbackEnd
                             | EncryptedFrame::ScreenState(_)
                             | EncryptedFrame::ScreenStateCompressed(_)
-                            | EncryptedFrame::CompressedBytes(_) => {}
+                            | EncryptedFrame::CompressedBytes(_)
+                            | EncryptedFrame::StateSyncDiff(_)
+                            | EncryptedFrame::PtyExit
+                            | EncryptedFrame::StateChunk(_)
+                            | EncryptedFrame::ClientAck(_) => {}
                         }
                     }
                     nak_check_deadline = TokioInstant::now() + self.nak_check_interval();
                 },
-                frame_res = self.read_encrypted_frame() => {
+                frame_res = self.recv_frame_from() => {
                     match frame_res {
-                        Ok(Some((frame, seq))) => {
+                        Ok(Some((frame, seq, src_addr))) => {
+                            if let Some(ref counter) = self.last_rx_us {
+                                counter.store(now_micros(), Ordering::Relaxed);
+                            }
+                            if src_addr != current_peer {
+                                info!("NAT roam: peer {} → {}", current_peer, src_addr);
+                                current_peer = src_addr;
+                                if let Some(ref tx) = self.peer_addr_tx
+                                    && let Err(e) = tx.try_send(src_addr)
+                                {
+                                    warn!("Failed to signal NAT roam: {e}");
+                                }
+                            }
                             for ready in self.handle_arrival(frame, seq) {
                                 match ready {
                                     EncryptedFrame::Bytes((_id, message)) => {
@@ -848,7 +914,17 @@ impl UdpReader {
                                     | EncryptedFrame::ScrollbackEnd
                                     | EncryptedFrame::ScreenState(_)
                                     | EncryptedFrame::ScreenStateCompressed(_)
-                                    | EncryptedFrame::CompressedBytes(_) => {}
+                                    | EncryptedFrame::CompressedBytes(_)
+                                    | EncryptedFrame::StateSyncDiff(_)
+                                    | EncryptedFrame::PtyExit
+                                    | EncryptedFrame::StateChunk(_) => {}
+                                    EncryptedFrame::ClientAck(diff_id) => {
+                                        if let Some(ref tx) = self.client_ack_tx
+                                            && let Err(e) = tx.try_send(diff_id)
+                                        {
+                                            warn!("Failed to forward ClientAck: {e}");
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -862,6 +938,82 @@ impl UdpReader {
             }
         }
         Ok(())
+    }
+
+    /// Process one `StateChunk` frame in `StateSync` client mode.
+    ///
+    /// Accumulates chunks in order.  When the assembly is complete the combined payload
+    /// is processed identically to a [`EncryptedFrame::ScreenStateCompressed`] frame:
+    /// decompressed, fed into a scratch [`vt100::Parser`], ack state reset, and rendered
+    /// via the shared renderer.  Out-of-order chunks trigger a [`EncryptedFrame::RepaintRequest`].
+    async fn handle_state_chunk(
+        &mut self,
+        seq: u16,
+        total: u16,
+        data: Vec<u8>,
+        emulator: &Arc<Mutex<Emulator>>,
+        renderer: &Arc<Mutex<Renderer>>,
+        stdout_tx: &Sender<Vec<u8>>,
+    ) {
+        if seq == 0 {
+            self.pending_chunk_total = total;
+            self.pending_chunk_seq = 0;
+            self.pending_chunk_data = data;
+        } else if seq == self.pending_chunk_seq && total == self.pending_chunk_total {
+            self.pending_chunk_data.extend_from_slice(&data);
+        } else {
+            // Out-of-order or stale chunk — discard assembly and request a fresh push.
+            self.pending_chunk_total = 0;
+            self.pending_chunk_seq = 0;
+            self.pending_chunk_data.clear();
+            if let Some(ref tx) = self.nak_out_tx {
+                drop(tx.try_send(EncryptedFrame::RepaintRequest));
+            }
+            return;
+        }
+        self.pending_chunk_seq += 1;
+        if self.pending_chunk_seq == self.pending_chunk_total {
+            // Assembly complete — process as ScreenStateCompressed.
+            let payload_compressed = std::mem::take(&mut self.pending_chunk_data);
+            self.pending_chunk_seq = 0;
+            self.pending_chunk_total = 0;
+            match decode_all(payload_compressed.as_slice()) {
+                Ok(payload) => {
+                    let (rows, cols) = {
+                        let emu = emulator.lock().unwrap();
+                        emu.screen().size()
+                    };
+                    let mut tmp = vt100::Parser::new(rows, cols, 0);
+                    tmp.process(&payload);
+                    if self.diff_mode == DiffMode::StateSync {
+                        let is_alt = tmp.screen().alternate_screen();
+                        let mut ack = tmp.screen().contents_formatted();
+                        if is_alt {
+                            let mut prefixed = b"\x1b[?1049h".to_vec();
+                            prefixed.extend_from_slice(&ack);
+                            ack = prefixed;
+                        }
+                        self.ack_state = ack;
+                        self.ack_state_seq = 0;
+                        self.statesync_mismatch_count = 0;
+                        self.initial_state_received = true;
+                    }
+                    let repaint = {
+                        let mut rend = renderer.lock().unwrap();
+                        rend.invalidate();
+                        rend.render(tmp.screen(), &[], None)
+                    };
+                    if !repaint.is_empty()
+                        && let Err(e) = stdout_tx.send(repaint).await
+                    {
+                        error!("Error sending StateChunk repaint to stdout channel: {e}");
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to decompress StateChunk assembly: {e}");
+                }
+            }
+        }
     }
 
     /// Run the client frame reading loop
@@ -886,6 +1038,7 @@ impl UdpReader {
     pub async fn client_frame_loop(
         &mut self,
         token: CancellationToken,
+        exit_token: CancellationToken,
         stdout_tx: Sender<Vec<u8>>,
         emulator: Arc<Mutex<Emulator>>,
         prediction: Arc<Mutex<PredictionEngine>>,
@@ -893,7 +1046,16 @@ impl UdpReader {
     ) {
         let mut prev_bytes = BytesMut::with_capacity(1024);
         let mut osc_started = false;
-        let mut nak_check_deadline = TokioInstant::now() + self.nak_check_interval();
+        // In Datagram and StateSync modes the NAK timer is never actually used
+        // (check_nak_timeouts returns immediately), so we park the deadline far in
+        // the future to keep the select! branch from firing on every loop iteration.
+        let nak_park = Duration::from_hours(24);
+        let mut nak_check_deadline = TokioInstant::now()
+            + if self.diff_mode == DiffMode::Reliable {
+                self.nak_check_interval()
+            } else {
+                nak_park
+            };
         // When true, raw bytes are fed into the emulator only — not sent to
         // stdout.  Set by ScrollbackStart, cleared by ScrollbackEnd.
         let mut scrollback_mode = false;
@@ -931,7 +1093,10 @@ impl UdpReader {
                                     warn!("Failed to echo keepalive: {e}");
                                 }
                             }
-                            EncryptedFrame::Nak(_) | EncryptedFrame::RepaintRequest => {}
+                            EncryptedFrame::Nak(_)
+                            | EncryptedFrame::RepaintRequest
+                            | EncryptedFrame::StateSyncDiff(_)
+                            | EncryptedFrame::ClientAck(_) => {}
                             EncryptedFrame::Shutdown => {
                                 info!("Server is shutting down, reconnecting");
                                 self.signal_reconnect_or_exit(0);
@@ -981,6 +1146,19 @@ impl UdpReader {
                                         };
                                         let mut tmp = vt100::Parser::new(rows, cols, 0);
                                         tmp.process(&payload);
+                                        if self.diff_mode == DiffMode::StateSync {
+                                            let is_alt = tmp.screen().alternate_screen();
+                                            let mut ack = tmp.screen().contents_formatted();
+                                            if is_alt {
+                                                let mut prefixed = b"\x1b[?1049h".to_vec();
+                                                prefixed.extend_from_slice(&ack);
+                                                ack = prefixed;
+                                            }
+                                            self.ack_state = ack;
+                                            self.ack_state_seq = 0;
+                                            self.statesync_mismatch_count = 0;
+                                            self.initial_state_received = true;
+                                        }
                                         let repaint = {
                                             let mut rend = renderer.lock().unwrap();
                                             rend.invalidate();
@@ -996,6 +1174,23 @@ impl UdpReader {
                                         error!("Failed to decompress ScreenStateCompressed: {e}");
                                     }
                                 }
+                            }
+                            EncryptedFrame::PtyExit => {
+                                let msg = b"\r\n\x1b[0m[moshpit] Remote session ended.\r\n";
+                                drop(stdout_tx.send(msg.to_vec()).await);
+                                exit_token.cancel();
+                                break 'session;
+                            }
+                            EncryptedFrame::StateChunk((seq, total, data)) => {
+                                self.handle_state_chunk(
+                                    seq,
+                                    total,
+                                    data,
+                                    &emulator,
+                                    &renderer,
+                                    &stdout_tx,
+                                )
+                                .await;
                             }
                             EncryptedFrame::CompressedBytes((_id, compressed)) => {
                                 match decode_all(compressed.as_slice()) {
@@ -1021,7 +1216,12 @@ impl UdpReader {
                             }
                         }
                     }
-                    nak_check_deadline = TokioInstant::now() + self.nak_check_interval();
+                    nak_check_deadline = TokioInstant::now()
+                        + if self.diff_mode == DiffMode::Reliable {
+                            self.nak_check_interval()
+                        } else {
+                            nak_park
+                        };
                 },
                 // Silence timeout: no frame received within `silence_timeout`.
                 () = async {
@@ -1054,7 +1254,9 @@ impl UdpReader {
                                             warn!("Failed to echo keepalive: {e}");
                                         }
                                     }
-                                    EncryptedFrame::Nak(_) | EncryptedFrame::RepaintRequest => {}
+                                    EncryptedFrame::Nak(_)
+                                    | EncryptedFrame::RepaintRequest
+                                    | EncryptedFrame::ClientAck(_) => {}
                                     EncryptedFrame::Shutdown => {
                                         info!("Server is shutting down, reconnecting");
                                         self.signal_reconnect_or_exit(0);
@@ -1104,6 +1306,19 @@ impl UdpReader {
                                                 };
                                                 let mut tmp = vt100::Parser::new(rows, cols, 0);
                                                 tmp.process(&payload);
+                                                if self.diff_mode == DiffMode::StateSync {
+                                                    let is_alt = tmp.screen().alternate_screen();
+                                                    let mut ack = tmp.screen().contents_formatted();
+                                                    if is_alt {
+                                                        let mut prefixed = b"\x1b[?1049h".to_vec();
+                                                        prefixed.extend_from_slice(&ack);
+                                                        ack = prefixed;
+                                                    }
+                                                    self.ack_state = ack;
+                                                    self.ack_state_seq = 0;
+                                                    self.statesync_mismatch_count = 0;
+                                                    self.initial_state_received = true;
+                                                }
                                                 let repaint = {
                                                     let mut rend = renderer.lock().unwrap();
                                                     rend.invalidate();
@@ -1154,6 +1369,83 @@ impl UdpReader {
                                             &token,
                                             &emulator,
                                             &prediction,
+                                        )
+                                        .await;
+                                    }
+                                    EncryptedFrame::StateSyncDiff((base_id, diff_id, compressed)) => {
+                                        if !self.initial_state_received {
+                                            // Full state not yet received — discard and trigger a push.
+                                            if let Some(ref tx) = self.nak_out_tx {
+                                                drop(tx.try_send(EncryptedFrame::RepaintRequest));
+                                            }
+                                        } else if base_id == self.ack_state_seq {
+                                            self.statesync_mismatch_count = 0;
+                                            match decode_all(compressed.as_slice()) {
+                                                Ok(diff_bytes) => {
+                                                    let (rows, cols) = {
+                                                        let emu = emulator.lock().unwrap();
+                                                        emu.screen().size()
+                                                    };
+                                                    let mut tmp = vt100::Parser::new(rows, cols, 0);
+                                                    if !self.ack_state.is_empty() {
+                                                        tmp.process(&self.ack_state);
+                                                    }
+                                                    tmp.process(&diff_bytes);
+                                                    let is_alt = tmp.screen().alternate_screen();
+                                                    let mut new_ack = tmp.screen().contents_formatted();
+                                                    if is_alt {
+                                                        let mut prefixed = b"\x1b[?1049h".to_vec();
+                                                        prefixed.extend_from_slice(&new_ack);
+                                                        new_ack = prefixed;
+                                                    }
+                                                    self.ack_state = new_ack;
+                                                    self.ack_state_seq = diff_id;
+                                                    // Route through the renderer so displayed tracks
+                                                    // alt-screen state and ScreenStateCompressed
+                                                    // repaints compute correct diffs afterward.
+                                                    let repaint = {
+                                                        let mut rend = renderer.lock().unwrap();
+                                                        rend.render(tmp.screen(), &[], None)
+                                                    };
+                                                    if let Err(e) = stdout_tx.send(repaint).await {
+                                                        error!("Error sending StateSyncDiff to stdout channel: {e}");
+                                                    }
+                                                    if let Some(ref tx) = self.nak_out_tx
+                                                        && let Err(e) = tx.try_send(EncryptedFrame::ClientAck(diff_id))
+                                                    {
+                                                        warn!("Failed to send ClientAck: {e}");
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    error!("Failed to decompress StateSyncDiff: {e}");
+                                                }
+                                            }
+                                        } else {
+                                            self.statesync_mismatch_count += 1;
+                                            if self.statesync_mismatch_count >= 3 {
+                                                self.statesync_mismatch_count = 0;
+                                                if let Some(ref tx) = self.nak_out_tx
+                                                    && let Err(e) = tx.try_send(EncryptedFrame::RepaintRequest)
+                                                {
+                                                    warn!("Failed to send StateSync desync RepaintRequest: {e}");
+                                                }
+                                            }
+                                        }
+                                    }
+                                    EncryptedFrame::PtyExit => {
+                                        let msg = b"\r\n\x1b[0m[moshpit] Remote session ended.\r\n";
+                                        drop(stdout_tx.send(msg.to_vec()).await);
+                                        exit_token.cancel();
+                                        break 'session;
+                                    }
+                                    EncryptedFrame::StateChunk((seq, total, data)) => {
+                                        self.handle_state_chunk(
+                                            seq,
+                                            total,
+                                            data,
+                                            &emulator,
+                                            &renderer,
+                                            &stdout_tx,
                                         )
                                         .await;
                                     }
@@ -1318,6 +1610,28 @@ impl UdpReader {
                 }
                 Err(err) => {
                     warn!("Failed to parse encrypted frame: {err}");
+                }
+            }
+        }
+    }
+
+    /// Receives one UDP datagram via `recv_from`, parses and authenticates it, and
+    /// returns the decoded frame, its sequence number, and the sender's address.
+    /// Used by `server_frame_loop` so that the source address of every packet is
+    /// visible for NAT roam detection without connecting the socket.
+    async fn recv_frame_from(&self) -> Result<Option<(EncryptedFrame, u64, SocketAddr)>> {
+        let mut buf = vec![0u8; 65535];
+        loop {
+            let (len, src) = self.socket.recv_from(&mut buf).await?;
+            if len == 0 {
+                return Ok(None);
+            }
+            let mut buffer = BytesMut::from(&buf[..len]);
+            match self.parse_encrypted_frame(&mut buffer) {
+                Ok(Some((frame, seq))) => return Ok(Some((frame, seq, src))),
+                Ok(None) => {}
+                Err(e) => {
+                    warn!("Failed to parse UDP frame from {src}: {e}");
                 }
             }
         }
@@ -2162,6 +2476,315 @@ mod tests {
         assert!(
             reader.nak_timeout.unwrap() > MIN_NAK_TIMEOUT,
             "clamped spike must grow nak_timeout above MIN — death spiral broken"
+        );
+    }
+
+    // ── handle_arrival: ScreenState obsoletes prior gaps ─────────────────────
+
+    #[tokio::test]
+    async fn handle_arrival_screen_state_obsoletes_gaps() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let mut reader = UdpReader::builder()
+            .socket(socket)
+            .id(Uuid::new_v4())
+            .rnk([0u8; 32])
+            .unwrap()
+            .hmac([0u8; 64])
+            .build();
+
+        // seq 0 delivered normally
+        drop(reader.handle_arrival(EncryptedFrame::Keepalive(0), 0));
+        // Seq 3 arrives out-of-order → gaps 1 and 2 recorded
+        drop(reader.handle_arrival(EncryptedFrame::Keepalive(0), 3));
+        assert_eq!(reader.gap_first_seen.len(), 2);
+
+        // ScreenState at seq 5 must discard gaps 1, 2, 3 and deliver itself
+        let ready = reader.handle_arrival(EncryptedFrame::ScreenState(vec![]), 5);
+        assert!(
+            ready
+                .iter()
+                .any(|f| matches!(f, EncryptedFrame::ScreenState(_))),
+            "ScreenState must be in the returned ready list"
+        );
+        assert!(
+            reader.gap_first_seen.is_empty(),
+            "all gaps must be discarded after ScreenState"
+        );
+        assert_eq!(reader.next_seq, 6);
+    }
+
+    #[tokio::test]
+    async fn handle_arrival_screen_state_drains_following_buffered_frames() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let mut reader = UdpReader::builder()
+            .socket(socket)
+            .id(Uuid::new_v4())
+            .rnk([0u8; 32])
+            .unwrap()
+            .hmac([0u8; 64])
+            .build();
+
+        // seq 0 delivered
+        drop(reader.handle_arrival(EncryptedFrame::Keepalive(0), 0));
+        // Pre-buffer seq 6 (next after the upcoming ScreenState at 5)
+        drop(reader.handle_arrival(EncryptedFrame::Keepalive(0), 6));
+
+        // ScreenState at seq 5 — should deliver itself AND drain buffered seq 6
+        let ready = reader.handle_arrival(EncryptedFrame::ScreenState(vec![]), 5);
+        assert_eq!(
+            ready.len(),
+            2,
+            "ready must contain the ScreenState and the following buffered frame"
+        );
+        assert_eq!(reader.next_seq, 7);
+        assert!(reader.recv_buffer.is_empty());
+    }
+
+    #[tokio::test]
+    async fn handle_arrival_screen_state_compressed_also_obsoletes_gaps() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let mut reader = UdpReader::builder()
+            .socket(socket)
+            .id(Uuid::new_v4())
+            .rnk([0u8; 32])
+            .unwrap()
+            .hmac([0u8; 64])
+            .build();
+
+        drop(reader.handle_arrival(EncryptedFrame::Keepalive(0), 0));
+        drop(reader.handle_arrival(EncryptedFrame::Keepalive(0), 3));
+        assert!(!reader.gap_first_seen.is_empty());
+
+        let ready = reader.handle_arrival(EncryptedFrame::ScreenStateCompressed(vec![]), 5);
+        assert!(
+            ready
+                .iter()
+                .any(|f| matches!(f, EncryptedFrame::ScreenStateCompressed(_))),
+        );
+        assert!(reader.gap_first_seen.is_empty());
+    }
+
+    // ── handle_arrival: burst gap threshold + immediate NAK ──────────────────
+
+    #[tokio::test]
+    async fn handle_arrival_burst_triggers_repaint_request_at_threshold() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (nak_tx, mut nak_rx) = tokio::sync::mpsc::channel::<EncryptedFrame>(32);
+        let mut reader = UdpReader::builder()
+            .socket(socket)
+            .id(Uuid::new_v4())
+            .rnk([0u8; 32])
+            .unwrap()
+            .hmac([0u8; 64])
+            .nak_out_tx(nak_tx)
+            .build();
+
+        // Deliver frames out-of-order to fill recv_buffer to RECV_BUFFER_REPAINT_THRESHOLD.
+        // next_seq starts at 0; deliver seq RECV_BUFFER_REPAINT_THRESHOLD through
+        // RECV_BUFFER_REPAINT_THRESHOLD * 2 so there are that many frames in the buffer.
+        let threshold = RECV_BUFFER_REPAINT_THRESHOLD;
+        for i in 0..=threshold {
+            let seq = u64::try_from(threshold + 1 + i).unwrap();
+            drop(reader.handle_arrival(EncryptedFrame::Keepalive(0), seq));
+        }
+
+        // Drain NAK frames; verify at least one RepaintRequest was sent.
+        let mut saw_repaint = false;
+        while let Ok(frame) = nak_rx.try_recv() {
+            if matches!(frame, EncryptedFrame::RepaintRequest) {
+                saw_repaint = true;
+            }
+        }
+        assert!(
+            saw_repaint,
+            "expected RepaintRequest when recv_buffer reaches threshold"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_arrival_new_gap_triggers_immediate_nak() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (nak_tx, mut nak_rx) = tokio::sync::mpsc::channel::<EncryptedFrame>(32);
+        let mut reader = UdpReader::builder()
+            .socket(socket)
+            .id(Uuid::new_v4())
+            .rnk([0u8; 32])
+            .unwrap()
+            .hmac([0u8; 64])
+            .nak_out_tx(nak_tx)
+            .build();
+
+        // seq=5 arrives when next_seq=0 → gaps 0..4 are new → immediate NAK
+        drop(reader.handle_arrival(EncryptedFrame::Keepalive(0), 5));
+
+        let frame = nak_rx.try_recv().expect("expected an immediate NAK frame");
+        let EncryptedFrame::Nak(seqs) = frame else {
+            panic!("expected Nak frame, got {frame:?}");
+        };
+        assert_eq!(seqs.len(), 5, "expected gaps 0..4 in NAK");
+        for i in 0u64..5 {
+            assert!(seqs.contains(&i), "gap {i} missing from NAK");
+        }
+    }
+
+    // ── drain_given_up_seqs: consecutive give-ups with buffered frames ────────
+
+    #[test]
+    fn drain_given_up_seqs_consecutive_give_ups_with_buffered_frames() {
+        let mut reader = make_reader_sync();
+
+        // Set up: seq 0 and seq 2 are given up (retry count at MAX), seq 1 is buffered.
+        let past = Instant::now().checked_sub(Duration::from_mins(1)).unwrap();
+        let _r = reader.gap_first_seen.insert(0, past);
+        let _r = reader.gap_nak_count.insert(0, MAX_NAK_RETRIES);
+        let _r = reader.recv_buffer.insert(1, EncryptedFrame::Keepalive(0));
+        let _r = reader.gap_first_seen.insert(2, past);
+        let _r = reader.gap_nak_count.insert(2, MAX_NAK_RETRIES);
+        let _r = reader.recv_buffer.insert(3, EncryptedFrame::Keepalive(0));
+
+        let delivered = reader.drain_given_up_seqs();
+
+        // seq 1 and 3 (buffered after the give-ups) should be delivered
+        assert_eq!(
+            delivered.len(),
+            2,
+            "buffered frames after give-ups should be delivered"
+        );
+        assert_eq!(reader.next_seq, 4);
+        assert!(reader.gap_first_seen.is_empty());
+        assert!(reader.gap_nak_count.is_empty());
+    }
+
+    // ── check_nak_timeouts: multiple timed-out gaps send a single Nak ─────────
+
+    #[tokio::test]
+    async fn check_nak_timeouts_multiple_gaps_sends_single_nak() {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (nak_tx, mut nak_rx) = tokio::sync::mpsc::channel::<EncryptedFrame>(16);
+        let mut reader = UdpReader::builder()
+            .socket(socket)
+            .id(Uuid::new_v4())
+            .rnk([0u8; 32])
+            .unwrap()
+            .hmac([0u8; 64])
+            .nak_out_tx(nak_tx)
+            .build();
+
+        // Insert 3 gaps with an old timestamp so they all time out immediately.
+        let past = Instant::now().checked_sub(Duration::from_secs(10)).unwrap();
+        for seq in [1u64, 3, 5] {
+            let _r = reader.gap_first_seen.insert(seq, past);
+            let _r = reader.gap_nak_count.insert(seq, 0);
+        }
+
+        drop(reader.check_nak_timeouts());
+
+        // Collect all frames sent by check_nak_timeouts (Nak + optional RepaintRequest).
+        let mut frames = Vec::new();
+        while let Ok(f) = nak_rx.try_recv() {
+            frames.push(f);
+        }
+        let nak_frame = frames
+            .into_iter()
+            .find(|f| matches!(f, EncryptedFrame::Nak(_)))
+            .expect("expected a Nak frame");
+        let EncryptedFrame::Nak(seqs) = nak_frame else {
+            unreachable!()
+        };
+        assert_eq!(seqs.len(), 3, "all 3 gaps should appear in a single NAK");
+        for s in [1u64, 3, 5] {
+            assert!(seqs.contains(&s), "gap {s} missing from NAK");
+        }
+    }
+
+    // ── RTT: ceiling exact boundary ───────────────────────────────────────────
+
+    #[test]
+    fn update_rtt_estimate_sample_at_exact_ceiling_is_not_clamped() {
+        let mut reader = make_reader_sync();
+        // Default ceiling = NAK_TIMEOUT (50ms) × 8 = 400ms.
+        // A sample exactly at 400ms must NOT be clamped (condition is `> ceiling`).
+        reader.update_rtt_estimate(Duration::from_millis(400));
+        // The estimator should have used 400ms directly (not clamped), producing
+        // SRTT=400ms → nak_timeout = MAX (500ms).
+        assert_eq!(
+            reader.nak_timeout.unwrap(),
+            MAX_NAK_TIMEOUT,
+            "sample equal to ceiling should not be clamped and should raise nak_timeout"
+        );
+    }
+
+    // ── handle_state_chunk ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn handle_state_chunk_single_chunk_completes_assembly() {
+        use std::sync::Mutex as StdMutex;
+        use zstd::encode_all;
+
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let mut reader = UdpReader::builder()
+            .socket(socket)
+            .id(Uuid::new_v4())
+            .rnk([0u8; 32])
+            .unwrap()
+            .hmac([0u8; 64])
+            .build();
+
+        let emulator = Arc::new(StdMutex::new(Emulator::new(24, 80)));
+        let renderer = Arc::new(StdMutex::new(Renderer::new(24, 80)));
+        let (stdout_tx, _stdout_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+
+        let raw = b"hello";
+        let compressed = encode_all(raw.as_slice(), 0).unwrap();
+
+        // Single-chunk assembly: seq=0, total=1
+        reader
+            .handle_state_chunk(0, 1, compressed, &emulator, &renderer, &stdout_tx)
+            .await;
+
+        // After completion the assembly state must be reset
+        assert_eq!(reader.pending_chunk_seq, 0);
+        assert_eq!(reader.pending_chunk_total, 0);
+        assert!(reader.pending_chunk_data.is_empty());
+    }
+
+    #[tokio::test]
+    async fn handle_state_chunk_out_of_order_clears_and_requests_repaint() {
+        use std::sync::Mutex as StdMutex;
+
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (nak_tx, mut nak_rx) = tokio::sync::mpsc::channel::<EncryptedFrame>(8);
+        let mut reader = UdpReader::builder()
+            .socket(socket)
+            .id(Uuid::new_v4())
+            .rnk([0u8; 32])
+            .unwrap()
+            .hmac([0u8; 64])
+            .nak_out_tx(nak_tx)
+            .build();
+
+        let emulator = Arc::new(StdMutex::new(Emulator::new(24, 80)));
+        let renderer = Arc::new(StdMutex::new(Renderer::new(24, 80)));
+        let (stdout_tx, _stdout_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+
+        // Start assembly: seq=0, total=3
+        reader
+            .handle_state_chunk(0, 3, vec![0xAA; 10], &emulator, &renderer, &stdout_tx)
+            .await;
+
+        // Out-of-order: seq=2 (skipping seq=1) → discard and send RepaintRequest
+        reader
+            .handle_state_chunk(2, 3, vec![0xBB; 10], &emulator, &renderer, &stdout_tx)
+            .await;
+
+        assert!(
+            reader.pending_chunk_data.is_empty(),
+            "assembly must be cleared"
+        );
+        let frame = nak_rx.try_recv().expect("expected RepaintRequest");
+        assert!(
+            matches!(frame, EncryptedFrame::RepaintRequest),
+            "expected RepaintRequest after out-of-order chunk"
         );
     }
 }

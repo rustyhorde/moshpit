@@ -85,11 +85,22 @@ impl Renderer {
         let mut out: Vec<u8> = Vec::with_capacity(4096);
 
         // ── 1. diff the real screen against what we last displayed ───────
+        let new_alt = screen.alternate_screen();
+        let old_alt = self.displayed.screen().alternate_screen();
+
+        // Emit the alt-screen transition before any content so the terminal is in the
+        // correct buffer before the diff / full-refresh bytes are applied.
+        if new_alt && !old_alt {
+            out.extend_from_slice(b"\x1b[?1049h");
+        } else if !new_alt && old_alt {
+            out.extend_from_slice(b"\x1b[?1049l");
+        }
+
         if self.initialized {
             let diff = screen.contents_diff(self.displayed.screen());
             out.extend_from_slice(&diff);
         } else {
-            // First render or after resize: full refresh.
+            // First render or after resize/invalidate: full refresh.
             out.extend_from_slice(&screen.contents_formatted());
             self.initialized = true;
         }
@@ -362,6 +373,44 @@ mod tests {
         assert!(
             s.contains("\x1b[4;8H"),
             "cursor overlay must produce ESC[4;8H: {s:?}"
+        );
+    }
+
+    #[test]
+    fn render_emits_alt_screen_enter_on_transition() {
+        let mut r = Renderer::new(24, 80);
+        // First render to initialise (main screen).
+        let mut p1 = vt100::Parser::new(24, 80, 0);
+        p1.process(b"hello");
+        drop(r.render(p1.screen(), &[], None));
+
+        // Switch to alt-screen.
+        let mut p2 = vt100::Parser::new(24, 80, 0);
+        p2.process(b"\x1b[?1049h");
+        let out = r.render(p2.screen(), &[], None);
+        let s = String::from_utf8_lossy(&out);
+        assert!(
+            s.contains("\x1b[?1049h"),
+            "alt-screen enter must appear in output when transitioning to alt-screen: {s:?}"
+        );
+    }
+
+    #[test]
+    fn render_emits_alt_screen_exit_on_transition() {
+        let mut r = Renderer::new(24, 80);
+        // Start in alt-screen.
+        let mut p1 = vt100::Parser::new(24, 80, 0);
+        p1.process(b"\x1b[?1049h");
+        drop(r.render(p1.screen(), &[], None));
+
+        // Switch back to main screen.
+        let mut p2 = vt100::Parser::new(24, 80, 0);
+        p2.process(b"\x1b[?1049h\x1b[?1049l");
+        let out = r.render(p2.screen(), &[], None);
+        let s = String::from_utf8_lossy(&out);
+        assert!(
+            s.contains("\x1b[?1049l"),
+            "alt-screen exit must appear in output when transitioning to main screen: {s:?}"
         );
     }
 

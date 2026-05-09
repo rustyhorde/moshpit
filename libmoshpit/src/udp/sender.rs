@@ -8,6 +8,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    net::SocketAddr,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -29,6 +30,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use super::DiffMode;
 use crate::EncryptedFrame;
 
 /// Current time as microseconds since the UNIX epoch.
@@ -87,15 +89,23 @@ pub struct UdpSender {
     #[builder(default)]
     pending_retransmit: HashSet<u64>,
     /// Oneshot receiver paired with [`UdpReader::peer_discovered_tx`](crate::UdpReader).
-    /// When present, `frame_loop` waits for the signal before sending any packets,
-    /// ensuring the UDP socket is connected (via `recv_from` bootstrap in
-    /// `server_frame_loop`) before `send()` is called.
-    peer_discovered_rx: Option<oneshot::Receiver<()>>,
+    /// When present, `frame_loop` awaits the initial peer `SocketAddr` before sending
+    /// any packets, so `send_to()` always has a valid destination.
+    peer_discovered_rx: Option<oneshot::Receiver<SocketAddr>>,
+    /// Receiver for mid-session NAT roam notifications from the reader.
+    /// Each value is the new peer address to use for subsequent sends.
+    peer_addr_rx: Option<Receiver<SocketAddr>>,
     /// Optional additional delay applied after peer discovery (server-side only).
     /// When set, `frame_loop` sleeps for this duration after the NAT address is
     /// confirmed, giving slow NAT devices extra time to stabilise the binding
     /// before bulk terminal data starts flowing.
     warmup_delay: Option<Duration>,
+    /// UDP diff transport mode for this session.
+    /// In `Datagram` or `StateSync` mode the retransmit buffer is disabled —
+    /// packets are never stored for re-send, and incoming retransmit requests
+    /// are silently drained.
+    #[builder(default)]
+    diff_mode: DiffMode,
 }
 
 impl UdpSender {
@@ -106,11 +116,12 @@ impl UdpSender {
     /// * I/O error.
     ///
     pub async fn frame_loop(&mut self, token: CancellationToken) -> Result<()> {
-        // If paired with a server UdpReader, wait until the reader has discovered
-        // the client's post-NAT address and called connect() on the shared socket.
-        // This prevents send() from being called on an unconnected socket.
+        // If paired with a server UdpReader, wait for the initial peer SocketAddr
+        // before sending anything — the socket is unconnected so send_to() needs
+        // an explicit destination from the first authenticated client packet.
+        let mut current_peer: Option<SocketAddr> = None;
         if let Some(rx) = self.peer_discovered_rx.take() {
-            let _ = rx.await;
+            current_peer = rx.await.ok();
         }
         // Optional warmup delay: after peer discovery, pause before sending any
         // data frames so that slow NAT devices have extra time to establish the
@@ -144,25 +155,34 @@ impl UdpSender {
                             let seq = self.send_seq;
                             self.send_seq += 1;
                             let wire = self.encrypt(&frame, seq)?;
-                            let _bytes_sent = self.socket.send(&wire).await?;
+                            self.drain_roam_updates(&mut current_peer);
+                            self.send_wire(&wire, current_peer).await?;
                         }
                         None => control_active = false,
                     }
                 },
                 // Collect incoming retransmit requests into a HashSet, deduplicating
                 // repeated NAKs for the same sequence number before we actually send.
+                // In Datagram mode the client never sends NAKs, so this branch
+                // drains the channel without acting on the requests.
                 seqs = self.retransmit_rx.recv(), if retransmit_active => {
                     match seqs {
-                        Some(seqs) => self.pending_retransmit.extend(seqs),
+                        Some(seqs) => {
+                            if self.diff_mode == DiffMode::Reliable {
+                                self.pending_retransmit.extend(seqs);
+                            }
+                        }
                         None => retransmit_active = false,
                     }
                 },
                 // Drain the deduplicated pending set once per tick.
                 _ = retransmit_tick.tick(), if !self.pending_retransmit.is_empty() => {
-                    for seq in self.pending_retransmit.drain() {
+                    self.drain_roam_updates(&mut current_peer);
+                    let pending: Vec<u64> = self.pending_retransmit.drain().collect();
+                    for seq in pending {
                         if let Some(wire) = self.retransmit_buffer.get(&seq) {
                             let wire = wire.clone();
-                            let _bytes_sent = self.socket.send(&wire).await?;
+                            self.send_wire(&wire, current_peer).await?;
                         }
                     }
                 },
@@ -172,16 +192,41 @@ impl UdpSender {
                             let seq = self.send_seq;
                             self.send_seq += 1;
                             let wire = self.encrypt(&frame, seq)?;
-                            let _prev = self.retransmit_buffer.insert(seq, wire.clone());
-                            // Evict packets that fell outside the retransmit window
-                            let cutoff = seq.saturating_sub(RETRANSMIT_WINDOW);
-                            self.retransmit_buffer.retain(|&s, _| s >= cutoff);
-                            let _bytes_sent = self.socket.send(&wire).await?;
+                            if self.diff_mode == DiffMode::Reliable {
+                                let _prev = self.retransmit_buffer.insert(seq, wire.clone());
+                                // Evict packets that fell outside the retransmit window
+                                let cutoff = seq.saturating_sub(RETRANSMIT_WINDOW);
+                                self.retransmit_buffer.retain(|&s, _| s >= cutoff);
+                            }
+                            self.drain_roam_updates(&mut current_peer);
+                            self.send_wire(&wire, current_peer).await?;
                         }
                         None => break,
                     }
                 },
             }
+        }
+        Ok(())
+    }
+
+    /// Drain pending NAT roam notifications from `peer_addr_rx`, updating `peer`
+    /// to the latest address.  Called immediately before each outgoing send so that
+    /// address changes take effect on the very next packet.
+    fn drain_roam_updates(&mut self, peer: &mut Option<SocketAddr>) {
+        if let Some(ref mut rx) = self.peer_addr_rx {
+            while let Ok(addr) = rx.try_recv() {
+                *peer = Some(addr);
+            }
+        }
+    }
+
+    /// Send `wire` to the current peer.  When `peer` is `Some`, uses `send_to`;
+    /// when `None` (client mode — socket is already connected), falls back to `send`.
+    async fn send_wire(&self, wire: &[u8], peer: Option<SocketAddr>) -> Result<()> {
+        if let Some(addr) = peer {
+            let _n = self.socket.send_to(wire, addr).await?;
+        } else {
+            let _n = self.socket.send(wire).await?;
         }
         Ok(())
     }
@@ -340,5 +385,70 @@ mod tests {
 
         // Two wire packets: one Keepalive (control) + one Shutdown (data).
         assert_eq!(count, 2, "expected exactly 2 wire packets");
+    }
+
+    /// After a NAT roam signal arrives on `peer_addr_rx`, subsequent sends must
+    /// go to the new address — verified by checking which of two receiver sockets
+    /// actually receives the encrypted wire packet.
+    #[tokio::test]
+    async fn sender_adopts_roamed_peer_addr() {
+        let old_peer = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let new_peer = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let old_addr = old_peer.local_addr().unwrap();
+        let new_addr = new_peer.local_addr().unwrap();
+
+        let (_ctrl_tx, ctrl_rx) = channel::<EncryptedFrame>(4);
+        let (frame_tx, frame_rx) = channel::<EncryptedFrame>(4);
+        let (_retransmit_tx, retransmit_rx) = channel::<Vec<u64>>(4);
+        let (peer_disc_tx, peer_disc_rx) = oneshot::channel::<SocketAddr>();
+        let (peer_addr_tx, peer_addr_rx) = channel::<SocketAddr>(4);
+        let token = CancellationToken::new();
+
+        let send_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let mut sender = UdpSender::builder()
+            .id(Uuid::new_v4())
+            .rnk([0u8; 32])
+            .unwrap()
+            .hmac([0u8; 64])
+            .socket(send_socket)
+            .control_rx(ctrl_rx)
+            .rx(frame_rx)
+            .retransmit_rx(retransmit_rx)
+            .peer_discovered_rx(peer_disc_rx)
+            .peer_addr_rx(peer_addr_rx)
+            .build();
+
+        // Give the sender its initial destination: old_peer.
+        peer_disc_tx.send(old_addr).unwrap();
+
+        let token2 = token.clone();
+        let handle = tokio::spawn(async move {
+            drop(sender.frame_loop(token2).await);
+        });
+
+        // First frame must reach old_peer.
+        frame_tx.send(EncryptedFrame::Keepalive(0)).await.unwrap();
+        let mut buf = vec![0u8; 65535];
+        let got_old = tokio::time::timeout(Duration::from_millis(500), old_peer.recv(&mut buf))
+            .await
+            .is_ok();
+
+        // Signal a NAT roam to new_peer.
+        peer_addr_tx.send(new_addr).await.unwrap();
+
+        // Give frame_loop one pass through the select! so it drains peer_addr_rx.
+        sleep(Duration::from_millis(10)).await;
+
+        // Second frame must reach new_peer.
+        frame_tx.send(EncryptedFrame::Keepalive(0)).await.unwrap();
+        let got_new = tokio::time::timeout(Duration::from_millis(500), new_peer.recv(&mut buf))
+            .await
+            .is_ok();
+
+        token.cancel();
+        drop(handle.await);
+
+        assert!(got_old, "first frame did not reach original peer");
+        assert!(got_new, "second frame did not reach roamed peer");
     }
 }

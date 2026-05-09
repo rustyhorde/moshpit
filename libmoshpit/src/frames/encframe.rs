@@ -69,6 +69,28 @@ pub enum EncryptedFrame {
     /// payload size, fitting bursts into a single datagram and reducing NAK exposure.
     /// Client decompresses and processes identically to [`EncryptedFrame::Bytes`].
     CompressedBytes((UuidWrapper, Vec<u8>)),
+    /// Server → client in [`DiffMode::StateSync`](crate::DiffMode): a vt100 diff computed from
+    /// the screen state identified by `base_id` (the client's last-acked diff id) to the
+    /// current screen.  `diff_id` is a server-side monotonic counter unique to this diff;
+    /// the client echoes it in [`EncryptedFrame::ClientAck`] so the server can look up the
+    /// matching `contents_formatted()` snapshot and advance its ack baseline.
+    /// Carries zstd-compressed output of `vt100::Screen::contents_diff(ack_screen, current)`.
+    /// Client discards if `base_id != ack_state_seq`; applies and sends
+    /// [`EncryptedFrame::ClientAck`] otherwise.
+    StateSyncDiff((u64, u64, Vec<u8>)),
+    /// Client → server in [`DiffMode::StateSync`](crate::DiffMode): the seq of the last
+    /// [`EncryptedFrame::StateSyncDiff`] the client successfully applied and rendered.
+    /// Server looks up the matching `contents_formatted()` snapshot and advances its ack
+    /// baseline, so future diffs start from the confirmed client state.
+    ClientAck(u64),
+    /// Server → client: the remote PTY process has exited.
+    /// Client should exit cleanly without entering the reconnect loop.
+    PtyExit,
+    /// Server → client: one chunk of a multi-part full-state push too large for a single UDP
+    /// datagram.  `seq` is 0-based; `total` is the total chunk count.  Client buffers until
+    /// `seq == total - 1`, then concatenates in order and processes the assembled bytes
+    /// identically to a [`EncryptedFrame::ScreenStateCompressed`] payload.
+    StateChunk((u16, u16, Vec<u8>)),
 }
 
 impl EncryptedFrame {
@@ -87,6 +109,10 @@ impl EncryptedFrame {
             EncryptedFrame::RepaintRequest => 8,
             EncryptedFrame::ScreenStateCompressed(_) => 9,
             EncryptedFrame::CompressedBytes(_) => 10,
+            EncryptedFrame::StateSyncDiff(_) => 11,
+            EncryptedFrame::ClientAck(_) => 12,
+            EncryptedFrame::PtyExit => 13,
+            EncryptedFrame::StateChunk(_) => 14,
         }
     }
 
@@ -224,6 +250,10 @@ mod tests {
             EncryptedFrame::CompressedBytes((UuidWrapper::new(uuid), vec![])).id(),
             10
         );
+        assert_eq!(EncryptedFrame::StateSyncDiff((0, 0, vec![])).id(), 11);
+        assert_eq!(EncryptedFrame::ClientAck(0).id(), 12);
+        assert_eq!(EncryptedFrame::PtyExit.id(), 13);
+        assert_eq!(EncryptedFrame::StateChunk((0, 1, vec![])).id(), 14);
     }
 
     #[test]

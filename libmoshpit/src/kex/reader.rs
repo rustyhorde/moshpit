@@ -39,7 +39,7 @@ use uuid::Uuid;
 use crate::kex::HostKeyMismatchFn;
 use crate::{
     ConnectionReader, Frame, KexEvent, MoshpitError, ServerKex, UuidWrapper, kex::TofuFn,
-    load_private_key, load_public_key, session::SessionRegistry,
+    load_private_key, load_public_key, session::SessionRegistry, udp::DiffMode,
 };
 
 const AEAD_KEY_INFO: &[u8] = b"AEAD KEY";
@@ -62,6 +62,12 @@ pub struct KexReader {
     tofu_fn: Option<TofuFn>,
     /// Callback for known-host key mismatch replacement prompt.
     host_key_mismatch_fn: Option<HostKeyMismatchFn>,
+    /// UDP diff transport mode requested by this client.  When `Datagram` or
+    /// `StateSync`, the client sends a `Frame::ClientOptions(1)` or `(2)` before
+    /// the `Check` frame so the server can enable the appropriate delivery path
+    /// for this session.  Defaults to `Reliable` (no `ClientOptions` frame sent).
+    #[builder(default)]
+    diff_mode: DiffMode,
 }
 
 impl std::fmt::Debug for KexReader {
@@ -88,6 +94,7 @@ impl std::fmt::Debug for KexReader {
                     "None"
                 },
             )
+            .field("diff_mode", &self.diff_mode)
             .finish()
     }
 }
@@ -166,6 +173,17 @@ impl KexReader {
                     let rnk = RandomizedNonceKey::new(&AES_256_GCM_SIV, &key_bytes)?;
                     let nonce = rnk.seal_in_place_append_tag(Aad::empty(), &mut check)?;
 
+                    match self.diff_mode {
+                        DiffMode::Datagram => self
+                            .tx
+                            .send(Frame::ClientOptions(1))
+                            .map_err(|_| Unspecified)?,
+                        DiffMode::StateSync => self
+                            .tx
+                            .send(Frame::ClientOptions(2))
+                            .map_err(|_| Unspecified)?,
+                        DiffMode::Reliable => {}
+                    }
                     self.tx
                         .send(Frame::Check(*nonce.as_ref(), check))
                         .map_err(|_| Unspecified)?;
@@ -344,22 +362,65 @@ impl KexReader {
                 }
             };
 
-        trace!("server_kex: waiting for Check frame");
-        match self.reader.read_frame().await? {
+        // Read the next frame: clients that requested datagram mode send
+        // `ClientOptions` before `Check`; older/reliable clients send `Check`
+        // directly.  Any other frame type is a protocol error.
+        trace!("server_kex: waiting for ClientOptions or Check frame");
+        let negotiated_diff_mode = match self.reader.read_frame().await? {
+            Some(Frame::ClientOptions(mode_byte)) => {
+                let mode = match mode_byte {
+                    1 => {
+                        trace!("server_kex: client requested DiffMode::Datagram");
+                        DiffMode::Datagram
+                    }
+                    2 => {
+                        trace!("server_kex: client requested DiffMode::StateSync");
+                        DiffMode::StateSync
+                    }
+                    other => {
+                        trace!("server_kex: ClientOptions mode_byte={other}, using Reliable");
+                        DiffMode::Reliable
+                    }
+                };
+                // Now read the Check frame
+                match self.reader.read_frame().await? {
+                    Some(Frame::Check(nonce, enc)) => {
+                        trace!("server_kex: received Check frame after ClientOptions, verifying");
+                        self.handle_check(&rnk, nonce, enc, &self.tx_event.clone())?;
+                        trace!("server_kex: Check verified, KeyAgreement sent");
+                    }
+                    Some(other) => {
+                        error!(
+                            "server_kex: expected Check after ClientOptions but got frame id={}",
+                            other.id()
+                        );
+                        return Err(MoshpitError::InvalidFrame.into());
+                    }
+                    None => {
+                        error!("server_kex: client closed connection after ClientOptions");
+                        return Err(MoshpitError::InvalidFrame.into());
+                    }
+                }
+                mode
+            }
             Some(Frame::Check(nonce, enc)) => {
-                trace!("server_kex: received Check frame, verifying");
+                trace!("server_kex: received Check frame (no ClientOptions), verifying");
                 self.handle_check(&rnk, nonce, enc, &self.tx_event.clone())?;
                 trace!("server_kex: Check verified, KeyAgreement sent");
+                DiffMode::Reliable
             }
             Some(other) => {
-                error!("server_kex: expected Check but got frame id={}", other.id());
+                error!(
+                    "server_kex: expected ClientOptions or Check but got frame id={}",
+                    other.id()
+                );
                 return Err(MoshpitError::InvalidFrame.into());
             }
             None => {
                 error!("server_kex: client closed connection before sending Check");
                 return Err(MoshpitError::InvalidFrame.into());
             }
-        }
+        };
 
         // Determine session UUID: reuse the requested session if user matches,
         // else create new.  Any live connection on the same session will be
@@ -397,6 +458,7 @@ impl KexReader {
             .shell(shell)
             .session_uuid(session_uuid)
             .is_resume(is_resume)
+            .diff_mode(negotiated_diff_mode)
             .build();
 
         Ok((skex, udp_arc))
@@ -497,25 +559,52 @@ impl KexReader {
         socket_addr: SocketAddr,
         port_pool: Arc<Mutex<BTreeSet<u16>>>,
     ) -> Result<Arc<UdpSocket>> {
-        let mut port_p = port_pool.lock().await;
-        let next_port = port_p.pop_first().unwrap_or(49999);
-
-        // Advertise the IP that the client used to reach us (the TCP connection's
-        // local address).  This is the IP the client can actually route UDP packets
-        // to, regardless of which bind address the listener was configured with.
-        let udp_addr_for_client = SocketAddr::new(socket_addr.ip(), next_port);
-        trace!("advertising moshpits UDP socket at {udp_addr_for_client}");
-        self.tx.send(Frame::MoshpitsAddr(udp_addr_for_client))?;
-
         // Bind to all interfaces so we can receive from the client regardless of
         // NAT, multi-homing, or routing asymmetry.
         let unspecified = match socket_addr {
             SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
         };
-        let bind_addr = SocketAddr::new(unspecified, next_port);
-        trace!("binding moshpits UDP socket at {bind_addr}");
-        let udp_listener = UdpSocket::bind(bind_addr).await?;
+
+        // Snapshot pool candidates without holding the lock during async bind attempts
+        // so concurrent connections do not block each other.
+        let candidates: Vec<u16> = {
+            let port_p = port_pool.lock().await;
+            port_p.iter().copied().collect()
+        };
+
+        // Try ports in ascending order; use the first one the OS accepts.
+        let mut bound: Option<(u16, UdpSocket)> = None;
+        for port in candidates {
+            let bind_addr = SocketAddr::new(unspecified, port);
+            trace!("trying moshpits UDP bind at {bind_addr}");
+            match UdpSocket::bind(bind_addr).await {
+                Ok(sock) => {
+                    bound = Some((port, sock));
+                    break;
+                }
+                Err(e) => {
+                    trace!("port {port} unavailable: {e}");
+                }
+            }
+        }
+
+        let (next_port, udp_listener) = bound.ok_or_else(|| {
+            anyhow::anyhow!("no available UDP port in pool (50000–59999 exhausted)")
+        })?;
+
+        // Remove the successfully-bound port from the pool.
+        {
+            let mut port_p = port_pool.lock().await;
+            let _ = port_p.remove(&next_port);
+        }
+
+        // Advertise after confirming the bind succeeded — avoids pointing the
+        // client at a port that subsequently fails to open.
+        let udp_addr_for_client = SocketAddr::new(socket_addr.ip(), next_port);
+        trace!("advertising moshpits UDP socket at {udp_addr_for_client}");
+        self.tx.send(Frame::MoshpitsAddr(udp_addr_for_client))?;
+
         let sock = SockRef::from(&udp_listener);
         drop(sock.set_recv_buffer_size(4 * 1024 * 1024));
         drop(sock.set_send_buffer_size(4 * 1024 * 1024));
@@ -523,7 +612,7 @@ impl KexReader {
         // traffic priority on QoS-aware networks.  Silently ignored on platforms
         // where the socket option is unavailable.
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        if bind_addr.is_ipv4() {
+        if socket_addr.is_ipv4() {
             drop(sock.set_tos_v4(0xB8));
         } else {
             drop(sock.set_tclass_v6(0xB8));
@@ -1156,7 +1245,7 @@ mod tests {
     };
     use tokio::sync::Mutex as TokioMutex;
     use tokio::{
-        net::{TcpListener, TcpStream},
+        net::{TcpListener, TcpStream, UdpSocket},
         sync::mpsc::unbounded_channel,
     };
 
@@ -1211,13 +1300,21 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn handle_udp_setup_pops_first_port_from_pool() {
+    async fn handle_udp_setup_uses_first_available_port() {
         let (client_reader, _client_writer, _server_reader, _server_writer) =
             make_bidirectional_loopback().await;
         let (mut kex_reader, mut rx_frames, _rx_events) = make_test_kex_reader(client_reader);
 
+        // Ask the OS for a free port so the test doesn't conflict with a running
+        // moshpit server that may already hold a port in the 50000–59999 range.
+        let free_port = {
+            let probe = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+            probe.local_addr().unwrap().port()
+            // probe drops here, releasing the port before handle_udp_setup re-binds it
+        };
+
         let mut pool = BTreeSet::new();
-        let _ = pool.insert(50001u16);
+        let _ = pool.insert(free_port);
         let port_pool = StdArc::new(TokioMutex::new(pool));
         let socket_addr: std::net::SocketAddr = "127.0.0.1:9000".parse().unwrap();
 
@@ -1231,32 +1328,74 @@ mod tests {
             Frame::MoshpitsAddr(a) => a.port(),
             other => panic!("expected MoshpitsAddr, got {other:?}"),
         };
-        assert_eq!(advertised_port, 50001);
-        // Socket should be bound (local_addr succeeds)
+        assert_eq!(advertised_port, free_port);
         assert!(udp_arc.local_addr().is_ok());
     }
 
     #[tokio::test]
-    async fn handle_udp_setup_empty_pool_falls_back_to_port_49999() {
+    async fn handle_udp_setup_empty_pool_returns_error() {
         let (client_reader, _client_writer, _server_reader, _server_writer) =
             make_bidirectional_loopback().await;
-        let (mut kex_reader, mut rx_frames, _rx_events) = make_test_kex_reader(client_reader);
+        let (mut kex_reader, _rx_frames, _rx_events) = make_test_kex_reader(client_reader);
 
         let pool: BTreeSet<u16> = BTreeSet::new();
         let port_pool = StdArc::new(TokioMutex::new(pool));
         let socket_addr: std::net::SocketAddr = "127.0.0.1:9000".parse().unwrap();
 
-        let _udp_arc = kex_reader
-            .handle_udp_setup(socket_addr, port_pool)
+        let result = kex_reader.handle_udp_setup(socket_addr, port_pool).await;
+        assert!(result.is_err(), "expected error when pool is empty");
+    }
+
+    #[tokio::test]
+    async fn handle_udp_setup_skips_in_use_port() {
+        let (client_reader, _client_writer, _server_reader, _server_writer) =
+            make_bidirectional_loopback().await;
+        let (mut kex_reader, mut rx_frames, _rx_events) = make_test_kex_reader(client_reader);
+
+        // Get two OS-assigned free ports.
+        let sock_a = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        let sock_b = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        let port_a = sock_a.local_addr().unwrap().port();
+        let port_b = sock_b.local_addr().unwrap().port();
+
+        // Ensure the lower-numbered port (tried first by BTreeSet iteration) stays
+        // occupied; drop the higher-numbered socket so handle_udp_setup can bind it.
+        let (occupied_port, occupied_sock, free_port) = if port_a < port_b {
+            drop(sock_b);
+            (port_a, sock_a, port_b)
+        } else {
+            drop(sock_a);
+            (port_b, sock_b, port_a)
+        };
+
+        let mut pool = BTreeSet::new();
+        let _ = pool.insert(occupied_port);
+        let _ = pool.insert(free_port);
+        let port_pool = StdArc::new(TokioMutex::new(pool));
+        let socket_addr: std::net::SocketAddr = "127.0.0.1:9000".parse().unwrap();
+
+        // occupied_sock is still alive — occupied_port is held at the OS level.
+        let udp_arc = kex_reader
+            .handle_udp_setup(socket_addr, port_pool.clone())
             .await
             .unwrap();
+        drop(occupied_sock); // explicit: ensure it outlives handle_udp_setup
 
         let frame = rx_frames.recv().await.unwrap();
         let advertised_port = match frame {
             Frame::MoshpitsAddr(a) => a.port(),
             other => panic!("expected MoshpitsAddr, got {other:?}"),
         };
-        assert_eq!(advertised_port, 49999);
+        assert_eq!(
+            advertised_port, free_port,
+            "should have skipped the in-use port"
+        );
+        assert!(udp_arc.local_addr().is_ok());
+        // The occupied port was never successfully bound — it must remain in the pool.
+        assert!(
+            port_pool.lock().await.contains(&occupied_port),
+            "in-use port should remain in pool"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1481,5 +1620,100 @@ mod tests {
         assert!(matches!(events[2], KexEvent::Uuid(_)));
         assert!(matches!(events[3], KexEvent::SessionInfo(_, false)));
         assert!(matches!(events[4], KexEvent::MoshpitsAddr(_)));
+    }
+
+    #[tokio::test]
+    async fn client_kex_server_closes_before_session_token_returns_error() {
+        let (client_reader, _client_writer, _server_reader, mut server_writer) =
+            make_bidirectional_loopback().await;
+        let (mut kex_reader, _rx_frames, _rx_events) = make_test_kex_reader(client_reader);
+
+        let server_epk = PrivateKey::generate(&X25519).unwrap();
+        let server_pub = server_epk.compute_public_key().unwrap();
+        let salt = vec![0u8; 32];
+        server_writer
+            .write_frame(&Frame::PeerInitialize(server_pub.as_ref().to_vec(), salt))
+            .await
+            .unwrap();
+        server_writer
+            .write_frame(&Frame::KeyAgreement(UuidWrapper::new(uuid::Uuid::new_v4())))
+            .await
+            .unwrap();
+        // Close without sending SessionToken
+        drop(server_writer);
+
+        let epk = PrivateKey::generate(&X25519).unwrap();
+        let result = kex_reader.client_kex(&epk).await;
+        assert!(
+            result.is_err(),
+            "expected error when server closes before SessionToken"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_kex_server_closes_before_moshpits_addr_returns_error() {
+        let (client_reader, _client_writer, _server_reader, mut server_writer) =
+            make_bidirectional_loopback().await;
+        let (mut kex_reader, _rx_frames, _rx_events) = make_test_kex_reader(client_reader);
+
+        let server_epk = PrivateKey::generate(&X25519).unwrap();
+        let server_pub = server_epk.compute_public_key().unwrap();
+        let salt = vec![0u8; 32];
+        server_writer
+            .write_frame(&Frame::PeerInitialize(server_pub.as_ref().to_vec(), salt))
+            .await
+            .unwrap();
+        server_writer
+            .write_frame(&Frame::KeyAgreement(UuidWrapper::new(uuid::Uuid::new_v4())))
+            .await
+            .unwrap();
+        server_writer
+            .write_frame(&Frame::SessionToken(UuidWrapper::new(uuid::Uuid::new_v4())))
+            .await
+            .unwrap();
+        // Close without sending MoshpitsAddr
+        drop(server_writer);
+
+        let epk = PrivateKey::generate(&X25519).unwrap();
+        let result = kex_reader.client_kex(&epk).await;
+        assert!(
+            result.is_err(),
+            "expected error when server closes before MoshpitsAddr"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_kex_wrong_frame_instead_of_session_token_returns_key_not_established() {
+        use crate::MoshpitError;
+
+        let (client_reader, _client_writer, _server_reader, mut server_writer) =
+            make_bidirectional_loopback().await;
+        let (mut kex_reader, _rx_frames, _rx_events) = make_test_kex_reader(client_reader);
+
+        let server_epk = PrivateKey::generate(&X25519).unwrap();
+        let server_pub = server_epk.compute_public_key().unwrap();
+        let salt = vec![0u8; 32];
+        server_writer
+            .write_frame(&Frame::PeerInitialize(server_pub.as_ref().to_vec(), salt))
+            .await
+            .unwrap();
+        server_writer
+            .write_frame(&Frame::KeyAgreement(UuidWrapper::new(uuid::Uuid::new_v4())))
+            .await
+            .unwrap();
+        // Send wrong frame instead of SessionToken
+        server_writer.write_frame(&Frame::KexFailure).await.unwrap();
+        drop(server_writer);
+
+        let epk = PrivateKey::generate(&X25519).unwrap();
+        let result = kex_reader.client_kex(&epk).await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .downcast_ref::<MoshpitError>()
+                .is_some_and(|e| *e == MoshpitError::KeyNotEstablished),
+            "expected KeyNotEstablished error"
+        );
     }
 }
