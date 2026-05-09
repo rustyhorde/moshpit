@@ -15,6 +15,7 @@ use bytes::Buf as _;
 use crate::{
     error::Error,
     frames::{get_bytes, get_usize},
+    kex::negotiate::AlgorithmList,
     uuid::UuidWrapper,
 };
 
@@ -51,6 +52,12 @@ pub enum Frame {
     /// send this frame when connecting to a server that supports it (i.e. same
     /// version or newer).
     ClientOptions(u8),
+    /// SSH-style algorithm negotiation frame sent by both client and server at
+    /// the very start of the handshake (before `Initialize` / `PeerInitialize`).
+    /// Each side lists its supported algorithms in preference order; the
+    /// receiver runs [`negotiate`](crate::kex::negotiate::negotiate) to pick
+    /// the first common algorithm in each category.
+    KexInit(AlgorithmList),
 }
 
 impl Frame {
@@ -67,6 +74,7 @@ impl Frame {
             Frame::SessionToken(_) => 6,
             Frame::ResumeRequest(_, _, _, _) => 7,
             Frame::ClientOptions(_) => 8,
+            Frame::KexInit(_) => 9,
         }
     }
 
@@ -77,7 +85,7 @@ impl Frame {
     ///
     pub fn parse(src: &mut Cursor<&[u8]>) -> Result<Option<Self>> {
         match get_u8(src) {
-            Some(0..=8) => {
+            Some(0..=9) => {
                 if let Some(length_slice) = get_usize(src)? {
                     let length = usize::from_be_bytes(length_slice.try_into()?);
                     if length > MAX_FRAME_LENGTH {
@@ -137,6 +145,11 @@ impl Display for Frame {
                 fpk.len()
             ),
             Frame::ClientOptions(mode) => write!(f, "ClientOptions({mode})"),
+            Frame::KexInit(list) => write!(
+                f,
+                "KexInit(kex={:?}, aead={:?}, mac={:?}, kdf={:?})",
+                list.kex, list.aead, list.mac, list.kdf
+            ),
         }
     }
 }
@@ -352,8 +365,8 @@ mod tests {
 
     #[test]
     fn test_parse_unknown_frame_id_returns_none() {
-        // Frame IDs 0–8 are known; anything above 8 must be silently ignored (Ok(None)).
-        let all_data = [9u8, 0, 0, 0, 0, 0, 0, 0, 0]; // id=9, length=0, no payload
+        // Frame IDs 0–9 are known; anything above 9 must be silently ignored (Ok(None)).
+        let all_data = [10u8, 0, 0, 0, 0, 0, 0, 0, 0]; // id=10, length=0, no payload
         let mut cursor = Cursor::new(&all_data[..]);
         let result = Frame::parse(&mut cursor);
         assert!(result.is_ok(), "unknown frame id must not be an error");
@@ -361,5 +374,29 @@ mod tests {
             result.unwrap().is_none(),
             "unknown frame id must return Ok(None)"
         );
+    }
+
+    #[test]
+    fn test_kex_init_round_trips() -> Result<()> {
+        use crate::kex::negotiate::{AlgorithmList, supported_algorithms};
+
+        let list: AlgorithmList = supported_algorithms();
+        let frame = Frame::KexInit(list.clone());
+        let encoded_frame = encode_to_vec(&frame, standard())?;
+        let length = encoded_frame.len();
+        let length_bytes = length.to_be_bytes();
+
+        let mut all_data = vec![9u8]; // KexInit id=9
+        all_data.extend_from_slice(&length_bytes);
+        all_data.extend_from_slice(&encoded_frame);
+
+        let mut cursor = Cursor::new(&all_data[..]);
+        let parsed = Frame::parse(&mut cursor)?;
+        assert!(parsed.is_some());
+        let Frame::KexInit(parsed_list) = parsed.unwrap() else {
+            panic!("expected KexInit");
+        };
+        assert_eq!(parsed_list, list);
+        Ok(())
     }
 }

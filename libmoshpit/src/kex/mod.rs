@@ -35,7 +35,8 @@ use uuid::Uuid;
 
 use crate::{
     ConnectionReader, ConnectionWriter, Frame, KexConfig, KexReader, KexSender, MoshpitError,
-    UuidWrapper, decrypt_private_key, load_private_key, load_public_key, udp::DiffMode,
+    UuidWrapper, decrypt_private_key, kex::negotiate::NegotiatedAlgorithms, load_private_key,
+    load_public_key, udp::DiffMode,
 };
 
 /// The callback type for TOFU (Trust-On-First-Use) interactive host key validation.
@@ -53,6 +54,7 @@ struct HostKeyCallbacks {
     host_key_mismatch_fn: Option<HostKeyMismatchFn>,
 }
 
+pub(crate) mod negotiate;
 pub(crate) mod reader;
 pub(crate) mod sender;
 
@@ -102,7 +104,7 @@ pub struct KexStateMachine {
 }
 
 /// The moshpit key exchange result
-#[derive(Clone, Copy, CopyGetters, Debug)]
+#[derive(Clone, Debug, CopyGetters, Getters)]
 pub struct Kex {
     /// AES-256-GCM-SIV key material for encrypting/decrypting UDP packets
     #[getset(get_copy = "pub")]
@@ -122,6 +124,9 @@ pub struct Kex {
     /// Whether this connection is resuming an existing session.
     #[getset(get_copy = "pub")]
     is_resume: bool,
+    /// Algorithms negotiated during key exchange.
+    #[getset(get = "pub")]
+    negotiated_algorithms: NegotiatedAlgorithms,
 }
 
 impl Kex {
@@ -141,6 +146,7 @@ impl Default for Kex {
             moshpits_addr: None,
             session_uuid: None,
             is_resume: false,
+            negotiated_algorithms: NegotiatedAlgorithms::default(),
         }
     }
 }
@@ -166,6 +172,10 @@ pub struct ServerKex {
     #[getset(get_copy = "pub")]
     #[builder(default)]
     diff_mode: DiffMode,
+    /// Algorithms negotiated during key exchange.
+    #[getset(get = "pub")]
+    #[builder(default)]
+    negotiated_algorithms: NegotiatedAlgorithms,
 }
 
 impl KexStateMachine {
@@ -404,6 +414,7 @@ async fn run_client_kex<T: KexConfig>(
     } = callbacks;
 
     let diff_mode = config.diff_mode();
+    let client_algos = config.preferred_algorithms();
     let _read_handle = spawn(async move {
         let mut frame_reader = KexReader::builder()
             .reader(reader)
@@ -414,13 +425,15 @@ async fn run_client_kex<T: KexConfig>(
             .maybe_tofu_fn(tofu_fn)
             .maybe_host_key_mismatch_fn(host_key_mismatch_fn)
             .diff_mode(diff_mode)
+            .client_algos(client_algos)
             .build();
         if let Err(e) = frame_reader.client_kex(&pk).await {
             error!("client_kex failed: {e}");
         }
     });
 
-    // Send the initialize or resume-request frame with our public key
+    // Send KexInit then the initialize or resume-request frame with our public key
+    tx.send(Frame::KexInit(config.preferred_algorithms()))?;
     let frame = if let Some(session_uuid) = config.resume_session_uuid() {
         info!(
             "Sending ResumeRequest for session {session_uuid} (user='{}')",

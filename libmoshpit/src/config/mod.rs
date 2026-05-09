@@ -15,7 +15,14 @@ use serde::Deserialize;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::{KexMode, error::Error, session::SessionRegistry, to_path_buf, udp::DiffMode};
+use crate::{
+    KexMode,
+    error::Error,
+    kex::negotiate::{AlgorithmList, supported_algorithms},
+    session::SessionRegistry,
+    to_path_buf,
+    udp::DiffMode,
+};
 
 pub(crate) mod mps;
 pub(crate) mod tracing;
@@ -73,6 +80,13 @@ pub trait KexConfig {
     /// client's `ClientOptions` KEX frame.
     fn diff_mode(&self) -> DiffMode {
         DiffMode::Reliable
+    }
+    /// The ordered list of algorithms this endpoint is willing to use.
+    /// Both client and server send this list in a `KexInit` frame at the start
+    /// of the handshake; the peer selects the first common algorithm in each
+    /// category.  Defaults to the full set of algorithms supported by this build.
+    fn preferred_algorithms(&self) -> AlgorithmList {
+        supported_algorithms()
     }
 }
 
