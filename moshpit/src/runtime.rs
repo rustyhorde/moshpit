@@ -106,6 +106,12 @@ impl PassCache {
     }
 }
 
+/// Maximum time allowed for the entire TCP key exchange.  If the server accepts
+/// the TCP connection but never sends a frame the client would otherwise block
+/// forever inside `read_frame().await`; this bound converts that hang into a
+/// retriable network error.
+const KEX_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// An unrecoverable key-exchange error that should not trigger the retry loop.
 #[derive(Debug)]
 struct FatalKexError {
@@ -633,6 +639,29 @@ async fn run_session_loop(
                     drop(disable_raw_mode());
                     return Err(e);
                 }
+                if let Some(&err) = e.downcast_ref::<MoshpitError>() {
+                    match err {
+                        MoshpitError::KeyNotEstablished => {
+                            eprintln!("mp: server rejected the key exchange");
+                            eprintln!(
+                                "mp: ensure your public key is listed in \
+                                 ~/.mp/authorized_keys on the server"
+                            );
+                            drop(disable_raw_mode());
+                            return Err(e);
+                        }
+                        MoshpitError::NoCommonAlgorithm => {
+                            eprintln!("mp: no common algorithm found during key exchange");
+                            eprintln!(
+                                "mp: check --kex-algos, --aead-algos, --mac-algos, \
+                                 and --kdf-algos settings on both client and server"
+                            );
+                            drop(disable_raw_mode());
+                            return Err(e);
+                        }
+                        _ => {}
+                    }
+                }
                 reconnect_attempt = reconnect_attempt.saturating_add(1);
                 error!("Failed to connect to {socket_addr}: {e}, retrying in {backoff:?}");
                 // Reset passphrase cache on early failures so the user can
@@ -761,15 +790,27 @@ async fn connect_and_kex(
     );
 
     let kex_start = Instant::now();
-    let (kex, udp_arc, _) = run_key_exchange(
-        config.clone(),
-        sock_read,
-        sock_write,
-        pass_fn,
-        Some(tofu_fn),
-        Some(mismatch_fn),
+    let kex_result = time::timeout(
+        KEX_TIMEOUT,
+        run_key_exchange(
+            config.clone(),
+            sock_read,
+            sock_write,
+            pass_fn,
+            Some(tofu_fn),
+            Some(mismatch_fn),
+        ),
     )
-    .await
+    .await;
+    let (kex, udp_arc, _) = match kex_result {
+        Err(_elapsed) => {
+            return Err(anyhow::anyhow!(
+                "key exchange timed out after {KEX_TIMEOUT:?} — \
+                 server accepted TCP connection but sent no data"
+            ));
+        }
+        Ok(inner) => inner,
+    }
     .map_err(|e| {
         if let Some(&moshpit_err) = e.downcast_ref::<MoshpitError>() {
             match moshpit_err {
