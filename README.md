@@ -34,7 +34,7 @@ moshpit draws its core motivation from [Mosh (Mobile Shell)](https://mosh.org/),
 |---------|------|---------|
 | **Language** | C++ | Rust |
 | **Authentication** | Delegated to SSH for the initial handshake; a one-time secret is passed back over SSH | Standalone asymmetric key-pair authentication (X25519, P-384, or P-256) — no SSH dependency |
-| **Transport model** | Pure UDP after setup; Mosh's *State Synchronization Protocol* (SSP) keeps a diff of the full terminal screen state and sends only the latest snapshot | TCP is used solely for the asymmetric key exchange; all terminal I/O runs over UDP after the exchange completes.  NAK-based selective retransmission with an adaptive RTT estimator ensures reliable, ordered delivery; a split data/control channel prevents control frames from being delayed by PTY data backlogs |
+| **Transport model** | Pure UDP after setup; Mosh's *State Synchronization Protocol* (SSP) keeps a diff of the full terminal screen state and sends only the latest snapshot | TCP is used solely for the asymmetric key exchange; all terminal I/O runs over UDP after the exchange completes.  Three selectable diff transport modes: `reliable` (default, NAK-based retransmission with adaptive RTT), `datagram` (fire-and-forget with periodic full-screen recovery), and `statesync` (Mosh-inspired ack-based diffs, no NAKs); see [UDP diff transport modes](#udp-diff-transport-modes) |
 | **Reconnect display sync** | SSP sends the latest screen snapshot; client repaints from the diff immediately | Server maintains a `vt100::Parser` tracking the live PTY screen; on reconnect a single `ScreenState` frame delivers `contents_formatted()` bytes for an instant clean repaint.  A 50 ms periodic task also sends `ScreenState` diffs during normal use so the client stays in sync even across network hiccups. |
 | **Client-side prediction** | Mosh echoes keystrokes locally and predicts cursor movement to hide latency, underlining characters that have not yet been confirmed by the server | Same — keystrokes are echoed locally, cursor movement is predicted, and unconfirmed characters are underlined until the server output arrives |
 | **Encryption** | AES-128-OCB authenticated encryption using a symmetric session key | Key exchange via an asymmetric key-pair handshake (default: X25519); negotiated symmetric encryption on the UDP channel (default: AES-256-GCM-SIV with per-packet HMAC-SHA-512; see [Algorithm negotiation](#algorithm-negotiation)) |
@@ -57,15 +57,97 @@ The client opens a TCP connection to the server's configured port (default 40404
 
 All subsequent communication happens exclusively over UDP (server-side port range 50000–59999).  Every frame is encrypted and authenticated using the algorithms negotiated during Phase 1 (default: AES-256-GCM-SIV with per-packet HMAC-SHA-512; see [Algorithm negotiation](#algorithm-negotiation) for the full list of supported ciphers and how to select them).
 
-Reliable, ordered delivery is provided at the application layer using **NAK-based selective retransmission**:
+The client selects a **diff transport mode** during key exchange (via `--diff-mode`; see [UDP diff transport modes](#udp-diff-transport-modes) below).  The mode determines how the server delivers PTY screen diffs and how lost packets are recovered.  All three modes use the same encryption and frame format; only the delivery and recovery strategy differ.
 
-- The **receiver** (`UdpReader`) tracks the highest sequence number seen and maintains a reorder buffer.  Any gap that persists beyond a 20–500 ms adaptive NAK timeout triggers a `Nak` frame — a compact list of missing sequence numbers — sent back to the sender over the same UDP channel.  When a gap opens mid-burst, a `RepaintRequest` is also sent immediately (rather than waiting for the first NAK retry cycle) so the server can deliver a fresh screen snapshot within one RTT.
-- The **sender** (`UdpSender`) keeps a sliding retransmit buffer of the 512 most-recently transmitted wire-encoded packets.  When a `Nak` arrives the missing packets are looked up and resent immediately.  The sender uses **two separate outbound channels** — a high-priority control channel (capacity 16) for `Keepalive` and `Shutdown` frames, and a data channel (capacity 256) for PTY diffs and screen states — so control frames are always polled first and bypass any data backlog.
-- Each gap is retried up to 4 times (with exponential backoff capped at 800 ms); after the limit is exceeded the gap is abandoned and the session proceeds.
-- The NAK timeout adapts to the measured round-trip time using a Jacobson-Karels estimator.  Outlier RTT spikes are clamped to 8× the current estimate rather than discarded, preventing a self-reinforcing loop where aggressive 20 ms NAKs worsen congestion on slow NAT paths.
-- Large PTY bursts (more than 10 MTU-sized chunks from a single PTY read, e.g. a full-screen `htop` redraw) are sent with **3× the configured inter-packet pacing delay** to reduce burst loss on stateful NAT devices.
+### UDP diff transport modes
 
-Because retransmission is handled entirely within the UDP layer there is no head-of-line blocking from TCP: a lost packet delays only the frames that depend on it, not the rest of the stream.  Control frames are additionally isolated from data backpressure via the split channel design.
+#### `reliable` (default)
+
+The server sends incremental PTY diffs as they are produced.  The client tracks sequence numbers, buffers out-of-order frames, and requests retransmission of any gaps via `Nak` frames.
+
+**How it works:**
+
+- The **receiver** (`UdpReader`) maintains a reorder buffer and tracks gaps.  Any gap that persists beyond the adaptive NAK timeout triggers a `Nak` frame — a compact list of missing sequence numbers — sent back to the server.  A `RepaintRequest` is also sent after the first NAK retry (or immediately when the reorder buffer grows large), so the server delivers a fresh full-screen snapshot within one RTT without waiting for retransmit to succeed.
+- The **sender** (`UdpSender`) keeps a sliding retransmit buffer of the 512 most-recently transmitted packets.  When a `Nak` arrives the missing packets are resent immediately.  Two separate outbound channels — a high-priority control channel for `Keepalive` and `Shutdown` frames and a data channel for diffs and screen states — ensure control frames always bypass any data backlog.
+- Each gap is retried up to 4 times with exponential backoff (initial 50 ms, capped at 800 ms); after the retry limit the gap is abandoned and the session proceeds.
+- The NAK timeout adapts continuously to the measured RTT using a Jacobson-Karels estimator (range: 20–500 ms).  Outlier RTT spikes are clamped to 8× the current estimate rather than discarded, preventing the estimator from staying locked at 20 ms and sending aggressive NAKs that worsen congestion.
+- Large PTY bursts (more than 10 MTU-sized chunks from a single PTY read, e.g. a full-screen `htop` redraw) are sent with **3× the configured pacing delay** to reduce burst loss on stateful NAT devices.
+- The server also runs a proactive watchdog: if it receives ≥10 NAK frames within a 200 ms window it pushes a full `ScreenStateCompressed` immediately, without waiting for an explicit `RepaintRequest` that may itself be lost on a high-loss path.
+
+**Pros:** Lowest bandwidth in steady state (only sends what changed); ordered, lossless delivery; fast per-gap recovery.
+
+**Cons:** Head-of-line blocking — a lost packet stalls all frames with higher sequence numbers until it is retransmitted or the gap is abandoned; retransmit overhead increases sharply on lossy paths.
+
+**Best for:** Low-loss networks — LAN, fibre, stable broadband — where retransmit fires rarely and packet ordering is mostly preserved.
+
+---
+
+#### `datagram`
+
+The server sends incremental PTY diffs with no retransmission.  The client applies diffs as they arrive and ignores gaps entirely.  As the sole recovery mechanism, the server pushes a compressed full-screen snapshot (`ScreenStateCompressed`) every **150 ms**; any accumulated drift is corrected on the next push regardless of what was lost.
+
+**How it works:**
+
+- No NAK frames are generated; no reorder buffer is maintained; incoming frames are delivered immediately in arrival order.
+- The server runs a dedicated periodic task that fires every 150 ms, compresses the current `contents_formatted()` snapshot with zstd, and sends it unconditionally.  At a typical compressed screen size of ~3 KB this costs roughly 20 KB/s of extra bandwidth — negligible on any modern link.
+- Large initial screen state (or state exceeding the single-datagram limit) is sent as a sequence of `StateChunk` frames (800 B payload each) that the client reassembles.
+
+**Pros:** No head-of-line blocking; the terminal never stalls regardless of loss rate; simple, stateless delivery path.
+
+**Cons:** Higher baseline bandwidth than `reliable` (periodic full-screen pushes even when nothing has changed); a lost diff is visible as a brief glitch for up to 150 ms before the next push corrects it.
+
+**Best for:** High-loss or flaky networks — bursty mobile data, lossy WiFi, satellite links with variable loss — where retransmission would be counterproductive or create congestion feedback loops.
+
+```bash
+mp --diff-mode datagram user@192.168.1.10
+```
+
+---
+
+#### `statesync`
+
+A Mosh-inspired ack-based delivery mode.  Instead of sending the incremental diff since the *last packet*, the server always sends `contents_diff(ack_state → current)`: the diff from the last state the client **acknowledged** to the current screen.  Each packet is therefore self-contained — a lost packet is automatically covered by the next one sent from the same baseline, with no explicit retransmission needed.
+
+**How it works:**
+
+- The server ticks every **50 ms**.  On each tick it computes `contents_diff(ack_state, current)` and sends a `StateSyncDiff(base_id, diff_id, compressed_diff)` frame if the diff is non-empty.
+- The client applies the diff to its local `ack_state`, advances its baseline, and immediately sends a `ClientAck(diff_id)` back to the server.  The server uses incoming `ClientAck` frames to advance its diff baseline so subsequent diffs are as small as possible.
+- The server keeps a ring buffer of the 32 most-recently sent states.  When a `ClientAck` arrives, the corresponding entry is looked up to advance the baseline; stale acks are silently discarded.
+- If a `StateSyncDiff` arrives with a `base_id` that does not match the client's current `ack_state_seq` (i.e. a packet was lost or arrived out of order), the client discards it and increments a mismatch counter.  After 3 consecutive mismatches the client sends a `RepaintRequest` to trigger a full-state push and reset the baseline.
+- Diffs exceeding 900 bytes compressed (e.g. a full alt-screen repaint from `htop`) are replaced with a chunked `ScreenStateCompressed` push rather than a single oversized datagram, preventing NAT fragmentation from stalling the ack pipeline.
+- No reorder buffer; no NAK frames; no periodic full-screen pushes in steady state.
+
+**Pros:** Each packet carries maximum useful information — no redundant retransmission; no head-of-line blocking; no periodic bandwidth tax in steady state; bandwidth scales with actual screen change rate rather than loss rate.
+
+**Cons:** Per-packet payload is larger than `reliable` mode (full diff from ack baseline rather than the incremental diff since last packet); latency of each rendered update is bounded by the ack round-trip; desync recovery (3 mismatches → `RepaintRequest`) adds a recovery round-trip on high-loss paths.
+
+**Best for:** Moderate-loss, low-bandwidth links — satellite, weak cellular, metered connections — where bandwidth is precious, each packet should carry maximum useful state, and explicit retransmission is undesirable.
+
+```bash
+mp --diff-mode statesync user@192.168.1.10
+```
+
+---
+
+#### Choosing a mode
+
+| Condition | Recommended mode |
+|-----------|-----------------|
+| Low loss, low latency (LAN, fibre, stable broadband) | `reliable` (default) |
+| High or bursty loss (lossy WiFi, poor mobile, VPN with drops) | `datagram` |
+| Moderate loss, bandwidth-constrained (satellite, weak cellular) | `statesync` |
+| High-throughput programs (`htop`, `vim`) over a flaky path | `datagram` |
+| Metered / low-bandwidth link, screen changes infrequently | `statesync` |
+
+The mode is requested by the client and honoured by the server for the lifetime of the session.  It can be set on the command line or in the client config file:
+
+```bash
+# Command line
+mp --diff-mode datagram user@192.168.1.10
+
+# Client config file (~/.config/moshpit/moshpit.toml)
+diff_mode = "datagram"   # or "reliable" / "statesync"
+```
 
 ### Reconnection
 
@@ -575,6 +657,8 @@ Options:
       --nat-warmup                     Send NAT warmup keepalives at UDP session start
       --nat-warmup-count <N>           Number of NAT warmup keepalives to send
                                        [default: 3]
+      --diff-mode <MODE>               UDP diff transport mode: reliable (default),
+                                       datagram, or statesync
       --kex-algos <ALGOS>              Ordered KEX algorithms to offer, comma-separated
       --aead-algos <ALGOS>             Ordered AEAD algorithms to offer, comma-separated
       --mac-algos <ALGOS>              Ordered MAC algorithms to offer, comma-separated
@@ -615,6 +699,12 @@ mp --aead-algos chacha20-poly1305,aes256-gcm-siv user@remote-server.com
 
 # Prefer P-384 and save bandwidth with a smaller MAC tag
 mp --kex-algos p384-sha384 --mac-algos hmac-sha256 user@remote-server.com
+
+# Use datagram mode on a lossy mobile connection
+mp --diff-mode datagram user@remote-server.com
+
+# Use statesync mode on a satellite / metered link
+mp --diff-mode statesync user@remote-server.com
 ```
 ### moshpit configuration
 
@@ -654,6 +744,13 @@ predict = "adaptive"
 # Only useful on NAT paths; adds one round-trip of startup latency.
 nat_warmup = false
 nat_warmup_count = 3  # Number of keepalive frames to send (default: 3)
+
+# ── UDP diff transport mode ───────────────────────────────────────────────────
+# Controls how the server delivers PTY screen diffs and recovers from packet loss.
+#   reliable   (default) NAK-based retransmission; lowest bandwidth; best on low-loss links
+#   datagram             Fire-and-forget + 150 ms full-screen push; best on high-loss links
+#   statesync            Ack-based diffs (Mosh-style); best on moderate-loss, low-bandwidth links
+# diff_mode = "reliable"
 
 # ── Algorithm preferences (optional) ─────────────────────────────────────────
 # Override the algorithms this client offers during negotiation.  The server's
