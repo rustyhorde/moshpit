@@ -316,7 +316,11 @@ mod tests {
                 Ok(None) => panic!("parse returned None for algorithm {alg:?}"),
                 Err(e) => panic!("parse failed for algorithm {alg:?}: {e}"),
             };
-            assert_eq!(parsed_frame, EncryptedFrame::Keepalive(ts), "wrong frame for {alg:?}");
+            assert_eq!(
+                parsed_frame,
+                EncryptedFrame::Keepalive(ts),
+                "wrong frame for {alg:?}"
+            );
             assert_eq!(seq, 7, "wrong seq for {alg:?}");
         }
     }

@@ -261,7 +261,10 @@ impl UdpSender {
 
 #[cfg(test)]
 mod tests {
-    use aws_lc_rs::{aead::{AES_256_GCM_SIV, UnboundKey}, hmac::HMAC_SHA512};
+    use aws_lc_rs::{
+        aead::{AES_256_GCM_SIV, UnboundKey},
+        hmac::HMAC_SHA512,
+    };
     use tokio::sync::mpsc::channel;
 
     use super::*;
@@ -274,7 +277,9 @@ mod tests {
     ) -> UdpSender {
         UdpSender::builder()
             .id(Uuid::new_v4())
-            .rnk(LessSafeKey::new(UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap()))
+            .rnk(LessSafeKey::new(
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+            ))
             .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .socket(socket)
             .control_rx(control_rx)
@@ -408,7 +413,9 @@ mod tests {
         let send_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let mut sender = UdpSender::builder()
             .id(Uuid::new_v4())
-            .rnk(LessSafeKey::new(UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap()))
+            .rnk(LessSafeKey::new(
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+            ))
             .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .socket(send_socket)
             .control_rx(ctrl_rx)

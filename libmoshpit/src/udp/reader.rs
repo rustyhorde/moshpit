@@ -1658,7 +1658,10 @@ impl UdpReader {
 
 #[cfg(test)]
 mod tests {
-    use aws_lc_rs::{aead::{AES_256_GCM_SIV, UnboundKey}, hmac::HMAC_SHA512};
+    use aws_lc_rs::{
+        aead::{AES_256_GCM_SIV, UnboundKey},
+        hmac::HMAC_SHA512,
+    };
 
     use super::*;
 
@@ -1670,7 +1673,9 @@ mod tests {
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
-            .rnk(LessSafeKey::new(UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap()))
+            .rnk(LessSafeKey::new(
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+            ))
             .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .build();
 
@@ -1717,7 +1722,9 @@ mod tests {
         UdpReader::builder()
             .socket(Arc::new(socket))
             .id(Uuid::new_v4())
-            .rnk(LessSafeKey::new(UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap()))
+            .rnk(LessSafeKey::new(
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+            ))
             .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .build()
     }
@@ -1823,7 +1830,9 @@ mod tests {
         let reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
-            .rnk(LessSafeKey::new(UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap()))
+            .rnk(LessSafeKey::new(
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+            ))
             .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .query_response_tx(tx)
             .build();
@@ -2080,7 +2089,9 @@ mod tests {
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
-            .rnk(LessSafeKey::new(UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap()))
+            .rnk(LessSafeKey::new(
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+            ))
             .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .retransmit_tx(retransmit_tx)
             .build();
@@ -2107,7 +2118,9 @@ mod tests {
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
-            .rnk(LessSafeKey::new(UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap()))
+            .rnk(LessSafeKey::new(
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+            ))
             .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .build();
 
@@ -2246,7 +2259,9 @@ mod tests {
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
-            .rnk(LessSafeKey::new(UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap()))
+            .rnk(LessSafeKey::new(
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+            ))
             .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .nak_out_tx(nak_tx)
             .build();
@@ -2292,7 +2307,9 @@ mod tests {
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
-            .rnk(LessSafeKey::new(UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap()))
+            .rnk(LessSafeKey::new(
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+            ))
             .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .nak_out_tx(nak_tx)
             .build();
@@ -2369,7 +2386,9 @@ mod tests {
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
-            .rnk(LessSafeKey::new(UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap()))
+            .rnk(LessSafeKey::new(
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+            ))
             .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .nak_received_count(counter.clone())
             .build();
@@ -2480,7 +2499,9 @@ mod tests {
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
-            .rnk(LessSafeKey::new(UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap()))
+            .rnk(LessSafeKey::new(
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+            ))
             .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .build();
 
@@ -2511,7 +2532,9 @@ mod tests {
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
-            .rnk(LessSafeKey::new(UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap()))
+            .rnk(LessSafeKey::new(
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+            ))
             .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .build();
 
@@ -2537,7 +2560,9 @@ mod tests {
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
-            .rnk(LessSafeKey::new(UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap()))
+            .rnk(LessSafeKey::new(
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+            ))
             .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .build();
 
@@ -2563,7 +2588,9 @@ mod tests {
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
-            .rnk(LessSafeKey::new(UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap()))
+            .rnk(LessSafeKey::new(
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+            ))
             .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .nak_out_tx(nak_tx)
             .build();
@@ -2597,7 +2624,9 @@ mod tests {
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
-            .rnk(LessSafeKey::new(UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap()))
+            .rnk(LessSafeKey::new(
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+            ))
             .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .nak_out_tx(nak_tx)
             .build();
@@ -2652,7 +2681,9 @@ mod tests {
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
-            .rnk(LessSafeKey::new(UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap()))
+            .rnk(LessSafeKey::new(
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+            ))
             .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .nak_out_tx(nak_tx)
             .build();
@@ -2712,7 +2743,9 @@ mod tests {
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
-            .rnk(LessSafeKey::new(UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap()))
+            .rnk(LessSafeKey::new(
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+            ))
             .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .build();
 
@@ -2743,7 +2776,9 @@ mod tests {
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
-            .rnk(LessSafeKey::new(UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap()))
+            .rnk(LessSafeKey::new(
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+            ))
             .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .nak_out_tx(nak_tx)
             .build();
