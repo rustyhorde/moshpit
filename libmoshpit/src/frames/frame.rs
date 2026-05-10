@@ -28,7 +28,8 @@ pub enum Frame {
     /// An initialization frame from moshpit.
     Initialize(Vec<u8>, Vec<u8>, Vec<u8>),
     /// A peer initialization frame from moshpits.
-    PeerInitialize(Vec<u8>, Vec<u8>),
+    /// Fields: (`identity_pk`, `ephemeral_pk`, `salt`)
+    PeerInitialize(Vec<u8>, Vec<u8>, Vec<u8>),
     /// A check message from moshpit.
     Check([u8; 12], Vec<u8>),
     /// A key agreement message from moshpits.
@@ -66,7 +67,7 @@ impl Frame {
     pub fn id(&self) -> u8 {
         match self {
             Frame::Initialize(_, _, _) => 0,
-            Frame::PeerInitialize(_, _) => 1,
+            Frame::PeerInitialize(_, _, _) => 1,
             Frame::Check(_, _) => 2,
             Frame::KeyAgreement(_) => 3,
             Frame::MoshpitsAddr(_) => 4,
@@ -124,10 +125,11 @@ impl Display for Frame {
                     full_pk.len()
                 )
             }
-            Frame::PeerInitialize(pk, salt) => write!(
+            Frame::PeerInitialize(identity_pk, ephemeral_pk, salt) => write!(
                 f,
-                "PeerInitialize({} bytes, {} bytes)",
-                pk.len(),
+                "PeerInitialize({} bytes, {} bytes, {} bytes)",
+                identity_pk.len(),
+                ephemeral_pk.len(),
                 salt.len(),
             ),
             Frame::Check(nonce, data) => {

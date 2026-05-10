@@ -49,7 +49,7 @@ use crate::{
         KEX_P384_SHA384, KEX_X25519_SHA256, MAC_HMAC_SHA256, MAC_HMAC_SHA512, NegotiatedAlgorithms,
         negotiate, supported_algorithms,
     },
-    load_private_key, load_public_key,
+    load_public_key,
     session::SessionRegistry,
     udp::DiffMode,
 };
@@ -247,17 +247,18 @@ impl KexReader {
                     "Server closed connection during key exchange"
                 ));
             }
-            Some(Frame::PeerInitialize(pk, salt_bytes)) => {
+            Some(Frame::PeerInitialize(identity_pk, ephemeral_pk, salt_bytes)) => {
                 trace!(
-                    "client_kex: received PeerInitialize ({} byte pubkey)",
-                    pk.len()
+                    "client_kex: received PeerInitialize (identity={} bytes, ephemeral={} bytes)",
+                    identity_pk.len(),
+                    ephemeral_pk.len()
                 );
 
                 if let Some(host) = &self.server_destination {
                     trace!("client_kex: checking known_hosts for host '{host}'");
                     match check_known_hosts(
                         host,
-                        &pk,
+                        &identity_pk,
                         self.tofu_fn.as_ref(),
                         self.host_key_mismatch_fn.as_ref(),
                     ) {
@@ -279,7 +280,8 @@ impl KexReader {
                     trace!("client_kex: no server_destination set, skipping host-key check");
                 }
 
-                let peer_public_key = UnparsedPublicKey::new(agreement_alg, &pk);
+                // Use the ephemeral key for ECDH (identity key is only for host auth)
+                let peer_public_key = UnparsedPublicKey::new(agreement_alg, &ephemeral_pk);
                 let salt = Salt::new(hkdf_alg, &salt_bytes);
 
                 trace!("client_kex: running ECDH agree()");
@@ -423,7 +425,6 @@ impl KexReader {
         &mut self,
         socket_addr: SocketAddr,
         port_pool: Arc<Mutex<BTreeSet<u16>>>,
-        private_key_path: &PathBuf,
         public_key_path: &PathBuf,
         session_registry: Option<SessionRegistry>,
     ) -> Result<(ServerKex, Arc<UdpSocket>)> {
@@ -524,7 +525,6 @@ impl KexReader {
                         &pk,
                         &negotiated,
                         &self.tx_event.clone(),
-                        private_key_path,
                         public_key_path,
                     )?;
                     trace!("server_kex: PeerInitialize sent to client");
@@ -640,7 +640,6 @@ impl KexReader {
         pk: &[u8],
         negotiated: &NegotiatedAlgorithms,
         tx_event: &UnboundedSender<KexEvent>,
-        private_key_path: &PathBuf,
         public_key_path: &PathBuf,
     ) -> Result<RandomizedNonceKey> {
         let agreement_alg = resolve_kex_alg(&negotiated.kex)?;
@@ -648,21 +647,12 @@ impl KexReader {
         let aead_alg = resolve_aead_alg(&negotiated.aead)?;
         let hmac_key_type = resolve_hmac_key_type(&negotiated.mac)?;
 
-        // Load the moshpits public and private key
-        let (unenc_key_pair_opt, _enc_key_pair_opt) = load_private_key(private_key_path)?;
-        let (_, public_key_bytes) = load_public_key(public_key_path)?;
+        // Load only the server's identity public key bytes for host authentication
+        let (_, identity_pub_key_bytes) = load_public_key(public_key_path)?;
 
-        let (private_key, public_key) = if let Some(unenc_key_pair) = unenc_key_pair_opt {
-            unenc_key_pair.take()
-        } else {
-            return Err(anyhow::anyhow!("No valid private key found"));
-        };
-
-        if public_key.as_ref() != public_key_bytes.as_slice() {
-            return Err(anyhow::anyhow!(
-                "public key from file does not match computed public key"
-            ));
-        }
+        // Generate a fresh ephemeral key pair for this session's ECDH
+        let ephemeral_priv = PrivateKey::generate(agreement_alg)?;
+        let ephemeral_pub = ephemeral_priv.compute_public_key()?;
 
         // Parse the client's ephemeral public key using the negotiated algorithm.
         let unparsed_public_key = UnparsedPublicKey::new(agreement_alg, pk);
@@ -672,15 +662,19 @@ impl KexReader {
         let mut salt_bytes = [0u8; 32];
         fill(&mut salt_bytes)?;
 
-        // Send the server's identity public key and salt back to the client.
-        let peer_initialize =
-            Frame::PeerInitialize(public_key.as_ref().to_vec(), salt_bytes.to_vec());
+        // Send the server's identity public key, ephemeral public key, and salt back to the client.
+        let peer_initialize = Frame::PeerInitialize(
+            identity_pub_key_bytes,
+            ephemeral_pub.as_ref().to_vec(),
+            salt_bytes.to_vec(),
+        );
         self.tx.send(peer_initialize)?;
 
         let salt = Salt::new(hkdf_alg, &salt_bytes);
 
+        // Do ECDH using the server's ephemeral key (not the identity key)
         let rnk = agree(
-            &private_key,
+            &ephemeral_priv,
             parsed_public_key,
             Unspecified,
             |key_material| {
@@ -1682,14 +1676,19 @@ mod tests {
 
         // Server sends KexInit then PeerInitialize with a valid X25519 public key, then closes
         let server_epk = PrivateKey::generate(&X25519).unwrap();
-        let server_pub = server_epk.compute_public_key().unwrap();
+        let server_epk_pub = server_epk.compute_public_key().unwrap();
+        let identity_key = vec![0u8; 32]; // fixed identity bytes (not used for ECDH)
         let salt = vec![0u8; 32];
         server_writer
             .write_frame(&Frame::KexInit(supported_algorithms()))
             .await
             .unwrap();
         server_writer
-            .write_frame(&Frame::PeerInitialize(server_pub.as_ref().to_vec(), salt))
+            .write_frame(&Frame::PeerInitialize(
+                identity_key,
+                server_epk_pub.as_ref().to_vec(),
+                salt,
+            ))
             .await
             .unwrap();
         drop(server_writer);
@@ -1710,14 +1709,19 @@ mod tests {
         let (mut kex_reader, _rx_frames, _rx_events) = make_test_kex_reader(client_reader);
 
         let server_epk = PrivateKey::generate(&X25519).unwrap();
-        let server_pub = server_epk.compute_public_key().unwrap();
+        let server_epk_pub = server_epk.compute_public_key().unwrap();
+        let identity_key = vec![0u8; 32];
         let salt = vec![0u8; 32];
         server_writer
             .write_frame(&Frame::KexInit(supported_algorithms()))
             .await
             .unwrap();
         server_writer
-            .write_frame(&Frame::PeerInitialize(server_pub.as_ref().to_vec(), salt))
+            .write_frame(&Frame::PeerInitialize(
+                identity_key,
+                server_epk_pub.as_ref().to_vec(),
+                salt,
+            ))
             .await
             .unwrap();
         // Send wrong frame instead of KeyAgreement
@@ -1750,7 +1754,8 @@ mod tests {
             .build();
 
         let server_epk = PrivateKey::generate(&X25519).unwrap();
-        let server_pub = server_epk.compute_public_key().unwrap();
+        let server_epk_pub = server_epk.compute_public_key().unwrap();
+        let identity_key = vec![0u8; 32]; // fixed identity bytes (not used for ECDH)
         let mut salt_bytes = [0u8; 32];
         aws_lc_rs::rand::fill(&mut salt_bytes).unwrap();
 
@@ -1767,10 +1772,11 @@ mod tests {
                 .unwrap();
             // 2. Drain the Initialize frame that client_kex sends after negotiation.
             drop(rx_out.recv().await);
-            // 3. Send PeerInitialize with the server's ephemeral key + salt.
+            // 3. Send PeerInitialize with the server's identity key, ephemeral key, and salt.
             server_writer
                 .write_frame(&Frame::PeerInitialize(
-                    server_pub.as_ref().to_vec(),
+                    identity_key,
+                    server_epk_pub.as_ref().to_vec(),
                     salt_bytes.to_vec(),
                 ))
                 .await
@@ -1819,14 +1825,19 @@ mod tests {
         let (mut kex_reader, _rx_frames, _rx_events) = make_test_kex_reader(client_reader);
 
         let server_epk = PrivateKey::generate(&X25519).unwrap();
-        let server_pub = server_epk.compute_public_key().unwrap();
+        let server_epk_pub = server_epk.compute_public_key().unwrap();
+        let identity_key = vec![0u8; 32];
         let salt = vec![0u8; 32];
         server_writer
             .write_frame(&Frame::KexInit(supported_algorithms()))
             .await
             .unwrap();
         server_writer
-            .write_frame(&Frame::PeerInitialize(server_pub.as_ref().to_vec(), salt))
+            .write_frame(&Frame::PeerInitialize(
+                identity_key,
+                server_epk_pub.as_ref().to_vec(),
+                salt,
+            ))
             .await
             .unwrap();
         server_writer
@@ -1850,14 +1861,19 @@ mod tests {
         let (mut kex_reader, _rx_frames, _rx_events) = make_test_kex_reader(client_reader);
 
         let server_epk = PrivateKey::generate(&X25519).unwrap();
-        let server_pub = server_epk.compute_public_key().unwrap();
+        let server_epk_pub = server_epk.compute_public_key().unwrap();
+        let identity_key = vec![0u8; 32];
         let salt = vec![0u8; 32];
         server_writer
             .write_frame(&Frame::KexInit(supported_algorithms()))
             .await
             .unwrap();
         server_writer
-            .write_frame(&Frame::PeerInitialize(server_pub.as_ref().to_vec(), salt))
+            .write_frame(&Frame::PeerInitialize(
+                identity_key,
+                server_epk_pub.as_ref().to_vec(),
+                salt,
+            ))
             .await
             .unwrap();
         server_writer
@@ -1887,14 +1903,19 @@ mod tests {
         let (mut kex_reader, _rx_frames, _rx_events) = make_test_kex_reader(client_reader);
 
         let server_epk = PrivateKey::generate(&X25519).unwrap();
-        let server_pub = server_epk.compute_public_key().unwrap();
+        let server_epk_pub = server_epk.compute_public_key().unwrap();
+        let identity_key = vec![0u8; 32];
         let salt = vec![0u8; 32];
         server_writer
             .write_frame(&Frame::KexInit(supported_algorithms()))
             .await
             .unwrap();
         server_writer
-            .write_frame(&Frame::PeerInitialize(server_pub.as_ref().to_vec(), salt))
+            .write_frame(&Frame::PeerInitialize(
+                identity_key,
+                server_epk_pub.as_ref().to_vec(),
+                salt,
+            ))
             .await
             .unwrap();
         server_writer

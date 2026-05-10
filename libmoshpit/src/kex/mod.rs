@@ -532,10 +532,9 @@ async fn run_server_kex<T: KexConfig>(
     kex_handle: JoinHandle<Result<Kex>>,
 ) -> Result<(Kex, Arc<UdpSocket>, Option<ServerKex>)> {
     let port_pool_opt = config.port_pool();
-    let (private_key_path, public_key_path) = config.key_pair_paths()?;
+    let (_private_key_path, public_key_path) = config.key_pair_paths()?;
     let session_registry = config.session_registry();
-    trace!("Loading private key from {}", private_key_path.display());
-    trace!("Loading public key from {}", public_key_path.display());
+    trace!("Loading identity public key from {}", public_key_path.display());
 
     // Setup the TCP frame reader
     let tx_c = tx.clone();
@@ -552,7 +551,6 @@ async fn run_server_kex<T: KexConfig>(
             .server_kex(
                 socket_addr,
                 port_pool,
-                &private_key_path,
                 &public_key_path,
                 session_registry,
             )

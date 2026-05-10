@@ -29,8 +29,9 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use dialoguer::{Confirm, Password};
 use libmoshpit::{
     DiffMode, DisplayPreference, Emulator, EncryptedFrame, Kex, KexConfig as _, KexMode, KeyPair,
-    MoshpitError, PredictionEngine, Renderer, UdpReader, UdpSender, UuidWrapper, init_tracing,
-    load, paint_overlays_to_ansi, parse_server_destination, run_key_exchange,
+    KEY_ALGORITHM_X25519, MoshpitError, PredictionEngine, Renderer, UdpReader, UdpSender,
+    UuidWrapper, init_tracing, load, paint_overlays_to_ansi, parse_server_destination,
+    run_key_exchange,
 };
 use terminal_size::terminal_size;
 #[cfg(unix)]
@@ -1128,7 +1129,7 @@ fn maybe_generate_keypair(config: &Config) -> Result<()> {
         .interact()?;
     let passphrase_opt = Some(passphrase);
 
-    let keypair = KeyPair::generate_key_pair(passphrase_opt.as_ref(), KexMode::Client)?;
+    let keypair = KeyPair::generate_key_pair(passphrase_opt.as_ref(), KexMode::Client, KEY_ALGORITHM_X25519)?;
 
     let mut priv_key_file = {
         #[cfg(unix)]

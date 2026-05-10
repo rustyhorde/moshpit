@@ -88,6 +88,15 @@ pub(crate) enum Commands {
             default_value_t = false
         )]
         server: bool,
+        /// Key algorithm to use for the identity key pair.
+        #[clap(
+            short = 'k',
+            long,
+            value_name = "TYPE",
+            default_value = "x25519",
+            help = "Key algorithm: x25519 (default), p384, p256"
+        )]
+        key_type: String,
     },
     #[clap(about = "Verify a public key fingerprint or randomart image")]
     Verify {
@@ -184,6 +193,39 @@ mod tests {
         match cli.command() {
             Commands::Generate { server, .. } => {
                 assert!(server);
+            }
+            _ => panic!("Expected Generate command"),
+        }
+    }
+
+    #[test]
+    fn verify_generate_key_type_flag() {
+        // Default is x25519
+        let args = vec!["moshpit-keygen", "generate"];
+        let cli = Cli::try_parse_from(args).unwrap();
+        match cli.command() {
+            Commands::Generate { key_type, .. } => {
+                assert_eq!(key_type, "x25519");
+            }
+            _ => panic!("Expected Generate command"),
+        }
+
+        // Explicit p384
+        let args = vec!["moshpit-keygen", "generate", "--key-type", "p384"];
+        let cli = Cli::try_parse_from(args).unwrap();
+        match cli.command() {
+            Commands::Generate { key_type, .. } => {
+                assert_eq!(key_type, "p384");
+            }
+            _ => panic!("Expected Generate command"),
+        }
+
+        // Short flag -k with p256
+        let args = vec!["moshpit-keygen", "generate", "-k", "p256"];
+        let cli = Cli::try_parse_from(args).unwrap();
+        match cli.command() {
+            Commands::Generate { key_type, .. } => {
+                assert_eq!(key_type, "p256");
             }
             _ => panic!("Expected Generate command"),
         }
