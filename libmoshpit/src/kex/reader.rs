@@ -36,7 +36,7 @@ use tokio::{
     process::Command,
     sync::{Mutex, mpsc::UnboundedSender},
 };
-use tracing::{error, trace};
+use tracing::{debug, error, trace};
 use uuid::Uuid;
 
 use crate::kex::HostKeyMismatchFn;
@@ -56,6 +56,14 @@ use crate::{
 
 const AEAD_KEY_INFO: &[u8] = b"AEAD KEY";
 const HMAC_KEY_INFO: &[u8] = b"HMAC KEY";
+
+fn fmt_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
 
 fn resolve_kex_alg(kex: &str) -> Result<&'static aws_lc_rs::agreement::Algorithm> {
     match kex {
@@ -209,6 +217,8 @@ impl KexReader {
         let hkdf_alg = resolve_hkdf_alg(&negotiated.kdf)?;
         let aead_alg = resolve_aead_alg(&negotiated.aead)?;
         let hmac_key_type = resolve_hmac_key_type(&negotiated.mac)?;
+        let kex_aead_log = negotiated.aead.clone();
+        let kex_mac_log = negotiated.mac.clone();
 
         // Emit the negotiated algorithm set so the runtime can construct the right crypto
         // primitives when it later receives KeyMaterial and HMACKeyMaterial.
@@ -292,11 +302,25 @@ impl KexReader {
                     let okm_aead = prk.expand(&[AEAD_KEY_INFO], aead_alg)?;
                     let mut key_bytes = vec![0u8; aead_key_len];
                     okm_aead.fill(&mut key_bytes)?;
+                    debug!(
+                        side = "client",
+                        aead = %kex_aead_log,
+                        key_len = key_bytes.len(),
+                        key_hex = %fmt_hex(&key_bytes),
+                        "kex: derived AEAD key"
+                    );
 
                     let mac_key_len = hmac_key_type.digest_algorithm().output_len();
                     let okm_hmac = prk.expand(&[HMAC_KEY_INFO], hmac_key_type)?;
                     let mut hmac_key_bytes = vec![0u8; mac_key_len];
                     okm_hmac.fill(&mut hmac_key_bytes)?;
+                    debug!(
+                        side = "client",
+                        mac = %kex_mac_log,
+                        hmac_key_len = hmac_key_bytes.len(),
+                        hmac_key_hex = %fmt_hex(&hmac_key_bytes),
+                        "kex: derived HMAC key"
+                    );
 
                     self.tx_event
                         .send(KexEvent::KeyMaterial(key_bytes.clone()))
@@ -646,6 +670,8 @@ impl KexReader {
         let hkdf_alg = resolve_hkdf_alg(&negotiated.kdf)?;
         let aead_alg = resolve_aead_alg(&negotiated.aead)?;
         let hmac_key_type = resolve_hmac_key_type(&negotiated.mac)?;
+        let kex_aead_log = negotiated.aead.clone();
+        let kex_mac_log = negotiated.mac.clone();
 
         // Load only the server's identity public key bytes for host authentication
         let (_, identity_pub_key_bytes) = load_public_key(public_key_path)?;
@@ -684,11 +710,25 @@ impl KexReader {
                 let okm = prk.expand(&[AEAD_KEY_INFO], aead_alg)?;
                 let mut key_bytes = vec![0u8; aead_key_len];
                 okm.fill(&mut key_bytes)?;
+                debug!(
+                    side = "server",
+                    aead = %kex_aead_log,
+                    key_len = key_bytes.len(),
+                    key_hex = %fmt_hex(&key_bytes),
+                    "kex: derived AEAD key"
+                );
 
                 let mac_key_len = hmac_key_type.digest_algorithm().output_len();
                 let okm_hmac = prk.expand(&[HMAC_KEY_INFO], hmac_key_type)?;
                 let mut hmac_key_bytes = vec![0u8; mac_key_len];
                 okm_hmac.fill(&mut hmac_key_bytes)?;
+                debug!(
+                    side = "server",
+                    mac = %kex_mac_log,
+                    hmac_key_len = hmac_key_bytes.len(),
+                    hmac_key_hex = %fmt_hex(&hmac_key_bytes),
+                    "kex: derived HMAC key"
+                );
 
                 tx_event
                     .send(KexEvent::KeyMaterial(key_bytes.clone()))

@@ -32,7 +32,7 @@ use tokio::{
     sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
     task::JoinHandle,
 };
-use tracing::{error, info, trace};
+use tracing::{debug, error, info, trace};
 use uuid::Uuid;
 
 use crate::{
@@ -40,6 +40,14 @@ use crate::{
     UuidWrapper, decrypt_private_key, kex::negotiate::NegotiatedAlgorithms, load_private_key,
     load_public_key, udp::DiffMode,
 };
+
+fn fmt_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
 
 /// The callback type for TOFU (Trust-On-First-Use) interactive host key validation.
 pub type TofuFn = Arc<dyn Fn(&str, &str) -> Result<bool> + Send + Sync>;
@@ -158,6 +166,12 @@ impl Kex {
             AEAD_AES128_GCM_SIV => &AES_128_GCM_SIV,
             _ => return Err(MoshpitError::NoCommonAlgorithm.into()),
         };
+        debug!(
+            aead = %self.negotiated_algorithms.aead,
+            key_len = self.key.len(),
+            key_hex = %fmt_hex(&self.key),
+            "build_rnk: constructing RandomizedNonceKey"
+        );
         RandomizedNonceKey::new(alg, &self.key).map_err(Into::into)
     }
 
