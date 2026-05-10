@@ -57,7 +57,7 @@ pub fn fingerprint(key_bytes: &[u8]) -> Result<String> {
 #[must_use]
 pub fn randomart(key_bytes: &[u8]) -> String {
     let draw_opts = DrawingOptions {
-        top_text: "X25519 SHA256".to_string(),
+        top_text: "moshpit SHA256".to_string(),
         bottom_text: "SHA256".to_string(),
         ..Default::default()
     };

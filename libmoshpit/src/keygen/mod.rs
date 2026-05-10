@@ -16,10 +16,10 @@ use anyhow::{Error, Result};
 use argon2::{Argon2, PasswordHasher, password_hash::phc::SaltString};
 use aws_lc_rs::{
     aead::{AES_256_GCM_SIV, Aad, Nonce, RandomizedNonceKey},
-    agreement::{PrivateKey, PublicKey, X25519},
+    agreement::{ECDH_P256, ECDH_P384, PrivateKey, PublicKey, X25519},
     cipher::AES_256_KEY_LEN,
     digest::SHA512_OUTPUT_LEN,
-    encoding::{AsBigEndian as _, Curve25519SeedBin},
+    encoding::{AsBigEndian as _, Curve25519SeedBin, EcPrivateKeyBin},
     hkdf::{HKDF_SHA512, Salt},
     rand::fill,
 };
@@ -33,7 +33,12 @@ use crate::{KexMode, MoshpitError};
 pub(crate) mod pk;
 
 const KEY_HEADER: &[u8] = b"moshpit-key-v1";
-const KEY_ALGORITHM: &str = "X25519";
+/// The key algorithm string for X25519 (Curve25519) ECDH keys.
+pub const KEY_ALGORITHM_X25519: &str = "X25519";
+/// The key algorithm string for ECDH P-384 keys.
+pub const KEY_ALGORITHM_P384: &str = "P384";
+/// The key algorithm string for ECDH P-256 keys.
+pub const KEY_ALGORITHM_P256: &str = "P256";
 const NONE_CIPHER: &str = "none";
 const NONE_KDF: &str = "none";
 const KEY_CIPHER: &str = "aes-256-gcm-siv";
@@ -235,24 +240,47 @@ impl KeyPair {
     /// # Errors
     /// If key generation or encryption fails, an error is returned.
     ///
-    pub fn generate_key_pair(passphrase_opt: Option<&String>, mode: KexMode) -> Result<Self> {
+    pub fn generate_key_pair(
+        passphrase_opt: Option<&String>,
+        mode: KexMode,
+        key_alg: &str,
+    ) -> Result<Self> {
         if matches!(mode, KexMode::Client) && passphrase_opt.is_none_or(String::is_empty) {
             return Err(anyhow::anyhow!(
                 "A non-empty passphrase is required to protect the private key"
             ));
         }
-        // Generate the ECDH using Curve25519 key pair
-        let priv_key = PrivateKey::generate(&X25519)?;
+
+        // Map key_alg string to the aws-lc-rs agreement Algorithm
+        let alg = match key_alg {
+            KEY_ALGORITHM_X25519 => &X25519,
+            KEY_ALGORITHM_P384 => &ECDH_P384,
+            KEY_ALGORITHM_P256 => &ECDH_P256,
+            _ => return Err(anyhow::anyhow!("Unknown key algorithm: {key_alg}")),
+        };
+
+        // Generate the ECDH key pair using the selected algorithm
+        let priv_key = PrivateKey::generate(alg)?;
         let public_key = priv_key.compute_public_key()?;
 
         // Setup the encoded public key
-        let (public_key_bytes, public_key_encoded) = generate_public_key(public_key.as_ref())?;
+        let (public_key_bytes, public_key_encoded) =
+            generate_public_key(key_alg, public_key.as_ref())?;
 
-        // Setup the encoded private key
-        let priv_key_bytes: Curve25519SeedBin<'_> = priv_key.as_be_bytes()?;
-        let mut priv_key_bytes = (priv_key_bytes.as_ref()).to_vec();
-        let private_key_encoded =
-            generate_private_key(&mut priv_key_bytes, public_key.as_ref(), passphrase_opt)?;
+        // Setup the encoded private key — extract raw bytes based on algorithm family
+        let mut priv_key_bytes = if key_alg == KEY_ALGORITHM_X25519 {
+            let bytes: Curve25519SeedBin<'_> = priv_key.as_be_bytes()?;
+            bytes.as_ref().to_vec()
+        } else {
+            let bytes: EcPrivateKeyBin<'_> = priv_key.as_be_bytes()?;
+            bytes.as_ref().to_vec()
+        };
+        let private_key_encoded = generate_private_key(
+            &mut priv_key_bytes,
+            public_key.as_ref(),
+            passphrase_opt,
+            key_alg,
+        )?;
 
         Ok(KeyPair {
             private_key: private_key_encoded,
@@ -311,9 +339,9 @@ impl KeyPair {
     }
 }
 
-fn add_key_alg(key: &mut Vec<u8>) -> Result<()> {
-    key.extend_from_slice(&as_be_bytes(KEY_ALGORITHM.len())?);
-    key.extend_from_slice(KEY_ALGORITHM.as_bytes());
+fn add_key_alg(key: &mut Vec<u8>, alg: &str) -> Result<()> {
+    key.extend_from_slice(&as_be_bytes(alg.len())?);
+    key.extend_from_slice(alg.as_bytes());
     Ok(())
 }
 
@@ -325,9 +353,9 @@ fn add_cipher_and_kdf(key: &mut Vec<u8>, cipher: &str, kdf: &str) -> Result<()> 
     Ok(())
 }
 
-fn generate_public_key(public_key: &[u8]) -> Result<(Vec<u8>, String)> {
+fn generate_public_key(alg: &str, public_key: &[u8]) -> Result<(Vec<u8>, String)> {
     let mut public_key_bytes = vec![];
-    add_key_alg(&mut public_key_bytes)?;
+    add_key_alg(&mut public_key_bytes, alg)?;
     public_key_bytes.extend_from_slice(&as_be_bytes(public_key.len())?);
     public_key_bytes.extend_from_slice(public_key);
     let encoded = STANDARD.encode(&public_key_bytes);
@@ -338,6 +366,7 @@ fn generate_private_key(
     private_key: &mut Vec<u8>,
     public_key: &[u8],
     passphrase_opt: Option<&String>,
+    alg: &str,
 ) -> Result<String> {
     let mut private_key_bytes = vec![];
 
@@ -354,9 +383,10 @@ fn generate_private_key(
             public_key,
             passphrase,
             &passphrase_hash,
+            alg,
         )?;
     } else {
-        setup_unencrypted_private_key(&mut private_key_bytes, private_key, public_key)?;
+        setup_unencrypted_private_key(&mut private_key_bytes, private_key, public_key, alg)?;
     }
     Ok(STANDARD.encode(&private_key_bytes))
 }
@@ -367,9 +397,10 @@ fn setup_encrypted_private_key(
     public_key: &[u8],
     passphrase: &str,
     passphrase_hash: &str,
+    alg: &str,
 ) -> Result<()> {
     add_cipher_and_kdf(private_key_bytes, KEY_CIPHER, passphrase_hash)?;
-    add_key_alg(private_key_bytes)?;
+    add_key_alg(private_key_bytes, alg)?;
     private_key_bytes.extend_from_slice(&as_be_bytes(public_key.len())?);
     private_key_bytes.extend_from_slice(public_key);
 
@@ -380,9 +411,10 @@ fn setup_unencrypted_private_key(
     private_key_bytes: &mut Vec<u8>,
     private_key: &[u8],
     public_key: &[u8],
+    alg: &str,
 ) -> Result<()> {
     add_cipher_and_kdf(private_key_bytes, NONE_CIPHER, NONE_KDF)?;
-    add_key_alg(private_key_bytes)?;
+    add_key_alg(private_key_bytes, alg)?;
     private_key_bytes.extend_from_slice(&as_be_bytes(public_key.len())?);
     private_key_bytes.extend_from_slice(public_key);
     private_key_bytes.extend_from_slice(&as_be_bytes(private_key.len())?);
@@ -496,8 +528,10 @@ pub fn load_public_key(pub_key_path: &PathBuf) -> Result<(Vec<u8>, Vec<u8>)> {
     // Parse the public key file
     let mut public_key_bytes = BytesMut::from(&decoded[..]);
     let key_alg = get_val_by_len(&mut public_key_bytes)?;
-    if key_alg != KEY_ALGORITHM.as_bytes() {
-        return Err(MoshpitError::InvalidKeyHeader.into());
+    let key_alg_str = std::str::from_utf8(&key_alg).map_err(|_| MoshpitError::InvalidKeyHeader)?;
+    match key_alg_str {
+        KEY_ALGORITHM_X25519 | KEY_ALGORITHM_P384 | KEY_ALGORITHM_P256 => {}
+        _ => return Err(MoshpitError::InvalidKeyHeader.into()),
     }
     let pub_key_bytes = get_val_by_len(&mut public_key_bytes)?;
 
@@ -530,15 +564,19 @@ pub fn load_private_key(
     let cipher = get_val_by_len(&mut private_key_bytes)?;
     let kdf = get_val_by_len(&mut private_key_bytes)?;
     let key_alg = get_val_by_len(&mut private_key_bytes)?;
-    if key_alg != KEY_ALGORITHM.as_bytes() {
-        return Err(MoshpitError::InvalidKeyHeader.into());
-    }
+    let key_alg_str = std::str::from_utf8(&key_alg).map_err(|_| MoshpitError::InvalidKeyHeader)?;
+    let agreement_alg: &aws_lc_rs::agreement::Algorithm = match key_alg_str {
+        KEY_ALGORITHM_X25519 => &X25519,
+        KEY_ALGORITHM_P384 => &ECDH_P384,
+        KEY_ALGORITHM_P256 => &ECDH_P256,
+        _ => return Err(MoshpitError::InvalidKeyHeader.into()),
+    };
 
     if cipher == NONE_CIPHER.as_bytes() && kdf == NONE_KDF.as_bytes() {
         let pub_key_bytes = get_val_by_len(&mut private_key_bytes)?;
         let priv_key_bytes = get_val_by_len(&mut private_key_bytes)?;
 
-        let private_key = PrivateKey::from_private_key(&X25519, &priv_key_bytes)?;
+        let private_key = PrivateKey::from_private_key(agreement_alg, &priv_key_bytes)?;
         let public_key = private_key.compute_public_key()?;
         if public_key.as_ref() != pub_key_bytes.as_ref() {
             return Err(MoshpitError::PublicKeyMismatch.into());
@@ -665,6 +703,7 @@ mod tests {
         let key_pair = super::KeyPair::generate_key_pair(
             None,
             super::KexMode::Server("0.0.0.0:0".parse().unwrap()),
+            super::KEY_ALGORITHM_X25519,
         )?;
         let mut priv_key_bytes = vec![];
         key_pair.write_private_key(&mut priv_key_bytes)?;

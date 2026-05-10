@@ -18,7 +18,7 @@
 use std::io::Cursor;
 
 use aws_lc_rs::{
-    aead::{AES_256_GCM_SIV, RandomizedNonceKey},
+    aead::{AES_256_GCM_SIV, LessSafeKey, UnboundKey},
     hmac::{HMAC_SHA512, Key},
 };
 use libfuzzer_sys::fuzz_target;
@@ -27,14 +27,15 @@ use uuid::Uuid;
 
 fuzz_target!(|data: &[u8]| {
     // Use a fixed zero key; HMAC/AEAD failures are expected and not bugs.
-    let Ok(rnk) = RandomizedNonceKey::new(&AES_256_GCM_SIV, &[0u8; 32]) else {
+    let Ok(unbound) = UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]) else {
         return;
     };
+    let rnk = LessSafeKey::new(unbound);
     let hmac = Key::new(HMAC_SHA512, &[0u8; 64]);
     let id = Uuid::nil();
 
     let mut cursor = Cursor::new(data);
-    match EncryptedFrame::parse(&mut cursor, id, &hmac, &rnk) {
+    match EncryptedFrame::parse(&mut cursor, id, &hmac, &rnk, 64) {
         Ok(Some(_)) => {
             // Parsed a valid frame — no panic, that's success (very unlikely
             // with random data given the HMAC gate, but theoretically possible).

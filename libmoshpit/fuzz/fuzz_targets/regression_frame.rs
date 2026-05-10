@@ -8,8 +8,8 @@
 
 //! Regression tests for `fuzz_frame` crashes.
 
-use std::io::Cursor;
 use libmoshpit::Frame;
+use std::io::Cursor;
 
 /// Helper that mirrors the fuzz target body exactly.
 fn run_fuzz_frame(data: &[u8]) {

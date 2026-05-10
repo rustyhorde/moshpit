@@ -18,7 +18,10 @@ use std::os::unix::fs::DirBuilderExt;
 use anyhow::Result;
 use clap::Parser as _;
 use dialoguer::{Confirm, Input, Password};
-use libmoshpit::{KexMode, KeyPair, extract_public_key_bytes, fingerprint};
+use libmoshpit::{
+    KEY_ALGORITHM_P256, KEY_ALGORITHM_P384, KEY_ALGORITHM_X25519, KexMode, KeyPair,
+    extract_public_key_bytes, fingerprint,
+};
 
 use crate::cli::{Cli, Commands};
 
@@ -41,7 +44,14 @@ where
             output_path,
             force,
             server,
-        } => generate_keypair(*no_passphrase, output_path.as_deref(), *force, *server),
+            key_type,
+        } => generate_keypair(
+            *no_passphrase,
+            output_path.as_deref(),
+            *force,
+            *server,
+            key_type,
+        ),
         Commands::Verify {
             randomart: _,
             signature: _,
@@ -93,12 +103,25 @@ fn generate_keypair(
     output_path: Option<&str>,
     force: bool,
     server: bool,
+    key_type: &str,
 ) -> Result<()> {
+    // Map CLI key type name to algorithm constant
+    let key_alg = match key_type.to_lowercase().as_str() {
+        "x25519" => KEY_ALGORITHM_X25519,
+        "p384" => KEY_ALGORITHM_P384,
+        "p256" => KEY_ALGORITHM_P256,
+        other => {
+            return Err(anyhow::anyhow!(
+                "Unknown key type '{other}'. Valid values: x25519, p384, p256"
+            ));
+        }
+    };
+
     // Output header
     println!("Generating public/private ed25519 key pair.");
 
     let mode = if server {
-        KexMode::Server("0.0.0.0:0".parse().unwrap())
+        KexMode::Server("0.0.0.0:0".parse().expect("hardcoded address is valid"))
     } else {
         KexMode::Client
     };
@@ -130,7 +153,7 @@ fn generate_keypair(
     } else {
         prompt_for_passphrase(&priv_key_path)?
     };
-    let keypair = KeyPair::generate_key_pair(passphrase_opt.as_ref(), mode)?;
+    let keypair = KeyPair::generate_key_pair(passphrase_opt.as_ref(), mode, key_alg)?;
     generate_and_write_keys_inner(&priv_key_path, &pub_key_path, &keypair)?;
     Ok(())
 }
@@ -245,21 +268,25 @@ mod tests {
         let count = DIR_COUNTER.fetch_add(1, Ordering::SeqCst);
         let time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("system time is before UNIX epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("moshpit_test_{time}_{count}"))
     }
 
     #[test]
-    fn test_setup_paths_inner_empty_input() {
+    fn test_setup_paths_inner_empty_input() -> Result<()> {
         let default_path = PathBuf::from("/tmp/dummy_id");
-        let (priv_path, pub_path) = setup_paths_inner(String::new(), &default_path, "pub").unwrap();
+        let (priv_path, pub_path) = setup_paths_inner(String::new(), &default_path, "pub")?;
         assert_eq!(priv_path, default_path);
-        assert_eq!(pub_path.extension().unwrap(), "pub");
+        assert_eq!(
+            pub_path.extension().expect("pub_path has an extension"),
+            "pub"
+        );
+        Ok(())
     }
 
     #[test]
-    fn test_setup_paths_inner_with_input() {
+    fn test_setup_paths_inner_with_input() -> Result<()> {
         let dir = get_temp_dir();
         let input_path = dir.join("my_key");
         let default_path = PathBuf::from("/tmp/dummy_id");
@@ -268,70 +295,75 @@ mod tests {
             input_path.to_string_lossy().to_string(),
             &default_path,
             "pub",
-        )
-        .unwrap();
+        )?;
         assert_eq!(priv_path, input_path);
         assert_eq!(pub_path, dir.join("my_key.pub"));
         assert!(dir.exists());
+        Ok(())
     }
 
     #[test]
-    fn test_check_paths_inner_not_exists() {
+    fn test_check_paths_inner_not_exists() -> Result<()> {
         let dir = get_temp_dir();
         let priv_path = dir.join("key");
         let pub_path = dir.join("key.pub");
 
-        let res = check_paths_inner(&priv_path, &pub_path, || Ok(false)).unwrap();
+        let res = check_paths_inner(&priv_path, &pub_path, || Ok(false))?;
         assert!(res);
+        Ok(())
     }
 
     #[test]
-    fn test_check_paths_inner_exists_prompt_yes() {
+    fn test_check_paths_inner_exists_prompt_yes() -> Result<()> {
         let dir = get_temp_dir();
-        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(&dir)?;
         let priv_path = dir.join("key");
         let pub_path = dir.join("key.pub");
-        fs::write(&priv_path, "dummy").unwrap();
+        fs::write(&priv_path, "dummy")?;
 
-        let res = check_paths_inner(&priv_path, &pub_path, || Ok(true)).unwrap();
+        let res = check_paths_inner(&priv_path, &pub_path, || Ok(true))?;
         assert!(res);
+        Ok(())
     }
 
     #[test]
-    fn test_check_paths_inner_exists_prompt_no() {
+    fn test_check_paths_inner_exists_prompt_no() -> Result<()> {
         let dir = get_temp_dir();
-        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(&dir)?;
         let priv_path = dir.join("key");
         let pub_path = dir.join("key.pub");
-        fs::write(&priv_path, "dummy").unwrap();
+        fs::write(&priv_path, "dummy")?;
 
-        let res = check_paths_inner(&priv_path, &pub_path, || Ok(false)).unwrap();
+        let res = check_paths_inner(&priv_path, &pub_path, || Ok(false))?;
         assert!(!res);
+        Ok(())
     }
 
     #[test]
-    fn test_generate_and_write_keys() {
+    fn test_generate_and_write_keys() -> Result<()> {
         let dir = get_temp_dir();
-        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(&dir)?;
         let priv_path = dir.join("key");
         let pub_path = dir.join("key.pub");
 
         let secret = "secret".to_string();
-        let keypair = KeyPair::generate_key_pair(Some(&secret), KexMode::Client).unwrap();
-        generate_and_write_keys_inner(&priv_path, &pub_path, &keypair).unwrap();
+        let keypair =
+            KeyPair::generate_key_pair(Some(&secret), KexMode::Client, KEY_ALGORITHM_X25519)?;
+        generate_and_write_keys_inner(&priv_path, &pub_path, &keypair)?;
 
         assert!(priv_path.exists());
         assert!(pub_path.exists());
 
         // Verify fingerprint can be read
-        display_fingerprint(pub_path.to_str().unwrap()).unwrap();
+        display_fingerprint(pub_path.to_str().expect("pub_path is valid UTF-8"))?;
+        Ok(())
     }
 
     #[test]
     fn test_display_fingerprint_error() {
         let dir = get_temp_dir();
         let missing_file = dir.join("missing.pub");
-        let res = display_fingerprint(missing_file.to_str().unwrap());
+        let res = display_fingerprint(missing_file.to_str().expect("path is valid UTF-8"));
         assert!(res.is_err());
     }
 }

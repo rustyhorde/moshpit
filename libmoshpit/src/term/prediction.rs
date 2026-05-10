@@ -141,7 +141,7 @@ impl ConditionalOverlayRow {
         }
         self.cells
             .push(ConditionalOverlayCell::new(col, ' ', tentative_epoch));
-        self.cells.last_mut().unwrap()
+        self.cells.last_mut().expect("vec is empty after push")
     }
 }
 
@@ -285,7 +285,9 @@ impl PredictionEngine {
             return &mut self.overlay_rows[pos];
         }
         self.overlay_rows.push(ConditionalOverlayRow::new(row));
-        self.overlay_rows.last_mut().unwrap()
+        self.overlay_rows
+            .last_mut()
+            .expect("vec is empty after push")
     }
 
     fn cursor(&self) -> Option<&ConditionalCursorMove> {

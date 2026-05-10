@@ -15,8 +15,9 @@ use std::{
 
 use anyhow::Result;
 use aws_lc_rs::{
-    aead::{AES_256_GCM_SIV, Aad, RandomizedNonceKey},
-    hmac::{HMAC_SHA512, Key, sign},
+    aead::{Aad, LessSafeKey, NONCE_LEN, Nonce},
+    hmac::{Key, sign},
+    rand,
 };
 use bincode_next::{config::standard, encode_to_vec};
 use bon::Builder;
@@ -64,10 +65,8 @@ pub struct UdpSender {
     /// Client UUID
     id: Uuid,
     /// Key for encrypting/decrypting UDP packets
-    #[builder(with = |key: [u8; 32]| -> Result<_> { RandomizedNonceKey::new(&AES_256_GCM_SIV, &key).map_err(Into::into) })]
-    rnk: RandomizedNonceKey,
+    rnk: LessSafeKey,
     /// Key for signing UDP packet HMAC
-    #[builder(with = |key: [u8; 64]| { Key::new(HMAC_SHA512, &key) })]
     hmac: Key,
     /// Underlying UDP socket
     socket: Arc<UdpSocket>,
@@ -238,20 +237,22 @@ impl UdpSender {
         // Encrypt the id, frame_id, and the data then MAC
         let mut encrypted_part = self.id.as_bytes().to_vec();
         encrypted_part.extend_from_slice(&data);
-        let nonce = self
-            .rnk
-            .seal_in_place_append_tag(aad, &mut encrypted_part)?;
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        rand::fill(&mut nonce_bytes)?;
+        let nonce = Nonce::try_assume_unique_for_key(&nonce_bytes)?;
+        self.rnk
+            .seal_in_place_append_tag(nonce, aad, &mut encrypted_part)?;
         // Sign seq_bytes || encrypted_part to authenticate the wire sequence number
         let seq_bytes = seq.to_be_bytes();
         let mut to_sign = seq_bytes.to_vec();
         to_sign.extend_from_slice(&encrypted_part);
         let tag = sign(&self.hmac, &to_sign);
-        let tag_bytes: [u8; 64] = tag.as_ref().try_into()?;
+        let tag_bytes = tag.as_ref();
         let len = encrypted_part.len().to_be_bytes();
         // Wire format: [nonce (12)] [seq (8)] [hmac_tag (64)] [length (8)] [encrypted_part]
-        let mut packet = nonce.as_ref().to_vec();
+        let mut packet = nonce_bytes.to_vec();
         packet.extend_from_slice(&seq_bytes);
-        packet.extend_from_slice(&tag_bytes);
+        packet.extend_from_slice(tag_bytes);
         packet.extend_from_slice(&len);
         packet.extend_from_slice(&encrypted_part);
         Ok(packet)
@@ -260,6 +261,10 @@ impl UdpSender {
 
 #[cfg(test)]
 mod tests {
+    use aws_lc_rs::{
+        aead::{AES_256_GCM_SIV, UnboundKey},
+        hmac::HMAC_SHA512,
+    };
     use tokio::sync::mpsc::channel;
 
     use super::*;
@@ -272,9 +277,10 @@ mod tests {
     ) -> UdpSender {
         UdpSender::builder()
             .id(Uuid::new_v4())
-            .rnk([0u8; 32])
-            .unwrap()
-            .hmac([0u8; 64])
+            .rnk(LessSafeKey::new(
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+            ))
+            .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .socket(socket)
             .control_rx(control_rx)
             .rx(rx)
@@ -407,9 +413,10 @@ mod tests {
         let send_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         let mut sender = UdpSender::builder()
             .id(Uuid::new_v4())
-            .rnk([0u8; 32])
-            .unwrap()
-            .hmac([0u8; 64])
+            .rnk(LessSafeKey::new(
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+            ))
+            .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .socket(send_socket)
             .control_rx(ctrl_rx)
             .rx(frame_rx)

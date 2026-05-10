@@ -28,9 +28,10 @@ use clap::Parser as _;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use dialoguer::{Confirm, Password};
 use libmoshpit::{
-    DiffMode, DisplayPreference, Emulator, EncryptedFrame, Kex, KexConfig as _, KexMode, KeyPair,
-    MoshpitError, PredictionEngine, Renderer, UdpReader, UdpSender, UuidWrapper, init_tracing,
-    load, paint_overlays_to_ansi, parse_server_destination, run_key_exchange,
+    DiffMode, DisplayPreference, Emulator, EncryptedFrame, KEY_ALGORITHM_X25519, Kex,
+    KexConfig as _, KexMode, KeyPair, MoshpitError, PredictionEngine, Renderer, UdpReader,
+    UdpSender, UuidWrapper, init_tracing, load, paint_overlays_to_ansi, parse_server_destination,
+    run_key_exchange,
 };
 use terminal_size::terminal_size;
 #[cfg(unix)]
@@ -104,6 +105,12 @@ impl PassCache {
         }
     }
 }
+
+/// Maximum time allowed for the entire TCP key exchange.  If the server accepts
+/// the TCP connection but never sends a frame the client would otherwise block
+/// forever inside `read_frame().await`; this bound converts that hang into a
+/// retriable network error.
+const KEX_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// An unrecoverable key-exchange error that should not trigger the retry loop.
 #[derive(Debug)]
@@ -632,12 +639,37 @@ async fn run_session_loop(
                     drop(disable_raw_mode());
                     return Err(e);
                 }
+                if let Some(&err) = e.downcast_ref::<MoshpitError>() {
+                    match err {
+                        MoshpitError::KeyNotEstablished => {
+                            eprintln!("mp: server rejected the key exchange");
+                            eprintln!(
+                                "mp: ensure your public key is listed in \
+                                 ~/.mp/authorized_keys on the server"
+                            );
+                            drop(disable_raw_mode());
+                            return Err(e);
+                        }
+                        MoshpitError::NoCommonAlgorithm => {
+                            eprintln!("mp: no common algorithm found during key exchange");
+                            eprintln!(
+                                "mp: check --kex-algos, --aead-algos, --mac-algos, \
+                                 and --kdf-algos settings on both client and server"
+                            );
+                            drop(disable_raw_mode());
+                            return Err(e);
+                        }
+                        _ => {}
+                    }
+                }
                 reconnect_attempt = reconnect_attempt.saturating_add(1);
                 error!("Failed to connect to {socket_addr}: {e}, retrying in {backoff:?}");
                 // Reset passphrase cache on early failures so the user can
                 // re-enter it on the next attempt.
                 if !had_successful_kex {
-                    *pass_cache.lock().unwrap() = PassCache::Uncached;
+                    *pass_cache
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = PassCache::Uncached;
                 }
                 if countdown_with_escape(
                     &stdout_tx,
@@ -681,7 +713,9 @@ async fn connect_and_kex(
     let cache = pass_cache.clone();
     let paused_pass = stdin_paused.clone();
     let pass_fn = move || -> Result<Option<String>> {
-        let guard = cache.lock().unwrap();
+        let guard = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if guard.is_cached() {
             info!(
                 "passphrase: returning cached value (has_passphrase={})",
@@ -699,7 +733,9 @@ async fn connect_and_kex(
             Err(e) => error!("passphrase: prompt failed: {e}"),
         }
         if let Ok(ref pass) = result {
-            *cache.lock().unwrap() = match pass {
+            *cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = match pass {
                 Some(s) => PassCache::Passphrase(s.clone()),
                 None => PassCache::NoPassphrase,
             };
@@ -754,15 +790,27 @@ async fn connect_and_kex(
     );
 
     let kex_start = Instant::now();
-    let (kex, udp_arc, _) = run_key_exchange(
-        config.clone(),
-        sock_read,
-        sock_write,
-        pass_fn,
-        Some(tofu_fn),
-        Some(mismatch_fn),
+    let kex_result = time::timeout(
+        KEX_TIMEOUT,
+        run_key_exchange(
+            config.clone(),
+            sock_read,
+            sock_write,
+            pass_fn,
+            Some(tofu_fn),
+            Some(mismatch_fn),
+        ),
     )
-    .await
+    .await;
+    let (kex, udp_arc, _) = match kex_result {
+        Err(_elapsed) => {
+            return Err(anyhow::anyhow!(
+                "key exchange timed out after {KEX_TIMEOUT:?} — \
+                 server accepted TCP connection but sent no data"
+            ));
+        }
+        Ok(inner) => inner,
+    }
     .map_err(|e| {
         if let Some(&moshpit_err) = e.downcast_ref::<MoshpitError>() {
             match moshpit_err {
@@ -838,11 +886,13 @@ async fn run_udp_session(
     // this gives 9 s vs the former fixed 15 s; on high-latency paths it scales
     // up proportionally so a single slow keepalive never causes a false disconnect.
     let silence_timeout = (nak_timeout * 30).max(Duration::from_secs(9));
+    let mac_tag_len = kex.mac_tag_len();
     let mut udp_reader = UdpReader::builder()
         .socket(udp_arc.clone())
         .id(kex.uuid())
-        .hmac(kex.hmac_key())
-        .rnk(kex.key())?
+        .hmac(kex.build_hmac())
+        .rnk(kex.build_aead_key()?)
+        .mac_tag_len(mac_tag_len)
         .nak_out_tx(tx.clone())
         .retransmit_tx(retransmit_tx)
         .silence_timeout(silence_timeout)
@@ -858,8 +908,8 @@ async fn run_udp_session(
         .rx(rx)
         .retransmit_rx(retransmit_rx)
         .id(kex.uuid())
-        .hmac(kex.hmac_key())
-        .rnk(kex.key())?
+        .hmac(kex.build_hmac())
+        .rnk(kex.build_aead_key()?)
         .diff_mode(diff_mode)
         .build();
 
@@ -981,9 +1031,9 @@ async fn run_udp_session(
                             }
                             // Local echo prediction: feed each byte to the engine.
                             let (overlays, cursor) = {
-                                let emu = emu_fwd.lock().unwrap();
+                                let emu = emu_fwd.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                                 let screen = emu.screen();
-                                let mut pred = pred_fwd.lock().unwrap();
+                                let mut pred = pred_fwd.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                                 for byte in &to_forward {
                                     pred.new_user_byte(*byte, screen);
                                 }
@@ -1035,8 +1085,8 @@ fn spawn_resize_handler(
                     _ = sigwinch.recv() => {
                         let (columns, rows) = terminal_size()
                             .map_or((80, 24), |(width, height)| (width.0, height.0));
-                        emulator.lock().unwrap().set_size(rows, columns);
-                        renderer.lock().unwrap().set_size(rows, columns);
+                        emulator.lock().unwrap_or_else(std::sync::PoisonError::into_inner).set_size(rows, columns);
+                        renderer.lock().unwrap_or_else(std::sync::PoisonError::into_inner).set_size(rows, columns);
                         if let Err(e) =
                             resize_tx.send(EncryptedFrame::Resize((resize_uuid, columns, rows))).await
                         {
@@ -1074,8 +1124,14 @@ fn spawn_resize_handler(
             if current_size != last_size {
                 last_size = current_size;
                 let (columns, rows) = current_size;
-                emulator.lock().unwrap().set_size(rows, columns);
-                renderer.lock().unwrap().set_size(rows, columns);
+                emulator
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .set_size(rows, columns);
+                renderer
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .set_size(rows, columns);
                 if let Err(e) =
                     resize_tx.blocking_send(EncryptedFrame::Resize((resize_uuid, columns, rows)))
                 {
@@ -1126,7 +1182,11 @@ fn maybe_generate_keypair(config: &Config) -> Result<()> {
         .interact()?;
     let passphrase_opt = Some(passphrase);
 
-    let keypair = KeyPair::generate_key_pair(passphrase_opt.as_ref(), KexMode::Client)?;
+    let keypair = KeyPair::generate_key_pair(
+        passphrase_opt.as_ref(),
+        KexMode::Client,
+        KEY_ALGORITHM_X25519,
+    )?;
 
     let mut priv_key_file = {
         #[cfg(unix)]
@@ -1409,7 +1469,7 @@ mod tests {
     impl TestHome {
         fn new() -> Self {
             let path = std::env::temp_dir().join(Uuid::new_v4().to_string());
-            std::fs::create_dir_all(&path).unwrap();
+            std::fs::create_dir_all(&path).expect("failed to create temp dir");
             Self { path }
         }
 
@@ -1446,22 +1506,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_banners() {
+    async fn test_banners() -> Result<()> {
         let (tx, mut rx) = channel(10);
         show_reconnect_banner(&tx).await;
-        let msg = rx.recv().await.unwrap();
+        let msg = rx
+            .recv()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("channel closed"))?;
         assert!(
             String::from_utf8_lossy(&msg).contains("[moshpit] server unreachable, reconnecting...")
         );
 
         clear_reconnect_banner(&tx).await;
-        let msg = rx.recv().await.unwrap();
+        let msg = rx
+            .recv()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("channel closed"))?;
         assert!(String::from_utf8_lossy(&msg).ends_with("\x1b[0m\x1b[K\x1b[u"));
 
         let token = CancellationToken::new();
         let _ = countdown_reconnect_banner(&tx, 0, 1, 10, &token).await;
-        let msg = rx.recv().await.unwrap();
+        let msg = rx
+            .recv()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("channel closed"))?;
         assert!(String::from_utf8_lossy(&msg).contains("attempt #1"));
+        Ok(())
     }
 
     #[tokio::test]
@@ -1483,28 +1553,30 @@ mod tests {
     #[test]
     fn read_uuid_from_path_garbage_returns_none() {
         let dir = std::env::temp_dir().join(Uuid::new_v4().to_string());
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&dir).expect("failed to create temp dir");
         let path = dir.join("session");
-        std::fs::write(&path, "not-a-uuid").unwrap();
+        std::fs::write(&path, "not-a-uuid").expect("failed to write test file");
         assert!(read_uuid_from_path(&path).is_none());
     }
 
     #[test]
-    fn write_and_read_uuid_roundtrip() {
+    fn write_and_read_uuid_roundtrip() -> Result<()> {
         let dir = std::env::temp_dir().join(Uuid::new_v4().to_string());
         let path = dir.join("sub").join("session");
         let uuid = Uuid::new_v4();
-        write_uuid_to_path(&path, uuid).unwrap();
+        write_uuid_to_path(&path, uuid)?;
         assert_eq!(read_uuid_from_path(&path), Some(uuid));
+        Ok(())
     }
 
     #[test]
-    fn write_uuid_creates_parent_directories() {
+    fn write_uuid_creates_parent_directories() -> Result<()> {
         let dir = std::env::temp_dir().join(Uuid::new_v4().to_string());
         let nested = dir.join("a").join("b").join("c").join("session");
         let uuid = Uuid::new_v4();
-        write_uuid_to_path(&nested, uuid).unwrap();
+        write_uuid_to_path(&nested, uuid)?;
         assert!(nested.exists());
+        Ok(())
     }
 
     #[test]
@@ -1512,7 +1584,7 @@ mod tests {
         let home = TestHome::new();
         let path = client_id_path(home.path());
         assert!(path.starts_with(home.path().join(".mp")));
-        assert_eq!(path.file_name().unwrap(), "client_id");
+        assert_eq!(path.file_name().expect("path has a file name"), "client_id");
     }
 
     #[test]
@@ -1525,58 +1597,63 @@ mod tests {
     }
 
     #[test]
-    fn test_session_uuid_persistence() {
+    fn test_session_uuid_persistence() -> Result<()> {
         let home = TestHome::new();
         let host = "test.host";
         let port = 12345;
         let uuid = Uuid::new_v4();
 
         // Write it
-        let path = session_file_path_in_home(home.path(), host, port).unwrap();
+        let path = session_file_path_in_home(home.path(), host, port)
+            .ok_or_else(|| anyhow::anyhow!("no session file path"))?;
         if let Some(parent) = path.parent() {
-            DirBuilder::new().recursive(true).create(parent).unwrap();
+            DirBuilder::new().recursive(true).create(parent)?;
         }
-        std::fs::write(&path, uuid.to_string()).unwrap();
+        std::fs::write(&path, uuid.to_string())?;
 
         // Read it back
         let read_uuid = {
-            let mut file = std::fs::File::open(&path).unwrap();
+            let mut file = std::fs::File::open(&path)?;
             let mut buf = String::new();
-            let _ = file.read_to_string(&mut buf).unwrap();
-            buf.trim().parse::<Uuid>().unwrap()
+            let _ = file.read_to_string(&mut buf)?;
+            buf.trim().parse::<Uuid>()?
         };
         assert_eq!(uuid, read_uuid);
+        Ok(())
     }
 
     #[test]
-    fn test_session_file_path() {
+    fn test_session_file_path() -> Result<()> {
         let home = TestHome::new();
         let host = "some_host.com";
         let port = 2222;
-        let path = session_file_path_in_home(home.path(), host, port).unwrap();
+        let path = session_file_path_in_home(home.path(), host, port)
+            .ok_or_else(|| anyhow::anyhow!("no session file path"))?;
         assert!(path.to_string_lossy().contains("some_host.com"));
         assert!(path.to_string_lossy().contains("2222"));
+        Ok(())
     }
 
     #[test]
-    fn test_create_key_dir() {
+    fn test_create_key_dir() -> Result<()> {
         let dir = std::env::temp_dir().join(Uuid::new_v4().to_string());
         let key_dir = dir.join("keys");
-        create_key_dir(&key_dir).unwrap();
+        create_key_dir(&key_dir)?;
         assert!(key_dir.exists());
         assert!(key_dir.is_dir());
+        Ok(())
     }
 
     #[test]
-    fn test_maybe_generate_keypair_existing() {
+    fn test_maybe_generate_keypair_existing() -> Result<()> {
         let dir = std::env::temp_dir().join(Uuid::new_v4().to_string());
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&dir)?;
         let priv_path = dir.join("id_ed25519");
         let pub_path = dir.join("id_ed25519.pub");
         let config_path = dir.join("config.toml");
 
-        std::fs::write(&priv_path, "fake private key").unwrap();
-        std::fs::write(&pub_path, "fake public key").unwrap();
+        std::fs::write(&priv_path, "fake private key")?;
+        std::fs::write(&pub_path, "fake public key")?;
         std::fs::write(
             &config_path,
             "[tracing.stdout]\n\
@@ -1594,38 +1671,37 @@ mod tests {
              with_thread_names = false\n\
              with_line_number = false\n\
              with_level = false\n",
-        )
-        .unwrap();
+        )?;
 
         let cli = Cli::try_parse_from([
             "moshpit",
             "-c",
-            config_path.to_str().unwrap(),
+            config_path.to_str().expect("path is valid UTF-8"),
             "-p",
-            priv_path.to_str().unwrap(),
+            priv_path.to_str().expect("path is valid UTF-8"),
             "-k",
-            pub_path.to_str().unwrap(),
+            pub_path.to_str().expect("path is valid UTF-8"),
             "user@host",
-        ])
-        .unwrap();
-        let config = load::<Cli, Config, Cli>(&cli, &cli).unwrap();
+        ])?;
+        let config = load::<Cli, Config, Cli>(&cli, &cli)?;
 
         // Should return Ok(()) immediately without prompting
         let result = maybe_generate_keypair(&config);
         assert!(result.is_ok());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_connect_and_kex_tcp_failure() {
+    async fn test_connect_and_kex_tcp_failure() -> Result<()> {
         let mut config = Config::default();
         let pass_cache = Arc::new(std::sync::Mutex::new(PassCache::Uncached));
 
         // Bind to a random port and immediately close it
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
         drop(listener);
 
-        let addr = format!("127.0.0.1:{port}").parse().unwrap();
+        let addr = format!("127.0.0.1:{port}").parse()?;
 
         // This should fail with ConnectionRefused
         let result = connect_and_kex(
@@ -1645,19 +1721,20 @@ mod tests {
                 .to_lowercase()
                 .contains("refused")
         );
+        Ok(())
     }
 
     #[tokio::test]
     #[should_panic(expected = "split_to out of bounds")]
     async fn test_connect_and_kex_kex_failure() {
         let dir = std::env::temp_dir().join(Uuid::new_v4().to_string());
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&dir).expect("failed to create temp dir");
         let config_path = dir.join("config.toml");
         // Empty key files: /dev/null doesn't exist on Windows, so create real empty files.
         let empty_priv_key_path = dir.join("empty_priv_key");
         let empty_pub_key_path = dir.join("empty_pub_key");
-        std::fs::write(&empty_priv_key_path, b"").unwrap();
-        std::fs::write(&empty_pub_key_path, b"").unwrap();
+        std::fs::write(&empty_priv_key_path, b"").expect("failed to write empty key file");
+        std::fs::write(&empty_pub_key_path, b"").expect("failed to write empty key file");
         std::fs::write(
             &config_path,
             "[tracing.stdout]\n\
@@ -1676,25 +1753,30 @@ mod tests {
              with_line_number = false\n\
              with_level = false\n",
         )
-        .unwrap();
+        .expect("failed to write config file");
         let cli = Cli::try_parse_from([
             "moshpit",
             "-c",
-            config_path.to_str().unwrap(),
+            config_path.to_str().expect("path is valid UTF-8"),
             "-p",
-            empty_priv_key_path.to_str().unwrap(),
+            empty_priv_key_path.to_str().expect("path is valid UTF-8"),
             "-k",
-            empty_pub_key_path.to_str().unwrap(),
+            empty_pub_key_path.to_str().expect("path is valid UTF-8"),
             "user@host",
         ])
-        .unwrap();
-        let mut config = load::<Cli, Config, Cli>(&cli, &cli).unwrap();
+        .expect("CLI parse failed");
+        let mut config = load::<Cli, Config, Cli>(&cli, &cli).expect("config load failed");
 
         let pass_cache = Arc::new(std::sync::Mutex::new(PassCache::Uncached));
 
         // Bind a real listener
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind listener");
+        let port = listener
+            .local_addr()
+            .expect("listener has local addr")
+            .port();
 
         // Spawn a task to accept the connection and send the greeting, then drop
         drop(spawn(async move {
@@ -1704,7 +1786,9 @@ mod tests {
             }
         }));
 
-        let addr = format!("127.0.0.1:{port}").parse().unwrap();
+        let addr = format!("127.0.0.1:{port}")
+            .parse()
+            .expect("address is valid");
 
         // TcpStream::connect will succeed, but run_key_exchange will fail
         let result = connect_and_kex(
@@ -1739,7 +1823,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connect_and_kex_missing_key_file_wrapped_as_fatal_error() {
+    async fn connect_and_kex_missing_key_file_wrapped_as_fatal_error() -> Result<()> {
         use clap::Parser as _;
         let home = TestHome::new();
         let config_path = home.path().join("config.toml");
@@ -1763,30 +1847,28 @@ mod tests {
              with_thread_names = false\n\
              with_line_number = false\n\
              with_level = false\n",
-        )
-        .unwrap();
+        )?;
         let cli = Cli::try_parse_from([
             "moshpit",
             "-c",
-            config_path.to_str().unwrap(),
+            config_path.to_str().expect("path is valid UTF-8"),
             "-p",
-            priv_path.to_str().unwrap(),
+            priv_path.to_str().expect("path is valid UTF-8"),
             "-k",
-            pub_path.to_str().unwrap(),
+            pub_path.to_str().expect("path is valid UTF-8"),
             "user@host",
-        ])
-        .unwrap();
-        let mut config = load::<Cli, Config, Cli>(&cli, &cli).unwrap();
+        ])?;
+        let mut config = load::<Cli, Config, Cli>(&cli, &cli)?;
         let pass_cache = Arc::new(std::sync::Mutex::new(PassCache::Uncached));
 
         // Bind a real listener so TCP connection succeeds
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
         drop(spawn(async move {
             if let Ok((_, _)) = listener.accept().await {}
         }));
 
-        let addr = format!("127.0.0.1:{port}").parse().unwrap();
+        let addr = format!("127.0.0.1:{port}").parse()?;
         let result = connect_and_kex(
             &mut config,
             addr,
@@ -1802,6 +1884,7 @@ mod tests {
             err.downcast_ref::<FatalKexError>().is_some(),
             "missing key file should produce FatalKexError, got: {err}"
         );
+        Ok(())
     }
 
     // crossterm's Unix parser maps 0x1C-0x1F bytes to Char('4'-'7') + CONTROL.
@@ -1859,64 +1942,70 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn normal_bytes_do_not_trigger_exit() {
+        async fn normal_bytes_do_not_trigger_exit() -> anyhow::Result<()> {
             let (tx, rx) = channel::<Vec<u8>>(8);
             let kb_rx = Arc::new(Mutex::new(rx));
             let exit_token = CancellationToken::new();
             let done_token = CancellationToken::new();
-            tx.send(b"hello".to_vec()).await.unwrap();
+            tx.send(b"hello".to_vec()).await?;
             drop(tx);
             run_escape_listener(kb_rx, exit_token.clone(), done_token).await;
             assert!(!exit_token.is_cancelled());
+            Ok(())
         }
 
         #[tokio::test]
-        async fn escape_prefix_then_non_dot_does_not_trigger_exit() {
+        async fn escape_prefix_then_non_dot_does_not_trigger_exit() -> anyhow::Result<()> {
             let (tx, rx) = channel::<Vec<u8>>(8);
             let kb_rx = Arc::new(Mutex::new(rx));
             let exit_token = CancellationToken::new();
             let done_token = CancellationToken::new();
             // 0x1E followed by 'x' — state resets to Normal
-            tx.send(vec![0x1E, b'x']).await.unwrap();
+            tx.send(vec![0x1E, b'x']).await?;
             drop(tx);
             run_escape_listener(kb_rx, exit_token.clone(), done_token).await;
             assert!(!exit_token.is_cancelled());
+            Ok(())
         }
 
         #[tokio::test]
-        async fn repeated_escape_prefix_stays_pending_without_triggering_exit() {
+        async fn repeated_escape_prefix_stays_pending_without_triggering_exit() -> anyhow::Result<()>
+        {
             let (tx, rx) = channel::<Vec<u8>>(8);
             let kb_rx = Arc::new(Mutex::new(rx));
             let exit_token = CancellationToken::new();
             let done_token = CancellationToken::new();
             // Multiple 0x1E bytes — stays in PendingDot but never completes
-            tx.send(vec![0x1E, 0x1E, 0x1E]).await.unwrap();
+            tx.send(vec![0x1E, 0x1E, 0x1E]).await?;
             drop(tx);
             run_escape_listener(kb_rx, exit_token.clone(), done_token).await;
             assert!(!exit_token.is_cancelled());
+            Ok(())
         }
 
         #[tokio::test]
-        async fn full_sequence_in_one_chunk_triggers_exit() {
+        async fn full_sequence_in_one_chunk_triggers_exit() -> anyhow::Result<()> {
             let (tx, rx) = channel::<Vec<u8>>(8);
             let kb_rx = Arc::new(Mutex::new(rx));
             let exit_token = CancellationToken::new();
             let done_token = CancellationToken::new();
-            tx.send(vec![0x1E, 0x2E]).await.unwrap();
+            tx.send(vec![0x1E, 0x2E]).await?;
             run_escape_listener(kb_rx, exit_token.clone(), done_token).await;
             assert!(exit_token.is_cancelled());
+            Ok(())
         }
 
         #[tokio::test]
-        async fn sequence_split_across_sends_triggers_exit() {
+        async fn sequence_split_across_sends_triggers_exit() -> anyhow::Result<()> {
             let (tx, rx) = channel::<Vec<u8>>(8);
             let kb_rx = Arc::new(Mutex::new(rx));
             let exit_token = CancellationToken::new();
             let done_token = CancellationToken::new();
-            tx.send(vec![0x1E]).await.unwrap();
-            tx.send(vec![0x2E]).await.unwrap();
+            tx.send(vec![0x1E]).await?;
+            tx.send(vec![0x2E]).await?;
             run_escape_listener(kb_rx, exit_token.clone(), done_token).await;
             assert!(exit_token.is_cancelled());
+            Ok(())
         }
     }
 

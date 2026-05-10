@@ -23,10 +23,7 @@ use ansi_control_codes::{
     parser::{Token, TokenStream},
 };
 use anyhow::Result;
-use aws_lc_rs::{
-    aead::{AES_256_GCM_SIV, RandomizedNonceKey},
-    hmac::{HMAC_SHA512, Key},
-};
+use aws_lc_rs::{aead::LessSafeKey, hmac::Key};
 use bon::Builder;
 use bytes::BytesMut;
 use tokio::{
@@ -83,11 +80,13 @@ pub struct UdpReader {
     /// Client UUID
     id: Uuid,
     /// Key for decrypting UDP packets
-    #[builder(with = |key: [u8; 32]| -> Result<_> { RandomizedNonceKey::new(&AES_256_GCM_SIV, &key).map_err(Into::into) })]
-    rnk: RandomizedNonceKey,
+    rnk: LessSafeKey,
     /// Key for verifying UDP packet HMAC
-    #[builder(with = |key: [u8; 64]| { Key::new(HMAC_SHA512, &key) })]
     hmac: Key,
+    /// Byte length of the MAC tag written by the peer's HMAC algorithm.
+    /// 64 for HMAC-SHA512 (default), 32 for HMAC-SHA256.
+    #[builder(default = 64)]
+    mac_tag_len: usize,
     /// Injects NAK frames into the outbound stream when gaps are detected
     nak_out_tx: Option<Sender<EncryptedFrame>>,
     /// Tells the local sender to retransmit when a NAK from the peer is received
@@ -381,7 +380,11 @@ impl UdpReader {
         *i += 1;
         let response: Option<Vec<u8>> = match (marker, params, terminator) {
             (None | Some(b'?'), b"6", b'n') => {
-                let (row, col) = emulator.lock().unwrap().screen().cursor_position();
+                let (row, col) = emulator
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .screen()
+                    .cursor_position();
                 Some(format!("\x1b[{};{}R", row + 1, col + 1).into_bytes())
             }
             (None, b"" | b"0", b'c') => Some(b"\x1b[?62c".to_vec()),
@@ -980,7 +983,9 @@ impl UdpReader {
             match decode_all(payload_compressed.as_slice()) {
                 Ok(payload) => {
                     let (rows, cols) = {
-                        let emu = emulator.lock().unwrap();
+                        let emu = emulator
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
                         emu.screen().size()
                     };
                     let mut tmp = vt100::Parser::new(rows, cols, 0);
@@ -999,7 +1004,9 @@ impl UdpReader {
                         self.initial_state_received = true;
                     }
                     let repaint = {
-                        let mut rend = renderer.lock().unwrap();
+                        let mut rend = renderer
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
                         rend.invalidate();
                         rend.render(tmp.screen(), &[], None)
                     };
@@ -1108,9 +1115,9 @@ impl UdpReader {
                             EncryptedFrame::ScrollbackEnd => {
                                 scrollback_mode = false;
                                 let repaint = {
-                                    let emu = emulator.lock().unwrap();
+                                    let emu = emulator.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                                     let screen = emu.screen();
-                                    let mut rend = renderer.lock().unwrap();
+                                    let mut rend = renderer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                                     rend.invalidate();
                                     rend.render(screen, &[], None)
                                 };
@@ -1121,13 +1128,13 @@ impl UdpReader {
                             }
                             EncryptedFrame::ScreenState(payload) => {
                                 let (rows, cols) = {
-                                    let emu = emulator.lock().unwrap();
+                                    let emu = emulator.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                                     emu.screen().size()
                                 };
                                 let mut tmp = vt100::Parser::new(rows, cols, 0);
                                 tmp.process(&payload);
                                 let repaint = {
-                                    let mut rend = renderer.lock().unwrap();
+                                    let mut rend = renderer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                                     rend.invalidate();
                                     rend.render(tmp.screen(), &[], None)
                                 };
@@ -1141,7 +1148,7 @@ impl UdpReader {
                                 match decode_all(compressed.as_slice()) {
                                     Ok(payload) => {
                                         let (rows, cols) = {
-                                            let emu = emulator.lock().unwrap();
+                                            let emu = emulator.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                                             emu.screen().size()
                                         };
                                         let mut tmp = vt100::Parser::new(rows, cols, 0);
@@ -1160,7 +1167,7 @@ impl UdpReader {
                                             self.initial_state_received = true;
                                         }
                                         let repaint = {
-                                            let mut rend = renderer.lock().unwrap();
+                                            let mut rend = renderer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                                             rend.invalidate();
                                             rend.render(tmp.screen(), &[], None)
                                         };
@@ -1268,9 +1275,9 @@ impl UdpReader {
                                     EncryptedFrame::ScrollbackEnd => {
                                         scrollback_mode = false;
                                         let repaint = {
-                                            let emu = emulator.lock().unwrap();
+                                            let emu = emulator.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                                             let screen = emu.screen();
-                                            let mut rend = renderer.lock().unwrap();
+                                            let mut rend = renderer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                                             rend.invalidate();
                                             rend.render(screen, &[], None)
                                         };
@@ -1281,13 +1288,13 @@ impl UdpReader {
                                     }
                                     EncryptedFrame::ScreenState(payload) => {
                                         let (rows, cols) = {
-                                            let emu = emulator.lock().unwrap();
+                                            let emu = emulator.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                                             emu.screen().size()
                                         };
                                         let mut tmp = vt100::Parser::new(rows, cols, 0);
                                         tmp.process(&payload);
                                         let repaint = {
-                                            let mut rend = renderer.lock().unwrap();
+                                            let mut rend = renderer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                                             rend.invalidate();
                                             rend.render(tmp.screen(), &[], None)
                                         };
@@ -1301,7 +1308,7 @@ impl UdpReader {
                                         match decode_all(compressed.as_slice()) {
                                             Ok(payload) => {
                                                 let (rows, cols) = {
-                                                    let emu = emulator.lock().unwrap();
+                                                    let emu = emulator.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                                                     emu.screen().size()
                                                 };
                                                 let mut tmp = vt100::Parser::new(rows, cols, 0);
@@ -1320,7 +1327,7 @@ impl UdpReader {
                                                     self.initial_state_received = true;
                                                 }
                                                 let repaint = {
-                                                    let mut rend = renderer.lock().unwrap();
+                                                    let mut rend = renderer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                                                     rend.invalidate();
                                                     rend.render(tmp.screen(), &[], None)
                                                 };
@@ -1383,7 +1390,7 @@ impl UdpReader {
                                             match decode_all(compressed.as_slice()) {
                                                 Ok(diff_bytes) => {
                                                     let (rows, cols) = {
-                                                        let emu = emulator.lock().unwrap();
+                                                        let emu = emulator.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                                                         emu.screen().size()
                                                     };
                                                     let mut tmp = vt100::Parser::new(rows, cols, 0);
@@ -1404,7 +1411,7 @@ impl UdpReader {
                                                     // alt-screen state and ScreenStateCompressed
                                                     // repaints compute correct diffs afterward.
                                                     let repaint = {
-                                                        let mut rend = renderer.lock().unwrap();
+                                                        let mut rend = renderer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                                                         rend.render(tmp.screen(), &[], None)
                                                     };
                                                     if let Err(e) = stdout_tx.send(repaint).await {
@@ -1541,7 +1548,9 @@ async fn process_bytes_with_prediction(
 
     // ── 3. Feed raw bytes into the emulator ──────────────────────────────
     {
-        let mut emu = emulator.lock().unwrap();
+        let mut emu = emulator
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         emu.process(&raw);
     }
 
@@ -1550,9 +1559,13 @@ async fn process_bytes_with_prediction(
     // predictions during reconnect and we do not want flickering output.
     if !scrollback_mode {
         let (overlays, cursor) = {
-            let emu = emulator.lock().unwrap();
+            let emu = emulator
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let screen = emu.screen();
-            let mut pred = prediction.lock().unwrap();
+            let mut pred = prediction
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             pred.cull(screen);
             pred.apply(screen)
         };
@@ -1646,7 +1659,7 @@ impl UdpReader {
         let mut buf = Cursor::new(&buffer[..]);
         buf.set_position(0);
 
-        match EncryptedFrame::parse(&mut buf, self.id, &self.hmac, &self.rnk) {
+        match EncryptedFrame::parse(&mut buf, self.id, &self.hmac, &self.rnk, self.mac_tag_len) {
             Ok(Some((frame, seq))) => {
                 buffer.clear();
                 Ok(Some((frame, seq)))
@@ -1659,6 +1672,11 @@ impl UdpReader {
 
 #[cfg(test)]
 mod tests {
+    use aws_lc_rs::{
+        aead::{AES_256_GCM_SIV, UnboundKey},
+        hmac::HMAC_SHA512,
+    };
+
     use super::*;
 
     #[tokio::test]
@@ -1669,9 +1687,10 @@ mod tests {
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
-            .rnk([0u8; 32])
-            .unwrap()
-            .hmac([0u8; 64])
+            .rnk(LessSafeKey::new(
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+            ))
+            .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .build();
 
         // First packet arrives normally
@@ -1717,9 +1736,10 @@ mod tests {
         UdpReader::builder()
             .socket(Arc::new(socket))
             .id(Uuid::new_v4())
-            .rnk([0u8; 32])
-            .unwrap()
-            .hmac([0u8; 64])
+            .rnk(LessSafeKey::new(
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+            ))
+            .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .build()
     }
 
@@ -1824,9 +1844,10 @@ mod tests {
         let reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
-            .rnk([0u8; 32])
-            .unwrap()
-            .hmac([0u8; 64])
+            .rnk(LessSafeKey::new(
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+            ))
+            .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .query_response_tx(tx)
             .build();
         (reader, rx)
@@ -2082,9 +2103,10 @@ mod tests {
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
-            .rnk([0u8; 32])
-            .unwrap()
-            .hmac([0u8; 64])
+            .rnk(LessSafeKey::new(
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+            ))
+            .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .retransmit_tx(retransmit_tx)
             .build();
 
@@ -2110,9 +2132,10 @@ mod tests {
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
-            .rnk([0u8; 32])
-            .unwrap()
-            .hmac([0u8; 64])
+            .rnk(LessSafeKey::new(
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+            ))
+            .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .build();
 
         // Simulate a gap at seq=0: record it in gap_first_seen
@@ -2250,9 +2273,10 @@ mod tests {
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
-            .rnk([0u8; 32])
-            .unwrap()
-            .hmac([0u8; 64])
+            .rnk(LessSafeKey::new(
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+            ))
+            .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .nak_out_tx(nak_tx)
             .build();
 
@@ -2297,9 +2321,10 @@ mod tests {
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
-            .rnk([0u8; 32])
-            .unwrap()
-            .hmac([0u8; 64])
+            .rnk(LessSafeKey::new(
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+            ))
+            .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .nak_out_tx(nak_tx)
             .build();
 
@@ -2375,9 +2400,10 @@ mod tests {
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
-            .rnk([0u8; 32])
-            .unwrap()
-            .hmac([0u8; 64])
+            .rnk(LessSafeKey::new(
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+            ))
+            .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .nak_received_count(counter.clone())
             .build();
 
@@ -2487,9 +2513,10 @@ mod tests {
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
-            .rnk([0u8; 32])
-            .unwrap()
-            .hmac([0u8; 64])
+            .rnk(LessSafeKey::new(
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+            ))
+            .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .build();
 
         // seq 0 delivered normally
@@ -2519,9 +2546,10 @@ mod tests {
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
-            .rnk([0u8; 32])
-            .unwrap()
-            .hmac([0u8; 64])
+            .rnk(LessSafeKey::new(
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+            ))
+            .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .build();
 
         // seq 0 delivered
@@ -2546,9 +2574,10 @@ mod tests {
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
-            .rnk([0u8; 32])
-            .unwrap()
-            .hmac([0u8; 64])
+            .rnk(LessSafeKey::new(
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+            ))
+            .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .build();
 
         drop(reader.handle_arrival(EncryptedFrame::Keepalive(0), 0));
@@ -2573,9 +2602,10 @@ mod tests {
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
-            .rnk([0u8; 32])
-            .unwrap()
-            .hmac([0u8; 64])
+            .rnk(LessSafeKey::new(
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+            ))
+            .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .nak_out_tx(nak_tx)
             .build();
 
@@ -2608,9 +2638,10 @@ mod tests {
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
-            .rnk([0u8; 32])
-            .unwrap()
-            .hmac([0u8; 64])
+            .rnk(LessSafeKey::new(
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+            ))
+            .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .nak_out_tx(nak_tx)
             .build();
 
@@ -2664,9 +2695,10 @@ mod tests {
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
-            .rnk([0u8; 32])
-            .unwrap()
-            .hmac([0u8; 64])
+            .rnk(LessSafeKey::new(
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+            ))
+            .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .nak_out_tx(nak_tx)
             .build();
 
@@ -2725,9 +2757,10 @@ mod tests {
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
-            .rnk([0u8; 32])
-            .unwrap()
-            .hmac([0u8; 64])
+            .rnk(LessSafeKey::new(
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+            ))
+            .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .build();
 
         let emulator = Arc::new(StdMutex::new(Emulator::new(24, 80)));
@@ -2757,9 +2790,10 @@ mod tests {
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
-            .rnk([0u8; 32])
-            .unwrap()
-            .hmac([0u8; 64])
+            .rnk(LessSafeKey::new(
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+            ))
+            .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .nak_out_tx(nak_tx)
             .build();
 

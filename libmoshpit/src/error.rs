@@ -85,6 +85,9 @@ pub enum Error {
     /// The user explicitly rejected the server's host key (TOFU or mismatch prompt)
     #[error("Host key rejected by user")]
     HostKeyRejected,
+    /// No common algorithm found during KEX negotiation
+    #[error("No common algorithm found during key exchange negotiation")]
+    NoCommonAlgorithm,
 }
 
 /// Converts an `anyhow::Error` into a suitable exit code or clap message for a CLI application.

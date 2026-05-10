@@ -7,7 +7,7 @@
 // modified, or distributed except according to those terms.
 
 use anyhow::Result;
-use aws_lc_rs::aead::{AES_256_GCM_SIV, RandomizedNonceKey};
+use aws_lc_rs::aead::{AES_256_GCM_SIV, LessSafeKey, UnboundKey};
 use bon::Builder;
 use getset::Getters;
 use serde::{Deserialize, Serialize};
@@ -57,6 +57,6 @@ pub struct UdpClient {
     /// Client UUID
     uuid: Uuid,
     /// Key for encrypting/decrypting UDP packets
-    #[builder(with = |key: [u8; 32]| -> Result<_> { RandomizedNonceKey::new(&AES_256_GCM_SIV, &key).map_err(Into::into) })]
-    rnk: RandomizedNonceKey,
+    #[builder(with = |key: [u8; 32]| -> Result<_> { Ok(LessSafeKey::new(UnboundKey::new(&AES_256_GCM_SIV, &key)?)) })]
+    rnk: LessSafeKey,
 }

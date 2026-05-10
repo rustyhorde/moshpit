@@ -19,7 +19,9 @@ static LONG_VERSION: LazyLock<String> = LazyLock::new(|| {
     let mut cursor = Cursor::new(vec![]);
     let mut output = env!("CARGO_PKG_VERSION").to_string();
     output.push_str("\n\n");
-    pretty.display(&mut cursor).unwrap();
+    pretty
+        .display(&mut cursor)
+        .expect("writing to Vec never fails");
     output += &String::from_utf8_lossy(cursor.get_ref());
     output
 });
@@ -138,6 +140,65 @@ pub(crate) struct Cli {
     )]
     #[getset(get = "pub(crate)")]
     diff_mode: String,
+    /// Ordered KEX algorithms to offer (comma-separated).
+    /// Example: `--kex-algos x25519-sha256,p256-sha256`
+    #[clap(
+        long,
+        value_name = "ALGOS",
+        help = "Ordered KEX algorithms to offer, comma-separated [supported: x25519-sha256 (default), p384-sha384, p256-sha256]"
+    )]
+    #[getset(get = "pub(crate)")]
+    kex_algos: Option<String>,
+    /// Ordered AEAD algorithms to offer (comma-separated).
+    /// Example: `--aead-algos chacha20-poly1305,aes256-gcm-siv`
+    #[clap(
+        long,
+        value_name = "ALGOS",
+        help = "Ordered AEAD algorithms to offer, comma-separated [supported: aes256-gcm-siv (default), aes256-gcm, chacha20-poly1305, aes128-gcm-siv]"
+    )]
+    #[getset(get = "pub(crate)")]
+    aead_algos: Option<String>,
+    /// Ordered MAC algorithms to offer (comma-separated).
+    /// Example: `--mac-algos hmac-sha256`
+    #[clap(
+        long,
+        value_name = "ALGOS",
+        help = "Ordered MAC algorithms to offer, comma-separated [supported: hmac-sha512 (default), hmac-sha256]"
+    )]
+    #[getset(get = "pub(crate)")]
+    mac_algos: Option<String>,
+    /// Ordered KDF algorithms to offer (comma-separated).
+    /// Example: `--kdf-algos hkdf-sha512`
+    #[clap(
+        long,
+        value_name = "ALGOS",
+        help = "Ordered KDF algorithms to offer, comma-separated [supported: hkdf-sha256 (default), hkdf-sha384, hkdf-sha512]"
+    )]
+    #[getset(get = "pub(crate)")]
+    kdf_algos: Option<String>,
+}
+
+fn build_algo_table(
+    kex: Option<&str>,
+    aead: Option<&str>,
+    mac: Option<&str>,
+    kdf: Option<&str>,
+) -> Option<Map<String, Value>> {
+    let mut table = Map::new();
+    let parse = |s: &str| -> Vec<Value> {
+        s.split(',')
+            .map(|a| Value::new(None, ValueKind::String(a.trim().to_string())))
+            .collect()
+    };
+    for (key, opt) in [("kex", kex), ("aead", aead), ("mac", mac), ("kdf", kdf)] {
+        if let Some(s) = opt {
+            let _old = table.insert(
+                key.to_string(),
+                Value::new(None, ValueKind::Array(parse(s))),
+            );
+        }
+    }
+    (!table.is_empty()).then_some(table)
 }
 
 impl Source for Cli {
@@ -210,6 +271,17 @@ impl Source for Cli {
             "diff_mode".to_string(),
             Value::new(Some(&origin), ValueKind::String(self.diff_mode.clone())),
         );
+        if let Some(table) = build_algo_table(
+            self.kex_algos.as_deref(),
+            self.aead_algos.as_deref(),
+            self.mac_algos.as_deref(),
+            self.kdf_algos.as_deref(),
+        ) {
+            let _old = map.insert(
+                "preferred_algorithms".to_string(),
+                Value::new(Some(&origin), ValueKind::Table(table)),
+            );
+        }
         Ok(map)
     }
 }
@@ -249,8 +321,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_cli_defaults() {
-        let cli = Cli::try_parse_from(["moshpit", "user@host"]).unwrap();
+    fn test_cli_defaults() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from(["moshpit", "user@host"])?;
         assert_eq!(cli.verbose(), 0);
         assert_eq!(cli.quiet(), 0);
         assert_eq!(cli.config_absolute_path(), &None);
@@ -260,10 +332,11 @@ mod tests {
         assert_eq!(cli.server_port(), 40404);
         assert_eq!(cli.server_destination(), "user@host");
         assert_eq!(cli.predict(), "adaptive");
+        Ok(())
     }
 
     #[test]
-    fn test_cli_parsing() {
+    fn test_cli_parsing() -> anyhow::Result<()> {
         let cli = Cli::try_parse_from([
             "moshpit",
             "-vv",
@@ -280,8 +353,7 @@ mod tests {
             "--predict",
             "always",
             "admin@10.0.0.1",
-        ])
-        .unwrap();
+        ])?;
         assert_eq!(cli.verbose(), 2);
         assert_eq!(cli.quiet(), 0);
         assert_eq!(cli.config_absolute_path().as_deref(), Some("/tmp/config"));
@@ -291,37 +363,56 @@ mod tests {
         assert_eq!(cli.server_port(), 1234);
         assert_eq!(cli.server_destination(), "admin@10.0.0.1");
         assert_eq!(cli.predict(), "always");
+        Ok(())
     }
 
     #[test]
-    fn test_cli_quiet() {
-        let cli = Cli::try_parse_from(["moshpit", "-qqq", "host"]).unwrap();
+    fn test_cli_quiet() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from(["moshpit", "-qqq", "host"])?;
         assert_eq!(cli.quiet(), 3);
         assert_eq!(cli.verbose(), 0);
+        Ok(())
     }
 
     #[test]
-    fn test_source_impl() {
-        let cli = Cli::try_parse_from(["moshpit", "host"]).unwrap();
-        let map = cli.collect().unwrap();
+    fn test_source_impl() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from(["moshpit", "host"])?;
+        let map = cli.collect()?;
 
         assert!(matches!(
-            map.get("verbose").unwrap().kind,
+            map.get("verbose")
+                .ok_or_else(|| anyhow::anyhow!("\"verbose\" not found in map"))?
+                .kind,
             ValueKind::U64(0)
         ));
-        assert!(matches!(map.get("quiet").unwrap().kind, ValueKind::U64(0)));
         assert!(matches!(
-            map.get("server_port").unwrap().kind,
+            map.get("quiet")
+                .ok_or_else(|| anyhow::anyhow!("\"quiet\" not found in map"))?
+                .kind,
+            ValueKind::U64(0)
+        ));
+        assert!(matches!(
+            map.get("server_port")
+                .ok_or_else(|| anyhow::anyhow!("\"server_port\" not found in map"))?
+                .kind,
             ValueKind::U64(40404)
         ));
 
-        if let ValueKind::String(ref s) = map.get("server_destination").unwrap().kind {
+        if let ValueKind::String(ref s) = map
+            .get("server_destination")
+            .ok_or_else(|| anyhow::anyhow!("\"server_destination\" not found in map"))?
+            .kind
+        {
             assert_eq!(s, "host");
         } else {
             panic!("Expected String");
         }
 
-        if let ValueKind::String(ref s) = map.get("predict").unwrap().kind {
+        if let ValueKind::String(ref s) = map
+            .get("predict")
+            .ok_or_else(|| anyhow::anyhow!("\"predict\" not found in map"))?
+            .kind
+        {
             assert_eq!(s, "adaptive");
         } else {
             panic!("Expected String");
@@ -330,50 +421,71 @@ mod tests {
         assert!(!map.contains_key("config_path"));
 
         let boxed = cli.clone_into_box();
-        let map2 = boxed.collect().unwrap();
-        if let ValueKind::String(ref s) = map2.get("server_destination").unwrap().kind {
+        let map2 = boxed.collect()?;
+        if let ValueKind::String(ref s) = map2
+            .get("server_destination")
+            .ok_or_else(|| anyhow::anyhow!("\"server_destination\" not found in map2"))?
+            .kind
+        {
             assert_eq!(s, "host");
         } else {
             panic!("Expected String");
         }
+        Ok(())
     }
 
     #[test]
-    fn test_source_impl_with_options() {
+    fn test_source_impl_with_options() -> anyhow::Result<()> {
         let cli = Cli::try_parse_from([
             "moshpit", "-c", "cfg", "-t", "trc", "-p", "prv", "-k", "pub", "host",
-        ])
-        .unwrap();
-        let map = cli.collect().unwrap();
+        ])?;
+        let map = cli.collect()?;
 
-        if let ValueKind::String(ref s) = map.get("config_path").unwrap().kind {
+        if let ValueKind::String(ref s) = map
+            .get("config_path")
+            .ok_or_else(|| anyhow::anyhow!("\"config_path\" not found in map"))?
+            .kind
+        {
             assert_eq!(s, "cfg");
         } else {
             panic!("Expected String");
         }
 
-        if let ValueKind::String(ref s) = map.get("tracing_path").unwrap().kind {
+        if let ValueKind::String(ref s) = map
+            .get("tracing_path")
+            .ok_or_else(|| anyhow::anyhow!("\"tracing_path\" not found in map"))?
+            .kind
+        {
             assert_eq!(s, "trc");
         } else {
             panic!("Expected String");
         }
 
-        if let ValueKind::String(ref s) = map.get("private_key_path").unwrap().kind {
+        if let ValueKind::String(ref s) = map
+            .get("private_key_path")
+            .ok_or_else(|| anyhow::anyhow!("\"private_key_path\" not found in map"))?
+            .kind
+        {
             assert_eq!(s, "prv");
         } else {
             panic!("Expected String");
         }
 
-        if let ValueKind::String(ref s) = map.get("public_key_path").unwrap().kind {
+        if let ValueKind::String(ref s) = map
+            .get("public_key_path")
+            .ok_or_else(|| anyhow::anyhow!("\"public_key_path\" not found in map"))?
+            .kind
+        {
             assert_eq!(s, "pub");
         } else {
             panic!("Expected String");
         }
+        Ok(())
     }
 
     #[test]
-    fn test_path_defaults() {
-        let cli = Cli::try_parse_from(["moshpit", "-c", "cfg", "-t", "trc", "host"]).unwrap();
+    fn test_path_defaults() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from(["moshpit", "-c", "cfg", "-t", "trc", "host"])?;
         assert_eq!(cli.env_prefix(), "MOSHPIT");
         assert_eq!(cli.config_absolute_path().as_deref(), Some("cfg"));
         assert_eq!(cli.default_file_path(), "moshpit");
@@ -381,5 +493,6 @@ mod tests {
         assert_eq!(cli.tracing_absolute_path().as_deref(), Some("trc"));
         assert_eq!(cli.default_tracing_path(), "moshpit/logs");
         assert_eq!(cli.default_tracing_file_name(), "moshpit");
+        Ok(())
     }
 }
