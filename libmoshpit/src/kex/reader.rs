@@ -59,10 +59,12 @@ const HMAC_KEY_INFO: &[u8] = b"HMAC KEY";
 
 fn fmt_hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
-    bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
-        let _ = write!(s, "{b:02x}");
-        s
-    })
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
 }
 
 fn resolve_kex_alg(kex: &str) -> Result<&'static aws_lc_rs::agreement::Algorithm> {
