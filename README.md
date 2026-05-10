@@ -83,20 +83,52 @@ Both sides exchange algorithm preferences in a `KexInit` frame at the start of t
 
 ### Supported algorithms
 
-| Category | Algorithm | Identifier | Notes |
-|----------|-----------|------------|-------|
-| **KEX** | X25519 + HKDF-SHA-256 | `x25519-sha256` | Default — fastest, widely deployed |
-| | NIST P-384 + HKDF-SHA-384 | `p384-sha384` | Higher security margin |
-| | NIST P-256 + HKDF-SHA-256 | `p256-sha256` | FIPS-compliant environments |
-| **AEAD** | AES-256-GCM-SIV | `aes256-gcm-siv` | Default — nonce-misuse resistant |
-| | AES-256-GCM | `aes256-gcm` | Standard GCM |
-| | ChaCha20-Poly1305 | `chacha20-poly1305` | Fast on CPUs without AES hardware |
-| | AES-128-GCM-SIV | `aes128-gcm-siv` | Smaller key (16 bytes) |
-| **MAC** | HMAC-SHA-512 | `hmac-sha512` | Default — 64-byte tag |
-| | HMAC-SHA-256 | `hmac-sha256` | 32-byte tag (saves 32 bytes/packet) |
-| **KDF** | HKDF-SHA-256 | `hkdf-sha256` | Default |
-| | HKDF-SHA-384 | `hkdf-sha384` | Natural pairing with P-384 KEX |
-| | HKDF-SHA-512 | `hkdf-sha512` | Higher security margin |
+#### Key exchange (KEX)
+
+| Algorithm | Identifier | Default | Pros | Cons |
+|-----------|------------|:-------:|------|------|
+| X25519 + HKDF-SHA-256 | `x25519-sha256` | ✓ | Fastest DH available; constant-time by construction; tiny 32-byte keys; 128-bit security level | Not NIST/FIPS approved; 128-bit security level (adequate but not the highest margin) |
+| NIST P-384 + HKDF-SHA-384 | `p384-sha384` | | 192-bit security level; NIST/FIPS approved; natural pairing with HKDF-SHA-384 | Slower than X25519; larger ephemeral key sizes; unnecessary margin for most deployments |
+| NIST P-256 + HKDF-SHA-256 | `p256-sha256` | | FIPS approved; hardware TPM and HSM support; 128-bit security level | Slower than X25519; lower security margin than P-384; no advantage over X25519 outside compliance requirements |
+
+#### Authenticated encryption (AEAD)
+
+| Algorithm | Identifier | Default | Pros | Cons |
+|-----------|------------|:-------:|------|------|
+| AES-256-GCM-SIV | `aes256-gcm-siv` | ✓ | Nonce-misuse resistant — accidental nonce reuse does not leak plaintext or the authentication key; 256-bit key; fast with AES-NI | Two-pass construction is slightly slower than standard GCM; not as universally deployed as AES-256-GCM; requires AES-NI for peak throughput |
+| AES-256-GCM | `aes256-gcm` | | Widely standardized (RFC 5116); fast with AES-NI; 256-bit key; FIPS approved | Nonce reuse is catastrophic — it leaks both plaintext and the Poly1305 authentication key; moshpit generates nonces with CSPRNG so reuse is not expected, but GCM-SIV is safer if any doubt exists |
+| ChaCha20-Poly1305 | `chacha20-poly1305` | | Fastest option on CPUs **without** AES hardware acceleration (mobile, embedded, older x86); constant-time by design; immune to AES cache-timing side-channels; recommended for low-power devices | Slower than AES-GCM on hardware with AES-NI (most modern x86-64 and ARM64); not FIPS approved |
+| AES-128-GCM-SIV | `aes128-gcm-siv` | | Nonce-misuse resistant; 128-bit key requires less key material and has slightly lighter key setup; fast with AES-NI | Lowest security level of the four (128-bit key vs 256-bit); no practical advantage over `aes256-gcm-siv` on modern hardware |
+
+#### Message authentication (MAC)
+
+These HMAC tags authenticate the wire sequence number and the entire encrypted payload, providing integrity protection before decryption.
+
+| Algorithm | Identifier | Default | Pros | Cons |
+|-----------|------------|:-------:|------|------|
+| HMAC-SHA-512 | `hmac-sha512` | ✓ | 512-bit (64-byte) tag; highest security margin; SHA-512 is faster than SHA-256 on 64-bit CPUs in most implementations | 64-byte tag adds 32 bytes per packet compared to HMAC-SHA-256 — noticeable overhead on high-packet-rate, bandwidth-constrained links |
+| HMAC-SHA-256 | `hmac-sha256` | | 256-bit (32-byte) tag saves 32 bytes per packet; FIPS approved; adequate security for all practical purposes | Lower security margin than HMAC-SHA-512; marginally slower on some 64-bit CPUs due to SHA-256 register pressure |
+
+#### Key derivation (KDF)
+
+The KDF derives the AEAD and HMAC keys from the shared ECDH secret.
+
+| Algorithm | Identifier | Default | Pros | Cons |
+|-----------|------------|:-------:|------|------|
+| HKDF-SHA-256 | `hkdf-sha256` | ✓ | Fast; widely used; natural security-level match with X25519 and P-256 KEX; output is more than sufficient for all supported ciphers | Lowest output entropy of the three (256-bit — still far more than any supported cipher needs) |
+| HKDF-SHA-384 | `hkdf-sha384` | | Matches the 192-bit security level of P-384 KEX; 384-bit internal HMAC | Marginal benefit unless P-384 is used for key exchange; slightly slower than SHA-256 |
+| HKDF-SHA-512 | `hkdf-sha512` | | Highest output entropy (512-bit); SHA-512 is fast on 64-bit systems | No practical advantage over SHA-256 for this use case — the derived key length is bounded by the cipher, not the KDF |
+
+#### Recommended pairings
+
+The defaults (`x25519-sha256` / `aes256-gcm-siv` / `hmac-sha512` / `hkdf-sha256`) are a well-balanced choice for most deployments.  Common reasons to deviate:
+
+| Scenario | Suggested override |
+|----------|--------------------|
+| No AES hardware (mobile, embedded) | `--aead-algos chacha20-poly1305` |
+| FIPS / compliance environment | `--kex-algos p256-sha256` or `--kex-algos p384-sha384` |
+| Highest security margin (P-384) | `--kex-algos p384-sha384 --kdf-algos hkdf-sha384` |
+| Reduce per-packet bandwidth overhead | `--mac-algos hmac-sha256` |
 
 ### Configuring algorithm preferences
 
