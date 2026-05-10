@@ -9,9 +9,9 @@ moshpit is a suite of tools for establishing encrypted, resilient remote termina
 |--------|-------|------|
 | `mps` | moshpits | Server — listens for incoming connections and spawns PTYs |
 | `mp` | moshpit | Client — connects to a running `mps` server |
-| `mp-keygen` | moshpit-keygen | Key management — generates and inspects ed25519 key pairs |
+| `mp-keygen` | moshpit-keygen | Key management — generates and inspects asymmetric key pairs (X25519, P-384, or P-256) |
 
-Sessions are authenticated with ed25519 key pairs.  TCP is used only for the initial key exchange; once the exchange completes the connection switches to UDP exclusively (ports 50000–59999) for all terminal I/O.  The server tracks full terminal screen state with a server-side vt100 emulator; on reconnect the client receives a single clean screen snapshot and repaints instantly rather than replaying raw scrollback history.
+Sessions are authenticated with asymmetric key pairs (X25519 by default; P-384 and P-256 are also supported).  TCP is used only for the initial key exchange; once the exchange completes the connection switches to UDP exclusively (ports 50000–59999) for all terminal I/O.  The server tracks full terminal screen state with a server-side vt100 emulator; on reconnect the client receives a single clean screen snapshot and repaints instantly rather than replaying raw scrollback history.
 
 ---
 
@@ -33,11 +33,11 @@ moshpit draws its core motivation from [Mosh (Mobile Shell)](https://mosh.org/),
 | Concern | Mosh | moshpit |
 |---------|------|---------|
 | **Language** | C++ | Rust |
-| **Authentication** | Delegated to SSH for the initial handshake; a one-time secret is passed back over SSH | Standalone ed25519 key-pair authentication — no SSH dependency |
-| **Transport model** | Pure UDP after setup; Mosh's *State Synchronization Protocol* (SSP) keeps a diff of the full terminal screen state and sends only the latest snapshot | TCP is used solely for the ed25519 key exchange; all terminal I/O runs over UDP after the exchange completes.  NAK-based selective retransmission with an adaptive RTT estimator ensures reliable, ordered delivery; a split data/control channel prevents control frames from being delayed by PTY data backlogs |
+| **Authentication** | Delegated to SSH for the initial handshake; a one-time secret is passed back over SSH | Standalone asymmetric key-pair authentication (X25519, P-384, or P-256) — no SSH dependency |
+| **Transport model** | Pure UDP after setup; Mosh's *State Synchronization Protocol* (SSP) keeps a diff of the full terminal screen state and sends only the latest snapshot | TCP is used solely for the asymmetric key exchange; all terminal I/O runs over UDP after the exchange completes.  NAK-based selective retransmission with an adaptive RTT estimator ensures reliable, ordered delivery; a split data/control channel prevents control frames from being delayed by PTY data backlogs |
 | **Reconnect display sync** | SSP sends the latest screen snapshot; client repaints from the diff immediately | Server maintains a `vt100::Parser` tracking the live PTY screen; on reconnect a single `ScreenState` frame delivers `contents_formatted()` bytes for an instant clean repaint.  A 50 ms periodic task also sends `ScreenState` diffs during normal use so the client stays in sync even across network hiccups. |
 | **Client-side prediction** | Mosh echoes keystrokes locally and predicts cursor movement to hide latency, underlining characters that have not yet been confirmed by the server | Same — keystrokes are echoed locally, cursor movement is predicted, and unconfirmed characters are underlined until the server output arrives |
-| **Encryption** | AES-128-OCB authenticated encryption using a symmetric session key | Key exchange via an ed25519-based handshake; negotiated symmetric encryption on the UDP channel (default: AES-256-GCM-SIV with per-packet HMAC-SHA-512; see [Algorithm negotiation](#algorithm-negotiation)) |
+| **Encryption** | AES-128-OCB authenticated encryption using a symmetric session key | Key exchange via an asymmetric key-pair handshake (default: X25519); negotiated symmetric encryption on the UDP channel (default: AES-256-GCM-SIV with per-packet HMAC-SHA-512; see [Algorithm negotiation](#algorithm-negotiation)) |
 | **Session multiplexing** | One Mosh session per `mosh-server` process | Same — one PTY per `mps` connection |
 | **Configuration** | Minimal; primarily driven by command-line options | TOML config files with environment-variable overrides |
 | **UDP port range** | 60001–61000 (by default) | 50000–59999 |
@@ -51,7 +51,7 @@ moshpit draws its core motivation from [Mosh (Mobile Shell)](https://mosh.org/),
 
 ### Phase 1 — TCP key exchange
 
-The client opens a TCP connection to the server's configured port (default 40404).  The two sides run a mutual ed25519 key-pair authentication and key-exchange protocol over this connection.  Once the handshake completes both halves of the TCP socket are released and the TCP connection is **closed immediately** — it is not kept alive, and is not used for anything after the key exchange.
+The client opens a TCP connection to the server's configured port (default 40404).  The two sides run a mutual asymmetric key-pair authentication and key-exchange protocol over this connection.  Once the handshake completes both halves of the TCP socket are released and the TCP connection is **closed immediately** — it is not kept alive, and is not used for anything after the key exchange.
 
 ### Phase 2 — UDP session
 
@@ -269,24 +269,48 @@ To install a specific version, append `--version <x.y.z>` to any of the commands
 
 ## mp-keygen
 
-`mp-keygen` creates and inspects the ed25519 key pairs used by both the server and client.
+`mp-keygen` creates and inspects the asymmetric key pairs used by both the server and client.  Three key algorithms are supported: X25519 (default), P-384, and P-256.
+
+### Supported identity key algorithms
+
+| Algorithm | Flag value | Default | Notes |
+|-----------|------------|:-------:|-------|
+| X25519 | `x25519` | ✓ | Fastest; constant-time by construction; 128-bit security level; recommended for most deployments |
+| NIST P-384 | `p384` | | 192-bit security level; FIPS/NIST approved; suited for high-security or compliance environments |
+| NIST P-256 | `p256` | | 128-bit security level; FIPS/NIST approved; hardware TPM/HSM support on many platforms |
 
 ### Subcommands
 
 #### `generate`
 
-Interactively generates a new ed25519 public/private key pair.  The tool prompts for an output path and an optional passphrase.
+Generates a new asymmetric public/private key pair.  By default the tool prompts for an output path and a passphrase; all prompts can be bypassed with flags for non-interactive use.
 
 ```bash
-mp-keygen generate
+mp-keygen generate                                        # X25519 key (default), prompts for path + passphrase
+mp-keygen generate --key-type p384                        # P-384 key
+mp-keygen generate --key-type p256                        # P-256 key
+mp-keygen generate -n -o ~/.mp/id_x25519                  # Non-interactive: X25519, no passphrase
+mp-keygen generate --server -n -o ~/.mp/mps_host_key      # Server host key, no passphrase
 ```
 
-Default key locations (when the default path is accepted at the prompt):
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--key-type <TYPE>` | `-k` | Key algorithm: `x25519` (default), `p384`, `p256` |
+| `--no-passphrase` | `-n` | Skip the passphrase prompt; create an unencrypted key |
+| `--output-path <PATH>` | `-o` | Write keys to this path (skips the interactive path prompt) |
+| `--force` | `-f` | Overwrite existing key files without confirmation |
+| `--server` | `-s` | Generate a server host key |
+
+Default key locations when accepting the default path prompt:
 
 | Key | Default path |
 |-----|-------------|
-| Private key | `~/.mp/id_ed25519` |
-| Public key  | `~/.mp/id_ed25519.pub` |
+| Client private key | `~/.mp/id_ed25519` |
+| Client public key  | `~/.mp/id_ed25519.pub` |
+| Server private key | `~/.mp/mps_host_ed25519_key` |
+| Server public key  | `~/.mp/mps_host_ed25519_key.pub` |
+
+> **Note**: The default file names use the `ed25519` naming convention for historical compatibility.  The actual key algorithm embedded in the file is determined by `--key-type` (default: `x25519`).  All three key algorithms share the same file format and the paths can be freely overridden with `--output-path`.
 
 #### `fingerprint`
 
@@ -324,10 +348,14 @@ mp-keygen verify --randomart "+--[ED25519 256]--+ ..."
 1. Generate a server host key pair (run once):
 
    ```bash
-   # The server uses a separate key stored at ~/.mp/mps_host_ed25519_key[.pub]
-   # by default.  You can generate it with mp-keygen using a custom path:
-   mp-keygen generate
-   # Enter a path such as: /home/user/.mp/mps_host_ed25519_key
+   # Interactive: prompts for path and passphrase
+   mp-keygen generate --server
+
+   # Non-interactive (e.g. during service setup):
+   mp-keygen generate --server --no-passphrase --output-path ~/.mp/mps_host_ed25519_key
+
+   # Use a P-384 key for a FIPS/compliance environment:
+   mp-keygen generate --server --key-type p384 --output-path ~/.mp/mps_host_p384_key
    ```
 
 2. Create the config file at `~/.config/moshpits/moshpits.toml` (see [Configuration](#moshpits-configuration) below).
@@ -488,13 +516,17 @@ with_level       = true
 1. Generate a client key pair (run once):
 
    ```bash
+   # X25519 (default) — accept the default path: ~/.mp/id_ed25519
    mp-keygen generate
-   # Accept the default path: ~/.mp/id_ed25519
+
+   # Or choose a different algorithm:
+   mp-keygen generate --key-type p384
+   mp-keygen generate --key-type p256
    ```
 
 2. Add the client's public key to the server's `authorized_keys` file.
 
-   On the **server**, append the contents of the client's `~/.mp/id_ed25519.pub` to `~$TARGET_USER/.mp/authorized_keys` (one key per line):
+   On the **server**, append the contents of the client's public key (e.g. `~/.mp/id_ed25519.pub`) to `~$TARGET_USER/.mp/authorized_keys` (one key per line):
 
    ```bash
    # On the client — display the public key to copy
@@ -565,8 +597,8 @@ mp --server-port 50505 192.168.1.10
 
 # Verbose logging, custom key files
 mp -vv \
-   --private-key-path ~/.mp/work_id_ed25519 \
-   --public-key-path  ~/.mp/work_id_ed25519.pub \
+   --private-key-path ~/.mp/work_key \
+   --public-key-path  ~/.mp/work_key.pub \
    alice@10.0.0.5
 
 # Disable prediction for low-latency LANs
@@ -607,7 +639,8 @@ server_destination = "192.168.1.10" # "ip" or "user@ip"; overridden by the
 max_reconnect_backoff_secs = 3600
 
 # ── Key files ─────────────────────────────────────────────────────────────────
-# Defaults to ~/.mp/id_ed25519 and ~/.mp/id_ed25519.pub when not set.
+# Defaults to ~/.mp/id_ed25519 and ~/.mp/id_ed25519.pub when not set
+# (regardless of which --key-type was used to generate the key pair).
 # private_key_path = "/home/alice/.mp/id_ed25519"
 # public_key_path  = "/home/alice/.mp/id_ed25519.pub"
 

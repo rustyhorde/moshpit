@@ -19,7 +19,9 @@ static LONG_VERSION: LazyLock<String> = LazyLock::new(|| {
     let mut cursor = Cursor::new(vec![]);
     let mut output = env!("CARGO_PKG_VERSION").to_string();
     output.push_str("\n\n");
-    pretty.display(&mut cursor).unwrap();
+    pretty
+        .display(&mut cursor)
+        .expect("writing to Vec never fails");
     output += &String::from_utf8_lossy(cursor.get_ref());
     output
 });

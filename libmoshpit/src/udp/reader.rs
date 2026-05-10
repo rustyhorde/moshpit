@@ -380,7 +380,11 @@ impl UdpReader {
         *i += 1;
         let response: Option<Vec<u8>> = match (marker, params, terminator) {
             (None | Some(b'?'), b"6", b'n') => {
-                let (row, col) = emulator.lock().unwrap().screen().cursor_position();
+                let (row, col) = emulator
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .screen()
+                    .cursor_position();
                 Some(format!("\x1b[{};{}R", row + 1, col + 1).into_bytes())
             }
             (None, b"" | b"0", b'c') => Some(b"\x1b[?62c".to_vec()),
@@ -979,7 +983,9 @@ impl UdpReader {
             match decode_all(payload_compressed.as_slice()) {
                 Ok(payload) => {
                     let (rows, cols) = {
-                        let emu = emulator.lock().unwrap();
+                        let emu = emulator
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
                         emu.screen().size()
                     };
                     let mut tmp = vt100::Parser::new(rows, cols, 0);
@@ -998,7 +1004,9 @@ impl UdpReader {
                         self.initial_state_received = true;
                     }
                     let repaint = {
-                        let mut rend = renderer.lock().unwrap();
+                        let mut rend = renderer
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
                         rend.invalidate();
                         rend.render(tmp.screen(), &[], None)
                     };
@@ -1107,9 +1115,9 @@ impl UdpReader {
                             EncryptedFrame::ScrollbackEnd => {
                                 scrollback_mode = false;
                                 let repaint = {
-                                    let emu = emulator.lock().unwrap();
+                                    let emu = emulator.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                                     let screen = emu.screen();
-                                    let mut rend = renderer.lock().unwrap();
+                                    let mut rend = renderer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                                     rend.invalidate();
                                     rend.render(screen, &[], None)
                                 };
@@ -1120,13 +1128,13 @@ impl UdpReader {
                             }
                             EncryptedFrame::ScreenState(payload) => {
                                 let (rows, cols) = {
-                                    let emu = emulator.lock().unwrap();
+                                    let emu = emulator.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                                     emu.screen().size()
                                 };
                                 let mut tmp = vt100::Parser::new(rows, cols, 0);
                                 tmp.process(&payload);
                                 let repaint = {
-                                    let mut rend = renderer.lock().unwrap();
+                                    let mut rend = renderer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                                     rend.invalidate();
                                     rend.render(tmp.screen(), &[], None)
                                 };
@@ -1140,7 +1148,7 @@ impl UdpReader {
                                 match decode_all(compressed.as_slice()) {
                                     Ok(payload) => {
                                         let (rows, cols) = {
-                                            let emu = emulator.lock().unwrap();
+                                            let emu = emulator.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                                             emu.screen().size()
                                         };
                                         let mut tmp = vt100::Parser::new(rows, cols, 0);
@@ -1159,7 +1167,7 @@ impl UdpReader {
                                             self.initial_state_received = true;
                                         }
                                         let repaint = {
-                                            let mut rend = renderer.lock().unwrap();
+                                            let mut rend = renderer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                                             rend.invalidate();
                                             rend.render(tmp.screen(), &[], None)
                                         };
@@ -1267,9 +1275,9 @@ impl UdpReader {
                                     EncryptedFrame::ScrollbackEnd => {
                                         scrollback_mode = false;
                                         let repaint = {
-                                            let emu = emulator.lock().unwrap();
+                                            let emu = emulator.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                                             let screen = emu.screen();
-                                            let mut rend = renderer.lock().unwrap();
+                                            let mut rend = renderer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                                             rend.invalidate();
                                             rend.render(screen, &[], None)
                                         };
@@ -1280,13 +1288,13 @@ impl UdpReader {
                                     }
                                     EncryptedFrame::ScreenState(payload) => {
                                         let (rows, cols) = {
-                                            let emu = emulator.lock().unwrap();
+                                            let emu = emulator.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                                             emu.screen().size()
                                         };
                                         let mut tmp = vt100::Parser::new(rows, cols, 0);
                                         tmp.process(&payload);
                                         let repaint = {
-                                            let mut rend = renderer.lock().unwrap();
+                                            let mut rend = renderer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                                             rend.invalidate();
                                             rend.render(tmp.screen(), &[], None)
                                         };
@@ -1300,7 +1308,7 @@ impl UdpReader {
                                         match decode_all(compressed.as_slice()) {
                                             Ok(payload) => {
                                                 let (rows, cols) = {
-                                                    let emu = emulator.lock().unwrap();
+                                                    let emu = emulator.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                                                     emu.screen().size()
                                                 };
                                                 let mut tmp = vt100::Parser::new(rows, cols, 0);
@@ -1319,7 +1327,7 @@ impl UdpReader {
                                                     self.initial_state_received = true;
                                                 }
                                                 let repaint = {
-                                                    let mut rend = renderer.lock().unwrap();
+                                                    let mut rend = renderer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                                                     rend.invalidate();
                                                     rend.render(tmp.screen(), &[], None)
                                                 };
@@ -1382,7 +1390,7 @@ impl UdpReader {
                                             match decode_all(compressed.as_slice()) {
                                                 Ok(diff_bytes) => {
                                                     let (rows, cols) = {
-                                                        let emu = emulator.lock().unwrap();
+                                                        let emu = emulator.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                                                         emu.screen().size()
                                                     };
                                                     let mut tmp = vt100::Parser::new(rows, cols, 0);
@@ -1403,7 +1411,7 @@ impl UdpReader {
                                                     // alt-screen state and ScreenStateCompressed
                                                     // repaints compute correct diffs afterward.
                                                     let repaint = {
-                                                        let mut rend = renderer.lock().unwrap();
+                                                        let mut rend = renderer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                                                         rend.render(tmp.screen(), &[], None)
                                                     };
                                                     if let Err(e) = stdout_tx.send(repaint).await {
@@ -1540,7 +1548,9 @@ async fn process_bytes_with_prediction(
 
     // ── 3. Feed raw bytes into the emulator ──────────────────────────────
     {
-        let mut emu = emulator.lock().unwrap();
+        let mut emu = emulator
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         emu.process(&raw);
     }
 
@@ -1549,9 +1559,13 @@ async fn process_bytes_with_prediction(
     // predictions during reconnect and we do not want flickering output.
     if !scrollback_mode {
         let (overlays, cursor) = {
-            let emu = emulator.lock().unwrap();
+            let emu = emulator
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let screen = emu.screen();
-            let mut pred = prediction.lock().unwrap();
+            let mut pred = prediction
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             pred.cull(screen);
             pred.apply(screen)
         };

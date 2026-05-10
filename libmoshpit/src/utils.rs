@@ -25,7 +25,7 @@ pub fn to_path_buf(path: &String) -> Result<PathBuf> {
 }
 
 static SERVER_DEST_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^((.*)@)?((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)(\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)){3})(:(\d{1,5}))?$").unwrap()
+    Regex::new(r"^((.*)@)?((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)(\.(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)){3})(:(\d{1,5}))?$").expect("invalid regex literal")
 });
 
 /// Parse the server destination command line option into a `SocketAddr`
@@ -52,8 +52,10 @@ pub fn parse_server_destination(dest: &str, port: u16) -> Result<(String, Socket
     }
 }
 
-static EXIT_TITLE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^0;exit$").unwrap());
-static EXIT_TITLE_RELAXED_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"0;exit").unwrap());
+static EXIT_TITLE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^0;exit$").expect("invalid regex literal"));
+static EXIT_TITLE_RELAXED_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"0;exit").expect("invalid regex literal"));
 
 /// Check if a terminal title indicates an exit command
 pub fn is_exit_title(title: &str, relaxed: bool) -> bool {
@@ -138,10 +140,14 @@ pub(crate) mod test {
     }
 
     #[test]
-    fn test_to_path_buf() {
+    fn test_to_path_buf() -> Result<()> {
         let path_str = String::from("/some/test/path");
-        let path_buf = to_path_buf(&path_str).unwrap();
-        assert_eq!(path_buf.to_str().unwrap(), "/some/test/path");
+        let path_buf = to_path_buf(&path_str)?;
+        assert_eq!(
+            path_buf.to_str().expect("path is valid UTF-8"),
+            "/some/test/path"
+        );
+        Ok(())
     }
 
     #[test]

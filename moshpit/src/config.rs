@@ -259,10 +259,10 @@ mod tests {
     }
 
     #[test]
-    fn test_load_key_paths() {
+    fn test_load_key_paths() -> Result<()> {
         // Without explicit paths, it should fall back to default
         let config = Config::default();
-        let (priv_path, pub_path) = config.load_key_paths().unwrap();
+        let (priv_path, pub_path) = config.load_key_paths()?;
         assert!(priv_path.to_string_lossy().contains("id_ed25519"));
         assert!(pub_path.to_string_lossy().contains("id_ed25519.pub"));
 
@@ -272,9 +272,10 @@ mod tests {
             public_key_path: Some("/tmp/my_pub".to_string()),
             ..Config::default()
         };
-        let (priv_path, pub_path) = config.load_key_paths().unwrap();
+        let (priv_path, pub_path) = config.load_key_paths()?;
         assert_eq!(priv_path, PathBuf::from("/tmp/my_priv"));
         assert_eq!(pub_path, PathBuf::from("/tmp/my_pub"));
+        Ok(())
     }
 
     #[test]

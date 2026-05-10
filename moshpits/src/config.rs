@@ -214,7 +214,11 @@ mod test {
     use super::Config;
 
     fn server_mode() -> KexMode {
-        KexMode::Server("0.0.0.0:0".parse::<SocketAddr>().unwrap())
+        KexMode::Server(
+            "0.0.0.0:0"
+                .parse::<SocketAddr>()
+                .expect("hardcoded address is valid"),
+        )
     }
 
     #[test]

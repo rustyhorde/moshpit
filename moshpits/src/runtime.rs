@@ -1259,14 +1259,18 @@ fn spawn_pty(
 ) {
     let _term_handle = thread::spawn(move || {
         let pty_system = native_pty_system();
-        let pair = pty_system
-            .openpty(PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .unwrap();
+        let pair = match pty_system.openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        }) {
+            Ok(p) => p,
+            Err(e) => {
+                error!("Failed to open PTY: {e}");
+                return;
+            }
+        };
 
         #[cfg(unix)]
         {
@@ -1416,8 +1420,20 @@ fn spawn_pty(
 
         let master = pair.master;
 
-        let term_out = master.try_clone_reader().unwrap();
-        let mut term_in = master.take_writer().unwrap();
+        let term_out = match master.try_clone_reader() {
+            Ok(r) => r,
+            Err(e) => {
+                error!("Failed to clone PTY reader: {e}");
+                return;
+            }
+        };
+        let mut term_in = match master.take_writer() {
+            Ok(w) => w,
+            Err(e) => {
+                error!("Failed to take PTY writer: {e}");
+                return;
+            }
+        };
 
         spawn_pty_reader(
             session_uuid,
@@ -1603,7 +1619,7 @@ mod test {
     // ── Phase 5: new_session ──────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn new_session_registers_in_full_registry() {
+    async fn new_session_registers_in_full_registry() -> anyhow::Result<()> {
         let kex = Kex::default();
         let conn_token = CancellationToken::new();
         let (data_tx, _data_rx) = channel::<EncryptedFrame>(4);
@@ -1620,14 +1636,14 @@ mod test {
             control_tx,
             &registry,
         )
-        .await
-        .unwrap();
+        .await?;
 
         assert!(registry.lock().await.contains_key(&session_uuid));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn new_session_returns_some_term_rx() {
+    async fn new_session_returns_some_term_rx() -> anyhow::Result<()> {
         let kex = Kex::default();
         let conn_token = CancellationToken::new();
         let (data_tx, _data_rx) = channel::<EncryptedFrame>(4);
@@ -1644,13 +1660,13 @@ mod test {
             control_tx,
             &registry,
         )
-        .await
-        .unwrap();
+        .await?;
         assert!(maybe_rx.is_some());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn new_session_output_handle_has_correct_kex_uuid() {
+    async fn new_session_output_handle_has_correct_kex_uuid() -> anyhow::Result<()> {
         let kex = Kex::default();
         let conn_token = CancellationToken::new();
         let (data_tx, _data_rx) = channel::<EncryptedFrame>(4);
@@ -1667,13 +1683,13 @@ mod test {
             control_tx,
             &registry,
         )
-        .await
-        .unwrap();
+        .await?;
         assert_eq!(output_handle.lock().await.kex_uuid, kex.uuid());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn new_session_scrollback_initially_empty() {
+    async fn new_session_scrollback_initially_empty() -> anyhow::Result<()> {
         let kex = Kex::default();
         let conn_token = CancellationToken::new();
         let (data_tx, _data_rx) = channel::<EncryptedFrame>(4);
@@ -1690,13 +1706,13 @@ mod test {
             control_tx,
             &registry,
         )
-        .await
-        .unwrap();
+        .await?;
         assert!(scrollback.lock().await.is_empty());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn new_session_emulator_default_size() {
+    async fn new_session_emulator_default_size() -> anyhow::Result<()> {
         let kex = Kex::default();
         let conn_token = CancellationToken::new();
         let (data_tx, _data_rx) = channel::<EncryptedFrame>(4);
@@ -1713,11 +1729,11 @@ mod test {
             control_tx,
             &registry,
         )
-        .await
-        .unwrap();
+        .await?;
         let emu = emulator.lock().await;
         let screen = emu.screen();
         assert_eq!(screen.size(), (24, 80));
+        Ok(())
     }
 
     // ── Phase 9: spawn_connection_watchdogs ────────────────────────────────────
@@ -1783,13 +1799,13 @@ mod test {
         // No further Keepalive frames should arrive
         let result = tokio::time::timeout(Duration::from_millis(100), control_rx.recv()).await;
         // Either timeout (no frame) or channel closed — both are acceptable
-        assert!(result.is_err() || result.unwrap().is_none());
+        assert!(result.map_or(true, |v| v.is_none()));
     }
 
     // ── Phase 10: resolve_session ─────────────────────────────────────────────
 
     #[tokio::test]
-    async fn resolve_session_new_session_path() {
+    async fn resolve_session_new_session_path() -> anyhow::Result<()> {
         let kex = Kex::default();
         let session_uuid = Uuid::new_v4();
         let skex = ServerKex::builder()
@@ -1811,14 +1827,14 @@ mod test {
             control_tx,
             &registry,
         )
-        .await
-        .unwrap();
+        .await?;
         // New session → PTY needs to be spawned → Some(term_rx)
         assert!(maybe_rx.is_some());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn resolve_session_resume_existing() {
+    async fn resolve_session_resume_existing() -> anyhow::Result<()> {
         let kex = Kex::default();
         let session_uuid = Uuid::new_v4();
         let conn_token = CancellationToken::new();
@@ -1836,8 +1852,7 @@ mod test {
             control_tx.clone(),
             &registry,
         )
-        .await
-        .unwrap();
+        .await?;
 
         // Second connection: resume
         let new_kex = Kex::default();
@@ -1860,8 +1875,7 @@ mod test {
             resume_ctrl_tx,
             &registry,
         )
-        .await
-        .unwrap();
+        .await?;
 
         // Resume → no new PTY → None
         assert!(maybe_rx.is_none());
@@ -1879,10 +1893,11 @@ mod test {
             }
         }
         assert!(saw_screen_state, "expected ScreenState frame on resume");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn resolve_session_resume_expired() {
+    async fn resolve_session_resume_expired() -> anyhow::Result<()> {
         let kex = Kex::default();
         let session_uuid = Uuid::new_v4();
         // Registry is empty — no existing session with this UUID
@@ -1906,10 +1921,10 @@ mod test {
             control_tx,
             &registry,
         )
-        .await
-        .unwrap();
+        .await?;
         // Falls back to new session → Some(term_rx)
         assert!(maybe_rx.is_some());
+        Ok(())
     }
 
     // ── Phase 5: platform helper functions ────────────────────────────────────
@@ -2101,7 +2116,7 @@ mod test {
         while rx.try_recv().is_ok() {}
         let result = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await;
         assert!(
-            result.is_err() || result.unwrap().is_none(),
+            result.map_or(true, |v| v.is_none()),
             "watchdog kept sending after cancellation"
         );
     }
@@ -2123,20 +2138,20 @@ mod test {
     }
 
     #[tokio::test]
-    async fn send_state_chunked_large_payload_sends_state_chunks() {
+    async fn send_state_chunked_large_payload_sends_state_chunks() -> anyhow::Result<()> {
         let (tx, mut rx) = channel::<EncryptedFrame>(128);
         let payload = vec![0xABu8; MAX_STATESYNC_DIFF_BYTES + STATE_CHUNK_SIZE + 1];
         let sent = send_state_chunked(&tx, payload.clone()).await;
         assert!(sent);
 
         let expected_chunks = payload.chunks(STATE_CHUNK_SIZE).count();
-        let total = u16::try_from(expected_chunks).unwrap();
+        let total = u16::try_from(expected_chunks)?;
         let mut received = 0usize;
         while let Ok(frame) = rx.try_recv() {
             let EncryptedFrame::StateChunk((seq, t, data)) = frame else {
                 panic!("expected StateChunk, got {frame:?}");
             };
-            assert_eq!(seq, u16::try_from(received).unwrap());
+            assert_eq!(seq, u16::try_from(received)?);
             assert_eq!(t, total);
             let expected_slice = &payload[received * STATE_CHUNK_SIZE
                 ..((received + 1) * STATE_CHUNK_SIZE).min(payload.len())];
@@ -2144,6 +2159,7 @@ mod test {
             received += 1;
         }
         assert_eq!(received, expected_chunks);
+        Ok(())
     }
 
     #[tokio::test]

@@ -22,7 +22,7 @@
 use std::io::Cursor;
 
 use aws_lc_rs::{
-    aead::{AES_256_GCM_SIV, RandomizedNonceKey},
+    aead::{AES_256_GCM_SIV, LessSafeKey, UnboundKey},
     hmac::{HMAC_SHA512, Key},
 };
 use libmoshpit::EncryptedFrame;
@@ -33,9 +33,10 @@ use uuid::Uuid;
 /// Any panic inside this function is a confirmed bug: the fuzzer found an
 /// input that causes an unwrap/unreachable/index-out-of-bounds in the parser.
 fn run_fuzz_encframe(data: &[u8]) {
-    let Ok(rnk) = RandomizedNonceKey::new(&AES_256_GCM_SIV, &[0u8; 32]) else {
+    let Ok(unbound) = UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]) else {
         return;
     };
+    let rnk = LessSafeKey::new(unbound);
     let hmac = Key::new(HMAC_SHA512, &[0u8; 64]);
     let id = Uuid::nil();
     let mut cursor = Cursor::new(data);

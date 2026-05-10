@@ -17,7 +17,9 @@ static LONG_VERSION: LazyLock<String> = LazyLock::new(|| {
     let mut cursor = Cursor::new(vec![]);
     let mut output = env!("CARGO_PKG_VERSION").to_string();
     output.push_str("\n\n");
-    pretty.display(&mut cursor).unwrap();
+    pretty
+        .display(&mut cursor)
+        .expect("writing to Vec never fails");
     output += &String::from_utf8_lossy(cursor.get_ref());
     output
 });
@@ -123,9 +125,9 @@ mod tests {
     }
 
     #[test]
-    fn verify_generate_command() {
+    fn verify_generate_command() -> anyhow::Result<()> {
         let args = vec!["moshpit-keygen", "generate"];
-        let cli = Cli::try_parse_from(args).unwrap();
+        let cli = Cli::try_parse_from(args)?;
         assert!(matches!(
             cli.command(),
             Commands::Generate {
@@ -135,12 +137,13 @@ mod tests {
         ));
         assert_eq!(cli.verbose(), 0);
         assert_eq!(cli.quiet(), 0);
+        Ok(())
     }
 
     #[test]
-    fn verify_generate_no_passphrase_flag() {
+    fn verify_generate_no_passphrase_flag() -> anyhow::Result<()> {
         let args = vec!["moshpit-keygen", "generate", "--no-passphrase"];
-        let cli = Cli::try_parse_from(args).unwrap();
+        let cli = Cli::try_parse_from(args)?;
         assert!(matches!(
             cli.command(),
             Commands::Generate {
@@ -148,12 +151,13 @@ mod tests {
                 ..
             }
         ));
+        Ok(())
     }
 
     #[test]
-    fn verify_generate_no_passphrase_short_flag() {
+    fn verify_generate_no_passphrase_short_flag() -> anyhow::Result<()> {
         let args = vec!["moshpit-keygen", "generate", "-n"];
-        let cli = Cli::try_parse_from(args).unwrap();
+        let cli = Cli::try_parse_from(args)?;
         assert!(matches!(
             cli.command(),
             Commands::Generate {
@@ -161,48 +165,52 @@ mod tests {
                 ..
             }
         ));
+        Ok(())
     }
     #[test]
-    fn verify_generate_output_path_flag() {
+    fn verify_generate_output_path_flag() -> anyhow::Result<()> {
         let args = vec!["moshpit-keygen", "generate", "--output-path", "/tmp/key"];
-        let cli = Cli::try_parse_from(args).unwrap();
+        let cli = Cli::try_parse_from(args)?;
         match cli.command() {
             Commands::Generate { output_path, .. } => {
                 assert_eq!(output_path.as_deref(), Some("/tmp/key"));
             }
             _ => panic!("Expected Generate command"),
         }
+        Ok(())
     }
 
     #[test]
-    fn verify_generate_force_flag() {
+    fn verify_generate_force_flag() -> anyhow::Result<()> {
         let args = vec!["moshpit-keygen", "generate", "--force"];
-        let cli = Cli::try_parse_from(args).unwrap();
+        let cli = Cli::try_parse_from(args)?;
         match cli.command() {
             Commands::Generate { force, .. } => {
                 assert!(force);
             }
             _ => panic!("Expected Generate command"),
         }
+        Ok(())
     }
 
     #[test]
-    fn verify_generate_server_flag() {
+    fn verify_generate_server_flag() -> anyhow::Result<()> {
         let args = vec!["moshpit-keygen", "generate", "--server"];
-        let cli = Cli::try_parse_from(args).unwrap();
+        let cli = Cli::try_parse_from(args)?;
         match cli.command() {
             Commands::Generate { server, .. } => {
                 assert!(server);
             }
             _ => panic!("Expected Generate command"),
         }
+        Ok(())
     }
 
     #[test]
-    fn verify_generate_key_type_flag() {
+    fn verify_generate_key_type_flag() -> anyhow::Result<()> {
         // Default is x25519
         let args = vec!["moshpit-keygen", "generate"];
-        let cli = Cli::try_parse_from(args).unwrap();
+        let cli = Cli::try_parse_from(args)?;
         match cli.command() {
             Commands::Generate { key_type, .. } => {
                 assert_eq!(key_type, "x25519");
@@ -212,7 +220,7 @@ mod tests {
 
         // Explicit p384
         let args = vec!["moshpit-keygen", "generate", "--key-type", "p384"];
-        let cli = Cli::try_parse_from(args).unwrap();
+        let cli = Cli::try_parse_from(args)?;
         match cli.command() {
             Commands::Generate { key_type, .. } => {
                 assert_eq!(key_type, "p384");
@@ -222,19 +230,20 @@ mod tests {
 
         // Short flag -k with p256
         let args = vec!["moshpit-keygen", "generate", "-k", "p256"];
-        let cli = Cli::try_parse_from(args).unwrap();
+        let cli = Cli::try_parse_from(args)?;
         match cli.command() {
             Commands::Generate { key_type, .. } => {
                 assert_eq!(key_type, "p256");
             }
             _ => panic!("Expected Generate command"),
         }
+        Ok(())
     }
 
     #[test]
-    fn verify_verify_command() {
+    fn verify_verify_command() -> anyhow::Result<()> {
         let args = vec!["moshpit-keygen", "verify", "--randomart", "dummy_sig"];
-        let cli = Cli::try_parse_from(args).unwrap();
+        let cli = Cli::try_parse_from(args)?;
         match cli.command() {
             Commands::Verify {
                 randomart,
@@ -245,30 +254,33 @@ mod tests {
             }
             _ => panic!("Expected Verify command"),
         }
+        Ok(())
     }
 
     #[test]
-    fn verify_fingerprint_command() {
+    fn verify_fingerprint_command() -> anyhow::Result<()> {
         let args = vec!["moshpit-keygen", "fingerprint", "dummy_path"];
-        let cli = Cli::try_parse_from(args).unwrap();
+        let cli = Cli::try_parse_from(args)?;
         match cli.command() {
             Commands::Fingerprint { public_key } => {
                 assert_eq!(public_key, "dummy_path");
             }
             _ => panic!("Expected Fingerprint command"),
         }
+        Ok(())
     }
 
     #[test]
-    fn verify_verbose_quiet_flags() {
+    fn verify_verbose_quiet_flags() -> anyhow::Result<()> {
         let args = vec!["moshpit-keygen", "-vv", "generate"];
-        let cli = Cli::try_parse_from(args).unwrap();
+        let cli = Cli::try_parse_from(args)?;
         assert_eq!(cli.verbose(), 2);
         assert_eq!(cli.quiet(), 0);
 
         let args2 = vec!["moshpit-keygen", "-q", "generate"];
-        let cli2 = Cli::try_parse_from(args2).unwrap();
+        let cli2 = Cli::try_parse_from(args2)?;
         assert_eq!(cli2.verbose(), 0);
         assert_eq!(cli2.quiet(), 1);
+        Ok(())
     }
 }
