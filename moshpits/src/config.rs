@@ -14,11 +14,39 @@ use std::{
 
 use anyhow::Result;
 use getset::{CloneGetters, CopyGetters, Getters, Setters};
-use libmoshpit::{KexConfig, KexMode, KeyPair, Mps, SessionRegistry, Tracing, TracingConfigExt};
+use libmoshpit::{
+    AlgorithmList, KexConfig, KexMode, KeyPair, Mps, SessionRegistry, Tracing, TracingConfigExt,
+    supported_algorithms,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::Level;
 use tracing_subscriber_init::{TracingConfig, get_effective_level};
+
+/// Per-category algorithm preferences for TOML config and CLI overrides.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct AlgorithmPreferences {
+    #[serde(default)]
+    pub(crate) kex: Option<Vec<String>>,
+    #[serde(default)]
+    pub(crate) aead: Option<Vec<String>>,
+    #[serde(default)]
+    pub(crate) mac: Option<Vec<String>>,
+    #[serde(default)]
+    pub(crate) kdf: Option<Vec<String>>,
+}
+
+impl AlgorithmPreferences {
+    fn into_algorithm_list(self) -> AlgorithmList {
+        let defaults = supported_algorithms();
+        AlgorithmList {
+            kex: self.kex.unwrap_or(defaults.kex),
+            aead: self.aead.unwrap_or(defaults.aead),
+            mac: self.mac.unwrap_or(defaults.mac),
+            kdf: self.kdf.unwrap_or(defaults.kdf),
+        }
+    }
+}
 
 #[derive(Clone, CloneGetters, CopyGetters, Debug, Deserialize, Getters, Serialize, Setters)]
 pub(crate) struct Config {
@@ -61,6 +89,9 @@ pub(crate) struct Config {
     #[serde(default = "default_term_type")]
     #[getset(get = "pub(crate)")]
     term_type: String,
+    /// Per-category algorithm overrides from TOML `[preferred_algorithms]` or CLI flags.
+    #[serde(default)]
+    preferred_algorithms: AlgorithmPreferences,
 }
 
 fn default_term_type() -> String {
@@ -83,6 +114,7 @@ impl Default for Config {
             warmup_delay_ms: None,
             pacing_delay_us: None,
             term_type: default_term_type(),
+            preferred_algorithms: AlgorithmPreferences::default(),
         }
     }
 }
@@ -122,6 +154,10 @@ impl KexConfig for Config {
 
     fn user(&self) -> Option<String> {
         None
+    }
+
+    fn preferred_algorithms(&self) -> AlgorithmList {
+        self.preferred_algorithms.clone().into_algorithm_list()
     }
 }
 

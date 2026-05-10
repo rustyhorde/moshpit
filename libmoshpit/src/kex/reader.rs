@@ -17,12 +17,15 @@ use std::{
 
 use anyhow::Result;
 use aws_lc_rs::{
-    aead::{AES_256_GCM_SIV, Aad, Nonce, RandomizedNonceKey},
-    agreement::{ParsedPublicKey, PrivateKey, UnparsedPublicKey, X25519, agree},
-    cipher::AES_256_KEY_LEN,
-    digest::SHA512_OUTPUT_LEN,
+    aead::{
+        AES_128_GCM_SIV, AES_256_GCM, AES_256_GCM_SIV, Aad, CHACHA20_POLY1305, Nonce,
+        RandomizedNonceKey,
+    },
+    agreement::{
+        ECDH_P256, ECDH_P384, ParsedPublicKey, PrivateKey, UnparsedPublicKey, X25519, agree,
+    },
     error::Unspecified,
-    hkdf::{HKDF_SHA256, HKDF_SHA512, Salt},
+    hkdf::{HKDF_SHA256, HKDF_SHA384, HKDF_SHA512, Salt},
     rand::fill,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -40,7 +43,12 @@ use crate::kex::HostKeyMismatchFn;
 use crate::{
     ConnectionReader, Frame, KexEvent, MoshpitError, ServerKex, UuidWrapper,
     kex::TofuFn,
-    kex::negotiate::{AlgorithmList, NegotiatedAlgorithms, negotiate, supported_algorithms},
+    kex::negotiate::{
+        AEAD_AES128_GCM_SIV, AEAD_AES256_GCM, AEAD_AES256_GCM_SIV, AEAD_CHACHA20_POLY1305,
+        AlgorithmList, KDF_HKDF_SHA256, KDF_HKDF_SHA384, KDF_HKDF_SHA512, KEX_P256_SHA256,
+        KEX_P384_SHA384, KEX_X25519_SHA256, MAC_HMAC_SHA256, MAC_HMAC_SHA512, NegotiatedAlgorithms,
+        negotiate, supported_algorithms,
+    },
     load_private_key, load_public_key,
     session::SessionRegistry,
     udp::DiffMode,
@@ -48,6 +56,42 @@ use crate::{
 
 const AEAD_KEY_INFO: &[u8] = b"AEAD KEY";
 const HMAC_KEY_INFO: &[u8] = b"HMAC KEY";
+
+fn resolve_kex_alg(kex: &str) -> Result<&'static aws_lc_rs::agreement::Algorithm> {
+    match kex {
+        KEX_X25519_SHA256 => Ok(&X25519),
+        KEX_P384_SHA384 => Ok(&ECDH_P384),
+        KEX_P256_SHA256 => Ok(&ECDH_P256),
+        _ => Err(MoshpitError::NoCommonAlgorithm.into()),
+    }
+}
+
+fn resolve_hkdf_alg(kdf: &str) -> Result<aws_lc_rs::hkdf::Algorithm> {
+    match kdf {
+        KDF_HKDF_SHA256 => Ok(HKDF_SHA256),
+        KDF_HKDF_SHA384 => Ok(HKDF_SHA384),
+        KDF_HKDF_SHA512 => Ok(HKDF_SHA512),
+        _ => Err(MoshpitError::NoCommonAlgorithm.into()),
+    }
+}
+
+fn resolve_aead_alg(aead: &str) -> Result<&'static aws_lc_rs::aead::Algorithm> {
+    match aead {
+        AEAD_AES256_GCM_SIV => Ok(&AES_256_GCM_SIV),
+        AEAD_AES256_GCM => Ok(&AES_256_GCM),
+        AEAD_CHACHA20_POLY1305 => Ok(&CHACHA20_POLY1305),
+        AEAD_AES128_GCM_SIV => Ok(&AES_128_GCM_SIV),
+        _ => Err(MoshpitError::NoCommonAlgorithm.into()),
+    }
+}
+
+fn resolve_hmac_key_type(mac: &str) -> Result<aws_lc_rs::hmac::Algorithm> {
+    match mac {
+        MAC_HMAC_SHA512 => Ok(HKDF_SHA512.hmac_algorithm()),
+        MAC_HMAC_SHA256 => Ok(HKDF_SHA256.hmac_algorithm()),
+        _ => Err(MoshpitError::NoCommonAlgorithm.into()),
+    }
+}
 
 /// The key exchange reader for the moshpit
 #[derive(Builder)]
@@ -76,6 +120,18 @@ pub struct KexReader {
     /// Defaults to [`supported_algorithms()`].
     #[builder(default = supported_algorithms())]
     client_algos: AlgorithmList,
+    /// Algorithm preferences for server mode.  The server sends this list in its
+    /// `KexInit` frame and negotiates using server-preference order.
+    /// Defaults to [`supported_algorithms()`].
+    #[builder(default = supported_algorithms())]
+    server_preferred_algos: AlgorithmList,
+    /// Username sent in `Initialize` frame (client mode only).
+    #[builder(default)]
+    user: String,
+    /// Long-term identity public key bytes sent in `Initialize` for authorized-keys
+    /// validation on the server (client mode only).
+    #[builder(default)]
+    full_public_key_bytes: Vec<u8>,
 }
 
 impl std::fmt::Debug for KexReader {
@@ -104,6 +160,9 @@ impl std::fmt::Debug for KexReader {
             )
             .field("diff_mode", &self.diff_mode)
             .field("client_algos", &self.client_algos)
+            .field("server_preferred_algos", &self.server_preferred_algos)
+            .field("user", &self.user)
+            .field("full_public_key_bytes", &"<redacted>")
             .finish()
     }
 }
@@ -114,7 +173,7 @@ impl KexReader {
     /// # Errors
     ///
     #[cfg_attr(nightly, allow(clippy::too_many_lines))]
-    pub async fn client_kex(&mut self, epk: &PrivateKey) -> Result<()> {
+    pub async fn client_kex(&mut self) -> Result<()> {
         trace!("client_kex: waiting for KexInit from server");
         let negotiated = match self.reader.read_frame().await? {
             Some(Frame::KexInit(server_algos)) => {
@@ -122,7 +181,8 @@ impl KexReader {
                     "client_kex: KexInit received — server offered: kex={:?} aead={:?} mac={:?} kdf={:?}",
                     server_algos.kex, server_algos.aead, server_algos.mac, server_algos.kdf
                 );
-                let negotiated = negotiate(&self.client_algos, &server_algos)?;
+                // Server-preferred negotiation: first of server's list that client supports.
+                let negotiated = negotiate(&server_algos, &self.client_algos)?;
                 trace!(
                     "client_kex: negotiated: kex={} aead={} mac={} kdf={}",
                     negotiated.kex, negotiated.aead, negotiated.mac, negotiated.kdf
@@ -131,7 +191,7 @@ impl KexReader {
             }
             None => {
                 error!("client_kex: server closed connection before sending KexInit");
-                let _ = self.tx_event.send(KexEvent::Failure);
+                drop(self.tx_event.send(KexEvent::Failure));
                 return Err(anyhow::anyhow!("Server closed connection before KexInit"));
             }
             Some(other) => {
@@ -139,10 +199,45 @@ impl KexReader {
                     "client_kex: expected KexInit but got frame id={}",
                     other.id()
                 );
-                let _ = self.tx_event.send(KexEvent::Failure);
+                drop(self.tx_event.send(KexEvent::Failure));
                 return Err(MoshpitError::KeyNotEstablished.into());
             }
         };
+
+        // Resolve algorithms from the negotiated names before generating the EPK.
+        let agreement_alg = resolve_kex_alg(&negotiated.kex)?;
+        let hkdf_alg = resolve_hkdf_alg(&negotiated.kdf)?;
+        let aead_alg = resolve_aead_alg(&negotiated.aead)?;
+        let hmac_key_type = resolve_hmac_key_type(&negotiated.mac)?;
+
+        // Emit the negotiated algorithm set so the runtime can construct the right crypto
+        // primitives when it later receives KeyMaterial and HMACKeyMaterial.
+        drop(
+            self.tx_event
+                .send(KexEvent::NegotiatedAlgorithms(negotiated)),
+        );
+
+        // Generate an ephemeral key for this connection using the negotiated KEX algorithm.
+        let epk = PrivateKey::generate(agreement_alg)?;
+        let epk_pub = epk.compute_public_key()?;
+
+        // Send Initialize or ResumeRequest with our ephemeral public key + identity key.
+        let user_bytes = self.user.as_bytes().to_vec();
+        let identity_pk = self.full_public_key_bytes.clone();
+        if let Some(session_uuid) = self.requested_session_uuid {
+            self.tx.send(Frame::ResumeRequest(
+                UuidWrapper::new(session_uuid),
+                user_bytes,
+                epk_pub.as_ref().to_vec(),
+                identity_pk,
+            ))?;
+        } else {
+            self.tx.send(Frame::Initialize(
+                user_bytes,
+                epk_pub.as_ref().to_vec(),
+                identity_pk,
+            ))?;
+        }
 
         trace!("client_kex: waiting for PeerInitialize");
         match self.reader.read_frame().await? {
@@ -168,12 +263,12 @@ impl KexReader {
                     ) {
                         Err(e) => {
                             error!("client_kex: known_hosts check error for '{host}': {e}");
-                            let _ = self.tx_event.send(KexEvent::Failure);
+                            drop(self.tx_event.send(KexEvent::Failure));
                             return Err(e);
                         }
                         Ok(false) => {
                             error!("client_kex: host key verification rejected for '{host}'");
-                            let _ = self.tx_event.send(KexEvent::Failure);
+                            drop(self.tx_event.send(KexEvent::Failure));
                             return Err(MoshpitError::HostKeyRejected.into());
                         }
                         Ok(true) => {
@@ -184,31 +279,32 @@ impl KexReader {
                     trace!("client_kex: no server_destination set, skipping host-key check");
                 }
 
-                let peer_public_key = UnparsedPublicKey::new(&X25519, &pk);
-                let salt = Salt::new(HKDF_SHA256, &salt_bytes);
+                let peer_public_key = UnparsedPublicKey::new(agreement_alg, &pk);
+                let salt = Salt::new(hkdf_alg, &salt_bytes);
 
                 trace!("client_kex: running ECDH agree()");
-                agree(epk, peer_public_key, Unspecified, |key_material| {
-                    let pseudo_random_key = salt.extract(key_material);
-                    let mut check = b"Yoda".to_vec();
+                agree(&epk, peer_public_key, Unspecified, |key_material| {
+                    let prk = salt.extract(key_material);
 
-                    // Derive UnboundKey for AES-256-GCM-SIV
-                    let okm_aes = pseudo_random_key.expand(&[AEAD_KEY_INFO], &AES_256_GCM_SIV)?;
-                    let mut key_bytes = [0u8; AES_256_KEY_LEN];
-                    okm_aes.fill(&mut key_bytes)?;
-                    // Derive the HMAC key and send it over UDP
-                    let okm_hmac =
-                        pseudo_random_key.expand(&[HMAC_KEY_INFO], HKDF_SHA512.hmac_algorithm())?;
-                    let mut hmac_key_bytes = [0u8; SHA512_OUTPUT_LEN];
+                    let aead_key_len = aead_alg.key_len();
+                    let okm_aead = prk.expand(&[AEAD_KEY_INFO], aead_alg)?;
+                    let mut key_bytes = vec![0u8; aead_key_len];
+                    okm_aead.fill(&mut key_bytes)?;
+
+                    let mac_key_len = hmac_key_type.digest_algorithm().output_len();
+                    let okm_hmac = prk.expand(&[HMAC_KEY_INFO], hmac_key_type)?;
+                    let mut hmac_key_bytes = vec![0u8; mac_key_len];
                     okm_hmac.fill(&mut hmac_key_bytes)?;
 
                     self.tx_event
-                        .send(KexEvent::KeyMaterial(key_bytes))
+                        .send(KexEvent::KeyMaterial(key_bytes.clone()))
                         .map_err(|_| Unspecified)?;
                     self.tx_event
                         .send(KexEvent::HMACKeyMaterial(hmac_key_bytes))
                         .map_err(|_| Unspecified)?;
-                    let rnk = RandomizedNonceKey::new(&AES_256_GCM_SIV, &key_bytes)?;
+
+                    let rnk = RandomizedNonceKey::new(aead_alg, &key_bytes)?;
+                    let mut check = b"Yoda".to_vec();
                     let nonce = rnk.seal_in_place_append_tag(Aad::empty(), &mut check)?;
 
                     match self.diff_mode {
@@ -229,21 +325,15 @@ impl KexReader {
                 })
                 .inspect(|()| trace!("client_kex: agree() succeeded, Check frame sent"))
                 .inspect_err(|_| {
-                    error!(
-                        "client_kex: agree() failed — channel closed or crypto error \
-                         (wrong passphrase?)"
-                    );
+                    error!("client_kex: agree() failed — channel closed or crypto error");
                 })?;
-                // Phase 1: negotiated is always the single supported algo set.
-                // Future phases will dispatch crypto based on negotiated.kex / .aead here.
-                drop(negotiated);
             }
             Some(other) => {
                 error!(
                     "client_kex: expected PeerInitialize but got frame id={}",
                     other.id()
                 );
-                let _ = self.tx_event.send(KexEvent::Failure);
+                drop(self.tx_event.send(KexEvent::Failure));
                 return Err(MoshpitError::KeyNotEstablished.into());
             }
         }
@@ -344,7 +434,8 @@ impl KexReader {
                     "server_kex: KexInit received — client offered: kex={:?} aead={:?} mac={:?} kdf={:?}",
                     client_algos.kex, client_algos.aead, client_algos.mac, client_algos.kdf
                 );
-                let negotiated = negotiate(&client_algos, &supported_algorithms())?;
+                // Server-preferred: first of server's list that client also offered.
+                let negotiated = negotiate(&self.server_preferred_algos, &client_algos)?;
                 trace!(
                     "server_kex: negotiated: kex={} aead={} mac={} kdf={}",
                     negotiated.kex, negotiated.aead, negotiated.mac, negotiated.kdf
@@ -364,78 +455,82 @@ impl KexReader {
             }
         };
 
+        // Send our KexInit immediately so the client can generate the ephemeral key
+        // for the negotiated algorithm before sending Initialize.
+        self.tx
+            .send(Frame::KexInit(self.server_preferred_algos.clone()))?;
+        trace!("server_kex: sent KexInit to client");
+
         trace!("server_kex: waiting for Initialize/ResumeRequest from client");
-        let (rnk, user_str, shell, requested_session_uuid_opt) = match self
-            .reader
-            .read_frame()
-            .await?
-        {
-            None => {
-                error!("server_kex: client closed connection before sending Initialize");
-                return Err(MoshpitError::InvalidFrame.into());
-            }
-            Some(frame) => {
-                let (user, pk, fpk, req_uuid) = match frame {
-                    Frame::Initialize(user, pk, fpk) => {
-                        trace!("server_kex: received Initialize from client");
-                        (user, pk, fpk, None)
-                    }
-                    Frame::ResumeRequest(session_uuid_wrapper, user, pk, fpk) => {
-                        trace!(
-                            "server_kex: received ResumeRequest for session {}",
-                            session_uuid_wrapper
-                        );
-                        (user, pk, fpk, Some(*session_uuid_wrapper.as_ref()))
-                    }
-                    other => {
-                        error!(
-                            "server_kex: expected Initialize/ResumeRequest but got frame id={}",
-                            other.id()
-                        );
-                        return Err(MoshpitError::InvalidFrame.into());
-                    }
-                };
-                let user_str = String::from_utf8_lossy(&user).to_string();
-                trace!(
-                    "server_kex: validating system account for user '{}'",
-                    user_str
-                );
-                let (home_dir, shell) = if self.validate_user(&user_str).await? {
+        let (rnk, user_str, shell, requested_session_uuid_opt) =
+            match self.reader.read_frame().await? {
+                None => {
+                    error!("server_kex: client closed connection before sending Initialize");
+                    return Err(MoshpitError::InvalidFrame.into());
+                }
+                Some(frame) => {
+                    let (user, pk, fpk, req_uuid) = match frame {
+                        Frame::Initialize(user, pk, fpk) => {
+                            trace!("server_kex: received Initialize from client");
+                            (user, pk, fpk, None)
+                        }
+                        Frame::ResumeRequest(session_uuid_wrapper, user, pk, fpk) => {
+                            trace!(
+                                "server_kex: received ResumeRequest for session {}",
+                                session_uuid_wrapper
+                            );
+                            (user, pk, fpk, Some(*session_uuid_wrapper.as_ref()))
+                        }
+                        other => {
+                            error!(
+                                "server_kex: expected Initialize/ResumeRequest but got frame id={}",
+                                other.id()
+                            );
+                            return Err(MoshpitError::InvalidFrame.into());
+                        }
+                    };
+                    let user_str = String::from_utf8_lossy(&user).to_string();
                     trace!(
-                        "server_kex: user '{}' is valid, getting home/shell",
+                        "server_kex: validating system account for user '{}'",
                         user_str
                     );
-                    self.get_home_dir_shell(&user_str).await?
-                } else {
-                    error!("server_kex: '{}' is not a valid system account", user_str);
-                    return Err(MoshpitError::KeyNotEstablished.into());
-                };
-                trace!(
-                    "server_kex: home_dir='{}', checking authorized_keys",
-                    home_dir
-                );
-                if !check_authorized_keys(&home_dir, &fpk)? {
-                    error!(
-                        "server_kex: client pubkey not in '{home_dir}/.mp/authorized_keys' \
-                             (file missing, wrong permissions, or key not added)",
+                    let (home_dir, shell) = if self.validate_user(&user_str).await? {
+                        trace!(
+                            "server_kex: user '{}' is valid, getting home/shell",
+                            user_str
+                        );
+                        self.get_home_dir_shell(&user_str).await?
+                    } else {
+                        error!("server_kex: '{}' is not a valid system account", user_str);
+                        return Err(MoshpitError::KeyNotEstablished.into());
+                    };
+                    trace!(
+                        "server_kex: home_dir='{}', checking authorized_keys",
+                        home_dir
                     );
-                    return Err(MoshpitError::KeyNotEstablished.into());
+                    if !check_authorized_keys(&home_dir, &fpk)? {
+                        error!(
+                            "server_kex: client pubkey not in '{home_dir}/.mp/authorized_keys' \
+                             (file missing, wrong permissions, or key not added)",
+                        );
+                        return Err(MoshpitError::KeyNotEstablished.into());
+                    }
+                    trace!("server_kex: authorized_keys OK, sending NegotiatedAlgorithms event");
+                    drop(
+                        self.tx_event
+                            .send(KexEvent::NegotiatedAlgorithms(negotiated.clone())),
+                    );
+                    let rnk = self.handle_initialize(
+                        &pk,
+                        &negotiated,
+                        &self.tx_event.clone(),
+                        private_key_path,
+                        public_key_path,
+                    )?;
+                    trace!("server_kex: PeerInitialize sent to client");
+                    (rnk, user_str, shell, req_uuid)
                 }
-                trace!(
-                    "server_kex: authorized_keys OK, sending KexInit and running handle_initialize"
-                );
-                self.tx.send(Frame::KexInit(supported_algorithms()))?;
-                let rnk = self.handle_initialize(
-                    &pk,
-                    &negotiated,
-                    &self.tx_event.clone(),
-                    private_key_path,
-                    public_key_path,
-                )?;
-                trace!("server_kex: PeerInitialize sent to client");
-                (rnk, user_str, shell, req_uuid)
-            }
-        };
+            };
 
         // Read the next frame: clients that requested datagram mode send
         // `ClientOptions` before `Check`; older/reliable clients send `Check`
@@ -548,8 +643,11 @@ impl KexReader {
         private_key_path: &PathBuf,
         public_key_path: &PathBuf,
     ) -> Result<RandomizedNonceKey> {
-        // Phase 1: negotiated algorithms are logged in server_kex; crypto dispatch is future work.
-        let _ = negotiated;
+        let agreement_alg = resolve_kex_alg(&negotiated.kex)?;
+        let hkdf_alg = resolve_hkdf_alg(&negotiated.kdf)?;
+        let aead_alg = resolve_aead_alg(&negotiated.aead)?;
+        let hmac_key_type = resolve_hmac_key_type(&negotiated.mac)?;
+
         // Load the moshpits public and private key
         let (unenc_key_pair_opt, _enc_key_pair_opt) = load_private_key(private_key_path)?;
         let (_, public_key_bytes) = load_public_key(public_key_path)?;
@@ -566,45 +664,45 @@ impl KexReader {
             ));
         }
 
-        // Setup the public key from the peer
-        let unparsed_public_key = UnparsedPublicKey::new(&X25519, &pk);
+        // Parse the client's ephemeral public key using the negotiated algorithm.
+        let unparsed_public_key = UnparsedPublicKey::new(agreement_alg, pk);
         let parsed_public_key = ParsedPublicKey::try_from(&unparsed_public_key)?;
 
         // Generate a (non-secret) salt value
         let mut salt_bytes = [0u8; 32];
         fill(&mut salt_bytes)?;
 
-        // Send the public key and salt back to the peer
+        // Send the server's identity public key and salt back to the client.
         let peer_initialize =
             Frame::PeerInitialize(public_key.as_ref().to_vec(), salt_bytes.to_vec());
         self.tx.send(peer_initialize)?;
 
-        // Extract pseudo-random key from secret keying materials
-        let salt = Salt::new(HKDF_SHA256, &salt_bytes);
+        let salt = Salt::new(hkdf_alg, &salt_bytes);
 
-        // Setup the rnk and wait for a check frame
         let rnk = agree(
             &private_key,
             parsed_public_key,
             Unspecified,
             |key_material| {
-                let pseudo_random_key = salt.extract(key_material);
-                let okm = pseudo_random_key.expand(&[AEAD_KEY_INFO], &AES_256_GCM_SIV)?;
-                let mut key_bytes = [0u8; AES_256_KEY_LEN];
+                let prk = salt.extract(key_material);
+
+                let aead_key_len = aead_alg.key_len();
+                let okm = prk.expand(&[AEAD_KEY_INFO], aead_alg)?;
+                let mut key_bytes = vec![0u8; aead_key_len];
                 okm.fill(&mut key_bytes)?;
-                // Derive the HMAC key and send it over UDP
-                let okm_hmac =
-                    pseudo_random_key.expand(&[HMAC_KEY_INFO], HKDF_SHA512.hmac_algorithm())?;
-                let mut hmac_key_bytes = [0u8; SHA512_OUTPUT_LEN];
+
+                let mac_key_len = hmac_key_type.digest_algorithm().output_len();
+                let okm_hmac = prk.expand(&[HMAC_KEY_INFO], hmac_key_type)?;
+                let mut hmac_key_bytes = vec![0u8; mac_key_len];
                 okm_hmac.fill(&mut hmac_key_bytes)?;
 
                 tx_event
-                    .send(KexEvent::KeyMaterial(key_bytes))
+                    .send(KexEvent::KeyMaterial(key_bytes.clone()))
                     .map_err(|_| Unspecified)?;
                 tx_event
                     .send(KexEvent::HMACKeyMaterial(hmac_key_bytes))
                     .map_err(|_| Unspecified)?;
-                let rnk = RandomizedNonceKey::new(&AES_256_GCM_SIV, &key_bytes)?;
+                let rnk = RandomizedNonceKey::new(aead_alg, &key_bytes)?;
                 Ok(rnk)
             },
         )?;
@@ -1547,8 +1645,7 @@ mod tests {
         // Drop server writer immediately — client reads EOF
         drop(server_writer);
 
-        let epk = PrivateKey::generate(&X25519).unwrap();
-        let result = kex_reader.client_kex(&epk).await;
+        let result = kex_reader.client_kex().await;
         assert!(
             result.is_err(),
             "expected error when server closes immediately"
@@ -1567,8 +1664,7 @@ mod tests {
         server_writer.write_frame(&Frame::KexFailure).await.unwrap();
         drop(server_writer);
 
-        let epk = PrivateKey::generate(&X25519).unwrap();
-        let result = kex_reader.client_kex(&epk).await;
+        let result = kex_reader.client_kex().await;
         assert!(result.is_err());
         assert!(
             result
@@ -1598,8 +1694,7 @@ mod tests {
             .unwrap();
         drop(server_writer);
 
-        let epk = PrivateKey::generate(&X25519).unwrap();
-        let result = kex_reader.client_kex(&epk).await;
+        let result = kex_reader.client_kex().await;
         assert!(
             result.is_err(),
             "expected error after server closes post-PeerInitialize"
@@ -1629,8 +1724,7 @@ mod tests {
         server_writer.write_frame(&Frame::KexFailure).await.unwrap();
         drop(server_writer);
 
-        let epk = PrivateKey::generate(&X25519).unwrap();
-        let result = kex_reader.client_kex(&epk).await;
+        let result = kex_reader.client_kex().await;
         assert!(result.is_err());
         assert!(
             result
@@ -1666,11 +1760,14 @@ mod tests {
 
         // Spawn mock server task
         let server_handle = tokio::spawn(async move {
-            // Send KexInit then PeerInitialize
+            // 1. Send KexInit so client can negotiate and generate its ephemeral key.
             server_writer
                 .write_frame(&Frame::KexInit(supported_algorithms()))
                 .await
                 .unwrap();
+            // 2. Drain the Initialize frame that client_kex sends after negotiation.
+            drop(rx_out.recv().await);
+            // 3. Send PeerInitialize with the server's ephemeral key + salt.
             server_writer
                 .write_frame(&Frame::PeerInitialize(
                     server_pub.as_ref().to_vec(),
@@ -1678,9 +1775,9 @@ mod tests {
                 ))
                 .await
                 .unwrap();
-            // Drain the Check frame that client_kex sends
+            // 4. Drain the Check frame that client_kex sends after ECDH.
             drop(rx_out.recv().await);
-            // Send KeyAgreement, SessionToken, MoshpitsAddr
+            // 5. Send KeyAgreement, SessionToken, MoshpitsAddr.
             server_writer
                 .write_frame(&Frame::KeyAgreement(UuidWrapper::new(conn_uuid)))
                 .await
@@ -1695,9 +1792,8 @@ mod tests {
                 .unwrap();
         });
 
-        let client_epk = PrivateKey::generate(&X25519).unwrap();
         let mut kex_reader = kex_reader;
-        kex_reader.client_kex(&client_epk).await.unwrap();
+        kex_reader.client_kex().await.unwrap();
         server_handle.await.unwrap();
 
         // Collect all events
@@ -1706,13 +1802,14 @@ mod tests {
             events.push(e);
         }
 
-        // Should have: KeyMaterial, HMACKeyMaterial, Uuid, SessionInfo, MoshpitsAddr
-        assert_eq!(events.len(), 5, "expected 5 kex events, got: {events:?}");
-        assert!(matches!(events[0], KexEvent::KeyMaterial(_)));
-        assert!(matches!(events[1], KexEvent::HMACKeyMaterial(_)));
-        assert!(matches!(events[2], KexEvent::Uuid(_)));
-        assert!(matches!(events[3], KexEvent::SessionInfo(_, false)));
-        assert!(matches!(events[4], KexEvent::MoshpitsAddr(_)));
+        // Should have: NegotiatedAlgorithms, KeyMaterial, HMACKeyMaterial, Uuid, SessionInfo, MoshpitsAddr
+        assert_eq!(events.len(), 6, "expected 6 kex events, got: {events:?}");
+        assert!(matches!(events[0], KexEvent::NegotiatedAlgorithms(_)));
+        assert!(matches!(events[1], KexEvent::KeyMaterial(_)));
+        assert!(matches!(events[2], KexEvent::HMACKeyMaterial(_)));
+        assert!(matches!(events[3], KexEvent::Uuid(_)));
+        assert!(matches!(events[4], KexEvent::SessionInfo(_, false)));
+        assert!(matches!(events[5], KexEvent::MoshpitsAddr(_)));
     }
 
     #[tokio::test]
@@ -1739,8 +1836,7 @@ mod tests {
         // Close without sending SessionToken
         drop(server_writer);
 
-        let epk = PrivateKey::generate(&X25519).unwrap();
-        let result = kex_reader.client_kex(&epk).await;
+        let result = kex_reader.client_kex().await;
         assert!(
             result.is_err(),
             "expected error when server closes before SessionToken"
@@ -1775,8 +1871,7 @@ mod tests {
         // Close without sending MoshpitsAddr
         drop(server_writer);
 
-        let epk = PrivateKey::generate(&X25519).unwrap();
-        let result = kex_reader.client_kex(&epk).await;
+        let result = kex_reader.client_kex().await;
         assert!(
             result.is_err(),
             "expected error when server closes before MoshpitsAddr"
@@ -1810,8 +1905,7 @@ mod tests {
         server_writer.write_frame(&Frame::KexFailure).await.unwrap();
         drop(server_writer);
 
-        let epk = PrivateKey::generate(&X25519).unwrap();
-        let result = kex_reader.client_kex(&epk).await;
+        let result = kex_reader.client_kex().await;
         assert!(result.is_err());
         assert!(
             result

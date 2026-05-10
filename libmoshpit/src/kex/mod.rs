@@ -14,8 +14,10 @@ use std::{
 
 use anyhow::Result;
 use aws_lc_rs::{
+    aead::{AES_128_GCM_SIV, AES_256_GCM, AES_256_GCM_SIV, CHACHA20_POLY1305, RandomizedNonceKey},
     agreement::{PrivateKey, X25519},
     cipher::AES_256_KEY_LEN,
+    hmac::{HMAC_SHA256, HMAC_SHA512, Key},
 };
 use bon::Builder;
 use getset::{CopyGetters, Getters};
@@ -59,12 +61,15 @@ pub(crate) mod reader;
 pub(crate) mod sender;
 
 /// The key exchange events
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum KexEvent {
-    /// Key material for encrypting/decrypting UDP packets
-    KeyMaterial([u8; 32]),
-    /// HMAC key for signing UDP packets
-    HMACKeyMaterial([u8; 64]),
+    /// Negotiated algorithms — sent before key material so the runtime can
+    /// construct the correct crypto primitives.
+    NegotiatedAlgorithms(NegotiatedAlgorithms),
+    /// AEAD key material for encrypting/decrypting UDP packets (variable size)
+    KeyMaterial(Vec<u8>),
+    /// HMAC key for signing UDP packets (variable size: 64 B for SHA-512, 32 B for SHA-256)
+    HMACKeyMaterial(Vec<u8>),
     /// moshpit client UUID
     Uuid(Uuid),
     /// moshpits socket address
@@ -78,8 +83,10 @@ pub enum KexEvent {
 /// The moshpit key exchange state
 #[derive(Clone, Copy, Debug, Default)]
 pub enum KexState {
-    /// Awaiting key material for encrypting/decrypting UDP packets
+    /// Awaiting the negotiated-algorithm event (arrives before key material)
     #[default]
+    AwaitingNegotiatedAlgorithms,
+    /// Awaiting key material for encrypting/decrypting UDP packets
     AwaitingKeyMaterial,
     /// Awaiting HMAC key for signing UDP packets
     AwaitingHMACKeyMaterial,
@@ -106,12 +113,12 @@ pub struct KexStateMachine {
 /// The moshpit key exchange result
 #[derive(Clone, Debug, CopyGetters, Getters)]
 pub struct Kex {
-    /// AES-256-GCM-SIV key material for encrypting/decrypting UDP packets
-    #[getset(get_copy = "pub")]
-    key: [u8; 32],
-    /// HMAC key for signing UDP packets
-    #[getset(get_copy = "pub")]
-    hmac_key: [u8; 64],
+    /// AEAD key material for encrypting/decrypting UDP packets (variable size)
+    #[getset(get = "pub")]
+    key: Vec<u8>,
+    /// HMAC key for signing UDP packets (variable size)
+    #[getset(get = "pub")]
+    hmac_key: Vec<u8>,
     /// moshpit client UUID (per-connection, changes on every reconnect)
     #[getset(get_copy = "pub")]
     uuid: Uuid,
@@ -135,13 +142,55 @@ impl Kex {
     pub fn uuid_wrapper(&self) -> UuidWrapper {
         UuidWrapper::new(self.uuid)
     }
+
+    /// Build a `RandomizedNonceKey` for UDP encryption using the negotiated AEAD algorithm.
+    ///
+    /// # Errors
+    /// Returns an error if the negotiated AEAD algorithm is unknown or the key bytes are invalid.
+    pub fn build_rnk(&self) -> Result<RandomizedNonceKey> {
+        use negotiate::{
+            AEAD_AES128_GCM_SIV, AEAD_AES256_GCM, AEAD_AES256_GCM_SIV, AEAD_CHACHA20_POLY1305,
+        };
+        let alg = match self.negotiated_algorithms.aead.as_str() {
+            AEAD_AES256_GCM_SIV => &AES_256_GCM_SIV,
+            AEAD_AES256_GCM => &AES_256_GCM,
+            AEAD_CHACHA20_POLY1305 => &CHACHA20_POLY1305,
+            AEAD_AES128_GCM_SIV => &AES_128_GCM_SIV,
+            _ => return Err(MoshpitError::NoCommonAlgorithm.into()),
+        };
+        RandomizedNonceKey::new(alg, &self.key).map_err(Into::into)
+    }
+
+    /// Build an HMAC `Key` for UDP packet authentication using the negotiated MAC algorithm.
+    #[must_use]
+    pub fn build_hmac(&self) -> Key {
+        use negotiate::MAC_HMAC_SHA256;
+        if self.negotiated_algorithms.mac.as_str() == MAC_HMAC_SHA256 {
+            Key::new(HMAC_SHA256, &self.hmac_key)
+        } else {
+            Key::new(HMAC_SHA512, &self.hmac_key)
+        }
+    }
+
+    /// Returns the byte length of the MAC tag produced by the negotiated MAC algorithm.
+    ///
+    /// HMAC-SHA256 produces 32-byte tags; all others produce 64-byte tags.
+    #[must_use]
+    pub fn mac_tag_len(&self) -> usize {
+        use negotiate::MAC_HMAC_SHA256;
+        if self.negotiated_algorithms.mac.as_str() == MAC_HMAC_SHA256 {
+            32
+        } else {
+            64
+        }
+    }
 }
 
 impl Default for Kex {
     fn default() -> Self {
         Self {
-            key: [0u8; 32],
-            hmac_key: [0u8; 64],
+            key: Vec::new(),
+            hmac_key: Vec::new(),
             uuid: Uuid::nil(),
             moshpits_addr: None,
             session_uuid: None,
@@ -189,6 +238,10 @@ impl KexStateMachine {
 
         while let Some(event) = self.rx_event.recv().await {
             match (self.state, event) {
+                (KexState::AwaitingNegotiatedAlgorithms, KexEvent::NegotiatedAlgorithms(algos)) => {
+                    kex.negotiated_algorithms = algos;
+                    self.state = KexState::AwaitingKeyMaterial;
+                }
                 (KexState::AwaitingKeyMaterial, KexEvent::KeyMaterial(key_material)) => {
                     kex.key = key_material;
                     self.state = KexState::AwaitingHMACKeyMaterial;
@@ -344,7 +397,7 @@ async fn run_client_kex<T: KexConfig>(
         })
         .map_err(|_| MoshpitError::KeyFileMissing)?;
 
-    let (pk, my_public_key) = if let Some(enc_key_pair) = enc_key_pair_opt {
+    let (_pk, _my_public_key) = if let Some(enc_key_pair) = enc_key_pair_opt {
         info!("Private key is encrypted — invoking passphrase prompt");
         // Get the passphrase
         if let Some(passphrase) = passphrase_fn().map_err(|e| {
@@ -415,6 +468,7 @@ async fn run_client_kex<T: KexConfig>(
 
     let diff_mode = config.diff_mode();
     let client_algos = config.preferred_algorithms();
+    let user = config.user().unwrap_or_default();
     let _read_handle = spawn(async move {
         let mut frame_reader = KexReader::builder()
             .reader(reader)
@@ -426,37 +480,17 @@ async fn run_client_kex<T: KexConfig>(
             .maybe_host_key_mismatch_fn(host_key_mismatch_fn)
             .diff_mode(diff_mode)
             .client_algos(client_algos)
+            .user(user)
+            .full_public_key_bytes(full_public_key_bytes)
             .build();
-        if let Err(e) = frame_reader.client_kex(&pk).await {
+        if let Err(e) = frame_reader.client_kex().await {
             error!("client_kex failed: {e}");
         }
     });
 
-    // Send KexInit then the initialize or resume-request frame with our public key
+    // Send KexInit only — Initialize/ResumeRequest is sent inside client_kex() after
+    // reading the server's KexInit and generating the correct ephemeral key.
     tx.send(Frame::KexInit(config.preferred_algorithms()))?;
-    let frame = if let Some(session_uuid) = config.resume_session_uuid() {
-        info!(
-            "Sending ResumeRequest for session {session_uuid} (user='{}')",
-            config.user().unwrap_or_default()
-        );
-        Frame::ResumeRequest(
-            UuidWrapper::new(session_uuid),
-            config.user().unwrap_or_default().as_bytes().to_vec(),
-            my_public_key.as_ref().to_vec(),
-            full_public_key_bytes,
-        )
-    } else {
-        info!(
-            "Sending Initialize for user='{}'",
-            config.user().unwrap_or_default()
-        );
-        Frame::Initialize(
-            config.user().unwrap_or_default().as_bytes().to_vec(),
-            my_public_key.as_ref().to_vec(),
-            full_public_key_bytes,
-        )
-    };
-    tx.send(frame)?;
 
     let kex = kex_handle.await??;
 
@@ -506,10 +540,12 @@ async fn run_server_kex<T: KexConfig>(
     // Setup the TCP frame reader
     let tx_c = tx.clone();
     let tx_event_c = tx_event.clone();
+    let server_preferred_algos = config.preferred_algorithms();
     let mut frame_reader = KexReader::builder()
         .reader(reader)
         .tx(tx_c)
         .tx_event(tx_event_c)
+        .server_preferred_algos(server_preferred_algos)
         .build();
     if let Some(port_pool) = port_pool_opt {
         let (skex, udp_arc) = frame_reader
@@ -535,18 +571,25 @@ mod tests {
 
     #[tokio::test]
     async fn kex_state_machine_server_mode_completes_after_uuid() {
+        use crate::kex::negotiate::NegotiatedAlgorithms;
+
         let (tx, rx) = unbounded_channel();
         let mut sm = KexStateMachine::builder().rx_event(rx).build();
-        let key = [1u8; 32];
-        let hmac_key = [2u8; 64];
+        let key = vec![1u8; 32];
+        let hmac_key = vec![2u8; 64];
         let uuid = Uuid::new_v4();
-        tx.send(KexEvent::KeyMaterial(key)).unwrap();
-        tx.send(KexEvent::HMACKeyMaterial(hmac_key)).unwrap();
+        tx.send(KexEvent::NegotiatedAlgorithms(
+            NegotiatedAlgorithms::default(),
+        ))
+        .unwrap();
+        tx.send(KexEvent::KeyMaterial(key.clone())).unwrap();
+        tx.send(KexEvent::HMACKeyMaterial(hmac_key.clone()))
+            .unwrap();
         tx.send(KexEvent::Uuid(uuid)).unwrap();
         drop(tx);
         let kex = sm.handle_events(false).await.unwrap();
-        assert_eq!(kex.key(), key);
-        assert_eq!(kex.hmac_key(), hmac_key);
+        assert_eq!(kex.key().as_slice(), key.as_slice());
+        assert_eq!(kex.hmac_key().as_slice(), hmac_key.as_slice());
         assert_eq!(kex.uuid(), uuid);
         assert!(kex.moshpits_addr().is_none());
         assert!(kex.session_uuid().is_none());
@@ -554,21 +597,28 @@ mod tests {
 
     #[tokio::test]
     async fn kex_state_machine_client_mode_full_sequence() {
+        use crate::kex::negotiate::NegotiatedAlgorithms;
+
         let (tx, rx) = unbounded_channel();
         let mut sm = KexStateMachine::builder().rx_event(rx).build();
-        let key = [3u8; 32];
-        let hmac_key = [4u8; 64];
+        let key = vec![3u8; 32];
+        let hmac_key = vec![4u8; 64];
         let uuid = Uuid::new_v4();
         let session_uuid = Uuid::new_v4();
         let addr: SocketAddr = "127.0.0.1:50001".parse().unwrap();
-        tx.send(KexEvent::KeyMaterial(key)).unwrap();
-        tx.send(KexEvent::HMACKeyMaterial(hmac_key)).unwrap();
+        tx.send(KexEvent::NegotiatedAlgorithms(
+            NegotiatedAlgorithms::default(),
+        ))
+        .unwrap();
+        tx.send(KexEvent::KeyMaterial(key.clone())).unwrap();
+        tx.send(KexEvent::HMACKeyMaterial(hmac_key.clone()))
+            .unwrap();
         tx.send(KexEvent::Uuid(uuid)).unwrap();
         tx.send(KexEvent::SessionInfo(session_uuid, false)).unwrap();
         tx.send(KexEvent::MoshpitsAddr(addr)).unwrap();
         let kex = sm.handle_events(true).await.unwrap();
-        assert_eq!(kex.key(), key);
-        assert_eq!(kex.hmac_key(), hmac_key);
+        assert_eq!(kex.key().as_slice(), key.as_slice());
+        assert_eq!(kex.hmac_key().as_slice(), hmac_key.as_slice());
         assert_eq!(kex.uuid(), uuid);
         assert_eq!(kex.session_uuid(), Some(session_uuid));
         assert_eq!(kex.moshpits_addr(), Some(addr));
@@ -579,7 +629,7 @@ mod tests {
     async fn kex_state_machine_wrong_event_order_returns_invalid_state() {
         let (tx, rx) = unbounded_channel();
         let mut sm = KexStateMachine::builder().rx_event(rx).build();
-        // Send Uuid when state is AwaitingKeyMaterial — wrong order
+        // Send Uuid when state is AwaitingNegotiatedAlgorithms — wrong order
         tx.send(KexEvent::Uuid(Uuid::new_v4())).unwrap();
         drop(tx);
         let result = sm.handle_events(true).await;

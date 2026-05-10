@@ -34,7 +34,7 @@ fuzz_target!(|data: &[u8]| {
     let id = Uuid::nil();
 
     let mut cursor = Cursor::new(data);
-    match EncryptedFrame::parse(&mut cursor, id, &hmac, &rnk) {
+    match EncryptedFrame::parse(&mut cursor, id, &hmac, &rnk, 64) {
         Ok(Some(_)) => {
             // Parsed a valid frame — no panic, that's success (very unlikely
             // with random data given the HMAC gate, but theoretically possible).

@@ -23,10 +23,7 @@ use ansi_control_codes::{
     parser::{Token, TokenStream},
 };
 use anyhow::Result;
-use aws_lc_rs::{
-    aead::{AES_256_GCM_SIV, RandomizedNonceKey},
-    hmac::{HMAC_SHA512, Key},
-};
+use aws_lc_rs::{aead::RandomizedNonceKey, hmac::Key};
 use bon::Builder;
 use bytes::BytesMut;
 use tokio::{
@@ -83,11 +80,13 @@ pub struct UdpReader {
     /// Client UUID
     id: Uuid,
     /// Key for decrypting UDP packets
-    #[builder(with = |key: [u8; 32]| -> Result<_> { RandomizedNonceKey::new(&AES_256_GCM_SIV, &key).map_err(Into::into) })]
     rnk: RandomizedNonceKey,
     /// Key for verifying UDP packet HMAC
-    #[builder(with = |key: [u8; 64]| { Key::new(HMAC_SHA512, &key) })]
     hmac: Key,
+    /// Byte length of the MAC tag written by the peer's HMAC algorithm.
+    /// 64 for HMAC-SHA512 (default), 32 for HMAC-SHA256.
+    #[builder(default = 64)]
+    mac_tag_len: usize,
     /// Injects NAK frames into the outbound stream when gaps are detected
     nak_out_tx: Option<Sender<EncryptedFrame>>,
     /// Tells the local sender to retransmit when a NAK from the peer is received
@@ -1646,7 +1645,7 @@ impl UdpReader {
         let mut buf = Cursor::new(&buffer[..]);
         buf.set_position(0);
 
-        match EncryptedFrame::parse(&mut buf, self.id, &self.hmac, &self.rnk) {
+        match EncryptedFrame::parse(&mut buf, self.id, &self.hmac, &self.rnk, self.mac_tag_len) {
             Ok(Some((frame, seq))) => {
                 buffer.clear();
                 Ok(Some((frame, seq)))
@@ -1659,6 +1658,8 @@ impl UdpReader {
 
 #[cfg(test)]
 mod tests {
+    use aws_lc_rs::{aead::AES_256_GCM_SIV, hmac::HMAC_SHA512};
+
     use super::*;
 
     #[tokio::test]
@@ -1669,9 +1670,8 @@ mod tests {
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
-            .rnk([0u8; 32])
-            .unwrap()
-            .hmac([0u8; 64])
+            .rnk(RandomizedNonceKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap())
+            .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .build();
 
         // First packet arrives normally
@@ -1717,9 +1717,8 @@ mod tests {
         UdpReader::builder()
             .socket(Arc::new(socket))
             .id(Uuid::new_v4())
-            .rnk([0u8; 32])
-            .unwrap()
-            .hmac([0u8; 64])
+            .rnk(RandomizedNonceKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap())
+            .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .build()
     }
 
@@ -1824,9 +1823,8 @@ mod tests {
         let reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
-            .rnk([0u8; 32])
-            .unwrap()
-            .hmac([0u8; 64])
+            .rnk(RandomizedNonceKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap())
+            .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .query_response_tx(tx)
             .build();
         (reader, rx)
@@ -2082,9 +2080,8 @@ mod tests {
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
-            .rnk([0u8; 32])
-            .unwrap()
-            .hmac([0u8; 64])
+            .rnk(RandomizedNonceKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap())
+            .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .retransmit_tx(retransmit_tx)
             .build();
 
@@ -2110,9 +2107,8 @@ mod tests {
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
-            .rnk([0u8; 32])
-            .unwrap()
-            .hmac([0u8; 64])
+            .rnk(RandomizedNonceKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap())
+            .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .build();
 
         // Simulate a gap at seq=0: record it in gap_first_seen
@@ -2250,9 +2246,8 @@ mod tests {
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
-            .rnk([0u8; 32])
-            .unwrap()
-            .hmac([0u8; 64])
+            .rnk(RandomizedNonceKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap())
+            .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .nak_out_tx(nak_tx)
             .build();
 
@@ -2297,9 +2292,8 @@ mod tests {
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
-            .rnk([0u8; 32])
-            .unwrap()
-            .hmac([0u8; 64])
+            .rnk(RandomizedNonceKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap())
+            .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .nak_out_tx(nak_tx)
             .build();
 
@@ -2375,9 +2369,8 @@ mod tests {
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
-            .rnk([0u8; 32])
-            .unwrap()
-            .hmac([0u8; 64])
+            .rnk(RandomizedNonceKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap())
+            .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .nak_received_count(counter.clone())
             .build();
 
@@ -2487,9 +2480,8 @@ mod tests {
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
-            .rnk([0u8; 32])
-            .unwrap()
-            .hmac([0u8; 64])
+            .rnk(RandomizedNonceKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap())
+            .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .build();
 
         // seq 0 delivered normally
@@ -2519,9 +2511,8 @@ mod tests {
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
-            .rnk([0u8; 32])
-            .unwrap()
-            .hmac([0u8; 64])
+            .rnk(RandomizedNonceKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap())
+            .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .build();
 
         // seq 0 delivered
@@ -2546,9 +2537,8 @@ mod tests {
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
-            .rnk([0u8; 32])
-            .unwrap()
-            .hmac([0u8; 64])
+            .rnk(RandomizedNonceKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap())
+            .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .build();
 
         drop(reader.handle_arrival(EncryptedFrame::Keepalive(0), 0));
@@ -2573,9 +2563,8 @@ mod tests {
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
-            .rnk([0u8; 32])
-            .unwrap()
-            .hmac([0u8; 64])
+            .rnk(RandomizedNonceKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap())
+            .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .nak_out_tx(nak_tx)
             .build();
 
@@ -2608,9 +2597,8 @@ mod tests {
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
-            .rnk([0u8; 32])
-            .unwrap()
-            .hmac([0u8; 64])
+            .rnk(RandomizedNonceKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap())
+            .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .nak_out_tx(nak_tx)
             .build();
 
@@ -2664,9 +2652,8 @@ mod tests {
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
-            .rnk([0u8; 32])
-            .unwrap()
-            .hmac([0u8; 64])
+            .rnk(RandomizedNonceKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap())
+            .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .nak_out_tx(nak_tx)
             .build();
 
@@ -2725,9 +2712,8 @@ mod tests {
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
-            .rnk([0u8; 32])
-            .unwrap()
-            .hmac([0u8; 64])
+            .rnk(RandomizedNonceKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap())
+            .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .build();
 
         let emulator = Arc::new(StdMutex::new(Emulator::new(24, 80)));
@@ -2757,9 +2743,8 @@ mod tests {
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
-            .rnk([0u8; 32])
-            .unwrap()
-            .hmac([0u8; 64])
+            .rnk(RandomizedNonceKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap())
+            .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .nak_out_tx(nak_tx)
             .build();
 

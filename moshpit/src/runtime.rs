@@ -838,11 +838,13 @@ async fn run_udp_session(
     // this gives 9 s vs the former fixed 15 s; on high-latency paths it scales
     // up proportionally so a single slow keepalive never causes a false disconnect.
     let silence_timeout = (nak_timeout * 30).max(Duration::from_secs(9));
+    let mac_tag_len = kex.mac_tag_len();
     let mut udp_reader = UdpReader::builder()
         .socket(udp_arc.clone())
         .id(kex.uuid())
-        .hmac(kex.hmac_key())
-        .rnk(kex.key())?
+        .hmac(kex.build_hmac())
+        .rnk(kex.build_rnk()?)
+        .mac_tag_len(mac_tag_len)
         .nak_out_tx(tx.clone())
         .retransmit_tx(retransmit_tx)
         .silence_timeout(silence_timeout)
@@ -858,8 +860,8 @@ async fn run_udp_session(
         .rx(rx)
         .retransmit_rx(retransmit_rx)
         .id(kex.uuid())
-        .hmac(kex.hmac_key())
-        .rnk(kex.key())?
+        .hmac(kex.build_hmac())
+        .rnk(kex.build_rnk()?)
         .diff_mode(diff_mode)
         .build();
 

@@ -40,7 +40,7 @@ fn run_fuzz_encframe(data: &[u8]) {
     let id = Uuid::nil();
     let mut cursor = Cursor::new(data);
     // All outcomes (Ok or Err) are acceptable; only panics are failures.
-    let _ = EncryptedFrame::parse(&mut cursor, id, &hmac, &rnk);
+    let _ = EncryptedFrame::parse(&mut cursor, id, &hmac, &rnk, 64);
 }
 
 #[test]

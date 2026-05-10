@@ -15,12 +15,28 @@ use crate::error::Error as MoshpitError;
 
 /// X25519 ECDH with HKDF-SHA256 key extraction
 pub const KEX_X25519_SHA256: &str = "x25519-sha256";
-/// AES-256-GCM-SIV authenticated encryption
+/// NIST P-384 ECDH with HKDF-SHA384 key extraction (higher security margin)
+pub const KEX_P384_SHA384: &str = "p384-sha384";
+/// NIST P-256 ECDH with HKDF-SHA256 (FIPS-compliant environments)
+pub const KEX_P256_SHA256: &str = "p256-sha256";
+/// AES-256-GCM-SIV authenticated encryption (nonce-misuse resistant)
 pub const AEAD_AES256_GCM_SIV: &str = "aes256-gcm-siv";
+/// AES-256-GCM authenticated encryption
+pub const AEAD_AES256_GCM: &str = "aes256-gcm";
+/// ChaCha20-Poly1305 authenticated encryption (fast on no-AES-NI CPUs)
+pub const AEAD_CHACHA20_POLY1305: &str = "chacha20-poly1305";
+/// AES-128-GCM-SIV authenticated encryption (16-byte key)
+pub const AEAD_AES128_GCM_SIV: &str = "aes128-gcm-siv";
 /// HMAC-SHA512 packet authentication (64-byte tag)
 pub const MAC_HMAC_SHA512: &str = "hmac-sha512";
+/// HMAC-SHA256 packet authentication (32-byte tag, saves 32 B/packet)
+pub const MAC_HMAC_SHA256: &str = "hmac-sha256";
 /// HKDF-SHA256 key expansion
 pub const KDF_HKDF_SHA256: &str = "hkdf-sha256";
+/// HKDF-SHA384 key expansion (natural pairing with P-384)
+pub const KDF_HKDF_SHA384: &str = "hkdf-sha384";
+/// HKDF-SHA512 key expansion (higher security margin)
+pub const KDF_HKDF_SHA512: &str = "hkdf-sha512";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -66,17 +82,28 @@ impl Default for NegotiatedAlgorithms {
 
 // ── Public functions ──────────────────────────────────────────────────────────
 
-/// Returns the complete set of algorithms supported by this build.
-///
-/// Phase 1: only the current hardcoded stack is listed.  Future phases will
-/// extend each `Vec` as new algorithms are added.
+/// Returns the complete set of algorithms supported by this build, in server-default
+/// preference order (strongest / most broadly compatible first).
 #[must_use]
 pub fn supported_algorithms() -> AlgorithmList {
     AlgorithmList {
-        kex: vec![KEX_X25519_SHA256.to_string()],
-        aead: vec![AEAD_AES256_GCM_SIV.to_string()],
-        mac: vec![MAC_HMAC_SHA512.to_string()],
-        kdf: vec![KDF_HKDF_SHA256.to_string()],
+        kex: vec![
+            KEX_X25519_SHA256.to_string(),
+            KEX_P384_SHA384.to_string(),
+            KEX_P256_SHA256.to_string(),
+        ],
+        aead: vec![
+            AEAD_AES256_GCM_SIV.to_string(),
+            AEAD_AES256_GCM.to_string(),
+            AEAD_CHACHA20_POLY1305.to_string(),
+            AEAD_AES128_GCM_SIV.to_string(),
+        ],
+        mac: vec![MAC_HMAC_SHA512.to_string(), MAC_HMAC_SHA256.to_string()],
+        kdf: vec![
+            KDF_HKDF_SHA256.to_string(),
+            KDF_HKDF_SHA384.to_string(),
+            KDF_HKDF_SHA512.to_string(),
+        ],
     }
 }
 
@@ -207,5 +234,58 @@ mod tests {
         assert_eq!(negotiated.aead, AEAD_AES256_GCM_SIV);
         assert_eq!(negotiated.mac, MAC_HMAC_SHA512);
         assert_eq!(negotiated.kdf, KDF_HKDF_SHA256);
+    }
+
+    #[test]
+    fn negotiate_server_preference_order_wins() {
+        // Server prefers x448 over x25519; client supports both but prefers x25519.
+        // When server's list is passed first (server-preferred mode), x448 wins.
+        let server_prefs = AlgorithmList {
+            kex: vec![KEX_P384_SHA384.to_string(), KEX_X25519_SHA256.to_string()],
+            aead: vec![
+                AEAD_CHACHA20_POLY1305.to_string(),
+                AEAD_AES256_GCM_SIV.to_string(),
+            ],
+            mac: vec![MAC_HMAC_SHA256.to_string(), MAC_HMAC_SHA512.to_string()],
+            kdf: vec![KDF_HKDF_SHA512.to_string(), KDF_HKDF_SHA256.to_string()],
+        };
+        let client_offered = AlgorithmList {
+            kex: vec![KEX_X25519_SHA256.to_string(), KEX_P384_SHA384.to_string()],
+            aead: vec![
+                AEAD_AES256_GCM_SIV.to_string(),
+                AEAD_CHACHA20_POLY1305.to_string(),
+            ],
+            mac: vec![MAC_HMAC_SHA512.to_string(), MAC_HMAC_SHA256.to_string()],
+            kdf: vec![KDF_HKDF_SHA256.to_string(), KDF_HKDF_SHA512.to_string()],
+        };
+        // Server-preferred: negotiate(server_prefs, client_offered)
+        let negotiated = negotiate(&server_prefs, &client_offered)
+            .expect("should find common algorithms in server preference order");
+        assert_eq!(negotiated.kex, KEX_P384_SHA384, "server prefers x448");
+        assert_eq!(
+            negotiated.aead, AEAD_CHACHA20_POLY1305,
+            "server prefers chacha20"
+        );
+        assert_eq!(negotiated.mac, MAC_HMAC_SHA256, "server prefers sha256 mac");
+        assert_eq!(
+            negotiated.kdf, KDF_HKDF_SHA512,
+            "server prefers hkdf-sha512"
+        );
+    }
+
+    #[test]
+    fn supported_algorithms_contains_all_known_algorithms() {
+        let algos = supported_algorithms();
+        assert!(algos.kex.contains(&KEX_X25519_SHA256.to_string()));
+        assert!(algos.kex.contains(&KEX_P384_SHA384.to_string()));
+        assert!(algos.kex.contains(&KEX_P256_SHA256.to_string()));
+        assert!(algos.aead.contains(&AEAD_AES256_GCM_SIV.to_string()));
+        assert!(algos.aead.contains(&AEAD_AES256_GCM.to_string()));
+        assert!(algos.aead.contains(&AEAD_CHACHA20_POLY1305.to_string()));
+        assert!(algos.aead.contains(&AEAD_AES128_GCM_SIV.to_string()));
+        assert!(algos.mac.contains(&MAC_HMAC_SHA512.to_string()));
+        assert!(algos.mac.contains(&MAC_HMAC_SHA256.to_string()));
+        assert!(algos.kdf.contains(&KDF_HKDF_SHA256.to_string()));
+        assert!(algos.kdf.contains(&KDF_HKDF_SHA512.to_string()));
     }
 }

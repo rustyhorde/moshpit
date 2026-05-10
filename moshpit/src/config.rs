@@ -11,13 +11,40 @@ use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
 use anyhow::Result;
 use getset::{CopyGetters, Getters, Setters};
 use libmoshpit::{
-    DiffMode, DisplayPreference, KexConfig, KexMode, KeyPair, Tracing, TracingConfigExt,
+    AlgorithmList, DiffMode, DisplayPreference, KexConfig, KexMode, KeyPair, Tracing,
+    TracingConfigExt, supported_algorithms,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::Level;
 use tracing_subscriber_init::{TracingConfig, get_effective_level};
 use uuid::Uuid;
+
+/// Per-category algorithm preferences for TOML config and CLI overrides.
+/// Each field is optional; missing categories fall back to `supported_algorithms()`.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct AlgorithmPreferences {
+    #[serde(default)]
+    pub(crate) kex: Option<Vec<String>>,
+    #[serde(default)]
+    pub(crate) aead: Option<Vec<String>>,
+    #[serde(default)]
+    pub(crate) mac: Option<Vec<String>>,
+    #[serde(default)]
+    pub(crate) kdf: Option<Vec<String>>,
+}
+
+impl AlgorithmPreferences {
+    fn into_algorithm_list(self) -> AlgorithmList {
+        let defaults = supported_algorithms();
+        AlgorithmList {
+            kex: self.kex.unwrap_or(defaults.kex),
+            aead: self.aead.unwrap_or(defaults.aead),
+            mac: self.mac.unwrap_or(defaults.mac),
+            kdf: self.kdf.unwrap_or(defaults.kdf),
+        }
+    }
+}
 
 #[derive(Clone, CopyGetters, Debug, Deserialize, Eq, Getters, PartialEq, Serialize, Setters)]
 pub(crate) struct Config {
@@ -68,6 +95,9 @@ pub(crate) struct Config {
     #[serde(default)]
     #[getset(get_copy = "pub(crate)")]
     diff_mode: DiffMode,
+    /// Per-category algorithm overrides from TOML `[preferred_algorithms]` or CLI flags.
+    #[serde(default)]
+    preferred_algorithms: AlgorithmPreferences,
 }
 
 impl Config {
@@ -112,6 +142,7 @@ impl Default for Config {
             nat_warmup: false,
             nat_warmup_count: Self::default_nat_warmup_count(),
             diff_mode: DiffMode::default(),
+            preferred_algorithms: AlgorithmPreferences::default(),
         }
     }
 }
@@ -143,6 +174,10 @@ impl KexConfig for Config {
 
     fn diff_mode(&self) -> DiffMode {
         self.diff_mode
+    }
+
+    fn preferred_algorithms(&self) -> AlgorithmList {
+        self.preferred_algorithms.clone().into_algorithm_list()
     }
 }
 

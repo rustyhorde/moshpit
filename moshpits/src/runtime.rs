@@ -405,11 +405,13 @@ async fn handle_connection(
     let nak_received_count = Arc::new(AtomicU64::new(0));
     let nak_received_count_for_mtu = nak_received_count.clone();
     let last_rx_us = Arc::new(AtomicU64::new(now_micros()));
+    let mac_tag_len = kex.mac_tag_len();
     let mut udp_reader = UdpReader::builder()
         .socket(udp_recv)
         .id(kex.uuid())
-        .hmac(kex.hmac_key())
-        .rnk(kex.key())?
+        .hmac(kex.build_hmac())
+        .rnk(kex.build_rnk()?)
+        .mac_tag_len(mac_tag_len)
         .nak_out_tx(data_tx.clone())
         .retransmit_tx(retransmit_tx)
         .peer_discovered_tx(peer_discovered_tx)
@@ -426,8 +428,8 @@ async fn handle_connection(
         .rx(data_rx)
         .retransmit_rx(retransmit_rx)
         .id(kex.uuid())
-        .hmac(kex.hmac_key())
-        .rnk(kex.key())?
+        .hmac(kex.build_hmac())
+        .rnk(kex.build_rnk()?)
         .peer_discovered_rx(peer_discovered_rx)
         .peer_addr_rx(peer_addr_rx)
         .maybe_warmup_delay(warmup_delay)

@@ -11,7 +11,6 @@ use std::io::Cursor;
 use anyhow::Result;
 use aws_lc_rs::{
     aead::{AES_256_GCM_SIV, Aad, Nonce, RandomizedNonceKey},
-    digest::SHA512_OUTPUT_LEN,
     error::Unspecified,
     hmac::{Key, verify},
 };
@@ -131,6 +130,7 @@ impl EncryptedFrame {
         id: Uuid,
         hmac: &Key,
         rnk: &RandomizedNonceKey,
+        mac_tag_len: usize,
     ) -> Result<Option<(Self, u64)>> {
         let Some(nonce_bytes) = get_nonce(src)? else {
             return Ok(None);
@@ -139,7 +139,7 @@ impl EncryptedFrame {
             return Ok(None);
         };
         let seq = u64::from_be_bytes(seq_bytes.try_into()?);
-        if let Some(tag_bytes) = get_bytes(src, SHA512_OUTPUT_LEN)?
+        if let Some(tag_bytes) = get_bytes(src, mac_tag_len)?
             && let Some(length_slice) = get_usize(src)?
         {
             let length = usize::from_be_bytes(length_slice.try_into()?);
@@ -262,7 +262,7 @@ mod tests {
         let ts = 1_234_567_890_u64;
         let packet = encrypt_frame(&EncryptedFrame::Keepalive(ts), 0, id, &rnk, &hmac);
         let mut cursor = Cursor::new(packet.as_slice());
-        let (parsed_frame, seq) = EncryptedFrame::parse(&mut cursor, id, &hmac, &rnk)
+        let (parsed_frame, seq) = EncryptedFrame::parse(&mut cursor, id, &hmac, &rnk, 64)
             .unwrap()
             .unwrap();
         assert_eq!(parsed_frame, EncryptedFrame::Keepalive(ts));
@@ -274,7 +274,7 @@ mod tests {
         let (id, rnk, hmac) = make_keys();
         let packet = encrypt_frame(&EncryptedFrame::Shutdown, 42, id, &rnk, &hmac);
         let mut cursor = Cursor::new(packet.as_slice());
-        let (parsed_frame, seq) = EncryptedFrame::parse(&mut cursor, id, &hmac, &rnk)
+        let (parsed_frame, seq) = EncryptedFrame::parse(&mut cursor, id, &hmac, &rnk, 64)
             .unwrap()
             .unwrap();
         assert_eq!(parsed_frame, EncryptedFrame::Shutdown);
@@ -286,7 +286,7 @@ mod tests {
         let (id, rnk, hmac) = make_keys();
         let packet = [0u8; 4];
         let mut cursor = Cursor::new(packet.as_slice());
-        let result = EncryptedFrame::parse(&mut cursor, id, &hmac, &rnk).unwrap();
+        let result = EncryptedFrame::parse(&mut cursor, id, &hmac, &rnk, 64).unwrap();
         assert!(result.is_none());
     }
 
@@ -296,7 +296,7 @@ mod tests {
         let packet = encrypt_frame(&EncryptedFrame::Keepalive(0), 0, id, &rnk, &hmac);
         let wrong_id = Uuid::new_v4();
         let mut cursor = Cursor::new(packet.as_slice());
-        let result = EncryptedFrame::parse(&mut cursor, wrong_id, &hmac, &rnk);
+        let result = EncryptedFrame::parse(&mut cursor, wrong_id, &hmac, &rnk, 64);
         assert!(result.is_err());
     }
 
@@ -331,7 +331,7 @@ mod tests {
         packet.extend_from_slice(&encrypted_part);
 
         let mut cursor = Cursor::new(packet.as_slice());
-        let result = EncryptedFrame::parse(&mut cursor, id, &hmac, &rnk);
+        let result = EncryptedFrame::parse(&mut cursor, id, &hmac, &rnk, 64);
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err().to_string(),

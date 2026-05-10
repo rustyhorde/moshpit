@@ -138,6 +138,65 @@ pub(crate) struct Cli {
     )]
     #[getset(get = "pub(crate)")]
     diff_mode: String,
+    /// Ordered KEX algorithms to offer (comma-separated).
+    /// Example: `--kex-algos x25519-sha256,p256-sha256`
+    #[clap(
+        long,
+        value_name = "ALGOS",
+        help = "Ordered KEX algorithms to offer, comma-separated [supported: x25519-sha256 (default), p384-sha384, p256-sha256]"
+    )]
+    #[getset(get = "pub(crate)")]
+    kex_algos: Option<String>,
+    /// Ordered AEAD algorithms to offer (comma-separated).
+    /// Example: `--aead-algos chacha20-poly1305,aes256-gcm-siv`
+    #[clap(
+        long,
+        value_name = "ALGOS",
+        help = "Ordered AEAD algorithms to offer, comma-separated [supported: aes256-gcm-siv (default), aes256-gcm, chacha20-poly1305, aes128-gcm-siv]"
+    )]
+    #[getset(get = "pub(crate)")]
+    aead_algos: Option<String>,
+    /// Ordered MAC algorithms to offer (comma-separated).
+    /// Example: `--mac-algos hmac-sha256`
+    #[clap(
+        long,
+        value_name = "ALGOS",
+        help = "Ordered MAC algorithms to offer, comma-separated [supported: hmac-sha512 (default), hmac-sha256]"
+    )]
+    #[getset(get = "pub(crate)")]
+    mac_algos: Option<String>,
+    /// Ordered KDF algorithms to offer (comma-separated).
+    /// Example: `--kdf-algos hkdf-sha512`
+    #[clap(
+        long,
+        value_name = "ALGOS",
+        help = "Ordered KDF algorithms to offer, comma-separated [supported: hkdf-sha256 (default), hkdf-sha384, hkdf-sha512]"
+    )]
+    #[getset(get = "pub(crate)")]
+    kdf_algos: Option<String>,
+}
+
+fn build_algo_table(
+    kex: Option<&str>,
+    aead: Option<&str>,
+    mac: Option<&str>,
+    kdf: Option<&str>,
+) -> Option<Map<String, Value>> {
+    let mut table = Map::new();
+    let parse = |s: &str| -> Vec<Value> {
+        s.split(',')
+            .map(|a| Value::new(None, ValueKind::String(a.trim().to_string())))
+            .collect()
+    };
+    for (key, opt) in [("kex", kex), ("aead", aead), ("mac", mac), ("kdf", kdf)] {
+        if let Some(s) = opt {
+            let _old = table.insert(
+                key.to_string(),
+                Value::new(None, ValueKind::Array(parse(s))),
+            );
+        }
+    }
+    (!table.is_empty()).then_some(table)
 }
 
 impl Source for Cli {
@@ -210,6 +269,17 @@ impl Source for Cli {
             "diff_mode".to_string(),
             Value::new(Some(&origin), ValueKind::String(self.diff_mode.clone())),
         );
+        if let Some(table) = build_algo_table(
+            self.kex_algos.as_deref(),
+            self.aead_algos.as_deref(),
+            self.mac_algos.as_deref(),
+            self.kdf_algos.as_deref(),
+        ) {
+            let _old = map.insert(
+                "preferred_algorithms".to_string(),
+                Value::new(Some(&origin), ValueKind::Table(table)),
+            );
+        }
         Ok(map)
     }
 }

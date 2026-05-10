@@ -37,7 +37,7 @@ moshpit draws its core motivation from [Mosh (Mobile Shell)](https://mosh.org/),
 | **Transport model** | Pure UDP after setup; Mosh's *State Synchronization Protocol* (SSP) keeps a diff of the full terminal screen state and sends only the latest snapshot | TCP is used solely for the ed25519 key exchange; all terminal I/O runs over UDP after the exchange completes.  NAK-based selective retransmission with an adaptive RTT estimator ensures reliable, ordered delivery; a split data/control channel prevents control frames from being delayed by PTY data backlogs |
 | **Reconnect display sync** | SSP sends the latest screen snapshot; client repaints from the diff immediately | Server maintains a `vt100::Parser` tracking the live PTY screen; on reconnect a single `ScreenState` frame delivers `contents_formatted()` bytes for an instant clean repaint.  A 50 ms periodic task also sends `ScreenState` diffs during normal use so the client stays in sync even across network hiccups. |
 | **Client-side prediction** | Mosh echoes keystrokes locally and predicts cursor movement to hide latency, underlining characters that have not yet been confirmed by the server | Same — keystrokes are echoed locally, cursor movement is predicted, and unconfirmed characters are underlined until the server output arrives |
-| **Encryption** | AES-128-OCB authenticated encryption using a symmetric session key | Key exchange via an ed25519-based handshake; symmetric AES-256-GCM-SIV on the UDP channel with per-packet HMAC-SHA-512 authentication |
+| **Encryption** | AES-128-OCB authenticated encryption using a symmetric session key | Key exchange via an ed25519-based handshake; negotiated symmetric encryption on the UDP channel (default: AES-256-GCM-SIV with per-packet HMAC-SHA-512; see [Algorithm negotiation](#algorithm-negotiation)) |
 | **Session multiplexing** | One Mosh session per `mosh-server` process | Same — one PTY per `mps` connection |
 | **Configuration** | Minimal; primarily driven by command-line options | TOML config files with environment-variable overrides |
 | **UDP port range** | 60001–61000 (by default) | 50000–59999 |
@@ -55,7 +55,7 @@ The client opens a TCP connection to the server's configured port (default 40404
 
 ### Phase 2 — UDP session
 
-All subsequent communication happens exclusively over UDP (server-side port range 50000–59999).  Every frame is encrypted with AES-256-GCM-SIV and authenticated with a per-packet HMAC-SHA-512.
+All subsequent communication happens exclusively over UDP (server-side port range 50000–59999).  Every frame is encrypted and authenticated using the algorithms negotiated during Phase 1 (default: AES-256-GCM-SIV with per-packet HMAC-SHA-512; see [Algorithm negotiation](#algorithm-negotiation) for the full list of supported ciphers and how to select them).
 
 Reliable, ordered delivery is provided at the application layer using **NAK-based selective retransmission**:
 
@@ -70,6 +70,57 @@ Because retransmission is handled entirely within the UDP layer there is no head
 ### Reconnection
 
 If the UDP path is interrupted the client automatically reconnects — performing a new TCP key exchange for the same logical session — and the server delivers a single `ScreenState` frame containing the current terminal contents so the display repaints instantly without replaying scrollback history.
+
+### NAT roaming
+
+If the client's IP address or UDP port changes mid-session (e.g. a mobile device switching networks), the server detects the new source address on the first authenticated packet it receives from that address and immediately redirects all subsequent outbound traffic there.  No reconnect or re-authentication is required; the session continues without interruption.
+
+---
+
+## Algorithm negotiation
+
+Both sides exchange algorithm preferences in a `KexInit` frame at the start of the TCP handshake.  The server's preference order wins: the first algorithm the server lists that the client also supports is selected for each category.  All four categories are negotiated independently.
+
+### Supported algorithms
+
+| Category | Algorithm | Identifier | Notes |
+|----------|-----------|------------|-------|
+| **KEX** | X25519 + HKDF-SHA-256 | `x25519-sha256` | Default — fastest, widely deployed |
+| | NIST P-384 + HKDF-SHA-384 | `p384-sha384` | Higher security margin |
+| | NIST P-256 + HKDF-SHA-256 | `p256-sha256` | FIPS-compliant environments |
+| **AEAD** | AES-256-GCM-SIV | `aes256-gcm-siv` | Default — nonce-misuse resistant |
+| | AES-256-GCM | `aes256-gcm` | Standard GCM |
+| | ChaCha20-Poly1305 | `chacha20-poly1305` | Fast on CPUs without AES hardware |
+| | AES-128-GCM-SIV | `aes128-gcm-siv` | Smaller key (16 bytes) |
+| **MAC** | HMAC-SHA-512 | `hmac-sha512` | Default — 64-byte tag |
+| | HMAC-SHA-256 | `hmac-sha256` | 32-byte tag (saves 32 bytes/packet) |
+| **KDF** | HKDF-SHA-256 | `hkdf-sha256` | Default |
+| | HKDF-SHA-384 | `hkdf-sha384` | Natural pairing with P-384 KEX |
+| | HKDF-SHA-512 | `hkdf-sha512` | Higher security margin |
+
+### Configuring algorithm preferences
+
+Use the `--kex-algos`, `--aead-algos`, `--mac-algos`, and `--kdf-algos` flags to override one or more categories.  Unspecified categories use the full default preference list.  Values are comma-separated, most-preferred first.
+
+```bash
+# Client: prefer ChaCha20-Poly1305 for AEAD (e.g. no AES-NI on this machine)
+mp --aead-algos chacha20-poly1305,aes256-gcm-siv user@192.168.1.10
+
+# Client: request the P-384 key exchange and HMAC-SHA-256 to reduce packet overhead
+mp --kex-algos p384-sha384 --mac-algos hmac-sha256 user@192.168.1.10
+
+# Server: prefer P-384 for all connections (overrides client preference ordering)
+mps --kex-algos p384-sha384,x25519-sha256,p256-sha256
+```
+
+Algorithm preferences can also be set in the TOML config file.  Only the categories you list are overridden; omitted categories fall back to the defaults.
+
+```toml
+# Prefer ChaCha20 and reduce MAC overhead — server config
+[preferred_algorithms]
+aead = ["chacha20-poly1305", "aes256-gcm-siv"]
+mac  = ["hmac-sha256", "hmac-sha512"]
+```
 
 ---
 
@@ -275,6 +326,10 @@ Options:
                                        [default: 1000]
       --term-type <TERM>               TERM environment variable for spawned shells
                                        [default: xterm-256color]
+      --kex-algos <ALGOS>              Ordered KEX algorithms to prefer, comma-separated
+      --aead-algos <ALGOS>             Ordered AEAD algorithms to prefer, comma-separated
+      --mac-algos <ALGOS>              Ordered MAC algorithms to prefer, comma-separated
+      --kdf-algos <ALGOS>              Ordered KDF algorithms to prefer, comma-separated
   -h, --help                           Print help
   -V, --version                        Print version
 ```
@@ -300,6 +355,12 @@ mps --term-type screen-256color
 
 # Tune for NAT devices with high warmup delay and packet pacing
 mps --warmup-delay-ms 200 --pacing-delay-us 2000
+
+# Prefer P-384 key exchange and ChaCha20 for all sessions
+mps --kex-algos p384-sha384,x25519-sha256 --aead-algos chacha20-poly1305,aes256-gcm-siv
+
+# Reduce per-packet overhead by preferring HMAC-SHA-256 (32-byte tag vs 64-byte)
+mps --mac-algos hmac-sha256,hmac-sha512
 ```
 
 ### moshpits configuration
@@ -342,6 +403,17 @@ term_type = "xterm-256color"
 # PTY read batch. Spreads back-to-back packets to prevent burst loss on stateful
 # NAT devices. Default: 1000 (1 ms). Set to 0 to disable pacing.
 # pacing_delay_us = 1000
+
+# ── Algorithm preferences (optional) ─────────────────────────────────────────
+# Override the server's preferred algorithm order.  The server's order wins
+# during negotiation — the first algorithm from this list that the connecting
+# client also supports is selected.  Omitted categories use the built-in defaults.
+#
+# [preferred_algorithms]
+# kex  = ["x25519-sha256", "p384-sha384", "p256-sha256"]
+# aead = ["aes256-gcm-siv", "aes256-gcm", "chacha20-poly1305", "aes128-gcm-siv"]
+# mac  = ["hmac-sha512", "hmac-sha256"]
+# kdf  = ["hkdf-sha256", "hkdf-sha384", "hkdf-sha512"]
 
 # ── Tracing (log output) ──────────────────────────────────────────────────────
 # stdout layer — controls the format of log lines written to stderr when
@@ -439,6 +511,10 @@ Options:
       --nat-warmup                     Send NAT warmup keepalives at UDP session start
       --nat-warmup-count <N>           Number of NAT warmup keepalives to send
                                        [default: 3]
+      --kex-algos <ALGOS>              Ordered KEX algorithms to offer, comma-separated
+      --aead-algos <ALGOS>             Ordered AEAD algorithms to offer, comma-separated
+      --mac-algos <ALGOS>              Ordered MAC algorithms to offer, comma-separated
+      --kdf-algos <ALGOS>              Ordered KDF algorithms to offer, comma-separated
   -h, --help                           Print help
   -V, --version                        Print version
 ```
@@ -469,9 +545,13 @@ mp --nat-warmup --nat-warmup-count 5 192.168.1.10
 
 # Force prediction always on
 mp --predict always user@remote-server.com
-```
-```
 
+# Use ChaCha20-Poly1305 when connecting from a device without AES hardware
+mp --aead-algos chacha20-poly1305,aes256-gcm-siv user@remote-server.com
+
+# Prefer P-384 and save bandwidth with a smaller MAC tag
+mp --kex-algos p384-sha384 --mac-algos hmac-sha256 user@remote-server.com
+```
 ### moshpit configuration
 
 **Default config file**: `~/.config/moshpit/moshpit.toml`  
@@ -509,6 +589,17 @@ predict = "adaptive"
 # Only useful on NAT paths; adds one round-trip of startup latency.
 nat_warmup = false
 nat_warmup_count = 3  # Number of keepalive frames to send (default: 3)
+
+# ── Algorithm preferences (optional) ─────────────────────────────────────────
+# Override the algorithms this client offers during negotiation.  The server's
+# preference order wins, but the server can only pick from what you offer here.
+# Omitted categories use the built-in defaults.
+#
+# [preferred_algorithms]
+# kex  = ["x25519-sha256", "p384-sha384", "p256-sha256"]
+# aead = ["chacha20-poly1305", "aes256-gcm-siv"]  # prefer ChaCha on this device
+# mac  = ["hmac-sha256", "hmac-sha512"]            # save 32 bytes per packet
+# kdf  = ["hkdf-sha256", "hkdf-sha384", "hkdf-sha512"]
 
 # ── Tracing (log output) ──────────────────────────────────────────────────────
 [tracing.stdout]
