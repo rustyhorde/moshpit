@@ -19,7 +19,7 @@ use anyhow::Result;
 use clap::Parser as _;
 use dialoguer::{Confirm, Input, Password};
 use libmoshpit::{
-    KexMode, KeyPair, KEY_ALGORITHM_P256, KEY_ALGORITHM_P384, KEY_ALGORITHM_X25519,
+    KEY_ALGORITHM_P256, KEY_ALGORITHM_P384, KEY_ALGORITHM_X25519, KexMode, KeyPair,
     extract_public_key_bytes, fingerprint,
 };
 
@@ -45,7 +45,13 @@ where
             force,
             server,
             key_type,
-        } => generate_keypair(*no_passphrase, output_path.as_deref(), *force, *server, key_type),
+        } => generate_keypair(
+            *no_passphrase,
+            output_path.as_deref(),
+            *force,
+            *server,
+            key_type,
+        ),
         Commands::Verify {
             randomart: _,
             signature: _,
@@ -334,7 +340,9 @@ mod tests {
         let pub_path = dir.join("key.pub");
 
         let secret = "secret".to_string();
-        let keypair = KeyPair::generate_key_pair(Some(&secret), KexMode::Client, KEY_ALGORITHM_X25519).unwrap();
+        let keypair =
+            KeyPair::generate_key_pair(Some(&secret), KexMode::Client, KEY_ALGORITHM_X25519)
+                .unwrap();
         generate_and_write_keys_inner(&priv_path, &pub_path, &keypair).unwrap();
 
         assert!(priv_path.exists());

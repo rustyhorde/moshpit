@@ -264,7 +264,8 @@ impl KeyPair {
         let public_key = priv_key.compute_public_key()?;
 
         // Setup the encoded public key
-        let (public_key_bytes, public_key_encoded) = generate_public_key(key_alg, public_key.as_ref())?;
+        let (public_key_bytes, public_key_encoded) =
+            generate_public_key(key_alg, public_key.as_ref())?;
 
         // Setup the encoded private key — extract raw bytes based on algorithm family
         let mut priv_key_bytes = if key_alg == KEY_ALGORITHM_X25519 {
@@ -274,8 +275,12 @@ impl KeyPair {
             let bytes: EcPrivateKeyBin<'_> = priv_key.as_be_bytes()?;
             bytes.as_ref().to_vec()
         };
-        let private_key_encoded =
-            generate_private_key(&mut priv_key_bytes, public_key.as_ref(), passphrase_opt, key_alg)?;
+        let private_key_encoded = generate_private_key(
+            &mut priv_key_bytes,
+            public_key.as_ref(),
+            passphrase_opt,
+            key_alg,
+        )?;
 
         Ok(KeyPair {
             private_key: private_key_encoded,
@@ -523,8 +528,7 @@ pub fn load_public_key(pub_key_path: &PathBuf) -> Result<(Vec<u8>, Vec<u8>)> {
     // Parse the public key file
     let mut public_key_bytes = BytesMut::from(&decoded[..]);
     let key_alg = get_val_by_len(&mut public_key_bytes)?;
-    let key_alg_str = std::str::from_utf8(&key_alg)
-        .map_err(|_| MoshpitError::InvalidKeyHeader)?;
+    let key_alg_str = std::str::from_utf8(&key_alg).map_err(|_| MoshpitError::InvalidKeyHeader)?;
     match key_alg_str {
         KEY_ALGORITHM_X25519 | KEY_ALGORITHM_P384 | KEY_ALGORITHM_P256 => {}
         _ => return Err(MoshpitError::InvalidKeyHeader.into()),
@@ -560,8 +564,7 @@ pub fn load_private_key(
     let cipher = get_val_by_len(&mut private_key_bytes)?;
     let kdf = get_val_by_len(&mut private_key_bytes)?;
     let key_alg = get_val_by_len(&mut private_key_bytes)?;
-    let key_alg_str = std::str::from_utf8(&key_alg)
-        .map_err(|_| MoshpitError::InvalidKeyHeader)?;
+    let key_alg_str = std::str::from_utf8(&key_alg).map_err(|_| MoshpitError::InvalidKeyHeader)?;
     let agreement_alg: &aws_lc_rs::agreement::Algorithm = match key_alg_str {
         KEY_ALGORITHM_X25519 => &X25519,
         KEY_ALGORITHM_P384 => &ECDH_P384,

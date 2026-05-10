@@ -534,7 +534,10 @@ async fn run_server_kex<T: KexConfig>(
     let port_pool_opt = config.port_pool();
     let (_private_key_path, public_key_path) = config.key_pair_paths()?;
     let session_registry = config.session_registry();
-    trace!("Loading identity public key from {}", public_key_path.display());
+    trace!(
+        "Loading identity public key from {}",
+        public_key_path.display()
+    );
 
     // Setup the TCP frame reader
     let tx_c = tx.clone();
@@ -548,12 +551,7 @@ async fn run_server_kex<T: KexConfig>(
         .build();
     if let Some(port_pool) = port_pool_opt {
         let (skex, udp_arc) = frame_reader
-            .server_kex(
-                socket_addr,
-                port_pool,
-                &public_key_path,
-                session_registry,
-            )
+            .server_kex(socket_addr, port_pool, &public_key_path, session_registry)
             .await?;
         Ok((kex_handle.await??, udp_arc, Some(skex)))
     } else {
