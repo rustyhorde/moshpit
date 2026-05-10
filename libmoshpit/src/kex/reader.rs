@@ -18,8 +18,8 @@ use std::{
 use anyhow::Result;
 use aws_lc_rs::{
     aead::{
-        AES_128_GCM_SIV, AES_256_GCM, AES_256_GCM_SIV, Aad, CHACHA20_POLY1305, Nonce,
-        RandomizedNonceKey,
+        AES_128_GCM_SIV, AES_256_GCM, AES_256_GCM_SIV, Aad, CHACHA20_POLY1305, LessSafeKey,
+        NONCE_LEN, Nonce, UnboundKey,
     },
     agreement::{
         ECDH_P256, ECDH_P384, ParsedPublicKey, PrivateKey, UnparsedPublicKey, X25519, agree,
@@ -331,9 +331,12 @@ impl KexReader {
                         .send(KexEvent::HMACKeyMaterial(hmac_key_bytes))
                         .map_err(|_| Unspecified)?;
 
-                    let rnk = RandomizedNonceKey::new(aead_alg, &key_bytes)?;
+                    let rnk = LessSafeKey::new(UnboundKey::new(aead_alg, &key_bytes)?);
                     let mut check = b"Yoda".to_vec();
-                    let nonce = rnk.seal_in_place_append_tag(Aad::empty(), &mut check)?;
+                    let mut nonce_bytes = [0u8; NONCE_LEN];
+                    fill(&mut nonce_bytes)?;
+                    let nonce = Nonce::try_assume_unique_for_key(&nonce_bytes)?;
+                    rnk.seal_in_place_append_tag(nonce, Aad::empty(), &mut check)?;
 
                     match self.diff_mode {
                         DiffMode::Datagram => self
@@ -347,7 +350,7 @@ impl KexReader {
                         DiffMode::Reliable => {}
                     }
                     self.tx
-                        .send(Frame::Check(*nonce.as_ref(), check))
+                        .send(Frame::Check(nonce_bytes, check))
                         .map_err(|_| Unspecified)?;
                     Ok(())
                 })
@@ -667,7 +670,7 @@ impl KexReader {
         negotiated: &NegotiatedAlgorithms,
         tx_event: &UnboundedSender<KexEvent>,
         public_key_path: &PathBuf,
-    ) -> Result<RandomizedNonceKey> {
+    ) -> Result<LessSafeKey> {
         let agreement_alg = resolve_kex_alg(&negotiated.kex)?;
         let hkdf_alg = resolve_hkdf_alg(&negotiated.kdf)?;
         let aead_alg = resolve_aead_alg(&negotiated.aead)?;
@@ -738,7 +741,7 @@ impl KexReader {
                 tx_event
                     .send(KexEvent::HMACKeyMaterial(hmac_key_bytes))
                     .map_err(|_| Unspecified)?;
-                let rnk = RandomizedNonceKey::new(aead_alg, &key_bytes)?;
+                let rnk = LessSafeKey::new(UnboundKey::new(aead_alg, &key_bytes)?);
                 Ok(rnk)
             },
         )?;
@@ -747,7 +750,7 @@ impl KexReader {
 
     fn handle_check(
         &mut self,
-        rnk: &RandomizedNonceKey,
+        rnk: &LessSafeKey,
         nonce_bytes: [u8; 12],
         mut check_bytes: Vec<u8>,
         tx_event: &UnboundedSender<KexEvent>,
@@ -1453,8 +1456,9 @@ mod tests {
     use std::sync::Arc as StdArc;
 
     use aws_lc_rs::{
-        aead::{AES_256_GCM_SIV, Aad, RandomizedNonceKey},
+        aead::{AES_256_GCM_SIV, Aad, LessSafeKey, NONCE_LEN, UnboundKey},
         agreement::{PrivateKey, X25519},
+        rand::fill,
     };
     use tokio::sync::Mutex as TokioMutex;
     use tokio::{
@@ -1623,17 +1627,19 @@ mod tests {
         let (mut kex_reader, mut rx_frames, _rx_events) = make_test_kex_reader(client_reader);
 
         let key_bytes = [1u8; 32];
-        let rnk = RandomizedNonceKey::new(&AES_256_GCM_SIV, &key_bytes).unwrap();
+        let rnk = LessSafeKey::new(UnboundKey::new(&AES_256_GCM_SIV, &key_bytes).unwrap());
 
         // Encrypt "Yoda" the same way client_kex does
         let mut plaintext = b"Yoda".to_vec();
-        let nonce = rnk
-            .seal_in_place_append_tag(Aad::empty(), &mut plaintext)
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        fill(&mut nonce_bytes).unwrap();
+        let nonce = aws_lc_rs::aead::Nonce::try_assume_unique_for_key(&nonce_bytes).unwrap();
+        rnk.seal_in_place_append_tag(nonce, Aad::empty(), &mut plaintext)
             .unwrap();
 
         let (tx_event_clone, _rx_event_clone) = unbounded_channel::<KexEvent>();
         kex_reader
-            .handle_check(&rnk, *nonce.as_ref(), plaintext, &tx_event_clone)
+            .handle_check(&rnk, nonce_bytes, plaintext, &tx_event_clone)
             .unwrap();
 
         // Should have sent KeyAgreement frame via kex_reader's own tx
@@ -1652,9 +1658,9 @@ mod tests {
         let (mut kex_reader, _rx_frames, _rx_events) = make_test_kex_reader(client_reader);
 
         let key_bytes = [1u8; 32];
-        let rnk = RandomizedNonceKey::new(&AES_256_GCM_SIV, &key_bytes).unwrap();
+        let rnk = LessSafeKey::new(UnboundKey::new(&AES_256_GCM_SIV, &key_bytes).unwrap());
 
-        let nonce_bytes = [0u8; 12];
+        let nonce_bytes = [0u8; NONCE_LEN];
         let garbage = vec![0u8; 32]; // not a valid ciphertext
 
         let (tx_event_clone, _) = unbounded_channel::<KexEvent>();
@@ -1799,7 +1805,7 @@ mod tests {
         let server_epk_pub = server_epk.compute_public_key().unwrap();
         let identity_key = vec![0u8; 32]; // fixed identity bytes (not used for ECDH)
         let mut salt_bytes = [0u8; 32];
-        aws_lc_rs::rand::fill(&mut salt_bytes).unwrap();
+        fill(&mut salt_bytes).unwrap();
 
         let conn_uuid = Uuid::new_v4();
         let session_uuid = Uuid::new_v4();

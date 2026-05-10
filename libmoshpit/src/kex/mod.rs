@@ -14,7 +14,9 @@ use std::{
 
 use anyhow::Result;
 use aws_lc_rs::{
-    aead::{AES_128_GCM_SIV, AES_256_GCM, AES_256_GCM_SIV, CHACHA20_POLY1305, RandomizedNonceKey},
+    aead::{
+        AES_128_GCM_SIV, AES_256_GCM, AES_256_GCM_SIV, CHACHA20_POLY1305, LessSafeKey, UnboundKey,
+    },
     agreement::{PrivateKey, X25519},
     cipher::AES_256_KEY_LEN,
     hmac::{HMAC_SHA256, HMAC_SHA512, Key},
@@ -153,28 +155,33 @@ impl Kex {
         UuidWrapper::new(self.uuid)
     }
 
-    /// Build a `RandomizedNonceKey` for UDP encryption using the negotiated AEAD algorithm.
+    /// Build a `LessSafeKey` for UDP encryption using the negotiated AEAD algorithm.
+    ///
+    /// Supports all negotiated algorithms including ChaCha20-Poly1305.  Callers are
+    /// responsible for generating a unique random nonce per packet (use
+    /// `aws_lc_rs::rand::fill` on a `[u8; NONCE_LEN]` buffer).
     ///
     /// # Errors
     /// Returns an error if the negotiated AEAD algorithm is unknown or the key bytes are invalid.
-    pub fn build_rnk(&self) -> Result<RandomizedNonceKey> {
+    pub fn build_aead_key(&self) -> Result<LessSafeKey> {
         use negotiate::{
             AEAD_AES128_GCM_SIV, AEAD_AES256_GCM, AEAD_AES256_GCM_SIV, AEAD_CHACHA20_POLY1305,
         };
-        let alg = match self.negotiated_algorithms.aead.as_str() {
-            AEAD_AES256_GCM_SIV => &AES_256_GCM_SIV,
-            AEAD_AES256_GCM => &AES_256_GCM,
-            AEAD_CHACHA20_POLY1305 => &CHACHA20_POLY1305,
-            AEAD_AES128_GCM_SIV => &AES_128_GCM_SIV,
-            _ => return Err(MoshpitError::NoCommonAlgorithm.into()),
-        };
+        let alg: &'static aws_lc_rs::aead::Algorithm =
+            match self.negotiated_algorithms.aead.as_str() {
+                AEAD_AES256_GCM_SIV => &AES_256_GCM_SIV,
+                AEAD_AES256_GCM => &AES_256_GCM,
+                AEAD_CHACHA20_POLY1305 => &CHACHA20_POLY1305,
+                AEAD_AES128_GCM_SIV => &AES_128_GCM_SIV,
+                _ => return Err(MoshpitError::NoCommonAlgorithm.into()),
+            };
         debug!(
             aead = %self.negotiated_algorithms.aead,
             key_len = self.key.len(),
             key_hex = %fmt_hex(&self.key),
-            "build_rnk: constructing RandomizedNonceKey"
+            "build_aead_key: constructing LessSafeKey"
         );
-        RandomizedNonceKey::new(alg, &self.key).map_err(Into::into)
+        Ok(LessSafeKey::new(UnboundKey::new(alg, &self.key)?))
     }
 
     /// Build an HMAC `Key` for UDP packet authentication using the negotiated MAC algorithm.

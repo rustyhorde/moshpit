@@ -10,7 +10,7 @@ use std::io::Cursor;
 
 use anyhow::Result;
 use aws_lc_rs::{
-    aead::{AES_256_GCM_SIV, Aad, Nonce, RandomizedNonceKey},
+    aead::{Aad, LessSafeKey, Nonce},
     error::Unspecified,
     hmac::{Key, verify},
 };
@@ -25,6 +25,8 @@ use crate::{
 };
 
 const UUID_LEN: usize = 16;
+/// AEAD authentication tag length for all supported ciphers (16 bytes per RFC 5116).
+const AEAD_TAG_LEN: usize = 16;
 /// The maximum size of a UDP encrypted frame ciphertext in bytes (64 KB).
 ///
 /// The ciphertext includes the 16-byte UUID prefix, the encrypted payload, and
@@ -129,7 +131,7 @@ impl EncryptedFrame {
         src: &mut Cursor<&[u8]>,
         id: Uuid,
         hmac: &Key,
-        rnk: &RandomizedNonceKey,
+        rnk: &LessSafeKey,
         mac_tag_len: usize,
     ) -> Result<Option<(Self, u64)>> {
         let Some(nonce_bytes) = get_nonce(src)? else {
@@ -163,7 +165,7 @@ impl EncryptedFrame {
                     }
                     let mut message_with_tag = rest.to_vec();
                     message_with_tag.reverse();
-                    let mut message = message_with_tag.split_off(AES_256_GCM_SIV.tag_len());
+                    let mut message = message_with_tag.split_off(AEAD_TAG_LEN);
                     message.reverse();
                     let config = standard().with_limit::<65536>();
                     let frame_data: (EncryptedFrame, _) = decode_from_slice(&message, config)?;
@@ -182,8 +184,9 @@ mod tests {
     use std::io::Cursor;
 
     use aws_lc_rs::{
-        aead::{AES_256_GCM_SIV, Aad, RandomizedNonceKey},
+        aead::{AES_256_GCM_SIV, Aad, LessSafeKey, NONCE_LEN, UnboundKey},
         hmac::{HMAC_SHA512, Key, sign},
+        rand,
     };
     use bincode_next::{config::standard, encode_to_vec};
     use uuid::Uuid;
@@ -192,9 +195,9 @@ mod tests {
 
     use super::EncryptedFrame;
 
-    fn make_keys() -> (Uuid, RandomizedNonceKey, Key) {
+    fn make_keys() -> (Uuid, LessSafeKey, Key) {
         let id = Uuid::new_v4();
-        let rnk = RandomizedNonceKey::new(&AES_256_GCM_SIV, &[1u8; 32]).unwrap();
+        let rnk = LessSafeKey::new(UnboundKey::new(&AES_256_GCM_SIV, &[1u8; 32]).unwrap());
         let hmac = Key::new(HMAC_SHA512, &[2u8; 64]);
         (id, rnk, hmac)
     }
@@ -203,15 +206,17 @@ mod tests {
         frame: &EncryptedFrame,
         seq: u64,
         id: Uuid,
-        rnk: &RandomizedNonceKey,
+        rnk: &LessSafeKey,
         hmac: &Key,
     ) -> Vec<u8> {
         let data = encode_to_vec(frame, standard()).unwrap();
         let aad = Aad::from(seq.to_be_bytes());
         let mut encrypted_part = id.as_bytes().to_vec();
         encrypted_part.extend_from_slice(&data);
-        let nonce = rnk
-            .seal_in_place_append_tag(aad, &mut encrypted_part)
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        rand::fill(&mut nonce_bytes).unwrap();
+        let nonce = aws_lc_rs::aead::Nonce::try_assume_unique_for_key(&nonce_bytes).unwrap();
+        rnk.seal_in_place_append_tag(nonce, aad, &mut encrypted_part)
             .unwrap();
         let seq_bytes = seq.to_be_bytes();
         let mut to_sign = seq_bytes.to_vec();
@@ -219,7 +224,7 @@ mod tests {
         let tag = sign(hmac, &to_sign);
         let tag_bytes: [u8; 64] = tag.as_ref().try_into().unwrap();
         let len = encrypted_part.len().to_be_bytes();
-        let mut packet = nonce.as_ref().to_vec();
+        let mut packet = nonce_bytes.to_vec();
         packet.extend_from_slice(&seq_bytes);
         packet.extend_from_slice(&tag_bytes);
         packet.extend_from_slice(&len);
@@ -269,6 +274,53 @@ mod tests {
         assert_eq!(seq, 0);
     }
 
+    /// Verify that two independent `RandomizedNonceKey` instances constructed from the
+    /// same key bytes can cross-encrypt/decrypt — this mirrors the real system where the
+    /// UDP sender and UDP reader each hold separate instances.  Tested for each
+    /// supported AEAD algorithm to catch per-algorithm regressions.
+    /// Verify that two independent `LessSafeKey` instances constructed from the
+    /// same key bytes can cross-encrypt/decrypt — this mirrors the real system where the
+    /// UDP sender and UDP reader each hold separate instances.  Tested for each
+    /// supported AEAD algorithm to catch per-algorithm regressions.
+    #[test]
+    fn parse_round_trip_all_aead_algorithms_separate_key_instances() {
+        use aws_lc_rs::aead::{AES_128_GCM_SIV, AES_256_GCM, CHACHA20_POLY1305};
+
+        let algorithms: &[(&aws_lc_rs::aead::Algorithm, &[u8])] = &[
+            (&AES_256_GCM_SIV, &[1u8; 32]),
+            (&AES_256_GCM, &[2u8; 32]),
+            (&CHACHA20_POLY1305, &[3u8; 32]),
+            (&AES_128_GCM_SIV, &[4u8; 16]),
+        ];
+
+        for (alg, key_bytes) in algorithms {
+            eprintln!("testing alg={alg:?} key_len={}", key_bytes.len());
+            let id = Uuid::new_v4();
+            let hmac = Key::new(HMAC_SHA512, &[5u8; 64]);
+            // Two independent LessSafeKey instances from the same key — one for encrypt, one for decrypt.
+            let enc_key = LessSafeKey::new(
+                UnboundKey::new(alg, key_bytes)
+                    .unwrap_or_else(|e| panic!("enc_key creation failed for {alg:?}: {e:?}")),
+            );
+            let dec_key = LessSafeKey::new(
+                UnboundKey::new(alg, key_bytes)
+                    .unwrap_or_else(|e| panic!("dec_key creation failed for {alg:?}: {e:?}")),
+            );
+
+            let ts = 42_u64;
+            let packet = encrypt_frame(&EncryptedFrame::Keepalive(ts), 7, id, &enc_key, &hmac);
+            let mut cursor = Cursor::new(packet.as_slice());
+            let result = EncryptedFrame::parse(&mut cursor, id, &hmac, &dec_key, 64);
+            let (parsed_frame, seq) = match result {
+                Ok(Some(inner)) => inner,
+                Ok(None) => panic!("parse returned None for algorithm {alg:?}"),
+                Err(e) => panic!("parse failed for algorithm {alg:?}: {e}"),
+            };
+            assert_eq!(parsed_frame, EncryptedFrame::Keepalive(ts), "wrong frame for {alg:?}");
+            assert_eq!(seq, 7, "wrong seq for {alg:?}");
+        }
+    }
+
     #[test]
     fn parse_round_trip_shutdown() {
         let (id, rnk, hmac) = make_keys();
@@ -312,8 +364,10 @@ mod tests {
         let mut encrypted_part = id.as_bytes().to_vec();
         // Add fake payload to match length
         encrypted_part.extend_from_slice(&[0u8; 10]);
-        let nonce = rnk
-            .seal_in_place_append_tag(aad, &mut encrypted_part)
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        rand::fill(&mut nonce_bytes).unwrap();
+        let nonce = aws_lc_rs::aead::Nonce::try_assume_unique_for_key(&nonce_bytes).unwrap();
+        rnk.seal_in_place_append_tag(nonce, aad, &mut encrypted_part)
             .unwrap();
 
         let seq_bytes = seq.to_be_bytes();
@@ -324,7 +378,7 @@ mod tests {
 
         let len = oversized_len.to_be_bytes(); // Oversized!
 
-        let mut packet = nonce.as_ref().to_vec();
+        let mut packet = nonce_bytes.to_vec();
         packet.extend_from_slice(&seq_bytes);
         packet.extend_from_slice(&tag_bytes);
         packet.extend_from_slice(&len);

@@ -844,7 +844,7 @@ async fn run_udp_session(
         .socket(udp_arc.clone())
         .id(kex.uuid())
         .hmac(kex.build_hmac())
-        .rnk(kex.build_rnk()?)
+        .rnk(kex.build_aead_key()?)
         .mac_tag_len(mac_tag_len)
         .nak_out_tx(tx.clone())
         .retransmit_tx(retransmit_tx)
@@ -862,7 +862,7 @@ async fn run_udp_session(
         .retransmit_rx(retransmit_rx)
         .id(kex.uuid())
         .hmac(kex.build_hmac())
-        .rnk(kex.build_rnk()?)
+        .rnk(kex.build_aead_key()?)
         .diff_mode(diff_mode)
         .build();
 
