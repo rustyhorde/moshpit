@@ -23,6 +23,15 @@ use aws_lc_rs::{
     hkdf::{HKDF_SHA512, Salt},
     rand::fill,
 };
+#[cfg(feature = "pq-dsa-unstable")]
+use aws_lc_rs::{
+    encoding::AsRawBytes as _,
+    signature::KeyPair as _,
+    unstable::signature::{
+        ML_DSA_44_SIGNING, ML_DSA_65_SIGNING, ML_DSA_87_SIGNING, PqdsaKeyPair,
+        PqdsaSigningAlgorithm,
+    },
+};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bytes::{Buf as _, BytesMut};
 use getset::Getters;
@@ -39,10 +48,46 @@ pub const KEY_ALGORITHM_X25519: &str = "X25519";
 pub const KEY_ALGORITHM_P384: &str = "P384";
 /// The key algorithm string for ECDH P-256 keys.
 pub const KEY_ALGORITHM_P256: &str = "P256";
+/// The experimental key algorithm string for ML-DSA-44 identity keys.
+#[cfg(feature = "pq-dsa-unstable")]
+pub const KEY_ALGORITHM_ML_DSA_44: &str = "ML-DSA-44";
+/// The experimental key algorithm string for ML-DSA-65 identity keys.
+#[cfg(feature = "pq-dsa-unstable")]
+pub const KEY_ALGORITHM_ML_DSA_65: &str = "ML-DSA-65";
+/// The experimental key algorithm string for ML-DSA-87 identity keys.
+#[cfg(feature = "pq-dsa-unstable")]
+pub const KEY_ALGORITHM_ML_DSA_87: &str = "ML-DSA-87";
 const NONE_CIPHER: &str = "none";
 const NONE_KDF: &str = "none";
 const KEY_CIPHER: &str = "aes-256-gcm-siv";
 const HKDF_INFO: &[&[u8]] = &[b"moshpit HKDF"];
+
+#[cfg(feature = "pq-dsa-unstable")]
+fn resolve_pqdsa_signing_alg(key_alg: &str) -> Option<&'static PqdsaSigningAlgorithm> {
+    match key_alg {
+        KEY_ALGORITHM_ML_DSA_44 => Some(&ML_DSA_44_SIGNING),
+        KEY_ALGORITHM_ML_DSA_65 => Some(&ML_DSA_65_SIGNING),
+        KEY_ALGORITHM_ML_DSA_87 => Some(&ML_DSA_87_SIGNING),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "pq-dsa-unstable")]
+fn is_pqdsa_key_algorithm(key_alg: &str) -> bool {
+    resolve_pqdsa_signing_alg(key_alg).is_some()
+}
+
+#[cfg(not(feature = "pq-dsa-unstable"))]
+fn is_pqdsa_key_algorithm(_key_alg: &str) -> bool {
+    false
+}
+
+fn is_supported_key_algorithm(key_alg: &str) -> bool {
+    matches!(
+        key_alg,
+        KEY_ALGORITHM_X25519 | KEY_ALGORITHM_P384 | KEY_ALGORITHM_P256
+    ) || is_pqdsa_key_algorithm(key_alg)
+}
 
 /// The AEAD cipher algorithms supported by moshpit key generation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -117,12 +162,26 @@ pub struct EncryptedKeyPair {
     kdf: String,
     /// The public key half of the key pair.
     public_key: Vec<u8>,
+    /// The key algorithm string stored in the key file.
+    key_algorithm: String,
     /// The HMAC salt bytes used to extend the passphrase into key material.
     salt_bytes: Vec<u8>,
     /// The nonce bytes used for AEAD encryption/decryption.
     nonce_bytes: Vec<u8>,
     /// The encrypted private key bytes.
     encrypted_private_key_bytes: Vec<u8>,
+}
+
+/// Algorithm-aware identity key material loaded from a moshpit private key file.
+#[derive(Debug, Getters)]
+#[getset(get = "pub")]
+pub struct IdentityKeyPair {
+    /// The key algorithm string stored in the key file.
+    key_algorithm: String,
+    /// The public key half of the key pair.
+    public_key: Vec<u8>,
+    /// The private key bytes after decryption, if encrypted.
+    private_key: Vec<u8>,
 }
 
 /// A moshpit key pair consisting of a private and public key.
@@ -249,6 +308,23 @@ impl KeyPair {
             return Err(anyhow::anyhow!(
                 "A non-empty passphrase is required to protect the private key"
             ));
+        }
+
+        #[cfg(feature = "pq-dsa-unstable")]
+        if let Some(alg) = resolve_pqdsa_signing_alg(key_alg) {
+            let key_pair = PqdsaKeyPair::generate(alg)?;
+            let public_key = key_pair.public_key().as_ref();
+            let private_key = key_pair.private_key().as_raw_bytes()?;
+            let (public_key_bytes, public_key_encoded) = generate_public_key(key_alg, public_key)?;
+            let mut priv_key_bytes = private_key.as_ref().to_vec();
+            let private_key_encoded =
+                generate_private_key(&mut priv_key_bytes, public_key, passphrase_opt, key_alg)?;
+
+            return Ok(KeyPair {
+                private_key: private_key_encoded,
+                public_key: public_key_encoded,
+                public_key_bytes,
+            });
         }
 
         // Map key_alg string to the aws-lc-rs agreement Algorithm
@@ -479,6 +555,34 @@ pub fn decrypt_private_key(
     nonce_bytes: &[u8],
     encrypted_private_key_bytes: &mut [u8],
 ) -> Result<()> {
+    let _plaintext_len = decrypt_private_key_in_place(
+        passphrase,
+        salt_bytes,
+        nonce_bytes,
+        encrypted_private_key_bytes,
+    )?;
+    Ok(())
+}
+
+fn decrypt_private_key_to_vec(
+    passphrase: &str,
+    salt_bytes: &[u8],
+    nonce_bytes: &[u8],
+    encrypted_private_key_bytes: &[u8],
+) -> Result<Vec<u8>> {
+    let mut private_key = encrypted_private_key_bytes.to_vec();
+    let plaintext_len =
+        decrypt_private_key_in_place(passphrase, salt_bytes, nonce_bytes, &mut private_key)?;
+    private_key.truncate(plaintext_len);
+    Ok(private_key)
+}
+
+fn decrypt_private_key_in_place(
+    passphrase: &str,
+    salt_bytes: &[u8],
+    nonce_bytes: &[u8],
+    encrypted_private_key_bytes: &mut [u8],
+) -> Result<usize> {
     use zeroize::Zeroize;
     // Encrypt the private key bytes with the passphrase
     let key_bytes = passphrase.as_bytes();
@@ -494,8 +598,8 @@ pub fn decrypt_private_key(
     let rnk = RandomizedNonceKey::new(&AES_256_GCM_SIV, &derived_key)?;
     derived_key.zeroize();
     let nonce = Nonce::try_assume_unique_for_key(nonce_bytes)?;
-    let _ = rnk.open_in_place(nonce, Aad::empty(), encrypted_private_key_bytes)?;
-    Ok(())
+    let plaintext = rnk.open_in_place(nonce, Aad::empty(), encrypted_private_key_bytes)?;
+    Ok(plaintext.len())
 }
 
 fn as_be_bytes(value: usize) -> Result<[u8; 4]> {
@@ -529,9 +633,8 @@ pub fn load_public_key(pub_key_path: &PathBuf) -> Result<(Vec<u8>, Vec<u8>)> {
     let mut public_key_bytes = BytesMut::from(&decoded[..]);
     let key_alg = get_val_by_len(&mut public_key_bytes)?;
     let key_alg_str = std::str::from_utf8(&key_alg).map_err(|_| MoshpitError::InvalidKeyHeader)?;
-    match key_alg_str {
-        KEY_ALGORITHM_X25519 | KEY_ALGORITHM_P384 | KEY_ALGORITHM_P256 => {}
-        _ => return Err(MoshpitError::InvalidKeyHeader.into()),
+    if !is_supported_key_algorithm(key_alg_str) {
+        return Err(MoshpitError::InvalidKeyHeader.into());
     }
     let pub_key_bytes = get_val_by_len(&mut public_key_bytes)?;
 
@@ -595,12 +698,101 @@ pub fn load_private_key(
         let encrypted_key_pair = EncryptedKeyPair {
             kdf: String::from_utf8_lossy(&kdf).to_string(),
             public_key: pub_key_bytes.to_vec(),
+            key_algorithm: key_alg_str.to_string(),
             salt_bytes: salt_bytes.to_vec(),
             nonce_bytes: nonce_bytes.to_vec(),
             encrypted_private_key_bytes: encrypted_priv_key_bytes.to_vec(),
         };
         Ok((None, Some(encrypted_key_pair)))
     }
+}
+
+/// Load and validate identity key material, decrypting it with `passphrase` when needed.
+///
+/// # Errors
+/// If the key file is missing, malformed, encrypted without a passphrase, or the
+/// public/private halves do not match.
+pub fn load_identity_key(
+    priv_key_path: &PathBuf,
+    passphrase: Option<&str>,
+) -> Result<IdentityKeyPair> {
+    let mut buffered_reader = File::open(priv_key_path)?;
+    let mut file_bytes = vec![];
+    let _len = buffered_reader.read_to_end(&mut file_bytes)?;
+    let decoded = STANDARD.decode(&file_bytes)?;
+
+    let mut private_key_bytes = BytesMut::from(&decoded[..]);
+    let magic_key = private_key_bytes.split_to(KEY_HEADER.len());
+    let magic_key_bytes = magic_key.freeze();
+    if &magic_key_bytes[..] != KEY_HEADER {
+        return Err(MoshpitError::InvalidKeyHeader.into());
+    }
+    let cipher = get_val_by_len(&mut private_key_bytes)?;
+    let kdf = get_val_by_len(&mut private_key_bytes)?;
+    let key_alg = get_val_by_len(&mut private_key_bytes)?;
+    let key_alg_str = std::str::from_utf8(&key_alg).map_err(|_| MoshpitError::InvalidKeyHeader)?;
+    if !is_supported_key_algorithm(key_alg_str) {
+        return Err(MoshpitError::InvalidKeyHeader.into());
+    }
+    let public_key = get_val_by_len(&mut private_key_bytes)?.to_vec();
+
+    let private_key = if cipher == NONE_CIPHER.as_bytes() && kdf == NONE_KDF.as_bytes() {
+        get_val_by_len(&mut private_key_bytes)?.to_vec()
+    } else {
+        let salt_bytes = get_val_by_len(&mut private_key_bytes)?;
+        let nonce_bytes = get_val_by_len(&mut private_key_bytes)?;
+        let encrypted_priv_key_bytes = get_val_by_len(&mut private_key_bytes)?;
+        let passphrase = passphrase.ok_or(MoshpitError::KeyCorrupt)?;
+        decrypt_private_key_to_vec(
+            passphrase,
+            &salt_bytes,
+            &nonce_bytes,
+            &encrypted_priv_key_bytes,
+        )?
+    };
+
+    validate_identity_key_pair(key_alg_str, &public_key, &private_key)?;
+    Ok(IdentityKeyPair {
+        key_algorithm: key_alg_str.to_string(),
+        public_key,
+        private_key,
+    })
+}
+
+/// Validate decrypted identity key material against the public key stored in the key file.
+///
+/// # Errors
+/// If the key algorithm is unsupported or the public/private halves do not match.
+pub fn validate_identity_key_pair(
+    key_alg: &str,
+    public_key: &[u8],
+    private_key: &[u8],
+) -> Result<()> {
+    let agreement_alg: Option<&aws_lc_rs::agreement::Algorithm> = match key_alg {
+        KEY_ALGORITHM_X25519 => Some(&X25519),
+        KEY_ALGORITHM_P384 => Some(&ECDH_P384),
+        KEY_ALGORITHM_P256 => Some(&ECDH_P256),
+        _ => None,
+    };
+    if let Some(agreement_alg) = agreement_alg {
+        let private_key = PrivateKey::from_private_key(agreement_alg, private_key)?;
+        let computed_public_key = private_key.compute_public_key()?;
+        if computed_public_key.as_ref() == public_key {
+            return Ok(());
+        }
+        return Err(MoshpitError::PublicKeyMismatch.into());
+    }
+
+    #[cfg(feature = "pq-dsa-unstable")]
+    if let Some(signing_alg) = resolve_pqdsa_signing_alg(key_alg) {
+        let key_pair = PqdsaKeyPair::from_raw_private_key(signing_alg, private_key)?;
+        if key_pair.public_key().as_ref() == public_key {
+            return Ok(());
+        }
+        return Err(MoshpitError::PublicKeyMismatch.into());
+    }
+
+    Err(MoshpitError::InvalidKeyHeader.into())
 }
 
 fn get_val_by_len(bytes: &mut BytesMut) -> Result<BytesMut> {
@@ -617,6 +809,8 @@ mod tests {
     use argon2::{Argon2, PasswordHash, PasswordVerifier as _};
     use base64::Engine;
 
+    #[cfg(feature = "pq-dsa-unstable")]
+    use super::load_identity_key;
     use super::{decrypt_private_key, load_private_key};
 
     // SHA256:wyKn0zB58msvX/02OmeJfcKRauGoQ2lMhdD/cKcrS6A= jozias@CachyOS
@@ -719,6 +913,33 @@ mod tests {
         assert_eq!(&cipher[..], super::NONE_CIPHER.as_bytes());
         assert_eq!(&kdf[..], super::NONE_KDF.as_bytes());
 
+        Ok(())
+    }
+
+    #[cfg(feature = "pq-dsa-unstable")]
+    #[test]
+    fn test_generate_and_load_ml_dsa_identity_key() -> Result<()> {
+        for key_alg in [
+            super::KEY_ALGORITHM_ML_DSA_44,
+            super::KEY_ALGORITHM_ML_DSA_65,
+            super::KEY_ALGORITHM_ML_DSA_87,
+        ] {
+            let key_pair = super::KeyPair::generate_key_pair(
+                None,
+                super::KexMode::Server("0.0.0.0:0".parse().unwrap()),
+                key_alg,
+            )?;
+            let dir = tempfile::TempDir::new()?;
+            let key_path = dir.path().join("id_mldsa");
+            let mut private_key = std::fs::File::create(&key_path)?;
+            key_pair.write_private_key(&mut private_key)?;
+
+            let loaded = load_identity_key(&key_path, None)?;
+            assert_eq!(loaded.key_algorithm(), key_alg);
+            assert!(!key_pair.public_key_bytes().is_empty());
+            assert!(!loaded.public_key().is_empty());
+            assert!(!loaded.private_key().is_empty());
+        }
         Ok(())
     }
 }

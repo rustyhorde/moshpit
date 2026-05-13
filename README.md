@@ -170,6 +170,9 @@ Both sides exchange algorithm preferences in a `KexInit` frame at the start of t
 | Algorithm | Identifier | Default | Pros | Cons |
 |-----------|------------|:-------:|------|------|
 | X25519 + HKDF-SHA-256 | `x25519-sha256` | ✓ | Fastest DH available; constant-time by construction; tiny 32-byte keys; 128-bit security level | Not NIST/FIPS approved; 128-bit security level (adequate but not the highest margin) |
+| ML-KEM-768 + HKDF-SHA-256 | `ml-kem-768-sha256` | | Post-quantum KEM from AWS-LC; good default PQ security/performance balance | Larger TCP handshake messages than ECDH; must be supported by both peers |
+| ML-KEM-512 + HKDF-SHA-256 | `ml-kem-512-sha256` | | Smaller/faster post-quantum KEM option | Lower security margin than ML-KEM-768/1024 |
+| ML-KEM-1024 + HKDF-SHA-256 | `ml-kem-1024-sha256` | | Highest ML-KEM security margin | Largest ML-KEM public key and ciphertext |
 | NIST P-384 + HKDF-SHA-384 | `p384-sha384` | | 192-bit security level; NIST/FIPS approved; natural pairing with HKDF-SHA-384 | Slower than X25519; larger ephemeral key sizes; unnecessary margin for most deployments |
 | NIST P-256 + HKDF-SHA-256 | `p256-sha256` | | FIPS approved; hardware TPM and HSM support; 128-bit security level | Slower than X25519; lower security margin than P-384; no advantage over X25519 outside compliance requirements |
 
@@ -351,7 +354,7 @@ To install a specific version, append `--version <x.y.z>` to any of the commands
 
 ## mp-keygen
 
-`mp-keygen` creates and inspects the asymmetric key pairs used by both the server and client.  Three key algorithms are supported: X25519 (default), P-384, and P-256.
+`mp-keygen` creates and inspects the asymmetric key pairs used by both the server and client.  Three key algorithms are supported by default: X25519, P-384, and P-256. Experimental ML-DSA identity keys are available when built with `--features pq-dsa-unstable`.
 
 ### Supported identity key algorithms
 
@@ -360,6 +363,9 @@ To install a specific version, append `--version <x.y.z>` to any of the commands
 | X25519 | `x25519` | ✓ | Fastest; constant-time by construction; 128-bit security level; recommended for most deployments |
 | NIST P-384 | `p384` | | 192-bit security level; FIPS/NIST approved; suited for high-security or compliance environments |
 | NIST P-256 | `p256` | | 128-bit security level; FIPS/NIST approved; hardware TPM/HSM support on many platforms |
+| ML-DSA-44 | `mldsa44` | | Experimental post-quantum signature identity key; requires `pq-dsa-unstable` |
+| ML-DSA-65 | `mldsa65` | | Experimental post-quantum signature identity key; requires `pq-dsa-unstable` |
+| ML-DSA-87 | `mldsa87` | | Experimental post-quantum signature identity key; requires `pq-dsa-unstable` |
 
 ### Subcommands
 

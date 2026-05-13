@@ -17,8 +17,6 @@ use aws_lc_rs::{
     aead::{
         AES_128_GCM_SIV, AES_256_GCM, AES_256_GCM_SIV, CHACHA20_POLY1305, LessSafeKey, UnboundKey,
     },
-    agreement::{PrivateKey, X25519},
-    cipher::AES_256_KEY_LEN,
     hmac::{HMAC_SHA256, HMAC_SHA512, Key},
 };
 use bon::Builder;
@@ -39,8 +37,8 @@ use uuid::Uuid;
 
 use crate::{
     ConnectionReader, ConnectionWriter, Frame, KexConfig, KexReader, KexSender, MoshpitError,
-    UuidWrapper, decrypt_private_key, kex::negotiate::NegotiatedAlgorithms, load_private_key,
-    load_public_key, udp::DiffMode,
+    UuidWrapper, kex::negotiate::NegotiatedAlgorithms, load_identity_key, load_public_key,
+    udp::DiffMode,
 };
 
 fn fmt_hex(bytes: &[u8]) -> String {
@@ -402,15 +400,6 @@ async fn run_client_kex<T: KexConfig>(
     info!("Loading private key from {}", private_key_path.display());
     info!("Loading public key from {}", public_key_path.display());
 
-    // Load the moshpit public and private key
-    let (unenc_key_pair_opt, enc_key_pair_opt) = load_private_key(&private_key_path)
-        .inspect_err(|e| {
-            error!(
-                "Failed to load private key from {}: {e}",
-                private_key_path.display()
-            );
-        })
-        .map_err(|_| MoshpitError::KeyFileMissing)?;
     let (full_public_key_bytes, public_key_bytes) = load_public_key(&public_key_path)
         .inspect_err(|e| {
             error!(
@@ -419,65 +408,42 @@ async fn run_client_kex<T: KexConfig>(
             );
         })
         .map_err(|_| MoshpitError::KeyFileMissing)?;
+    if !private_key_path.try_exists().unwrap_or(false) {
+        error!(
+            "Failed to load private key from {}: file does not exist",
+            private_key_path.display()
+        );
+        return Err(MoshpitError::KeyFileMissing.into());
+    }
 
-    let (_pk, _my_public_key) = if let Some(enc_key_pair) = enc_key_pair_opt {
-        info!("Private key is encrypted — invoking passphrase prompt");
-        // Get the passphrase
-        if let Some(passphrase) = passphrase_fn().map_err(|e| {
+    let identity_key = if let Ok(identity_key) = load_identity_key(&private_key_path, None) {
+        info!("Private key is unencrypted — no passphrase needed");
+        identity_key
+    } else {
+        info!("Private key may be encrypted — invoking passphrase prompt");
+        let passphrase = passphrase_fn().map_err(|e| {
             error!("Passphrase prompt failed: {e}");
             e
-        })? {
-            info!("Passphrase received, decrypting private key");
-            let salt_bytes = enc_key_pair.salt_bytes();
-            let nonce_bytes = enc_key_pair.nonce_bytes();
-            let mut encrypted_private_key_bytes =
-                enc_key_pair.encrypted_private_key_bytes().clone();
-            decrypt_private_key(
-                &passphrase,
-                salt_bytes,
-                nonce_bytes,
-                &mut encrypted_private_key_bytes,
-            )
-            .inspect_err(|e| {
-                error!("Private key decryption failed: {e}");
-            })
-            .map_err(|_| MoshpitError::KeyCorrupt)?;
-
-            let private_key = PrivateKey::from_private_key(
-                &X25519,
-                &encrypted_private_key_bytes[..AES_256_KEY_LEN],
-            )
-            .inspect_err(|e| {
-                error!("Failed to parse decrypted private key bytes: {e}");
-            })
-            .map_err(|_| MoshpitError::KeyCorrupt)?;
-            let public_key = private_key
-                .compute_public_key()
-                .inspect_err(|e| {
-                    error!("Failed to compute public key from decrypted private key: {e}");
-                })
-                .map_err(|_| MoshpitError::KeyCorrupt)?;
-
-            if public_key.as_ref() != public_key_bytes.as_slice() {
-                error!(
-                    "Computed public key does not match stored public key at {}",
-                    public_key_path.display()
-                );
-                return Err(MoshpitError::KeyPairMismatch.into());
-            }
-            info!("Private key decrypted and verified successfully");
-            (private_key, public_key)
-        } else {
+        })?;
+        let Some(passphrase) = passphrase else {
             error!("Passphrase prompt returned no input — cannot decrypt key");
             return Err(MoshpitError::KeyCorrupt.into());
-        }
-    } else if let Some(unenc_key_pair) = unenc_key_pair_opt {
-        info!("Private key is unencrypted — no passphrase needed");
-        unenc_key_pair.take()
-    } else {
-        error!("No valid key pair found in {}", private_key_path.display());
-        return Err(MoshpitError::KeyFileMissing.into());
+        };
+        load_identity_key(&private_key_path, Some(&passphrase))
+            .inspect_err(|e| error!("Private key validation failed: {e}"))
+            .map_err(|_| MoshpitError::KeyCorrupt)?
     };
+    if identity_key.public_key().as_slice() != public_key_bytes.as_slice() {
+        error!(
+            "Computed public key does not match stored public key at {}",
+            public_key_path.display()
+        );
+        return Err(MoshpitError::KeyPairMismatch.into());
+    }
+    info!(
+        "Private identity key ({}) verified successfully",
+        identity_key.key_algorithm()
+    );
 
     // Setup the TCP frame reader
     let tx_c = tx.clone();
@@ -492,7 +458,28 @@ async fn run_client_kex<T: KexConfig>(
     let diff_mode = config.diff_mode();
     let client_algos = config.preferred_algorithms();
     let user = config.user().unwrap_or_default();
+    #[cfg(feature = "pq-dsa-unstable")]
+    let client_identity_key_algorithm = identity_key.key_algorithm().clone();
+    #[cfg(feature = "pq-dsa-unstable")]
+    let client_identity_private_key = identity_key.private_key().clone();
     let _read_handle = spawn(async move {
+        #[cfg(feature = "pq-dsa-unstable")]
+        let mut frame_reader = KexReader::builder()
+            .reader(reader)
+            .tx(tx_c)
+            .tx_event(tx_event_c)
+            .maybe_requested_session_uuid(requested)
+            .maybe_server_destination(server_id)
+            .maybe_tofu_fn(tofu_fn)
+            .maybe_host_key_mismatch_fn(host_key_mismatch_fn)
+            .diff_mode(diff_mode)
+            .client_algos(client_algos)
+            .user(user)
+            .full_public_key_bytes(full_public_key_bytes)
+            .client_identity_key_algorithm(client_identity_key_algorithm)
+            .client_identity_private_key(client_identity_private_key)
+            .build();
+        #[cfg(not(feature = "pq-dsa-unstable"))]
         let mut frame_reader = KexReader::builder()
             .reader(reader)
             .tx(tx_c)

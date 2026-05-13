@@ -18,6 +18,8 @@ use std::os::unix::fs::DirBuilderExt;
 use anyhow::Result;
 use clap::Parser as _;
 use dialoguer::{Confirm, Input, Password};
+#[cfg(feature = "pq-dsa-unstable")]
+use libmoshpit::{KEY_ALGORITHM_ML_DSA_44, KEY_ALGORITHM_ML_DSA_65, KEY_ALGORITHM_ML_DSA_87};
 use libmoshpit::{
     KEY_ALGORITHM_P256, KEY_ALGORITHM_P384, KEY_ALGORITHM_X25519, KexMode, KeyPair,
     extract_public_key_bytes, fingerprint,
@@ -110,9 +112,19 @@ fn generate_keypair(
         "x25519" => KEY_ALGORITHM_X25519,
         "p384" => KEY_ALGORITHM_P384,
         "p256" => KEY_ALGORITHM_P256,
+        #[cfg(feature = "pq-dsa-unstable")]
+        "mldsa44" | "ml-dsa-44" => KEY_ALGORITHM_ML_DSA_44,
+        #[cfg(feature = "pq-dsa-unstable")]
+        "mldsa65" | "ml-dsa-65" => KEY_ALGORITHM_ML_DSA_65,
+        #[cfg(feature = "pq-dsa-unstable")]
+        "mldsa87" | "ml-dsa-87" => KEY_ALGORITHM_ML_DSA_87,
         other => {
+            #[cfg(feature = "pq-dsa-unstable")]
+            let valid_values = "x25519, p384, p256, mldsa44, mldsa65, mldsa87";
+            #[cfg(not(feature = "pq-dsa-unstable"))]
+            let valid_values = "x25519, p384, p256";
             return Err(anyhow::anyhow!(
-                "Unknown key type '{other}'. Valid values: x25519, p384, p256"
+                "Unknown key type '{other}'. Valid values: {valid_values}"
             ));
         }
     };

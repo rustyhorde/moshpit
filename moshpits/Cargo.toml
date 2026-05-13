@@ -19,6 +19,7 @@ path = "src/main.rs"
 
 [features]
 unstable = []
+pq-dsa-unstable = ["libmoshpit/pq-dsa-unstable"]
 
 [dependencies]
 anyhow = { workspace = true }

@@ -15,6 +15,7 @@ rust-version = "1.91.1"
 
 [features]
 unstable = []
+pq-dsa-unstable = ["aws-lc-rs/unstable"]
 
 [dependencies]
 ansi-control-codes = { version = "1.0.1", features = ["parser", "explain"] }

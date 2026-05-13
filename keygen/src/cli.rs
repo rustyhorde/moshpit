@@ -96,7 +96,7 @@ pub(crate) enum Commands {
             long,
             value_name = "TYPE",
             default_value = "x25519",
-            help = "Key algorithm: x25519 (default), p384, p256"
+            help = "Key algorithm: x25519 (default), p384, p256; with pq-dsa-unstable: mldsa44, mldsa65, mldsa87"
         )]
         key_type: String,
     },
