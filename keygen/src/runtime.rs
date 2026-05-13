@@ -130,7 +130,7 @@ fn generate_keypair(
     };
 
     // Output header
-    println!("Generating public/private ed25519 key pair.");
+    println!("Generating public/private {key_alg} identity key pair.");
 
     let mode = if server {
         KexMode::Server("0.0.0.0:0".parse().expect("hardcoded address is valid"))

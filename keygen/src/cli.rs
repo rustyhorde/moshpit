@@ -54,7 +54,7 @@ pub(crate) struct Cli {
 
 #[derive(Clone, Debug, Subcommand)]
 pub(crate) enum Commands {
-    #[clap(about = "Generate a new ed25519 public/private key pair")]
+    #[clap(about = "Generate a new identity public/private key pair")]
     Generate {
         /// Skip the passphrase prompt and create an unencrypted (passwordless) key.
         /// Required when running non-interactively, e.g. as part of a service install.
@@ -96,7 +96,7 @@ pub(crate) enum Commands {
             long,
             value_name = "TYPE",
             default_value = "x25519",
-            help = "Key algorithm: x25519 (default), p384, p256; with pq-dsa-unstable: mldsa44, mldsa65, mldsa87"
+            help = "Identity key algorithm: x25519 (default), p384, p256; with pq-dsa-unstable: mldsa44, mldsa65, mldsa87"
         )]
         key_type: String,
     },

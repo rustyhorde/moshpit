@@ -377,13 +377,14 @@ Generates a new asymmetric public/private key pair.  By default the tool prompts
 mp-keygen generate                                        # X25519 key (default), prompts for path + passphrase
 mp-keygen generate --key-type p384                        # P-384 key
 mp-keygen generate --key-type p256                        # P-256 key
+mp-keygen generate --key-type mldsa65                     # Experimental ML-DSA key when built with pq-dsa-unstable
 mp-keygen generate -n -o ~/.mp/id_x25519                  # Non-interactive: X25519, no passphrase
 mp-keygen generate --server -n -o ~/.mp/mps_host_key      # Server host key, no passphrase
 ```
 
 | Flag | Short | Description |
 |------|-------|-------------|
-| `--key-type <TYPE>` | `-k` | Key algorithm: `x25519` (default), `p384`, `p256` |
+| `--key-type <TYPE>` | `-k` | Identity key algorithm: `x25519` (default), `p384`, `p256`; with `pq-dsa-unstable`: `mldsa44`, `mldsa65`, `mldsa87` |
 | `--no-passphrase` | `-n` | Skip the passphrase prompt; create an unencrypted key |
 | `--output-path <PATH>` | `-o` | Write keys to this path (skips the interactive path prompt) |
 | `--force` | `-f` | Overwrite existing key files without confirmation |
@@ -398,7 +399,7 @@ Default key locations when accepting the default path prompt:
 | Server private key | `~/.mp/mps_host_ed25519_key` |
 | Server public key  | `~/.mp/mps_host_ed25519_key.pub` |
 
-> **Note**: The default file names use the `ed25519` naming convention for historical compatibility.  The actual key algorithm embedded in the file is determined by `--key-type` (default: `x25519`).  All three key algorithms share the same file format and the paths can be freely overridden with `--output-path`.
+> **Note**: The default file names use the `ed25519` naming convention for historical compatibility.  The actual key algorithm embedded in the file is determined by `--key-type` (default: `x25519`).  All supported identity key algorithms share the same file format and the paths can be freely overridden with `--output-path`.
 
 #### `fingerprint`
 
@@ -475,6 +476,10 @@ Options:
       --term-type <TERM>               TERM environment variable for spawned shells
                                        [default: xterm-256color]
       --kex-algos <ALGOS>              Ordered KEX algorithms to prefer, comma-separated
+                                       [supported: x25519-sha256 (default),
+                                       ml-kem-768-sha256, ml-kem-512-sha256,
+                                       ml-kem-1024-sha256, p384-sha384,
+                                       p256-sha256]
       --aead-algos <ALGOS>             Ordered AEAD algorithms to prefer, comma-separated
       --mac-algos <ALGOS>              Ordered MAC algorithms to prefer, comma-separated
       --kdf-algos <ALGOS>              Ordered KDF algorithms to prefer, comma-separated
@@ -558,7 +563,7 @@ term_type = "xterm-256color"
 # client also supports is selected.  Omitted categories use the built-in defaults.
 #
 # [preferred_algorithms]
-# kex  = ["x25519-sha256", "p384-sha384", "p256-sha256"]
+# kex  = ["x25519-sha256", "ml-kem-768-sha256", "ml-kem-512-sha256", "ml-kem-1024-sha256", "p384-sha384", "p256-sha256"]
 # aead = ["aes256-gcm-siv", "aes256-gcm", "chacha20-poly1305", "aes128-gcm-siv"]
 # mac  = ["hmac-sha512", "hmac-sha256"]
 # kdf  = ["hkdf-sha256", "hkdf-sha384", "hkdf-sha512"]
@@ -666,6 +671,10 @@ Options:
       --diff-mode <MODE>               UDP diff transport mode: reliable (default),
                                        datagram, or statesync
       --kex-algos <ALGOS>              Ordered KEX algorithms to offer, comma-separated
+                                       [supported: x25519-sha256 (default),
+                                       ml-kem-768-sha256, ml-kem-512-sha256,
+                                       ml-kem-1024-sha256, p384-sha384,
+                                       p256-sha256]
       --aead-algos <ALGOS>             Ordered AEAD algorithms to offer, comma-separated
       --mac-algos <ALGOS>              Ordered MAC algorithms to offer, comma-separated
       --kdf-algos <ALGOS>              Ordered KDF algorithms to offer, comma-separated
@@ -764,7 +773,7 @@ nat_warmup_count = 3  # Number of keepalive frames to send (default: 3)
 # Omitted categories use the built-in defaults.
 #
 # [preferred_algorithms]
-# kex  = ["x25519-sha256", "p384-sha384", "p256-sha256"]
+# kex  = ["x25519-sha256", "ml-kem-768-sha256", "ml-kem-512-sha256", "ml-kem-1024-sha256", "p384-sha384", "p256-sha256"]
 # aead = ["chacha20-poly1305", "aes256-gcm-siv"]  # prefer ChaCha on this device
 # mac  = ["hmac-sha256", "hmac-sha512"]            # save 32 bytes per packet
 # kdf  = ["hkdf-sha256", "hkdf-sha384", "hkdf-sha512"]
