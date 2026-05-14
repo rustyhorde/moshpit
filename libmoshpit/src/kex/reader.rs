@@ -2362,4 +2362,137 @@ mod tests {
             "expected KeyNotEstablished error"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // resolve_kex_alg tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_kex_alg_all_known_variants() {
+        use super::resolve_kex_alg;
+        use crate::kex::negotiate::{
+            KEX_ML_KEM_512_SHA256, KEX_ML_KEM_768_SHA256, KEX_ML_KEM_1024_SHA256, KEX_P256_SHA256,
+            KEX_P384_SHA384, KEX_X25519_SHA256,
+        };
+        assert!(resolve_kex_alg(KEX_X25519_SHA256).is_ok());
+        assert!(resolve_kex_alg(KEX_P384_SHA384).is_ok());
+        assert!(resolve_kex_alg(KEX_P256_SHA256).is_ok());
+        assert!(resolve_kex_alg(KEX_ML_KEM_512_SHA256).is_ok());
+        assert!(resolve_kex_alg(KEX_ML_KEM_768_SHA256).is_ok());
+        assert!(resolve_kex_alg(KEX_ML_KEM_1024_SHA256).is_ok());
+    }
+
+    #[test]
+    fn resolve_kex_alg_unknown_returns_error() {
+        assert!(super::resolve_kex_alg("bogus-kex-alg").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // pq-dsa-unstable feature tests
+    // -----------------------------------------------------------------------
+
+    #[cfg(feature = "pq-dsa-unstable")]
+    #[test]
+    fn ml_dsa_sign_verify_ml_dsa_65_and_87() {
+        use aws_lc_rs::{
+            encoding::AsRawBytes as _,
+            signature::KeyPair as _,
+            unstable::signature::{ML_DSA_65_SIGNING, ML_DSA_87_SIGNING, PqdsaKeyPair},
+        };
+
+        let negotiated = NegotiatedAlgorithms {
+            kex: KEX_ML_KEM_768_SHA256.to_string(),
+            aead: AEAD_AES256_GCM_SIV.to_string(),
+            mac: MAC_HMAC_SHA512.to_string(),
+            kdf: KDF_HKDF_SHA256.to_string(),
+        };
+
+        for (signing_alg, alg_str) in [
+            (&ML_DSA_65_SIGNING, crate::KEY_ALGORITHM_ML_DSA_65),
+            (&ML_DSA_87_SIGNING, crate::KEY_ALGORITHM_ML_DSA_87),
+        ] {
+            let key_pair = PqdsaKeyPair::generate(signing_alg).unwrap();
+            let private_key = key_pair.private_key().as_raw_bytes().unwrap();
+            let public_key = key_pair.public_key().as_ref().to_vec();
+            let transcript = super::identity_transcript(&super::IdentityTranscriptParts {
+                role: b"client",
+                negotiated: &negotiated,
+                user: b"alice",
+                client_exchange: b"client-exchange",
+                client_identity: b"client-identity",
+                server_identity: b"server-identity",
+                server_exchange: b"server-exchange",
+                salt: b"salt",
+            })
+            .unwrap();
+            let signature =
+                super::sign_identity_transcript(alg_str, private_key.as_ref(), &transcript)
+                    .unwrap();
+            super::verify_identity_transcript(alg_str, &public_key, &transcript, &signature)
+                .unwrap();
+        }
+    }
+
+    #[cfg(feature = "pq-dsa-unstable")]
+    #[test]
+    fn is_ml_dsa_algorithm_returns_true_for_ml_dsa() {
+        assert!(super::is_ml_dsa_algorithm(crate::KEY_ALGORITHM_ML_DSA_44));
+        assert!(super::is_ml_dsa_algorithm(crate::KEY_ALGORITHM_ML_DSA_65));
+        assert!(super::is_ml_dsa_algorithm(crate::KEY_ALGORITHM_ML_DSA_87));
+    }
+
+    #[cfg(feature = "pq-dsa-unstable")]
+    #[test]
+    fn is_ml_dsa_algorithm_returns_false_for_ecdh() {
+        assert!(!super::is_ml_dsa_algorithm("X25519"));
+        assert!(!super::is_ml_dsa_algorithm("P384"));
+        assert!(!super::is_ml_dsa_algorithm("unknown"));
+    }
+
+    #[cfg(feature = "pq-dsa-unstable")]
+    #[test]
+    fn parse_full_public_key_valid() {
+        let alg = b"X25519";
+        let pubkey = [0xABu8; 32];
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&u32::try_from(alg.len()).unwrap().to_be_bytes());
+        payload.extend_from_slice(alg);
+        payload.extend_from_slice(&u32::try_from(pubkey.len()).unwrap().to_be_bytes());
+        payload.extend_from_slice(&pubkey);
+        let b64 = STANDARD.encode(&payload);
+        let full_key = format!("moshpit {b64} user@host").into_bytes();
+        let (key_alg, key_bytes) = super::parse_full_public_key(&full_key).unwrap();
+        assert_eq!(key_alg, "X25519");
+        assert_eq!(key_bytes, pubkey);
+    }
+
+    #[cfg(feature = "pq-dsa-unstable")]
+    #[test]
+    fn parse_full_public_key_wrong_part_count() {
+        let result = super::parse_full_public_key(b"moshpit only-two-parts");
+        assert!(result.is_err());
+    }
+
+    #[cfg(feature = "pq-dsa-unstable")]
+    #[test]
+    fn parse_full_public_key_truncated_payload() {
+        let b64 = STANDARD.encode(b"abc");
+        let full_key = format!("moshpit {b64} user@host").into_bytes();
+        let result = super::parse_full_public_key(&full_key);
+        assert!(result.is_err());
+    }
+
+    #[cfg(feature = "pq-dsa-unstable")]
+    #[test]
+    fn sign_identity_transcript_unknown_alg_errors() {
+        let result = super::sign_identity_transcript("X25519", &[], &[]);
+        assert!(result.is_err());
+    }
+
+    #[cfg(feature = "pq-dsa-unstable")]
+    #[test]
+    fn verify_identity_transcript_unknown_alg_errors() {
+        let result = super::verify_identity_transcript("X25519", &[], &[], &[]);
+        assert!(result.is_err());
+    }
 }

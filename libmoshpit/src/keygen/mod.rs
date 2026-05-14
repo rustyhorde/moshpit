@@ -809,9 +809,9 @@ mod tests {
     use argon2::{Argon2, PasswordHash, PasswordVerifier as _};
     use base64::Engine;
 
-    #[cfg(feature = "pq-dsa-unstable")]
-    use super::load_identity_key;
-    use super::{decrypt_private_key, load_private_key};
+    use super::{
+        decrypt_private_key, load_identity_key, load_private_key, validate_identity_key_pair,
+    };
 
     // SHA256:wyKn0zB58msvX/02OmeJfcKRauGoQ2lMhdD/cKcrS6A= jozias@CachyOS
     //
@@ -940,6 +940,185 @@ mod tests {
             assert!(!loaded.public_key().is_empty());
             assert!(!loaded.private_key().is_empty());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_identity_key_unenc_x25519() {
+        let path = PathBuf::from("tests/keys/id_ed25519_test");
+        let key = load_identity_key(&path, None).expect("load unencrypted key");
+        assert_eq!(key.key_algorithm(), super::KEY_ALGORITHM_X25519);
+        let expected = vec![
+            0x38, 0x43, 0x92, 0xD7, 0x3E, 0xEA, 0x2F, 0x77, 0x6B, 0x45, 0x7B, 0x99, 0xFD, 0xD6,
+            0x9D, 0x5B, 0x11, 0xF2, 0x3E, 0x8D, 0xB7, 0x13, 0x0B, 0xF7, 0x54, 0xF0, 0xC8, 0x49,
+            0x93, 0xD4, 0xF5, 0x5B,
+        ];
+        assert_eq!(key.public_key(), &expected);
+        assert!(!key.private_key().is_empty());
+    }
+
+    #[test]
+    fn test_load_identity_key_enc_x25519() {
+        let path = PathBuf::from("tests/keys/id_ed25519_test_enc");
+        let key = load_identity_key(&path, Some("test")).expect("load encrypted key");
+        assert_eq!(key.key_algorithm(), super::KEY_ALGORITHM_X25519);
+        let expected = vec![
+            0x45, 0xDA, 0x9E, 0xCC, 0x73, 0xE8, 0x69, 0xE1, 0x98, 0xAF, 0xD9, 0x57, 0xD0, 0xAA,
+            0xA4, 0x2D, 0xA9, 0x52, 0xD0, 0x9C, 0xE3, 0x7B, 0x0A, 0x93, 0xEA, 0x9D, 0xDF, 0x6F,
+            0x4D, 0x54, 0x3F, 0x2F,
+        ];
+        assert_eq!(key.public_key(), &expected);
+        assert!(!key.private_key().is_empty());
+    }
+
+    #[test]
+    fn test_load_identity_key_enc_wrong_passphrase() {
+        let path = PathBuf::from("tests/keys/id_ed25519_test_enc");
+        assert!(load_identity_key(&path, Some("wrong")).is_err());
+    }
+
+    #[test]
+    fn test_load_identity_key_enc_no_passphrase() {
+        let path = PathBuf::from("tests/keys/id_ed25519_test_enc");
+        assert!(load_identity_key(&path, None).is_err());
+    }
+
+    #[test]
+    fn test_load_identity_key_invalid_header() -> Result<()> {
+        let dir = tempfile::TempDir::new()?;
+        let path = dir.path().join("bad_key");
+        let garbage =
+            base64::engine::general_purpose::STANDARD.encode(b"wrong-header-for-testing-purposes");
+        std::fs::write(&path, garbage)?;
+        assert!(load_identity_key(&path, None).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_validate_identity_key_pair_mismatch() -> Result<()> {
+        let key = load_identity_key(&PathBuf::from("tests/keys/id_ed25519_test"), None)?;
+        let wrong_pub = vec![0u8; 32];
+        assert!(
+            validate_identity_key_pair(key.key_algorithm(), &wrong_pub, key.private_key()).is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_validate_identity_key_pair_unsupported_alg() {
+        assert!(validate_identity_key_pair("bogus-alg", &[0u8; 32], &[0u8; 32]).is_err());
+    }
+
+    #[test]
+    fn test_generate_key_pair_p384() -> Result<()> {
+        let key_pair = super::KeyPair::generate_key_pair(
+            None,
+            super::KexMode::Server("0.0.0.0:0".parse().unwrap()),
+            super::KEY_ALGORITHM_P384,
+        )?;
+        let dir = tempfile::TempDir::new()?;
+        let path = dir.path().join("id_p384");
+        let mut f = std::fs::File::create(&path)?;
+        key_pair.write_private_key(&mut f)?;
+        drop(f);
+        let loaded = load_identity_key(&path, None)?;
+        assert_eq!(loaded.key_algorithm(), super::KEY_ALGORITHM_P384);
+        validate_identity_key_pair(
+            super::KEY_ALGORITHM_P384,
+            loaded.public_key(),
+            loaded.private_key(),
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_generate_key_pair_p256() -> Result<()> {
+        let key_pair = super::KeyPair::generate_key_pair(
+            None,
+            super::KexMode::Server("0.0.0.0:0".parse().unwrap()),
+            super::KEY_ALGORITHM_P256,
+        )?;
+        let dir = tempfile::TempDir::new()?;
+        let path = dir.path().join("id_p256");
+        let mut f = std::fs::File::create(&path)?;
+        key_pair.write_private_key(&mut f)?;
+        drop(f);
+        let loaded = load_identity_key(&path, None)?;
+        assert_eq!(loaded.key_algorithm(), super::KEY_ALGORITHM_P256);
+        validate_identity_key_pair(
+            super::KEY_ALGORITHM_P256,
+            loaded.public_key(),
+            loaded.private_key(),
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_generate_key_pair_client_requires_passphrase() {
+        assert!(
+            super::KeyPair::generate_key_pair(
+                None,
+                super::KexMode::Client,
+                super::KEY_ALGORITHM_X25519,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_generate_key_pair_unknown_algorithm() {
+        assert!(
+            super::KeyPair::generate_key_pair(
+                None,
+                super::KexMode::Server("0.0.0.0:0".parse().unwrap()),
+                "unknown-alg",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_generate_key_pair_encrypted_x25519() -> Result<()> {
+        let passphrase = "my-test-passphrase".to_string();
+        let key_pair = super::KeyPair::generate_key_pair(
+            Some(&passphrase),
+            super::KexMode::Server("0.0.0.0:0".parse().unwrap()),
+            super::KEY_ALGORITHM_X25519,
+        )?;
+        let dir = tempfile::TempDir::new()?;
+        let path = dir.path().join("id_x25519_enc");
+        let mut f = std::fs::File::create(&path)?;
+        key_pair.write_private_key(&mut f)?;
+        drop(f);
+        let loaded = load_identity_key(&path, Some(&passphrase))?;
+        assert_eq!(loaded.key_algorithm(), super::KEY_ALGORITHM_X25519);
+        assert_eq!(loaded.public_key().len(), 32);
+        validate_identity_key_pair(
+            super::KEY_ALGORITHM_X25519,
+            loaded.public_key(),
+            loaded.private_key(),
+        )?;
+        Ok(())
+    }
+
+    #[cfg(feature = "pq-dsa-unstable")]
+    #[test]
+    fn test_load_identity_key_enc_ml_dsa() -> Result<()> {
+        let passphrase = "ml-dsa-passphrase".to_string();
+        let key_pair = super::KeyPair::generate_key_pair(
+            Some(&passphrase),
+            super::KexMode::Server("0.0.0.0:0".parse().unwrap()),
+            super::KEY_ALGORITHM_ML_DSA_44,
+        )?;
+        let dir = tempfile::TempDir::new()?;
+        let path = dir.path().join("id_mldsa_enc");
+        let mut f = std::fs::File::create(&path)?;
+        key_pair.write_private_key(&mut f)?;
+        drop(f);
+        let loaded = load_identity_key(&path, Some(&passphrase))?;
+        assert_eq!(loaded.key_algorithm(), super::KEY_ALGORITHM_ML_DSA_44);
+        assert!(!loaded.public_key().is_empty());
+        assert!(!loaded.private_key().is_empty());
         Ok(())
     }
 }

@@ -407,4 +407,32 @@ mod tests {
         assert_eq!(parsed_list, list);
         Ok(())
     }
+
+    #[test]
+    fn test_identity_proof_round_trips() -> Result<()> {
+        let sig = vec![1u8, 2, 3, 4, 5];
+        let frame = Frame::IdentityProof(sig.clone());
+        let encoded_frame = encode_to_vec(&frame, standard())?;
+        let length = encoded_frame.len();
+        let length_bytes = length.to_be_bytes();
+
+        let mut all_data = vec![10u8]; // IdentityProof id=10
+        all_data.extend_from_slice(&length_bytes);
+        all_data.extend_from_slice(&encoded_frame);
+
+        let mut cursor = Cursor::new(&all_data[..]);
+        let parsed = Frame::parse(&mut cursor)?;
+        assert!(parsed.is_some());
+        let Frame::IdentityProof(parsed_sig) = parsed.unwrap() else {
+            panic!("expected IdentityProof");
+        };
+        assert_eq!(parsed_sig, sig);
+        Ok(())
+    }
+
+    #[test]
+    fn test_identity_proof_display() {
+        let frame = Frame::IdentityProof(vec![0u8; 42]);
+        assert_eq!(format!("{frame}"), "IdentityProof(42 bytes)");
+    }
 }
