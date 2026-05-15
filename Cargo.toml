@@ -9,7 +9,7 @@ aws-lc-rs = "1.16.3"
 bon = "3.9.1"
 bytes = "1.11.1"
 clap = { version = "4.6.1", features = ["derive"] }
-config = { version = "0.15.22", features = ["toml"] }
+config = { version = "0.15.23", features = ["toml"] }
 getset = "0.1.6"
 rustversion = "1.0.22"
 serde = { version = "1.0.228", features = ["derive"] }
