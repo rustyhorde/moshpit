@@ -32,7 +32,7 @@ use aws_lc_rs::{
     },
     rand::fill,
 };
-#[cfg(feature = "pq-dsa-unstable")]
+#[cfg(feature = "unstable")]
 use aws_lc_rs::{
     signature::UnparsedPublicKey as SignatureUnparsedPublicKey,
     unstable::signature::{
@@ -42,9 +42,9 @@ use aws_lc_rs::{
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bon::Builder;
-#[cfg(feature = "pq-dsa-unstable")]
+#[cfg(feature = "unstable")]
 use bytes::Buf as _;
-#[cfg(feature = "pq-dsa-unstable")]
+#[cfg(feature = "unstable")]
 use bytes::BytesMut;
 use socket2::SockRef;
 use tokio::{
@@ -70,7 +70,7 @@ use crate::{
     session::SessionRegistry,
     udp::DiffMode,
 };
-#[cfg(feature = "pq-dsa-unstable")]
+#[cfg(feature = "unstable")]
 use crate::{KEY_ALGORITHM_ML_DSA_44, KEY_ALGORITHM_ML_DSA_65, KEY_ALGORITHM_ML_DSA_87};
 
 const AEAD_KEY_INFO: &[u8] = b"AEAD KEY";
@@ -96,7 +96,7 @@ enum ClientEphemeral {
     Kem(DecapsulationKey),
 }
 
-#[cfg(feature = "pq-dsa-unstable")]
+#[cfg(feature = "unstable")]
 struct IdentityProofContext<'a> {
     client_identity_full: &'a [u8],
     user: &'a [u8],
@@ -107,7 +107,7 @@ struct IdentityProofContext<'a> {
     public_key_path: &'a PathBuf,
 }
 
-#[cfg(feature = "pq-dsa-unstable")]
+#[cfg(feature = "unstable")]
 struct IdentityTranscriptParts<'a> {
     role: &'a [u8],
     negotiated: &'a NegotiatedAlgorithms,
@@ -181,7 +181,7 @@ fn derive_session_keys(
     Ok((key_bytes, hmac_key_bytes))
 }
 
-#[cfg(feature = "pq-dsa-unstable")]
+#[cfg(feature = "unstable")]
 fn push_transcript_field(transcript: &mut Vec<u8>, label: &[u8], value: &[u8]) -> Result<()> {
     transcript.extend_from_slice(&u32::try_from(label.len())?.to_be_bytes());
     transcript.extend_from_slice(label);
@@ -190,7 +190,7 @@ fn push_transcript_field(transcript: &mut Vec<u8>, label: &[u8], value: &[u8]) -
     Ok(())
 }
 
-#[cfg(feature = "pq-dsa-unstable")]
+#[cfg(feature = "unstable")]
 fn identity_transcript(parts: &IdentityTranscriptParts<'_>) -> Result<Vec<u8>> {
     let mut transcript = b"moshpit-identity-proof-v1".to_vec();
     push_transcript_field(&mut transcript, b"role", parts.role)?;
@@ -207,7 +207,7 @@ fn identity_transcript(parts: &IdentityTranscriptParts<'_>) -> Result<Vec<u8>> {
     Ok(transcript)
 }
 
-#[cfg(feature = "pq-dsa-unstable")]
+#[cfg(feature = "unstable")]
 fn is_ml_dsa_algorithm(key_alg: &str) -> bool {
     matches!(
         key_alg,
@@ -215,7 +215,7 @@ fn is_ml_dsa_algorithm(key_alg: &str) -> bool {
     )
 }
 
-#[cfg(feature = "pq-dsa-unstable")]
+#[cfg(feature = "unstable")]
 fn parse_full_public_key(full_public_key: &[u8]) -> Result<(String, Vec<u8>)> {
     let pub_key_str = String::from_utf8_lossy(full_public_key);
     let pub_key_parts: Vec<&str> = pub_key_str.split_whitespace().collect();
@@ -243,7 +243,7 @@ fn parse_full_public_key(full_public_key: &[u8]) -> Result<(String, Vec<u8>)> {
     Ok((key_alg, public_key))
 }
 
-#[cfg(feature = "pq-dsa-unstable")]
+#[cfg(feature = "unstable")]
 fn sign_identity_transcript(
     key_alg: &str,
     private_key: &[u8],
@@ -262,7 +262,7 @@ fn sign_identity_transcript(
     Ok(signature)
 }
 
-#[cfg(feature = "pq-dsa-unstable")]
+#[cfg(feature = "unstable")]
 fn verify_identity_transcript(
     key_alg: &str,
     public_key: &[u8],
@@ -321,11 +321,11 @@ pub struct KexReader {
     #[builder(default)]
     full_public_key_bytes: Vec<u8>,
     /// Long-term identity key algorithm string (client mode only).
-    #[cfg(feature = "pq-dsa-unstable")]
+    #[cfg(feature = "unstable")]
     #[builder(default)]
     client_identity_key_algorithm: String,
     /// Long-term identity private key bytes for optional transcript proofs.
-    #[cfg(feature = "pq-dsa-unstable")]
+    #[cfg(feature = "unstable")]
     #[builder(default)]
     client_identity_private_key: Vec<u8>,
 }
@@ -360,7 +360,7 @@ impl std::fmt::Debug for KexReader {
             .field("server_preferred_algos", &self.server_preferred_algos)
             .field("user", &self.user)
             .field("full_public_key_bytes", &"<redacted>");
-        #[cfg(feature = "pq-dsa-unstable")]
+        #[cfg(feature = "unstable")]
         let _ = debug
             .field(
                 "client_identity_key_algorithm",
@@ -386,12 +386,36 @@ impl KexReader {
                     server_algos.kex, server_algos.aead, server_algos.mac, server_algos.kdf
                 );
                 // Server-preferred negotiation: first of server's list that client supports.
-                let negotiated = negotiate(&server_algos, &self.client_algos)?;
+                let negotiated = match negotiate(&server_algos, &self.client_algos) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        error!(
+                            "client_kex: no algorithm in common — \
+                             server offered kex={:?} aead={:?} mac={:?} kdf={:?}, \
+                             client supports kex={:?} aead={:?} mac={:?} kdf={:?}",
+                            server_algos.kex,
+                            server_algos.aead,
+                            server_algos.mac,
+                            server_algos.kdf,
+                            self.client_algos.kex,
+                            self.client_algos.aead,
+                            self.client_algos.mac,
+                            self.client_algos.kdf,
+                        );
+                        drop(self.tx_event.send(KexEvent::NoCommonAlgorithm));
+                        return Err(e);
+                    }
+                };
                 trace!(
                     "client_kex: negotiated: kex={} aead={} mac={} kdf={}",
                     negotiated.kex, negotiated.aead, negotiated.mac, negotiated.kdf
                 );
                 negotiated
+            }
+            Some(Frame::KexFailure) => {
+                error!("client_kex: server rejected key exchange (KexFailure before KexInit)");
+                drop(self.tx_event.send(KexEvent::NoCommonAlgorithm));
+                return Err(MoshpitError::NoCommonAlgorithm.into());
             }
             None => {
                 error!("client_kex: server closed connection before sending KexInit");
@@ -441,9 +465,9 @@ impl KexReader {
         // Send Initialize or ResumeRequest with our ephemeral public key + identity key.
         let user_bytes = self.user.as_bytes().to_vec();
         let identity_pk = self.full_public_key_bytes.clone();
-        #[cfg(feature = "pq-dsa-unstable")]
+        #[cfg(feature = "unstable")]
         let transcript_user = user_bytes.clone();
-        #[cfg(feature = "pq-dsa-unstable")]
+        #[cfg(feature = "unstable")]
         let transcript_client_exchange = epk_pub_bytes.clone();
         if let Some(session_uuid) = self.requested_session_uuid {
             self.tx.send(Frame::ResumeRequest(
@@ -462,6 +486,13 @@ impl KexReader {
 
         trace!("client_kex: waiting for PeerInitialize");
         match self.reader.read_frame().await? {
+            Some(Frame::KexFailure) => {
+                error!(
+                    "client_kex: server rejected key exchange (KexFailure before PeerInitialize)"
+                );
+                drop(self.tx_event.send(KexEvent::NoCommonAlgorithm));
+                return Err(MoshpitError::NoCommonAlgorithm.into());
+            }
             None => {
                 error!("client_kex: server closed connection before sending PeerInitialize");
                 return Err(anyhow::anyhow!(
@@ -501,7 +532,7 @@ impl KexReader {
                     trace!("client_kex: no server_destination set, skipping host-key check");
                 }
 
-                #[cfg(feature = "pq-dsa-unstable")]
+                #[cfg(feature = "unstable")]
                 if is_ml_dsa_algorithm(&self.client_identity_key_algorithm) {
                     let transcript = identity_transcript(&IdentityTranscriptParts {
                         role: b"client",
@@ -688,7 +719,22 @@ impl KexReader {
                     client_algos.kex, client_algos.aead, client_algos.mac, client_algos.kdf
                 );
                 // Server-preferred: first of server's list that client also offered.
-                let negotiated = negotiate(&self.server_preferred_algos, &client_algos)?;
+                let Ok(negotiated) = negotiate(&self.server_preferred_algos, &client_algos) else {
+                    error!(
+                        "server_kex: no algorithm in common — \
+                         server preferred kex={:?} aead={:?} mac={:?} kdf={:?}, \
+                         client offered kex={:?} aead={:?} mac={:?} kdf={:?}",
+                        self.server_preferred_algos.kex,
+                        self.server_preferred_algos.aead,
+                        self.server_preferred_algos.mac,
+                        self.server_preferred_algos.kdf,
+                        client_algos.kex,
+                        client_algos.aead,
+                        client_algos.mac,
+                        client_algos.kdf,
+                    );
+                    return Err(MoshpitError::NoCommonAlgorithm.into());
+                };
                 trace!(
                     "server_kex: negotiated: kex={} aead={} mac={} kdf={}",
                     negotiated.kex, negotiated.aead, negotiated.mac, negotiated.kdf
@@ -780,7 +826,7 @@ impl KexReader {
                         public_key_path,
                     )?;
                     let rnk = initialize_result.0;
-                    #[cfg(feature = "pq-dsa-unstable")]
+                    #[cfg(feature = "unstable")]
                     self.handle_identity_proof_if_required(IdentityProofContext {
                         client_identity_full: &fpk,
                         user: &user,
@@ -899,7 +945,7 @@ impl KexReader {
         Ok((skex, udp_arc))
     }
 
-    #[cfg(feature = "pq-dsa-unstable")]
+    #[cfg(feature = "unstable")]
     async fn handle_identity_proof_if_required(
         &mut self,
         context: IdentityProofContext<'_>,
@@ -1605,7 +1651,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "pq-dsa-unstable")]
+    #[cfg(feature = "unstable")]
     #[test]
     fn ml_dsa_identity_transcript_signature_verifies() {
         use aws_lc_rs::{
@@ -2073,15 +2119,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_kex_wrong_initial_frame_returns_key_not_established() {
+    async fn client_kex_kex_failure_before_kex_init_returns_no_common_algorithm() {
         use crate::MoshpitError;
 
         let (client_reader, _client_writer, _server_reader, mut server_writer) =
             make_bidirectional_loopback().await;
         let (mut kex_reader, _rx_frames, _rx_events) = make_test_kex_reader(client_reader);
 
-        // Server sends wrong frame type
+        // Server rejects immediately with KexFailure (e.g. no common algorithm)
         server_writer.write_frame(&Frame::KexFailure).await.unwrap();
+        drop(server_writer);
+
+        let result = kex_reader.client_kex().await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .downcast_ref::<MoshpitError>()
+                .is_some_and(|e| *e == MoshpitError::NoCommonAlgorithm),
+        );
+    }
+
+    #[tokio::test]
+    async fn client_kex_unexpected_initial_frame_returns_key_not_established() {
+        use crate::MoshpitError;
+
+        let (client_reader, _client_writer, _server_reader, mut server_writer) =
+            make_bidirectional_loopback().await;
+        let (mut kex_reader, _rx_frames, _rx_events) = make_test_kex_reader(client_reader);
+
+        // Server sends a non-KexInit, non-KexFailure frame — truly unexpected
+        server_writer
+            .write_frame(&Frame::KeyAgreement(UuidWrapper::new(uuid::Uuid::nil())))
+            .await
+            .unwrap();
         drop(server_writer);
 
         let result = kex_reader.client_kex().await;
@@ -2388,10 +2459,10 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // pq-dsa-unstable feature tests
+    // unstable feature (ML-DSA) tests
     // -----------------------------------------------------------------------
 
-    #[cfg(feature = "pq-dsa-unstable")]
+    #[cfg(feature = "unstable")]
     #[test]
     fn ml_dsa_sign_verify_ml_dsa_65_and_87() {
         use aws_lc_rs::{
@@ -2433,7 +2504,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "pq-dsa-unstable")]
+    #[cfg(feature = "unstable")]
     #[test]
     fn is_ml_dsa_algorithm_returns_true_for_ml_dsa() {
         assert!(super::is_ml_dsa_algorithm(crate::KEY_ALGORITHM_ML_DSA_44));
@@ -2441,7 +2512,7 @@ mod tests {
         assert!(super::is_ml_dsa_algorithm(crate::KEY_ALGORITHM_ML_DSA_87));
     }
 
-    #[cfg(feature = "pq-dsa-unstable")]
+    #[cfg(feature = "unstable")]
     #[test]
     fn is_ml_dsa_algorithm_returns_false_for_ecdh() {
         assert!(!super::is_ml_dsa_algorithm("X25519"));
@@ -2449,7 +2520,7 @@ mod tests {
         assert!(!super::is_ml_dsa_algorithm("unknown"));
     }
 
-    #[cfg(feature = "pq-dsa-unstable")]
+    #[cfg(feature = "unstable")]
     #[test]
     fn parse_full_public_key_valid() {
         let alg = b"X25519";
@@ -2466,14 +2537,14 @@ mod tests {
         assert_eq!(key_bytes, pubkey);
     }
 
-    #[cfg(feature = "pq-dsa-unstable")]
+    #[cfg(feature = "unstable")]
     #[test]
     fn parse_full_public_key_wrong_part_count() {
         let result = super::parse_full_public_key(b"moshpit only-two-parts");
         assert!(result.is_err());
     }
 
-    #[cfg(feature = "pq-dsa-unstable")]
+    #[cfg(feature = "unstable")]
     #[test]
     fn parse_full_public_key_truncated_payload() {
         let b64 = STANDARD.encode(b"abc");
@@ -2482,14 +2553,14 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[cfg(feature = "pq-dsa-unstable")]
+    #[cfg(feature = "unstable")]
     #[test]
     fn sign_identity_transcript_unknown_alg_errors() {
         let result = super::sign_identity_transcript("X25519", &[], &[]);
         assert!(result.is_err());
     }
 
-    #[cfg(feature = "pq-dsa-unstable")]
+    #[cfg(feature = "unstable")]
     #[test]
     fn verify_identity_transcript_unknown_alg_errors() {
         let result = super::verify_identity_transcript("X25519", &[], &[], &[]);

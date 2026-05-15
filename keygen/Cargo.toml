@@ -18,8 +18,7 @@ name = "mp-keygen"
 path = "src/main.rs"
 
 [features]
-unstable = []
-pq-dsa-unstable = ["libmoshpit/pq-dsa-unstable"]
+unstable = ["libmoshpit/unstable"]
 
 [dependencies]
 anyhow = { workspace = true }

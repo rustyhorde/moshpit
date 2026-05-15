@@ -293,11 +293,11 @@ pub use self::kex::sender::KexSender;
 pub use self::keygen::AEADCipher;
 pub use self::keygen::EncryptedKeyPair;
 pub use self::keygen::IdentityKeyPair;
-#[cfg(feature = "pq-dsa-unstable")]
+#[cfg(feature = "unstable")]
 pub use self::keygen::KEY_ALGORITHM_ML_DSA_44;
-#[cfg(feature = "pq-dsa-unstable")]
+#[cfg(feature = "unstable")]
 pub use self::keygen::KEY_ALGORITHM_ML_DSA_65;
-#[cfg(feature = "pq-dsa-unstable")]
+#[cfg(feature = "unstable")]
 pub use self::keygen::KEY_ALGORITHM_ML_DSA_87;
 pub use self::keygen::KEY_ALGORITHM_P256;
 pub use self::keygen::KEY_ALGORITHM_P384;

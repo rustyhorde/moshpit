@@ -23,7 +23,7 @@ use aws_lc_rs::{
     hkdf::{HKDF_SHA512, Salt},
     rand::fill,
 };
-#[cfg(feature = "pq-dsa-unstable")]
+#[cfg(feature = "unstable")]
 use aws_lc_rs::{
     encoding::AsRawBytes as _,
     signature::KeyPair as _,
@@ -49,20 +49,20 @@ pub const KEY_ALGORITHM_P384: &str = "P384";
 /// The key algorithm string for ECDH P-256 keys.
 pub const KEY_ALGORITHM_P256: &str = "P256";
 /// The experimental key algorithm string for ML-DSA-44 identity keys.
-#[cfg(feature = "pq-dsa-unstable")]
+#[cfg(feature = "unstable")]
 pub const KEY_ALGORITHM_ML_DSA_44: &str = "ML-DSA-44";
 /// The experimental key algorithm string for ML-DSA-65 identity keys.
-#[cfg(feature = "pq-dsa-unstable")]
+#[cfg(feature = "unstable")]
 pub const KEY_ALGORITHM_ML_DSA_65: &str = "ML-DSA-65";
 /// The experimental key algorithm string for ML-DSA-87 identity keys.
-#[cfg(feature = "pq-dsa-unstable")]
+#[cfg(feature = "unstable")]
 pub const KEY_ALGORITHM_ML_DSA_87: &str = "ML-DSA-87";
 const NONE_CIPHER: &str = "none";
 const NONE_KDF: &str = "none";
 const KEY_CIPHER: &str = "aes-256-gcm-siv";
 const HKDF_INFO: &[&[u8]] = &[b"moshpit HKDF"];
 
-#[cfg(feature = "pq-dsa-unstable")]
+#[cfg(feature = "unstable")]
 fn resolve_pqdsa_signing_alg(key_alg: &str) -> Option<&'static PqdsaSigningAlgorithm> {
     match key_alg {
         KEY_ALGORITHM_ML_DSA_44 => Some(&ML_DSA_44_SIGNING),
@@ -72,12 +72,12 @@ fn resolve_pqdsa_signing_alg(key_alg: &str) -> Option<&'static PqdsaSigningAlgor
     }
 }
 
-#[cfg(feature = "pq-dsa-unstable")]
+#[cfg(feature = "unstable")]
 fn is_pqdsa_key_algorithm(key_alg: &str) -> bool {
     resolve_pqdsa_signing_alg(key_alg).is_some()
 }
 
-#[cfg(not(feature = "pq-dsa-unstable"))]
+#[cfg(not(feature = "unstable"))]
 fn is_pqdsa_key_algorithm(_key_alg: &str) -> bool {
     false
 }
@@ -310,7 +310,7 @@ impl KeyPair {
             ));
         }
 
-        #[cfg(feature = "pq-dsa-unstable")]
+        #[cfg(feature = "unstable")]
         if let Some(alg) = resolve_pqdsa_signing_alg(key_alg) {
             let key_pair = PqdsaKeyPair::generate(alg)?;
             let public_key = key_pair.public_key().as_ref();
@@ -783,7 +783,7 @@ pub fn validate_identity_key_pair(
         return Err(MoshpitError::PublicKeyMismatch.into());
     }
 
-    #[cfg(feature = "pq-dsa-unstable")]
+    #[cfg(feature = "unstable")]
     if let Some(signing_alg) = resolve_pqdsa_signing_alg(key_alg) {
         let key_pair = PqdsaKeyPair::from_raw_private_key(signing_alg, private_key)?;
         if key_pair.public_key().as_ref() == public_key {
@@ -916,7 +916,7 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "pq-dsa-unstable")]
+    #[cfg(feature = "unstable")]
     #[test]
     fn test_generate_and_load_ml_dsa_identity_key() -> Result<()> {
         for key_alg in [
@@ -1101,7 +1101,7 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "pq-dsa-unstable")]
+    #[cfg(feature = "unstable")]
     #[test]
     fn test_load_identity_key_enc_ml_dsa() -> Result<()> {
         let passphrase = "ml-dsa-passphrase".to_string();

@@ -88,6 +88,9 @@ pub enum KexEvent {
     SessionInfo(Uuid, bool),
     /// Key exchange failure
     Failure,
+    /// No algorithm in common between client and server — client should exit,
+    /// not retry.
+    NoCommonAlgorithm,
 }
 
 /// The moshpit key exchange state
@@ -296,6 +299,9 @@ impl KexStateMachine {
                     kex.moshpits_addr = Some(addr);
                     break;
                 }
+                (_, KexEvent::NoCommonAlgorithm) => {
+                    return Err(MoshpitError::NoCommonAlgorithm.into());
+                }
                 _ => {
                     return Err(MoshpitError::InvalidKexState.into());
                 }
@@ -458,12 +464,12 @@ async fn run_client_kex<T: KexConfig>(
     let diff_mode = config.diff_mode();
     let client_algos = config.preferred_algorithms();
     let user = config.user().unwrap_or_default();
-    #[cfg(feature = "pq-dsa-unstable")]
+    #[cfg(feature = "unstable")]
     let client_identity_key_algorithm = identity_key.key_algorithm().clone();
-    #[cfg(feature = "pq-dsa-unstable")]
+    #[cfg(feature = "unstable")]
     let client_identity_private_key = identity_key.private_key().clone();
     let _read_handle = spawn(async move {
-        #[cfg(feature = "pq-dsa-unstable")]
+        #[cfg(feature = "unstable")]
         let mut frame_reader = KexReader::builder()
             .reader(reader)
             .tx(tx_c)
@@ -479,7 +485,7 @@ async fn run_client_kex<T: KexConfig>(
             .client_identity_key_algorithm(client_identity_key_algorithm)
             .client_identity_private_key(client_identity_private_key)
             .build();
-        #[cfg(not(feature = "pq-dsa-unstable"))]
+        #[cfg(not(feature = "unstable"))]
         let mut frame_reader = KexReader::builder()
             .reader(reader)
             .tx(tx_c)
