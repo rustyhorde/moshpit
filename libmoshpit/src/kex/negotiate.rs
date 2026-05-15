@@ -19,6 +19,12 @@ pub const KEX_X25519_SHA256: &str = "x25519-sha256";
 pub const KEX_P384_SHA384: &str = "p384-sha384";
 /// NIST P-256 ECDH with HKDF-SHA256 (FIPS-compliant environments)
 pub const KEX_P256_SHA256: &str = "p256-sha256";
+/// NIST FIPS 203 ML-KEM-512 with HKDF-SHA256 key extraction
+pub const KEX_ML_KEM_512_SHA256: &str = "ml-kem-512-sha256";
+/// NIST FIPS 203 ML-KEM-768 with HKDF-SHA256 key extraction
+pub const KEX_ML_KEM_768_SHA256: &str = "ml-kem-768-sha256";
+/// NIST FIPS 203 ML-KEM-1024 with HKDF-SHA256 key extraction
+pub const KEX_ML_KEM_1024_SHA256: &str = "ml-kem-1024-sha256";
 /// AES-256-GCM-SIV authenticated encryption (nonce-misuse resistant)
 pub const AEAD_AES256_GCM_SIV: &str = "aes256-gcm-siv";
 /// AES-256-GCM authenticated encryption
@@ -89,6 +95,9 @@ pub fn supported_algorithms() -> AlgorithmList {
     AlgorithmList {
         kex: vec![
             KEX_X25519_SHA256.to_string(),
+            KEX_ML_KEM_768_SHA256.to_string(),
+            KEX_ML_KEM_512_SHA256.to_string(),
+            KEX_ML_KEM_1024_SHA256.to_string(),
             KEX_P384_SHA384.to_string(),
             KEX_P256_SHA256.to_string(),
         ],
@@ -171,6 +180,43 @@ mod tests {
         };
         let server = current();
         let negotiated = negotiate(&client, &server).expect("should find x25519-sha256");
+        assert_eq!(negotiated.kex, KEX_X25519_SHA256);
+    }
+
+    #[test]
+    fn negotiate_picks_ml_kem_when_preferred_and_supported() {
+        let client = AlgorithmList {
+            kex: vec![
+                KEX_ML_KEM_768_SHA256.to_string(),
+                KEX_X25519_SHA256.to_string(),
+            ],
+            aead: vec![AEAD_AES256_GCM_SIV.to_string()],
+            mac: vec![MAC_HMAC_SHA512.to_string()],
+            kdf: vec![KDF_HKDF_SHA256.to_string()],
+        };
+        let server = current();
+        let negotiated = negotiate(&client, &server).expect("should find ml-kem-768-sha256");
+        assert_eq!(negotiated.kex, KEX_ML_KEM_768_SHA256);
+    }
+
+    #[test]
+    fn negotiate_falls_back_from_ml_kem_to_ecdh() {
+        let client = AlgorithmList {
+            kex: vec![
+                KEX_ML_KEM_768_SHA256.to_string(),
+                KEX_X25519_SHA256.to_string(),
+            ],
+            aead: vec![AEAD_AES256_GCM_SIV.to_string()],
+            mac: vec![MAC_HMAC_SHA512.to_string()],
+            kdf: vec![KDF_HKDF_SHA256.to_string()],
+        };
+        let server = AlgorithmList {
+            kex: vec![KEX_X25519_SHA256.to_string()],
+            aead: vec![AEAD_AES256_GCM_SIV.to_string()],
+            mac: vec![MAC_HMAC_SHA512.to_string()],
+            kdf: vec![KDF_HKDF_SHA256.to_string()],
+        };
+        let negotiated = negotiate(&client, &server).expect("should fall back to x25519");
         assert_eq!(negotiated.kex, KEX_X25519_SHA256);
     }
 
@@ -277,6 +323,9 @@ mod tests {
     fn supported_algorithms_contains_all_known_algorithms() {
         let algos = supported_algorithms();
         assert!(algos.kex.contains(&KEX_X25519_SHA256.to_string()));
+        assert!(algos.kex.contains(&KEX_ML_KEM_512_SHA256.to_string()));
+        assert!(algos.kex.contains(&KEX_ML_KEM_768_SHA256.to_string()));
+        assert!(algos.kex.contains(&KEX_ML_KEM_1024_SHA256.to_string()));
         assert!(algos.kex.contains(&KEX_P384_SHA384.to_string()));
         assert!(algos.kex.contains(&KEX_P256_SHA256.to_string()));
         assert!(algos.aead.contains(&AEAD_AES256_GCM_SIV.to_string()));

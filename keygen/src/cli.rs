@@ -54,7 +54,7 @@ pub(crate) struct Cli {
 
 #[derive(Clone, Debug, Subcommand)]
 pub(crate) enum Commands {
-    #[clap(about = "Generate a new ed25519 public/private key pair")]
+    #[clap(about = "Generate a new identity public/private key pair")]
     Generate {
         /// Skip the passphrase prompt and create an unencrypted (passwordless) key.
         /// Required when running non-interactively, e.g. as part of a service install.
@@ -90,13 +90,22 @@ pub(crate) enum Commands {
             default_value_t = false
         )]
         server: bool,
+        /// Read the passphrase from stdin (one line) instead of prompting interactively.
+        /// Mutually exclusive with --no-passphrase.
+        #[clap(
+            long,
+            help = "Read passphrase from stdin instead of prompting",
+            default_value_t = false,
+            conflicts_with = "no_passphrase"
+        )]
+        passphrase_stdin: bool,
         /// Key algorithm to use for the identity key pair.
         #[clap(
             short = 'k',
             long,
             value_name = "TYPE",
             default_value = "x25519",
-            help = "Key algorithm: x25519 (default), p384, p256"
+            help = "Identity key algorithm: x25519 (default), p384, p256; with unstable: mldsa44, mldsa65, mldsa87"
         )]
         key_type: String,
     },

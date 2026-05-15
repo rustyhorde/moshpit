@@ -141,11 +141,11 @@ pub(crate) struct Cli {
     #[getset(get = "pub(crate)")]
     diff_mode: String,
     /// Ordered KEX algorithms to offer (comma-separated).
-    /// Example: `--kex-algos x25519-sha256,p256-sha256`
+    /// Example: `--kex-algos ml-kem-768-sha256,x25519-sha256`
     #[clap(
         long,
         value_name = "ALGOS",
-        help = "Ordered KEX algorithms to offer, comma-separated [supported: x25519-sha256 (default), p384-sha384, p256-sha256]"
+        help = "Ordered KEX algorithms to offer, comma-separated [supported: x25519-sha256 (default), ml-kem-768-sha256, ml-kem-512-sha256, ml-kem-1024-sha256, p384-sha384, p256-sha256]"
     )]
     #[getset(get = "pub(crate)")]
     kex_algos: Option<String>,

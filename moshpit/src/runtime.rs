@@ -1725,16 +1725,15 @@ mod tests {
     }
 
     #[tokio::test]
-    #[should_panic(expected = "split_to out of bounds")]
-    async fn test_connect_and_kex_kex_failure() {
+    async fn test_connect_and_kex_kex_failure() -> Result<()> {
         let dir = std::env::temp_dir().join(Uuid::new_v4().to_string());
-        std::fs::create_dir_all(&dir).expect("failed to create temp dir");
+        std::fs::create_dir_all(&dir)?;
         let config_path = dir.join("config.toml");
         // Empty key files: /dev/null doesn't exist on Windows, so create real empty files.
         let empty_priv_key_path = dir.join("empty_priv_key");
         let empty_pub_key_path = dir.join("empty_pub_key");
-        std::fs::write(&empty_priv_key_path, b"").expect("failed to write empty key file");
-        std::fs::write(&empty_pub_key_path, b"").expect("failed to write empty key file");
+        std::fs::write(&empty_priv_key_path, b"")?;
+        std::fs::write(&empty_pub_key_path, b"")?;
         std::fs::write(
             &config_path,
             "[tracing.stdout]\n\
@@ -1752,31 +1751,32 @@ mod tests {
              with_thread_names = false\n\
              with_line_number = false\n\
              with_level = false\n",
-        )
-        .expect("failed to write config file");
+        )?;
         let cli = Cli::try_parse_from([
             "moshpit",
             "-c",
-            config_path.to_str().expect("path is valid UTF-8"),
+            config_path.to_str().expect("test path is valid UTF-8"),
             "-p",
-            empty_priv_key_path.to_str().expect("path is valid UTF-8"),
+            empty_priv_key_path
+                .to_str()
+                .expect("test path is valid UTF-8"),
             "-k",
-            empty_pub_key_path.to_str().expect("path is valid UTF-8"),
+            empty_pub_key_path
+                .to_str()
+                .expect("test path is valid UTF-8"),
             "user@host",
-        ])
-        .expect("CLI parse failed");
-        let mut config = load::<Cli, Config, Cli>(&cli, &cli).expect("config load failed");
+        ])?;
+        let mut config = load::<Cli, Config, Cli>(&cli, &cli)?;
 
         let pass_cache = Arc::new(std::sync::Mutex::new(PassCache::Uncached));
 
         // Bind a real listener
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("failed to bind listener");
-        let port = listener
-            .local_addr()
-            .expect("listener has local addr")
-            .port();
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        let port = listener.local_addr()?.port();
 
         // Spawn a task to accept the connection and send the greeting, then drop
         drop(spawn(async move {
@@ -1786,9 +1786,7 @@ mod tests {
             }
         }));
 
-        let addr = format!("127.0.0.1:{port}")
-            .parse()
-            .expect("address is valid");
+        let addr = format!("127.0.0.1:{port}").parse()?;
 
         // TcpStream::connect will succeed, but run_key_exchange will fail
         let result = connect_and_kex(
@@ -1801,6 +1799,12 @@ mod tests {
         )
         .await;
         assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.downcast_ref::<FatalKexError>().is_some(),
+            "empty key files should produce FatalKexError, got: {err}"
+        );
+        Ok(())
     }
 
     #[test]

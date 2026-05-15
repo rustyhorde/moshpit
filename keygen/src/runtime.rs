@@ -9,6 +9,7 @@
 use std::{
     ffi::OsString,
     fs::{DirBuilder, OpenOptions},
+    io::BufRead as _,
     path::{Path, PathBuf},
 };
 
@@ -18,12 +19,21 @@ use std::os::unix::fs::DirBuilderExt;
 use anyhow::Result;
 use clap::Parser as _;
 use dialoguer::{Confirm, Input, Password};
+#[cfg(feature = "unstable")]
+use libmoshpit::{KEY_ALGORITHM_ML_DSA_44, KEY_ALGORITHM_ML_DSA_65, KEY_ALGORITHM_ML_DSA_87};
 use libmoshpit::{
     KEY_ALGORITHM_P256, KEY_ALGORITHM_P384, KEY_ALGORITHM_X25519, KexMode, KeyPair,
     extract_public_key_bytes, fingerprint,
 };
 
 use crate::cli::{Cli, Commands};
+
+#[derive(Clone, Copy)]
+enum PassphraseSource {
+    Interactive,
+    None,
+    Stdin,
+}
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) fn run<I, T>(args: Option<I>) -> Result<()>
@@ -41,17 +51,27 @@ where
     match cli.command() {
         Commands::Generate {
             no_passphrase,
+            passphrase_stdin,
             output_path,
             force,
             server,
             key_type,
-        } => generate_keypair(
-            *no_passphrase,
-            output_path.as_deref(),
-            *force,
-            *server,
-            key_type,
-        ),
+        } => {
+            let passphrase_source = if *no_passphrase {
+                PassphraseSource::None
+            } else if *passphrase_stdin {
+                PassphraseSource::Stdin
+            } else {
+                PassphraseSource::Interactive
+            };
+            generate_keypair(
+                passphrase_source,
+                output_path.as_deref(),
+                *force,
+                *server,
+                key_type,
+            )
+        }
         Commands::Verify {
             randomart: _,
             signature: _,
@@ -81,6 +101,13 @@ fn prompt_for_overwrite() -> Result<bool> {
         .interact()?)
 }
 
+fn read_passphrase_from_stdin() -> Result<Option<String>> {
+    let mut line = String::new();
+    let _ = std::io::stdin().lock().read_line(&mut line)?;
+    let passphrase = line.trim_end_matches(['\n', '\r']).to_string();
+    Ok(Some(passphrase))
+}
+
 #[cfg_attr(coverage_nightly, coverage(off))]
 fn prompt_for_passphrase(priv_key_path: &Path) -> Result<Option<String>> {
     let passphrase_prompt = format!("Enter passphrase for \"{}\"", priv_key_path.display());
@@ -99,7 +126,7 @@ fn prompt_for_passphrase(priv_key_path: &Path) -> Result<Option<String>> {
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 fn generate_keypair(
-    no_passphrase: bool,
+    passphrase_source: PassphraseSource,
     output_path: Option<&str>,
     force: bool,
     server: bool,
@@ -110,15 +137,25 @@ fn generate_keypair(
         "x25519" => KEY_ALGORITHM_X25519,
         "p384" => KEY_ALGORITHM_P384,
         "p256" => KEY_ALGORITHM_P256,
+        #[cfg(feature = "unstable")]
+        "mldsa44" | "ml-dsa-44" => KEY_ALGORITHM_ML_DSA_44,
+        #[cfg(feature = "unstable")]
+        "mldsa65" | "ml-dsa-65" => KEY_ALGORITHM_ML_DSA_65,
+        #[cfg(feature = "unstable")]
+        "mldsa87" | "ml-dsa-87" => KEY_ALGORITHM_ML_DSA_87,
         other => {
+            #[cfg(feature = "unstable")]
+            let valid_values = "x25519, p384, p256, mldsa44, mldsa65, mldsa87";
+            #[cfg(not(feature = "unstable"))]
+            let valid_values = "x25519, p384, p256";
             return Err(anyhow::anyhow!(
-                "Unknown key type '{other}'. Valid values: x25519, p384, p256"
+                "Unknown key type '{other}'. Valid values: {valid_values}"
             ));
         }
     };
 
     // Output header
-    println!("Generating public/private ed25519 key pair.");
+    println!("Generating public/private {key_alg} identity key pair.");
 
     let mode = if server {
         KexMode::Server("0.0.0.0:0".parse().expect("hardcoded address is valid"))
@@ -148,10 +185,10 @@ fn generate_keypair(
         return Ok(());
     }
 
-    let passphrase_opt = if no_passphrase {
-        None
-    } else {
-        prompt_for_passphrase(&priv_key_path)?
+    let passphrase_opt = match passphrase_source {
+        PassphraseSource::None => None,
+        PassphraseSource::Stdin => read_passphrase_from_stdin()?,
+        PassphraseSource::Interactive => prompt_for_passphrase(&priv_key_path)?,
     };
     let keypair = KeyPair::generate_key_pair(passphrase_opt.as_ref(), mode, key_alg)?;
     generate_and_write_keys_inner(&priv_key_path, &pub_key_path, &keypair)?;

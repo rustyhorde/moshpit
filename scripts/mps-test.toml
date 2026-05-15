@@ -1,0 +1,21 @@
+[mps]
+ip = "0.0.0.0"
+port = 40406
+
+[tracing.stdout]
+with_target = false
+with_thread_ids = false
+with_thread_names = false
+with_line_number = false
+with_level = false
+
+[tracing.file]
+quiet = 0
+verbose = 0
+
+[tracing.file.layer]
+with_target = false
+with_thread_ids = false
+with_thread_names = false
+with_line_number = false
+with_level = false

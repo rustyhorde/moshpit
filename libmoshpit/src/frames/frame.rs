@@ -59,6 +59,8 @@ pub enum Frame {
     /// receiver runs [`negotiate`](crate::kex::negotiate::negotiate) to pick
     /// the first common algorithm in each category.
     KexInit(AlgorithmList),
+    /// Experimental identity-key proof over the key-exchange transcript.
+    IdentityProof(Vec<u8>),
 }
 
 impl Frame {
@@ -76,6 +78,7 @@ impl Frame {
             Frame::ResumeRequest(_, _, _, _) => 7,
             Frame::ClientOptions(_) => 8,
             Frame::KexInit(_) => 9,
+            Frame::IdentityProof(_) => 10,
         }
     }
 
@@ -86,7 +89,7 @@ impl Frame {
     ///
     pub fn parse(src: &mut Cursor<&[u8]>) -> Result<Option<Self>> {
         match get_u8(src) {
-            Some(0..=9) => {
+            Some(0..=10) => {
                 if let Some(length_slice) = get_usize(src)? {
                     let length = usize::from_be_bytes(length_slice.try_into()?);
                     if length > MAX_FRAME_LENGTH {
@@ -152,6 +155,9 @@ impl Display for Frame {
                 "KexInit(kex={:?}, aead={:?}, mac={:?}, kdf={:?})",
                 list.kex, list.aead, list.mac, list.kdf
             ),
+            Frame::IdentityProof(signature) => {
+                write!(f, "IdentityProof({} bytes)", signature.len())
+            }
         }
     }
 }
@@ -367,8 +373,8 @@ mod tests {
 
     #[test]
     fn test_parse_unknown_frame_id_returns_none() {
-        // Frame IDs 0–9 are known; anything above 9 must be silently ignored (Ok(None)).
-        let all_data = [10u8, 0, 0, 0, 0, 0, 0, 0, 0]; // id=10, length=0, no payload
+        // Frame IDs 0-10 are known; anything above 10 must be silently ignored (Ok(None)).
+        let all_data = [11u8, 0, 0, 0, 0, 0, 0, 0, 0]; // id=11, length=0, no payload
         let mut cursor = Cursor::new(&all_data[..]);
         let result = Frame::parse(&mut cursor);
         assert!(result.is_ok(), "unknown frame id must not be an error");
@@ -400,5 +406,33 @@ mod tests {
         };
         assert_eq!(parsed_list, list);
         Ok(())
+    }
+
+    #[test]
+    fn test_identity_proof_round_trips() -> Result<()> {
+        let sig = vec![1u8, 2, 3, 4, 5];
+        let frame = Frame::IdentityProof(sig.clone());
+        let encoded_frame = encode_to_vec(&frame, standard())?;
+        let length = encoded_frame.len();
+        let length_bytes = length.to_be_bytes();
+
+        let mut all_data = vec![10u8]; // IdentityProof id=10
+        all_data.extend_from_slice(&length_bytes);
+        all_data.extend_from_slice(&encoded_frame);
+
+        let mut cursor = Cursor::new(&all_data[..]);
+        let parsed = Frame::parse(&mut cursor)?;
+        assert!(parsed.is_some());
+        let Frame::IdentityProof(parsed_sig) = parsed.unwrap() else {
+            panic!("expected IdentityProof");
+        };
+        assert_eq!(parsed_sig, sig);
+        Ok(())
+    }
+
+    #[test]
+    fn test_identity_proof_display() {
+        let frame = Frame::IdentityProof(vec![0u8; 42]);
+        assert_eq!(format!("{frame}"), "IdentityProof(42 bytes)");
     }
 }

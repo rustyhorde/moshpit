@@ -4,3 +4,4 @@ lcov.info
 test_key
 .github/prompts
 *.bin
+scripts/logs/

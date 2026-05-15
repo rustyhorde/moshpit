@@ -1,6 +1,33 @@
 # moshpit
 An SSH and Mosh inspired tool written in Rust.
 
+## Current Releases
+
+### libmoshpit
+[![Crates.io](https://img.shields.io/crates/v/libmoshpit.svg)](https://crates.io/crates/libmoshpit)
+[![Crates.io](https://img.shields.io/crates/l/libmoshpit.svg)](https://crates.io/crates/libmoshpit)
+[![Crates.io](https://img.shields.io/crates/d/libmoshpit.svg)](https://crates.io/crates/libmoshpit)
+
+### moshpit
+[![Crates.io](https://img.shields.io/crates/v/moshpit.svg)](https://crates.io/crates/moshpit)
+[![Crates.io](https://img.shields.io/crates/l/moshpit.svg)](https://crates.io/crates/moshpit)
+[![Crates.io](https://img.shields.io/crates/d/moshpit.svg)](https://crates.io/crates/moshpit)
+
+### moshpits
+[![Crates.io](https://img.shields.io/crates/v/moshpits.svg)](https://crates.io/crates/moshpits)
+[![Crates.io](https://img.shields.io/crates/l/moshpits.svg)](https://crates.io/crates/moshpits)
+[![Crates.io](https://img.shields.io/crates/d/moshpits.svg)](https://crates.io/crates/moshpits)
+
+### moshpit-keygen
+[![Crates.io](https://img.shields.io/crates/v/moshpit-keygen.svg)](https://crates.io/crates/moshpit-keygen)
+[![Crates.io](https://img.shields.io/crates/l/moshpit-keygen.svg)](https://crates.io/crates/moshpit-keygen)
+[![Crates.io](https://img.shields.io/crates/d/moshpit-keygen.svg)](https://crates.io/crates/moshpit-keygen)
+
+### CI/CD
+[![docs.rs](https://docs.rs/libmoshpit/badge.svg)](https://docs.rs/libmoshpit)
+[![codecov](https://codecov.io/gh/rustyhorde/moshpit/branch/master/graph/badge.svg?token=cBXro7o2UN)](https://codecov.io/gh/rustyhorde/moshpit)
+[![CI](https://github.com/rustyhorde/moshpit/actions/workflows/moshpit.yml/badge.svg)](https://github.com/rustyhorde/moshpit/actions)
+
 ## Overview
 
 moshpit is a suite of tools for establishing encrypted, resilient remote terminal sessions:
@@ -170,6 +197,9 @@ Both sides exchange algorithm preferences in a `KexInit` frame at the start of t
 | Algorithm | Identifier | Default | Pros | Cons |
 |-----------|------------|:-------:|------|------|
 | X25519 + HKDF-SHA-256 | `x25519-sha256` | ✓ | Fastest DH available; constant-time by construction; tiny 32-byte keys; 128-bit security level | Not NIST/FIPS approved; 128-bit security level (adequate but not the highest margin) |
+| ML-KEM-768 + HKDF-SHA-256 | `ml-kem-768-sha256` | | Post-quantum KEM from AWS-LC; good default PQ security/performance balance | Larger TCP handshake messages than ECDH; must be supported by both peers |
+| ML-KEM-512 + HKDF-SHA-256 | `ml-kem-512-sha256` | | Smaller/faster post-quantum KEM option | Lower security margin than ML-KEM-768/1024 |
+| ML-KEM-1024 + HKDF-SHA-256 | `ml-kem-1024-sha256` | | Highest ML-KEM security margin | Largest ML-KEM public key and ciphertext |
 | NIST P-384 + HKDF-SHA-384 | `p384-sha384` | | 192-bit security level; NIST/FIPS approved; natural pairing with HKDF-SHA-384 | Slower than X25519; larger ephemeral key sizes; unnecessary margin for most deployments |
 | NIST P-256 + HKDF-SHA-256 | `p256-sha256` | | FIPS approved; hardware TPM and HSM support; 128-bit security level | Slower than X25519; lower security margin than P-384; no advantage over X25519 outside compliance requirements |
 
@@ -238,33 +268,6 @@ mac  = ["hmac-sha256", "hmac-sha512"]
 
 ---
 
-## Current Releases
-
-### libmoshpit
-[![Crates.io](https://img.shields.io/crates/v/libmoshpit.svg)](https://crates.io/crates/libmoshpit)
-[![Crates.io](https://img.shields.io/crates/l/libmoshpit.svg)](https://crates.io/crates/libmoshpit)
-[![Crates.io](https://img.shields.io/crates/d/libmoshpit.svg)](https://crates.io/crates/libmoshpit)
-
-### moshpit
-[![Crates.io](https://img.shields.io/crates/v/moshpit.svg)](https://crates.io/crates/moshpit)
-[![Crates.io](https://img.shields.io/crates/l/moshpit.svg)](https://crates.io/crates/moshpit)
-[![Crates.io](https://img.shields.io/crates/d/moshpit.svg)](https://crates.io/crates/moshpit)
-
-### moshpits
-[![Crates.io](https://img.shields.io/crates/v/moshpits.svg)](https://crates.io/crates/moshpits)
-[![Crates.io](https://img.shields.io/crates/l/moshpits.svg)](https://crates.io/crates/moshpits)
-[![Crates.io](https://img.shields.io/crates/d/moshpits.svg)](https://crates.io/crates/moshpits)
-
-### moshpit-keygen
-[![Crates.io](https://img.shields.io/crates/v/moshpit-keygen.svg)](https://crates.io/crates/moshpit-keygen)
-[![Crates.io](https://img.shields.io/crates/l/moshpit-keygen.svg)](https://crates.io/crates/moshpit-keygen)
-[![Crates.io](https://img.shields.io/crates/d/moshpit-keygen.svg)](https://crates.io/crates/moshpit-keygen)
-
-### CI/CD
-[![docs.rs](https://docs.rs/libmoshpit/badge.svg)](https://docs.rs/libmoshpit)
-[![codecov](https://codecov.io/gh/rustyhorde/moshpit/branch/master/graph/badge.svg?token=cBXro7o2UN)](https://codecov.io/gh/rustyhorde/moshpit)
-[![CI](https://github.com/rustyhorde/moshpit/actions/workflows/moshpit.yml/badge.svg)](https://github.com/rustyhorde/moshpit/actions)
-
 ## Security Notice (Pre-Hardening)
 
 This project has not yet completed a formal security hardening phase, external security review, or independent penetration testing.  It may contain security flaws that could lead to data loss, session compromise, privilege misuse, or other unintended behavior.
@@ -275,54 +278,84 @@ Use this software at your own risk, especially in internet-facing, production, o
 
 ## Installation (Arch Linux / AUR)
 
-All three binaries are available as separate AUR packages.  Install them with any AUR helper (e.g. `yay`, `paru`) or manually with `makepkg`.
+All three binaries are available in three package variants on the AUR.  Install them with any AUR helper (e.g. `yay`, `paru`) or manually with `makepkg`.
 
-| AUR package | Installs | Notes |
-|-------------|----------|-------|
-| `moshpit-keygen` | `mp-keygen` | No dependencies; install this first if building manually |
-| `moshpit` | `mp` (client) | Depends on `moshpit-keygen` |
-| `moshpits` | `mps` (server) | Depends on `moshpit-keygen` |
+| Variant | Packages | Build | ML-DSA keys |
+|---------|----------|-------|:-----------:|
+| Source (compile locally) | `moshpit-keygen` `moshpit` `moshpits` | `cargo build` from source tarball | — |
+| Pre-compiled binary | `moshpit-keygen-bin` `moshpit-bin` `moshpits-bin` | MUSL static binary from GitHub release | — |
+| Pre-compiled binary + unstable | `moshpit-keygen-unstable-bin` `moshpit-unstable-bin` `moshpits-unstable-bin` | MUSL static binary built with `--features unstable` | ✓ |
+
+The `-unstable-bin` packages install the same binary names (`mp-keygen`, `mp`, `mps`) and conflict with the other variants — only one variant can be installed at a time.
 
 ### Install with an AUR helper
 
 ```bash
-# Install the server (pulls in moshpit-keygen automatically)
-yay -S moshpits
+# Standard pre-compiled binaries (no Rust toolchain required)
+yay -S moshpits-bin moshpit-bin
 
-# Install the client (pulls in moshpit-keygen automatically)
-yay -S moshpit
+# Pre-compiled binaries with post-quantum ML-DSA identity key support
+yay -S moshpits-unstable-bin moshpit-unstable-bin
 
-# Or install both in one go
+# Source packages (compiles locally; requires Rust, cmake, gcc)
 yay -S moshpits moshpit
 ```
 
 ### Install manually with makepkg
 
+#### Pre-compiled binary packages (`-bin`)
+
+```bash
+# 1. Install moshpit-keygen-bin first (provides mp-keygen, no dependencies)
+git clone https://aur.archlinux.org/moshpit-keygen-bin.git
+cd moshpit-keygen-bin && makepkg -si && cd ..
+
+# 2. Install the server binary
+git clone https://aur.archlinux.org/moshpits-bin.git
+cd moshpits-bin && makepkg -si && cd ..
+
+# 3. Install the client binary
+git clone https://aur.archlinux.org/moshpit-bin.git
+cd moshpit-bin && makepkg -si && cd ..
+```
+
+#### Unstable binary packages (`-unstable-bin`, includes ML-DSA support)
+
+```bash
+# 1. Install moshpit-keygen-unstable-bin first
+git clone https://aur.archlinux.org/moshpit-keygen-unstable-bin.git
+cd moshpit-keygen-unstable-bin && makepkg -si && cd ..
+
+# 2. Install the server binary with unstable support
+git clone https://aur.archlinux.org/moshpits-unstable-bin.git
+cd moshpits-unstable-bin && makepkg -si && cd ..
+
+# 3. Install the client binary with unstable support
+git clone https://aur.archlinux.org/moshpit-unstable-bin.git
+cd moshpit-unstable-bin && makepkg -si && cd ..
+```
+
+#### Source packages (compile locally)
+
 ```bash
 # 1. Clone and build moshpit-keygen first (shared dependency)
 git clone https://aur.archlinux.org/moshpit-keygen.git
-cd moshpit-keygen
-makepkg -si
-cd ..
+cd moshpit-keygen && makepkg -si && cd ..
 
 # 2. Clone and build the server
 git clone https://aur.archlinux.org/moshpits.git
-cd moshpits
-makepkg -si
-cd ..
+cd moshpits && makepkg -si && cd ..
 
 # 3. Clone and build the client
 git clone https://aur.archlinux.org/moshpit.git
-cd moshpit
-makepkg -si
-cd ..
+cd moshpit && makepkg -si && cd ..
 ```
 
 ### Removing packages
 
 ```bash
 # Remove server and client (keep keygen)
-sudo pacman -R moshpits moshpit
+sudo pacman -R moshpits moshpit       # or moshpits-bin / moshpits-unstable-bin etc.
 
 # Remove everything including keygen
 sudo pacman -Rs moshpits moshpit moshpit-keygen
@@ -351,7 +384,7 @@ To install a specific version, append `--version <x.y.z>` to any of the commands
 
 ## mp-keygen
 
-`mp-keygen` creates and inspects the asymmetric key pairs used by both the server and client.  Three key algorithms are supported: X25519 (default), P-384, and P-256.
+`mp-keygen` creates and inspects the asymmetric key pairs used by both the server and client.  Three key algorithms are supported by default: X25519, P-384, and P-256. Experimental ML-DSA identity keys are available when built with `--features unstable`.
 
 ### Supported identity key algorithms
 
@@ -360,6 +393,9 @@ To install a specific version, append `--version <x.y.z>` to any of the commands
 | X25519 | `x25519` | ✓ | Fastest; constant-time by construction; 128-bit security level; recommended for most deployments |
 | NIST P-384 | `p384` | | 192-bit security level; FIPS/NIST approved; suited for high-security or compliance environments |
 | NIST P-256 | `p256` | | 128-bit security level; FIPS/NIST approved; hardware TPM/HSM support on many platforms |
+| ML-DSA-44 | `mldsa44` | | Experimental post-quantum signature identity key; requires `--features unstable` |
+| ML-DSA-65 | `mldsa65` | | Experimental post-quantum signature identity key; requires `--features unstable` |
+| ML-DSA-87 | `mldsa87` | | Experimental post-quantum signature identity key; requires `--features unstable` |
 
 ### Subcommands
 
@@ -371,13 +407,14 @@ Generates a new asymmetric public/private key pair.  By default the tool prompts
 mp-keygen generate                                        # X25519 key (default), prompts for path + passphrase
 mp-keygen generate --key-type p384                        # P-384 key
 mp-keygen generate --key-type p256                        # P-256 key
+mp-keygen generate --key-type mldsa65                     # Experimental ML-DSA key when built with --features unstable
 mp-keygen generate -n -o ~/.mp/id_x25519                  # Non-interactive: X25519, no passphrase
 mp-keygen generate --server -n -o ~/.mp/mps_host_key      # Server host key, no passphrase
 ```
 
 | Flag | Short | Description |
 |------|-------|-------------|
-| `--key-type <TYPE>` | `-k` | Key algorithm: `x25519` (default), `p384`, `p256` |
+| `--key-type <TYPE>` | `-k` | Identity key algorithm: `x25519` (default), `p384`, `p256`; with `--features unstable`: `mldsa44`, `mldsa65`, `mldsa87` |
 | `--no-passphrase` | `-n` | Skip the passphrase prompt; create an unencrypted key |
 | `--output-path <PATH>` | `-o` | Write keys to this path (skips the interactive path prompt) |
 | `--force` | `-f` | Overwrite existing key files without confirmation |
@@ -392,7 +429,7 @@ Default key locations when accepting the default path prompt:
 | Server private key | `~/.mp/mps_host_ed25519_key` |
 | Server public key  | `~/.mp/mps_host_ed25519_key.pub` |
 
-> **Note**: The default file names use the `ed25519` naming convention for historical compatibility.  The actual key algorithm embedded in the file is determined by `--key-type` (default: `x25519`).  All three key algorithms share the same file format and the paths can be freely overridden with `--output-path`.
+> **Note**: The default file names use the `ed25519` naming convention for historical compatibility.  The actual key algorithm embedded in the file is determined by `--key-type` (default: `x25519`).  All supported identity key algorithms share the same file format and the paths can be freely overridden with `--output-path`.
 
 #### `fingerprint`
 
@@ -469,6 +506,10 @@ Options:
       --term-type <TERM>               TERM environment variable for spawned shells
                                        [default: xterm-256color]
       --kex-algos <ALGOS>              Ordered KEX algorithms to prefer, comma-separated
+                                       [supported: x25519-sha256 (default),
+                                       ml-kem-768-sha256, ml-kem-512-sha256,
+                                       ml-kem-1024-sha256, p384-sha384,
+                                       p256-sha256]
       --aead-algos <ALGOS>             Ordered AEAD algorithms to prefer, comma-separated
       --mac-algos <ALGOS>              Ordered MAC algorithms to prefer, comma-separated
       --kdf-algos <ALGOS>              Ordered KDF algorithms to prefer, comma-separated
@@ -552,7 +593,7 @@ term_type = "xterm-256color"
 # client also supports is selected.  Omitted categories use the built-in defaults.
 #
 # [preferred_algorithms]
-# kex  = ["x25519-sha256", "p384-sha384", "p256-sha256"]
+# kex  = ["x25519-sha256", "ml-kem-768-sha256", "ml-kem-512-sha256", "ml-kem-1024-sha256", "p384-sha384", "p256-sha256"]
 # aead = ["aes256-gcm-siv", "aes256-gcm", "chacha20-poly1305", "aes128-gcm-siv"]
 # mac  = ["hmac-sha512", "hmac-sha256"]
 # kdf  = ["hkdf-sha256", "hkdf-sha384", "hkdf-sha512"]
@@ -660,6 +701,10 @@ Options:
       --diff-mode <MODE>               UDP diff transport mode: reliable (default),
                                        datagram, or statesync
       --kex-algos <ALGOS>              Ordered KEX algorithms to offer, comma-separated
+                                       [supported: x25519-sha256 (default),
+                                       ml-kem-768-sha256, ml-kem-512-sha256,
+                                       ml-kem-1024-sha256, p384-sha384,
+                                       p256-sha256]
       --aead-algos <ALGOS>             Ordered AEAD algorithms to offer, comma-separated
       --mac-algos <ALGOS>              Ordered MAC algorithms to offer, comma-separated
       --kdf-algos <ALGOS>              Ordered KDF algorithms to offer, comma-separated
@@ -758,7 +803,7 @@ nat_warmup_count = 3  # Number of keepalive frames to send (default: 3)
 # Omitted categories use the built-in defaults.
 #
 # [preferred_algorithms]
-# kex  = ["x25519-sha256", "p384-sha384", "p256-sha256"]
+# kex  = ["x25519-sha256", "ml-kem-768-sha256", "ml-kem-512-sha256", "ml-kem-1024-sha256", "p384-sha384", "p256-sha256"]
 # aead = ["chacha20-poly1305", "aes256-gcm-siv"]  # prefer ChaCha on this device
 # mac  = ["hmac-sha256", "hmac-sha512"]            # save 32 bytes per packet
 # kdf  = ["hkdf-sha256", "hkdf-sha384", "hkdf-sha512"]
@@ -882,6 +927,203 @@ mps --pacing-delay-us 2000
 |-----------|----------|-----------|---------|
 | `mps.port` (e.g. 40404) | TCP | Inbound to server | Key exchange only — connection switches to UDP after handshake |
 | 50000–59999 | UDP | Inbound to server | Encrypted terminal data |
+
+---
+
+## Full Post-Quantum Setup
+
+A fully post-quantum moshpit deployment replaces both authentication and key exchange with quantum-resistant algorithms, eliminating all classical asymmetric cryptography from the protocol.
+
+| Layer | Classical default | Post-quantum replacement |
+|-------|------------------|--------------------------|
+| Identity keys (authentication) | X25519 | ML-DSA-65 or ML-DSA-87 |
+| Key exchange | `x25519-sha256` | `ml-kem-768-sha256` or `ml-kem-1024-sha256` |
+| AEAD encryption | `aes256-gcm-siv` | No change — 256-bit keys are quantum-resistant |
+| MAC | `hmac-sha512` | No change |
+| KDF | `hkdf-sha256` | No change |
+
+**ML-KEM** key exchange is available in all standard builds.  **ML-DSA** identity keys require all three binaries — `mp-keygen`, `mps`, and `mp` — to be built with `--features unstable`.
+
+### Security level reference
+
+Choose a consistent security level for both the identity key and key exchange algorithm:
+
+| NIST level | Identity key | KEX algorithm | Recommended use |
+|-----------|-------------|---------------|-----------------|
+| 2 / 1 | `mldsa44` | `ml-kem-512-sha256` | Smallest keys; lightest TCP handshake |
+| **3 / 3** | **`mldsa65`** | **`ml-kem-768-sha256`** | **Recommended — comparable to AES-192 / P-384** |
+| 5 / 5 | `mldsa87` | `ml-kem-1024-sha256` | Maximum margin; largest keys and slowest handshake |
+
+The examples below use **ML-DSA-65 + ML-KEM-768** (NIST level 3).  Substitute `mldsa87` / `ml-kem-1024-sha256` throughout for the level-5 variant.
+
+### Building with ML-DSA support
+
+**From source:**
+
+```bash
+cargo build --release \
+    --bin mp-keygen --features unstable
+cargo build --release \
+    --bin mps       --features unstable
+cargo build --release \
+    --bin mp        --features unstable
+```
+
+**From crates.io:**
+
+```bash
+cargo install moshpit-keygen --features unstable
+cargo install moshpits       --features unstable
+cargo install moshpit        --features unstable
+```
+
+> **AUR note**: Use the `moshpit-keygen-unstable-bin`, `moshpit-unstable-bin`, and `moshpits-unstable-bin` AUR packages — these are pre-compiled MUSL static binaries built with `--features unstable` and are the easiest way to get ML-DSA support on Arch Linux.  The standard `-bin` packages and the source packages do not include `unstable` support unless you add `--features unstable` to the `cargo build` line in each PKGBUILD manually.
+
+### 1. Generate server and client keys
+
+```bash
+# Server host key — ML-DSA-65, no passphrase (service / daemon use)
+mp-keygen generate --server \
+    --key-type      mldsa65 \
+    --no-passphrase \
+    --output-path   ~/.mp/mps_host_mldsa65_key
+
+# Client identity key — ML-DSA-65, prompted passphrase
+mp-keygen generate \
+    --key-type    mldsa65 \
+    --output-path ~/.mp/id_mldsa65
+```
+
+Verify both fingerprints before proceeding:
+
+```bash
+mp-keygen fingerprint ~/.mp/mps_host_mldsa65_key.pub
+mp-keygen fingerprint ~/.mp/id_mldsa65.pub
+```
+
+### 2. Server setup
+
+#### Config file (`~/.config/moshpits/moshpits.toml`)
+
+```toml
+# ~/.config/moshpits/moshpits.toml — full post-quantum server (ML-DSA-65 + ML-KEM-768)
+
+# ── Key files ─────────────────────────────────────────────────────────────────
+private_key_path = "/home/user/.mp/mps_host_mldsa65_key"
+public_key_path  = "/home/user/.mp/mps_host_mldsa65_key.pub"
+
+# ── Algorithm preferences ─────────────────────────────────────────────────────
+# The server's preference order wins during negotiation.  The list below
+# prefers ML-KEM variants but still accepts classical algorithms so that
+# clients not built with --features unstable can still connect.
+[preferred_algorithms]
+kex  = ["ml-kem-768-sha256", "ml-kem-1024-sha256", "ml-kem-512-sha256",
+        "x25519-sha256", "p384-sha384", "p256-sha256"]
+aead = ["aes256-gcm-siv", "aes256-gcm", "chacha20-poly1305", "aes128-gcm-siv"]
+mac  = ["hmac-sha512", "hmac-sha256"]
+kdf  = ["hkdf-sha256", "hkdf-sha384", "hkdf-sha512"]
+```
+
+To **require** ML-KEM and reject classical key exchange entirely, list only ML-KEM algorithms:
+
+```toml
+# Strict: reject any client that does not offer an ML-KEM algorithm
+[preferred_algorithms]
+kex = ["ml-kem-768-sha256", "ml-kem-1024-sha256", "ml-kem-512-sha256"]
+```
+
+> **Warning**: A strict ML-KEM-only server will reject connections from clients offering only classical KEX algorithms (X25519, P-384, P-256).
+
+#### Start the server
+
+```bash
+# Recommended — reads ~/.config/moshpits/moshpits.toml
+mps
+
+# Alternatively, pass everything on the command line
+mps --private-key-path ~/.mp/mps_host_mldsa65_key \
+    --public-key-path  ~/.mp/mps_host_mldsa65_key.pub \
+    --kex-algos        ml-kem-768-sha256,ml-kem-1024-sha256,ml-kem-512-sha256
+```
+
+### 3. Authorize the client public key on the server
+
+On the **server**, append the client's public key line to `~$TARGET_USER/.mp/authorized_keys`.  The public key file written by `mp-keygen generate` already contains a correctly formatted line.
+
+```bash
+# On the client — display the public key to copy
+cat ~/.mp/id_mldsa65.pub
+# Output: moshpit <base64-encoded-public-key> user@host
+
+# On the server — create the directory if it does not exist
+mkdir -p ~/.mp && chmod 700 ~/.mp
+
+# Append the public key (paste the full line from above)
+echo 'moshpit <base64-encoded-public-key> user@host' >> ~/.mp/authorized_keys
+chmod 600 ~/.mp/authorized_keys
+```
+
+If SSH access to the server is available, copy the key in one step:
+
+```bash
+# Copy directly over SSH (run on the client)
+ssh user@server "mkdir -p ~/.mp && chmod 700 ~/.mp && cat >> ~/.mp/authorized_keys && chmod 600 ~/.mp/authorized_keys" \
+    < ~/.mp/id_mldsa65.pub
+```
+
+### 4. Client setup
+
+#### Config file (`~/.config/moshpit/moshpit.toml`)
+
+```toml
+# ~/.config/moshpit/moshpit.toml — full post-quantum client (ML-DSA-65 + ML-KEM-768)
+
+# ── Key files ─────────────────────────────────────────────────────────────────
+private_key_path = "/home/user/.mp/id_mldsa65"
+public_key_path  = "/home/user/.mp/id_mldsa65.pub"
+
+# ── Algorithm preferences ─────────────────────────────────────────────────────
+# Offer ML-KEM variants first; the server's preference order determines which
+# is actually selected.  Classical algorithms are listed as a fallback for
+# servers not running --features unstable builds.
+[preferred_algorithms]
+kex  = ["ml-kem-768-sha256", "ml-kem-1024-sha256", "ml-kem-512-sha256",
+        "x25519-sha256", "p384-sha384", "p256-sha256"]
+aead = ["aes256-gcm-siv", "aes256-gcm", "chacha20-poly1305", "aes128-gcm-siv"]
+mac  = ["hmac-sha512", "hmac-sha256"]
+kdf  = ["hkdf-sha256", "hkdf-sha384", "hkdf-sha512"]
+```
+
+#### Connect to the server
+
+```bash
+# Recommended — reads ~/.config/moshpit/moshpit.toml for keys and algorithms
+mp user@192.168.1.10
+
+# Alternatively, pass everything on the command line
+mp --private-key-path ~/.mp/id_mldsa65 \
+   --public-key-path  ~/.mp/id_mldsa65.pub \
+   --kex-algos        ml-kem-768-sha256,ml-kem-1024-sha256,ml-kem-512-sha256 \
+   user@192.168.1.10
+```
+
+### Confirming post-quantum algorithms are in use
+
+Enable verbose logging on both sides to see the negotiated algorithm set printed at session start:
+
+```bash
+# Server — verbose output to stderr
+mps -vv --enable-std-output
+
+# Client — verbose
+mp -vv user@192.168.1.10
+```
+
+A successful post-quantum session will show `ml-kem-*` for the key exchange algorithm in the negotiation log lines.  If the KEX algorithm falls back to `x25519-sha256` or another classical algorithm, verify that:
+
+1. Both binaries were compiled with `--features unstable`.
+2. The server's `kex` preference list includes at least one `ml-kem-*` entry.
+3. The client's `kex` offer list includes at least one `ml-kem-*` entry that matches the server's list.
 
 ---
 

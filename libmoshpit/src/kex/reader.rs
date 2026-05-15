@@ -26,10 +26,26 @@ use aws_lc_rs::{
     },
     error::Unspecified,
     hkdf::{HKDF_SHA256, HKDF_SHA384, HKDF_SHA512, Salt},
+    kem::{
+        Algorithm as KemAlgorithm, Ciphertext, DecapsulationKey, EncapsulationKey, ML_KEM_512,
+        ML_KEM_768, ML_KEM_1024,
+    },
     rand::fill,
+};
+#[cfg(feature = "unstable")]
+use aws_lc_rs::{
+    signature::UnparsedPublicKey as SignatureUnparsedPublicKey,
+    unstable::signature::{
+        ML_DSA_44, ML_DSA_44_SIGNING, ML_DSA_65, ML_DSA_65_SIGNING, ML_DSA_87, ML_DSA_87_SIGNING,
+        PqdsaKeyPair,
+    },
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bon::Builder;
+#[cfg(feature = "unstable")]
+use bytes::Buf as _;
+#[cfg(feature = "unstable")]
+use bytes::BytesMut;
 use socket2::SockRef;
 use tokio::{
     net::UdpSocket,
@@ -45,14 +61,17 @@ use crate::{
     kex::TofuFn,
     kex::negotiate::{
         AEAD_AES128_GCM_SIV, AEAD_AES256_GCM, AEAD_AES256_GCM_SIV, AEAD_CHACHA20_POLY1305,
-        AlgorithmList, KDF_HKDF_SHA256, KDF_HKDF_SHA384, KDF_HKDF_SHA512, KEX_P256_SHA256,
-        KEX_P384_SHA384, KEX_X25519_SHA256, MAC_HMAC_SHA256, MAC_HMAC_SHA512, NegotiatedAlgorithms,
-        negotiate, supported_algorithms,
+        AlgorithmList, KDF_HKDF_SHA256, KDF_HKDF_SHA384, KDF_HKDF_SHA512, KEX_ML_KEM_512_SHA256,
+        KEX_ML_KEM_768_SHA256, KEX_ML_KEM_1024_SHA256, KEX_P256_SHA256, KEX_P384_SHA384,
+        KEX_X25519_SHA256, MAC_HMAC_SHA256, MAC_HMAC_SHA512, NegotiatedAlgorithms, negotiate,
+        supported_algorithms,
     },
     load_public_key,
     session::SessionRegistry,
     udp::DiffMode,
 };
+#[cfg(feature = "unstable")]
+use crate::{KEY_ALGORITHM_ML_DSA_44, KEY_ALGORITHM_ML_DSA_65, KEY_ALGORITHM_ML_DSA_87};
 
 const AEAD_KEY_INFO: &[u8] = b"AEAD KEY";
 const HMAC_KEY_INFO: &[u8] = b"HMAC KEY";
@@ -67,11 +86,47 @@ fn fmt_hex(bytes: &[u8]) -> String {
         })
 }
 
-fn resolve_kex_alg(kex: &str) -> Result<&'static aws_lc_rs::agreement::Algorithm> {
+enum ResolvedKexAlgorithm {
+    Dh(&'static aws_lc_rs::agreement::Algorithm),
+    Kem(&'static KemAlgorithm),
+}
+
+enum ClientEphemeral {
+    Dh(PrivateKey),
+    Kem(DecapsulationKey),
+}
+
+#[cfg(feature = "unstable")]
+struct IdentityProofContext<'a> {
+    client_identity_full: &'a [u8],
+    user: &'a [u8],
+    client_exchange: &'a [u8],
+    server_exchange: &'a [u8],
+    salt: &'a [u8],
+    negotiated: &'a NegotiatedAlgorithms,
+    public_key_path: &'a PathBuf,
+}
+
+#[cfg(feature = "unstable")]
+struct IdentityTranscriptParts<'a> {
+    role: &'a [u8],
+    negotiated: &'a NegotiatedAlgorithms,
+    user: &'a [u8],
+    client_exchange: &'a [u8],
+    client_identity: &'a [u8],
+    server_identity: &'a [u8],
+    server_exchange: &'a [u8],
+    salt: &'a [u8],
+}
+
+fn resolve_kex_alg(kex: &str) -> Result<ResolvedKexAlgorithm> {
     match kex {
-        KEX_X25519_SHA256 => Ok(&X25519),
-        KEX_P384_SHA384 => Ok(&ECDH_P384),
-        KEX_P256_SHA256 => Ok(&ECDH_P256),
+        KEX_X25519_SHA256 => Ok(ResolvedKexAlgorithm::Dh(&X25519)),
+        KEX_P384_SHA384 => Ok(ResolvedKexAlgorithm::Dh(&ECDH_P384)),
+        KEX_P256_SHA256 => Ok(ResolvedKexAlgorithm::Dh(&ECDH_P256)),
+        KEX_ML_KEM_512_SHA256 => Ok(ResolvedKexAlgorithm::Kem(&ML_KEM_512)),
+        KEX_ML_KEM_768_SHA256 => Ok(ResolvedKexAlgorithm::Kem(&ML_KEM_768)),
+        KEX_ML_KEM_1024_SHA256 => Ok(ResolvedKexAlgorithm::Kem(&ML_KEM_1024)),
         _ => Err(MoshpitError::NoCommonAlgorithm.into()),
     }
 }
@@ -101,6 +156,129 @@ fn resolve_hmac_key_type(mac: &str) -> Result<aws_lc_rs::hmac::Algorithm> {
         MAC_HMAC_SHA256 => Ok(HKDF_SHA256.hmac_algorithm()),
         _ => Err(MoshpitError::NoCommonAlgorithm.into()),
     }
+}
+
+fn derive_session_keys(
+    shared_secret: &[u8],
+    salt_bytes: &[u8],
+    negotiated: &NegotiatedAlgorithms,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let hkdf_alg = resolve_hkdf_alg(&negotiated.kdf)?;
+    let aead_alg = resolve_aead_alg(&negotiated.aead)?;
+    let hmac_key_type = resolve_hmac_key_type(&negotiated.mac)?;
+    let salt = Salt::new(hkdf_alg, salt_bytes);
+    let prk = salt.extract(shared_secret);
+
+    let okm_aead = prk.expand(&[AEAD_KEY_INFO], aead_alg)?;
+    let mut key_bytes = vec![0u8; aead_alg.key_len()];
+    okm_aead.fill(&mut key_bytes)?;
+
+    let mac_key_len = hmac_key_type.digest_algorithm().output_len();
+    let okm_hmac = prk.expand(&[HMAC_KEY_INFO], hmac_key_type)?;
+    let mut hmac_key_bytes = vec![0u8; mac_key_len];
+    okm_hmac.fill(&mut hmac_key_bytes)?;
+
+    Ok((key_bytes, hmac_key_bytes))
+}
+
+#[cfg(feature = "unstable")]
+fn push_transcript_field(transcript: &mut Vec<u8>, label: &[u8], value: &[u8]) -> Result<()> {
+    transcript.extend_from_slice(&u32::try_from(label.len())?.to_be_bytes());
+    transcript.extend_from_slice(label);
+    transcript.extend_from_slice(&u32::try_from(value.len())?.to_be_bytes());
+    transcript.extend_from_slice(value);
+    Ok(())
+}
+
+#[cfg(feature = "unstable")]
+fn identity_transcript(parts: &IdentityTranscriptParts<'_>) -> Result<Vec<u8>> {
+    let mut transcript = b"moshpit-identity-proof-v1".to_vec();
+    push_transcript_field(&mut transcript, b"role", parts.role)?;
+    push_transcript_field(&mut transcript, b"kex", parts.negotiated.kex.as_bytes())?;
+    push_transcript_field(&mut transcript, b"aead", parts.negotiated.aead.as_bytes())?;
+    push_transcript_field(&mut transcript, b"mac", parts.negotiated.mac.as_bytes())?;
+    push_transcript_field(&mut transcript, b"kdf", parts.negotiated.kdf.as_bytes())?;
+    push_transcript_field(&mut transcript, b"user", parts.user)?;
+    push_transcript_field(&mut transcript, b"client-exchange", parts.client_exchange)?;
+    push_transcript_field(&mut transcript, b"client-identity", parts.client_identity)?;
+    push_transcript_field(&mut transcript, b"server-identity", parts.server_identity)?;
+    push_transcript_field(&mut transcript, b"server-exchange", parts.server_exchange)?;
+    push_transcript_field(&mut transcript, b"salt", parts.salt)?;
+    Ok(transcript)
+}
+
+#[cfg(feature = "unstable")]
+fn is_ml_dsa_algorithm(key_alg: &str) -> bool {
+    matches!(
+        key_alg,
+        KEY_ALGORITHM_ML_DSA_44 | KEY_ALGORITHM_ML_DSA_65 | KEY_ALGORITHM_ML_DSA_87
+    )
+}
+
+#[cfg(feature = "unstable")]
+fn parse_full_public_key(full_public_key: &[u8]) -> Result<(String, Vec<u8>)> {
+    let pub_key_str = String::from_utf8_lossy(full_public_key);
+    let pub_key_parts: Vec<&str> = pub_key_str.split_whitespace().collect();
+    if pub_key_parts.len() != 3 {
+        return Err(MoshpitError::InvalidKeyHeader.into());
+    }
+    let decoded = STANDARD.decode(pub_key_parts[1].as_bytes())?;
+    let mut bytes = BytesMut::from(&decoded[..]);
+    if bytes.remaining() < 4 {
+        return Err(MoshpitError::InvalidKeyHeader.into());
+    }
+    let key_alg_len = usize::try_from(bytes.get_u32())?;
+    if bytes.remaining() < key_alg_len + 4 {
+        return Err(MoshpitError::InvalidKeyHeader.into());
+    }
+    let key_alg = bytes.split_to(key_alg_len);
+    let key_alg = std::str::from_utf8(&key_alg)
+        .map_err(|_| MoshpitError::InvalidKeyHeader)?
+        .to_string();
+    let public_key_len = usize::try_from(bytes.get_u32())?;
+    if bytes.remaining() < public_key_len {
+        return Err(MoshpitError::InvalidKeyHeader.into());
+    }
+    let public_key = bytes.split_to(public_key_len).to_vec();
+    Ok((key_alg, public_key))
+}
+
+#[cfg(feature = "unstable")]
+fn sign_identity_transcript(
+    key_alg: &str,
+    private_key: &[u8],
+    transcript: &[u8],
+) -> Result<Vec<u8>> {
+    let signing_alg = match key_alg {
+        KEY_ALGORITHM_ML_DSA_44 => &ML_DSA_44_SIGNING,
+        KEY_ALGORITHM_ML_DSA_65 => &ML_DSA_65_SIGNING,
+        KEY_ALGORITHM_ML_DSA_87 => &ML_DSA_87_SIGNING,
+        _ => return Err(MoshpitError::InvalidKeyHeader.into()),
+    };
+    let key_pair = PqdsaKeyPair::from_raw_private_key(signing_alg, private_key)?;
+    let mut signature = vec![0u8; signing_alg.signature_len()];
+    let signature_len = key_pair.sign(transcript, &mut signature)?;
+    signature.truncate(signature_len);
+    Ok(signature)
+}
+
+#[cfg(feature = "unstable")]
+fn verify_identity_transcript(
+    key_alg: &str,
+    public_key: &[u8],
+    transcript: &[u8],
+    signature: &[u8],
+) -> Result<()> {
+    let verification_alg = match key_alg {
+        KEY_ALGORITHM_ML_DSA_44 => &ML_DSA_44,
+        KEY_ALGORITHM_ML_DSA_65 => &ML_DSA_65,
+        KEY_ALGORITHM_ML_DSA_87 => &ML_DSA_87,
+        _ => return Err(MoshpitError::InvalidKeyHeader.into()),
+    };
+    let public_key = SignatureUnparsedPublicKey::new(verification_alg, public_key);
+    public_key
+        .verify(transcript, signature)
+        .map_err(|_| MoshpitError::KeyNotEstablished.into())
 }
 
 /// The key exchange reader for the moshpit
@@ -142,11 +320,20 @@ pub struct KexReader {
     /// validation on the server (client mode only).
     #[builder(default)]
     full_public_key_bytes: Vec<u8>,
+    /// Long-term identity key algorithm string (client mode only).
+    #[cfg(feature = "unstable")]
+    #[builder(default)]
+    client_identity_key_algorithm: String,
+    /// Long-term identity private key bytes for optional transcript proofs.
+    #[cfg(feature = "unstable")]
+    #[builder(default)]
+    client_identity_private_key: Vec<u8>,
 }
 
 impl std::fmt::Debug for KexReader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("KexReader")
+        let mut debug = f.debug_struct("KexReader");
+        let _ = debug
             .field("reader", &self.reader)
             .field("tx", &self.tx)
             .field("tx_event", &self.tx_event)
@@ -172,8 +359,15 @@ impl std::fmt::Debug for KexReader {
             .field("client_algos", &self.client_algos)
             .field("server_preferred_algos", &self.server_preferred_algos)
             .field("user", &self.user)
-            .field("full_public_key_bytes", &"<redacted>")
-            .finish()
+            .field("full_public_key_bytes", &"<redacted>");
+        #[cfg(feature = "unstable")]
+        let _ = debug
+            .field(
+                "client_identity_key_algorithm",
+                &self.client_identity_key_algorithm,
+            )
+            .field("client_identity_private_key", &"<redacted>");
+        debug.finish()
     }
 }
 
@@ -192,12 +386,36 @@ impl KexReader {
                     server_algos.kex, server_algos.aead, server_algos.mac, server_algos.kdf
                 );
                 // Server-preferred negotiation: first of server's list that client supports.
-                let negotiated = negotiate(&server_algos, &self.client_algos)?;
+                let negotiated = match negotiate(&server_algos, &self.client_algos) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        error!(
+                            "client_kex: no algorithm in common — \
+                             server offered kex={:?} aead={:?} mac={:?} kdf={:?}, \
+                             client supports kex={:?} aead={:?} mac={:?} kdf={:?}",
+                            server_algos.kex,
+                            server_algos.aead,
+                            server_algos.mac,
+                            server_algos.kdf,
+                            self.client_algos.kex,
+                            self.client_algos.aead,
+                            self.client_algos.mac,
+                            self.client_algos.kdf,
+                        );
+                        drop(self.tx_event.send(KexEvent::NoCommonAlgorithm));
+                        return Err(e);
+                    }
+                };
                 trace!(
                     "client_kex: negotiated: kex={} aead={} mac={} kdf={}",
                     negotiated.kex, negotiated.aead, negotiated.mac, negotiated.kdf
                 );
                 negotiated
+            }
+            Some(Frame::KexFailure) => {
+                error!("client_kex: server rejected key exchange (KexFailure before KexInit)");
+                drop(self.tx_event.send(KexEvent::NoCommonAlgorithm));
+                return Err(MoshpitError::NoCommonAlgorithm.into());
             }
             None => {
                 error!("client_kex: server closed connection before sending KexInit");
@@ -215,10 +433,8 @@ impl KexReader {
         };
 
         // Resolve algorithms from the negotiated names before generating the EPK.
-        let agreement_alg = resolve_kex_alg(&negotiated.kex)?;
-        let hkdf_alg = resolve_hkdf_alg(&negotiated.kdf)?;
+        let kex_alg = resolve_kex_alg(&negotiated.kex)?;
         let aead_alg = resolve_aead_alg(&negotiated.aead)?;
-        let hmac_key_type = resolve_hmac_key_type(&negotiated.mac)?;
         let kex_aead_log = negotiated.aead.clone();
         let kex_mac_log = negotiated.mac.clone();
 
@@ -226,33 +442,57 @@ impl KexReader {
         // primitives when it later receives KeyMaterial and HMACKeyMaterial.
         drop(
             self.tx_event
-                .send(KexEvent::NegotiatedAlgorithms(negotiated)),
+                .send(KexEvent::NegotiatedAlgorithms(negotiated.clone())),
         );
 
-        // Generate an ephemeral key for this connection using the negotiated KEX algorithm.
-        let epk = PrivateKey::generate(agreement_alg)?;
-        let epk_pub = epk.compute_public_key()?;
+        let (client_ephemeral, epk_pub_bytes) = match kex_alg {
+            ResolvedKexAlgorithm::Dh(agreement_alg) => {
+                let epk = PrivateKey::generate(agreement_alg)?;
+                let epk_pub = epk.compute_public_key()?;
+                (ClientEphemeral::Dh(epk), epk_pub.as_ref().to_vec())
+            }
+            ResolvedKexAlgorithm::Kem(kem_algorithm) => {
+                let decapsulation_key = DecapsulationKey::generate(kem_algorithm)?;
+                let encapsulation_key = decapsulation_key.encapsulation_key()?;
+                let encapsulation_key_bytes = encapsulation_key.key_bytes()?;
+                (
+                    ClientEphemeral::Kem(decapsulation_key),
+                    encapsulation_key_bytes.as_ref().to_vec(),
+                )
+            }
+        };
 
         // Send Initialize or ResumeRequest with our ephemeral public key + identity key.
         let user_bytes = self.user.as_bytes().to_vec();
         let identity_pk = self.full_public_key_bytes.clone();
+        #[cfg(feature = "unstable")]
+        let transcript_user = user_bytes.clone();
+        #[cfg(feature = "unstable")]
+        let transcript_client_exchange = epk_pub_bytes.clone();
         if let Some(session_uuid) = self.requested_session_uuid {
             self.tx.send(Frame::ResumeRequest(
                 UuidWrapper::new(session_uuid),
                 user_bytes,
-                epk_pub.as_ref().to_vec(),
+                epk_pub_bytes.clone(),
                 identity_pk,
             ))?;
         } else {
             self.tx.send(Frame::Initialize(
                 user_bytes,
-                epk_pub.as_ref().to_vec(),
+                epk_pub_bytes.clone(),
                 identity_pk,
             ))?;
         }
 
         trace!("client_kex: waiting for PeerInitialize");
         match self.reader.read_frame().await? {
+            Some(Frame::KexFailure) => {
+                error!(
+                    "client_kex: server rejected key exchange (KexFailure before PeerInitialize)"
+                );
+                drop(self.tx_event.send(KexEvent::NoCommonAlgorithm));
+                return Err(MoshpitError::NoCommonAlgorithm.into());
+            }
             None => {
                 error!("client_kex: server closed connection before sending PeerInitialize");
                 return Err(anyhow::anyhow!(
@@ -292,72 +532,86 @@ impl KexReader {
                     trace!("client_kex: no server_destination set, skipping host-key check");
                 }
 
-                // Use the ephemeral key for ECDH (identity key is only for host auth)
-                let peer_public_key = UnparsedPublicKey::new(agreement_alg, &ephemeral_pk);
-                let salt = Salt::new(hkdf_alg, &salt_bytes);
+                #[cfg(feature = "unstable")]
+                if is_ml_dsa_algorithm(&self.client_identity_key_algorithm) {
+                    let transcript = identity_transcript(&IdentityTranscriptParts {
+                        role: b"client",
+                        negotiated: &negotiated,
+                        user: &transcript_user,
+                        client_exchange: &transcript_client_exchange,
+                        client_identity: &self.full_public_key_bytes,
+                        server_identity: &identity_pk,
+                        server_exchange: &ephemeral_pk,
+                        salt: &salt_bytes,
+                    })?;
+                    let signature = sign_identity_transcript(
+                        &self.client_identity_key_algorithm,
+                        &self.client_identity_private_key,
+                        &transcript,
+                    )?;
+                    self.tx.send(Frame::IdentityProof(signature))?;
+                }
 
-                trace!("client_kex: running ECDH agree()");
-                agree(&epk, peer_public_key, Unspecified, |key_material| {
-                    let prk = salt.extract(key_material);
-
-                    let aead_key_len = aead_alg.key_len();
-                    let okm_aead = prk.expand(&[AEAD_KEY_INFO], aead_alg)?;
-                    let mut key_bytes = vec![0u8; aead_key_len];
-                    okm_aead.fill(&mut key_bytes)?;
-                    debug!(
-                        side = "client",
-                        aead = %kex_aead_log,
-                        key_len = key_bytes.len(),
-                        key_hex = %fmt_hex(&key_bytes),
-                        "kex: derived AEAD key"
-                    );
-
-                    let mac_key_len = hmac_key_type.digest_algorithm().output_len();
-                    let okm_hmac = prk.expand(&[HMAC_KEY_INFO], hmac_key_type)?;
-                    let mut hmac_key_bytes = vec![0u8; mac_key_len];
-                    okm_hmac.fill(&mut hmac_key_bytes)?;
-                    debug!(
-                        side = "client",
-                        mac = %kex_mac_log,
-                        hmac_key_len = hmac_key_bytes.len(),
-                        hmac_key_hex = %fmt_hex(&hmac_key_bytes),
-                        "kex: derived HMAC key"
-                    );
-
-                    self.tx_event
-                        .send(KexEvent::KeyMaterial(key_bytes.clone()))
-                        .map_err(|_| Unspecified)?;
-                    self.tx_event
-                        .send(KexEvent::HMACKeyMaterial(hmac_key_bytes))
-                        .map_err(|_| Unspecified)?;
-
-                    let rnk = LessSafeKey::new(UnboundKey::new(aead_alg, &key_bytes)?);
-                    let mut check = b"Yoda".to_vec();
-                    let mut nonce_bytes = [0u8; NONCE_LEN];
-                    fill(&mut nonce_bytes)?;
-                    let nonce = Nonce::try_assume_unique_for_key(&nonce_bytes)?;
-                    rnk.seal_in_place_append_tag(nonce, Aad::empty(), &mut check)?;
-
-                    match self.diff_mode {
-                        DiffMode::Datagram => self
-                            .tx
-                            .send(Frame::ClientOptions(1))
-                            .map_err(|_| Unspecified)?,
-                        DiffMode::StateSync => self
-                            .tx
-                            .send(Frame::ClientOptions(2))
-                            .map_err(|_| Unspecified)?,
-                        DiffMode::Reliable => {}
+                let shared_secret = match client_ephemeral {
+                    ClientEphemeral::Dh(epk) => {
+                        let ResolvedKexAlgorithm::Dh(agreement_alg) =
+                            resolve_kex_alg(&negotiated.kex)?
+                        else {
+                            return Err(MoshpitError::NoCommonAlgorithm.into());
+                        };
+                        let peer_public_key = UnparsedPublicKey::new(agreement_alg, &ephemeral_pk);
+                        trace!("client_kex: running ECDH agree()");
+                        agree(&epk, peer_public_key, Unspecified, |key_material| {
+                            Ok(key_material.to_vec())
+                        })?
                     }
-                    self.tx
-                        .send(Frame::Check(nonce_bytes, check))
-                        .map_err(|_| Unspecified)?;
-                    Ok(())
-                })
-                .inspect(|()| trace!("client_kex: agree() succeeded, Check frame sent"))
-                .inspect_err(|_| {
-                    error!("client_kex: agree() failed — channel closed or crypto error");
-                })?;
+                    ClientEphemeral::Kem(decapsulation_key) => {
+                        trace!("client_kex: running ML-KEM decapsulate()");
+                        decapsulation_key
+                            .decapsulate(Ciphertext::from(ephemeral_pk.as_slice()))?
+                            .as_ref()
+                            .to_vec()
+                    }
+                };
+
+                let (key_bytes, hmac_key_bytes) =
+                    derive_session_keys(&shared_secret, &salt_bytes, &negotiated)?;
+                debug!(
+                    side = "client",
+                    aead = %kex_aead_log,
+                    key_len = key_bytes.len(),
+                    key_hex = %fmt_hex(&key_bytes),
+                    "kex: derived AEAD key"
+                );
+                debug!(
+                    side = "client",
+                    mac = %kex_mac_log,
+                    hmac_key_len = hmac_key_bytes.len(),
+                    hmac_key_hex = %fmt_hex(&hmac_key_bytes),
+                    "kex: derived HMAC key"
+                );
+
+                self.tx_event
+                    .send(KexEvent::KeyMaterial(key_bytes.clone()))
+                    .map_err(|_| Unspecified)?;
+                self.tx_event
+                    .send(KexEvent::HMACKeyMaterial(hmac_key_bytes))
+                    .map_err(|_| Unspecified)?;
+
+                let rnk = LessSafeKey::new(UnboundKey::new(aead_alg, &key_bytes)?);
+                let mut check = b"Yoda".to_vec();
+                let mut nonce_bytes = [0u8; NONCE_LEN];
+                fill(&mut nonce_bytes)?;
+                let nonce = Nonce::try_assume_unique_for_key(&nonce_bytes)?;
+                rnk.seal_in_place_append_tag(nonce, Aad::empty(), &mut check)?;
+
+                match self.diff_mode {
+                    DiffMode::Datagram => self.tx.send(Frame::ClientOptions(1))?,
+                    DiffMode::StateSync => self.tx.send(Frame::ClientOptions(2))?,
+                    DiffMode::Reliable => {}
+                }
+                self.tx.send(Frame::Check(nonce_bytes, check))?;
+                trace!("client_kex: key exchange secret established, Check frame sent");
             }
             Some(other) => {
                 error!(
@@ -465,7 +719,22 @@ impl KexReader {
                     client_algos.kex, client_algos.aead, client_algos.mac, client_algos.kdf
                 );
                 // Server-preferred: first of server's list that client also offered.
-                let negotiated = negotiate(&self.server_preferred_algos, &client_algos)?;
+                let Ok(negotiated) = negotiate(&self.server_preferred_algos, &client_algos) else {
+                    error!(
+                        "server_kex: no algorithm in common — \
+                         server preferred kex={:?} aead={:?} mac={:?} kdf={:?}, \
+                         client offered kex={:?} aead={:?} mac={:?} kdf={:?}",
+                        self.server_preferred_algos.kex,
+                        self.server_preferred_algos.aead,
+                        self.server_preferred_algos.mac,
+                        self.server_preferred_algos.kdf,
+                        client_algos.kex,
+                        client_algos.aead,
+                        client_algos.mac,
+                        client_algos.kdf,
+                    );
+                    return Err(MoshpitError::NoCommonAlgorithm.into());
+                };
                 trace!(
                     "server_kex: negotiated: kex={} aead={} mac={} kdf={}",
                     negotiated.kex, negotiated.aead, negotiated.mac, negotiated.kdf
@@ -550,12 +819,24 @@ impl KexReader {
                         self.tx_event
                             .send(KexEvent::NegotiatedAlgorithms(negotiated.clone())),
                     );
-                    let rnk = self.handle_initialize(
+                    let initialize_result = self.handle_initialize(
                         &pk,
                         &negotiated,
                         &self.tx_event.clone(),
                         public_key_path,
                     )?;
+                    let rnk = initialize_result.0;
+                    #[cfg(feature = "unstable")]
+                    self.handle_identity_proof_if_required(IdentityProofContext {
+                        client_identity_full: &fpk,
+                        user: &user,
+                        client_exchange: &pk,
+                        server_exchange: &initialize_result.1,
+                        salt: &initialize_result.2,
+                        negotiated: &negotiated,
+                        public_key_path,
+                    })
+                    .await?;
                     trace!("server_kex: PeerInitialize sent to client");
                     (rnk, user_str, shell, req_uuid)
                 }
@@ -664,88 +945,121 @@ impl KexReader {
         Ok((skex, udp_arc))
     }
 
+    #[cfg(feature = "unstable")]
+    async fn handle_identity_proof_if_required(
+        &mut self,
+        context: IdentityProofContext<'_>,
+    ) -> Result<()> {
+        let (key_alg, public_key) = parse_full_public_key(context.client_identity_full)?;
+        if !is_ml_dsa_algorithm(&key_alg) {
+            return Ok(());
+        }
+
+        let signature = match self.reader.read_frame().await? {
+            Some(Frame::IdentityProof(signature)) => signature,
+            Some(other) => {
+                error!(
+                    "server_kex: expected IdentityProof for ML-DSA key but got frame id={}",
+                    other.id()
+                );
+                return Err(MoshpitError::KeyNotEstablished.into());
+            }
+            None => {
+                error!("server_kex: client closed before sending ML-DSA IdentityProof");
+                return Err(MoshpitError::KeyNotEstablished.into());
+            }
+        };
+        let (_, server_identity_public) = load_public_key(context.public_key_path)?;
+        let transcript = identity_transcript(&IdentityTranscriptParts {
+            role: b"client",
+            negotiated: context.negotiated,
+            user: context.user,
+            client_exchange: context.client_exchange,
+            client_identity: context.client_identity_full,
+            server_identity: &server_identity_public,
+            server_exchange: context.server_exchange,
+            salt: context.salt,
+        })?;
+        verify_identity_transcript(&key_alg, &public_key, &transcript, &signature)
+    }
+
     fn handle_initialize(
         &mut self,
         pk: &[u8],
         negotiated: &NegotiatedAlgorithms,
         tx_event: &UnboundedSender<KexEvent>,
         public_key_path: &PathBuf,
-    ) -> Result<LessSafeKey> {
-        let agreement_alg = resolve_kex_alg(&negotiated.kex)?;
-        let hkdf_alg = resolve_hkdf_alg(&negotiated.kdf)?;
+    ) -> Result<(LessSafeKey, Vec<u8>, Vec<u8>)> {
+        let kex_alg = resolve_kex_alg(&negotiated.kex)?;
         let aead_alg = resolve_aead_alg(&negotiated.aead)?;
-        let hmac_key_type = resolve_hmac_key_type(&negotiated.mac)?;
         let kex_aead_log = negotiated.aead.clone();
         let kex_mac_log = negotiated.mac.clone();
 
         // Load only the server's identity public key bytes for host authentication
         let (_, identity_pub_key_bytes) = load_public_key(public_key_path)?;
 
-        // Generate a fresh ephemeral key pair for this session's ECDH
-        let ephemeral_priv = PrivateKey::generate(agreement_alg)?;
-        let ephemeral_pub = ephemeral_priv.compute_public_key()?;
-
-        // Parse the client's ephemeral public key using the negotiated algorithm.
-        let unparsed_public_key = UnparsedPublicKey::new(agreement_alg, pk);
-        let parsed_public_key = ParsedPublicKey::try_from(&unparsed_public_key)?;
-
         // Generate a (non-secret) salt value
         let mut salt_bytes = [0u8; 32];
         fill(&mut salt_bytes)?;
 
-        // Send the server's identity public key, ephemeral public key, and salt back to the client.
+        let (server_ephemeral_or_ciphertext, shared_secret) = match kex_alg {
+            ResolvedKexAlgorithm::Dh(agreement_alg) => {
+                let ephemeral_priv = PrivateKey::generate(agreement_alg)?;
+                let ephemeral_pub = ephemeral_priv.compute_public_key()?;
+                let unparsed_public_key = UnparsedPublicKey::new(agreement_alg, pk);
+                let parsed_public_key = ParsedPublicKey::try_from(&unparsed_public_key)?;
+                let shared_secret = agree(
+                    &ephemeral_priv,
+                    parsed_public_key,
+                    Unspecified,
+                    |key_material| Ok(key_material.to_vec()),
+                )?;
+                (ephemeral_pub.as_ref().to_vec(), shared_secret)
+            }
+            ResolvedKexAlgorithm::Kem(kem_algorithm) => {
+                let encapsulation_key = EncapsulationKey::new(kem_algorithm, pk)?;
+                let (ciphertext, shared_secret) = encapsulation_key.encapsulate()?;
+                (
+                    ciphertext.as_ref().to_vec(),
+                    shared_secret.as_ref().to_vec(),
+                )
+            }
+        };
+
+        // Send the server's identity public key, ephemeral public key or KEM ciphertext,
+        // and salt back to the client.
         let peer_initialize = Frame::PeerInitialize(
             identity_pub_key_bytes,
-            ephemeral_pub.as_ref().to_vec(),
+            server_ephemeral_or_ciphertext.clone(),
             salt_bytes.to_vec(),
         );
         self.tx.send(peer_initialize)?;
 
-        let salt = Salt::new(hkdf_alg, &salt_bytes);
+        let (key_bytes, hmac_key_bytes) =
+            derive_session_keys(&shared_secret, &salt_bytes, negotiated)?;
+        debug!(
+            side = "server",
+            aead = %kex_aead_log,
+            key_len = key_bytes.len(),
+            key_hex = %fmt_hex(&key_bytes),
+            "kex: derived AEAD key"
+        );
+        debug!(
+            side = "server",
+            mac = %kex_mac_log,
+            hmac_key_len = hmac_key_bytes.len(),
+            hmac_key_hex = %fmt_hex(&hmac_key_bytes),
+            "kex: derived HMAC key"
+        );
 
-        // Do ECDH using the server's ephemeral key (not the identity key)
-        let rnk = agree(
-            &ephemeral_priv,
-            parsed_public_key,
-            Unspecified,
-            |key_material| {
-                let prk = salt.extract(key_material);
-
-                let aead_key_len = aead_alg.key_len();
-                let okm = prk.expand(&[AEAD_KEY_INFO], aead_alg)?;
-                let mut key_bytes = vec![0u8; aead_key_len];
-                okm.fill(&mut key_bytes)?;
-                debug!(
-                    side = "server",
-                    aead = %kex_aead_log,
-                    key_len = key_bytes.len(),
-                    key_hex = %fmt_hex(&key_bytes),
-                    "kex: derived AEAD key"
-                );
-
-                let mac_key_len = hmac_key_type.digest_algorithm().output_len();
-                let okm_hmac = prk.expand(&[HMAC_KEY_INFO], hmac_key_type)?;
-                let mut hmac_key_bytes = vec![0u8; mac_key_len];
-                okm_hmac.fill(&mut hmac_key_bytes)?;
-                debug!(
-                    side = "server",
-                    mac = %kex_mac_log,
-                    hmac_key_len = hmac_key_bytes.len(),
-                    hmac_key_hex = %fmt_hex(&hmac_key_bytes),
-                    "kex: derived HMAC key"
-                );
-
-                tx_event
-                    .send(KexEvent::KeyMaterial(key_bytes.clone()))
-                    .map_err(|_| Unspecified)?;
-                tx_event
-                    .send(KexEvent::HMACKeyMaterial(hmac_key_bytes))
-                    .map_err(|_| Unspecified)?;
-                let rnk = LessSafeKey::new(UnboundKey::new(aead_alg, &key_bytes)?);
-                Ok(rnk)
-            },
-        )?;
-        Ok(rnk)
+        tx_event
+            .send(KexEvent::KeyMaterial(key_bytes.clone()))
+            .map_err(|_| Unspecified)?;
+        tx_event
+            .send(KexEvent::HMACKeyMaterial(hmac_key_bytes))
+            .map_err(|_| Unspecified)?;
+        let rnk = LessSafeKey::new(UnboundKey::new(aead_alg, &key_bytes)?);
+        Ok((rnk, server_ephemeral_or_ciphertext, salt_bytes.to_vec()))
     }
 
     fn handle_check(
@@ -1232,7 +1546,15 @@ mod tests {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use tempfile::TempDir;
 
-    use super::{check_authorized_keys, check_known_hosts};
+    use aws_lc_rs::kem::{
+        Ciphertext, DecapsulationKey, EncapsulationKey, ML_KEM_512, ML_KEM_768, ML_KEM_1024,
+    };
+
+    use super::{check_authorized_keys, check_known_hosts, derive_session_keys};
+    use crate::kex::negotiate::{
+        AEAD_AES256_GCM_SIV, KDF_HKDF_SHA256, KEX_ML_KEM_512_SHA256, KEX_ML_KEM_768_SHA256,
+        KEX_ML_KEM_1024_SHA256, MAC_HMAC_SHA512, NegotiatedAlgorithms,
+    };
     use crate::kex::{HostKeyMismatchFn, TofuFn};
 
     /// Tests that mutate the `HOME` environment variable must hold this lock
@@ -1268,6 +1590,108 @@ mod tests {
             .open(ak)
             .unwrap();
         f.write_all(content).unwrap();
+    }
+
+    #[test]
+    fn ml_kem_round_trip_derives_same_session_keys() {
+        for (alg, name) in [
+            (&ML_KEM_512, KEX_ML_KEM_512_SHA256),
+            (&ML_KEM_768, KEX_ML_KEM_768_SHA256),
+            (&ML_KEM_1024, KEX_ML_KEM_1024_SHA256),
+        ] {
+            let decapsulation_key = DecapsulationKey::generate(alg).unwrap();
+            let encapsulation_key_bytes = decapsulation_key
+                .encapsulation_key()
+                .unwrap()
+                .key_bytes()
+                .unwrap();
+            let encapsulation_key =
+                EncapsulationKey::new(alg, encapsulation_key_bytes.as_ref()).unwrap();
+            let (ciphertext, server_secret) = encapsulation_key.encapsulate().unwrap();
+            let client_secret = decapsulation_key
+                .decapsulate(Ciphertext::from(ciphertext.as_ref()))
+                .unwrap();
+            assert_eq!(server_secret.as_ref(), client_secret.as_ref());
+
+            let negotiated = NegotiatedAlgorithms {
+                kex: name.to_string(),
+                aead: AEAD_AES256_GCM_SIV.to_string(),
+                mac: MAC_HMAC_SHA512.to_string(),
+                kdf: KDF_HKDF_SHA256.to_string(),
+            };
+            let salt = [7u8; 32];
+            let server_keys =
+                derive_session_keys(server_secret.as_ref(), &salt, &negotiated).unwrap();
+            let client_keys =
+                derive_session_keys(client_secret.as_ref(), &salt, &negotiated).unwrap();
+            assert_eq!(server_keys, client_keys);
+            assert_eq!(server_keys.0.len(), 32);
+            assert_eq!(server_keys.1.len(), 64);
+        }
+    }
+
+    #[test]
+    fn ml_kem_rejects_mismatched_or_malformed_inputs() {
+        let decapsulation_key = DecapsulationKey::generate(&ML_KEM_512).unwrap();
+        let encapsulation_key_bytes = decapsulation_key
+            .encapsulation_key()
+            .unwrap()
+            .key_bytes()
+            .unwrap();
+        assert!(EncapsulationKey::new(&ML_KEM_768, encapsulation_key_bytes.as_ref()).is_err());
+
+        let encapsulation_key =
+            EncapsulationKey::new(&ML_KEM_512, encapsulation_key_bytes.as_ref()).unwrap();
+        let (ciphertext, _) = encapsulation_key.encapsulate().unwrap();
+        let truncated = &ciphertext.as_ref()[..ciphertext.as_ref().len() - 1];
+        assert!(
+            decapsulation_key
+                .decapsulate(Ciphertext::from(truncated))
+                .is_err()
+        );
+    }
+
+    #[cfg(feature = "unstable")]
+    #[test]
+    fn ml_dsa_identity_transcript_signature_verifies() {
+        use aws_lc_rs::{
+            encoding::AsRawBytes as _, signature::KeyPair as _, unstable::signature::PqdsaKeyPair,
+        };
+
+        let key_pair =
+            PqdsaKeyPair::generate(&aws_lc_rs::unstable::signature::ML_DSA_44_SIGNING).unwrap();
+        let private_key = key_pair.private_key().as_raw_bytes().unwrap();
+        let public_key = key_pair.public_key().as_ref();
+        let negotiated = NegotiatedAlgorithms {
+            kex: KEX_ML_KEM_768_SHA256.to_string(),
+            aead: AEAD_AES256_GCM_SIV.to_string(),
+            mac: MAC_HMAC_SHA512.to_string(),
+            kdf: KDF_HKDF_SHA256.to_string(),
+        };
+        let transcript = super::identity_transcript(&super::IdentityTranscriptParts {
+            role: b"client",
+            negotiated: &negotiated,
+            user: b"alice",
+            client_exchange: b"client-exchange",
+            client_identity: b"client-identity",
+            server_identity: b"server-identity",
+            server_exchange: b"server-exchange",
+            salt: b"salt",
+        })
+        .unwrap();
+        let signature = super::sign_identity_transcript(
+            crate::KEY_ALGORITHM_ML_DSA_44,
+            private_key.as_ref(),
+            &transcript,
+        )
+        .unwrap();
+        super::verify_identity_transcript(
+            crate::KEY_ALGORITHM_ML_DSA_44,
+            public_key,
+            &transcript,
+            &signature,
+        )
+        .unwrap();
     }
 
     // -----------------------------------------------------------------------
@@ -1695,15 +2119,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_kex_wrong_initial_frame_returns_key_not_established() {
+    async fn client_kex_kex_failure_before_kex_init_returns_no_common_algorithm() {
         use crate::MoshpitError;
 
         let (client_reader, _client_writer, _server_reader, mut server_writer) =
             make_bidirectional_loopback().await;
         let (mut kex_reader, _rx_frames, _rx_events) = make_test_kex_reader(client_reader);
 
-        // Server sends wrong frame type
+        // Server rejects immediately with KexFailure (e.g. no common algorithm)
         server_writer.write_frame(&Frame::KexFailure).await.unwrap();
+        drop(server_writer);
+
+        let result = kex_reader.client_kex().await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .downcast_ref::<MoshpitError>()
+                .is_some_and(|e| *e == MoshpitError::NoCommonAlgorithm),
+        );
+    }
+
+    #[tokio::test]
+    async fn client_kex_unexpected_initial_frame_returns_key_not_established() {
+        use crate::MoshpitError;
+
+        let (client_reader, _client_writer, _server_reader, mut server_writer) =
+            make_bidirectional_loopback().await;
+        let (mut kex_reader, _rx_frames, _rx_events) = make_test_kex_reader(client_reader);
+
+        // Server sends a non-KexInit, non-KexFailure frame — truly unexpected
+        server_writer
+            .write_frame(&Frame::KeyAgreement(UuidWrapper::new(uuid::Uuid::nil())))
+            .await
+            .unwrap();
         drop(server_writer);
 
         let result = kex_reader.client_kex().await;
@@ -1983,5 +2432,138 @@ mod tests {
                 .is_some_and(|e| *e == MoshpitError::KeyNotEstablished),
             "expected KeyNotEstablished error"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_kex_alg tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_kex_alg_all_known_variants() {
+        use super::resolve_kex_alg;
+        use crate::kex::negotiate::{
+            KEX_ML_KEM_512_SHA256, KEX_ML_KEM_768_SHA256, KEX_ML_KEM_1024_SHA256, KEX_P256_SHA256,
+            KEX_P384_SHA384, KEX_X25519_SHA256,
+        };
+        assert!(resolve_kex_alg(KEX_X25519_SHA256).is_ok());
+        assert!(resolve_kex_alg(KEX_P384_SHA384).is_ok());
+        assert!(resolve_kex_alg(KEX_P256_SHA256).is_ok());
+        assert!(resolve_kex_alg(KEX_ML_KEM_512_SHA256).is_ok());
+        assert!(resolve_kex_alg(KEX_ML_KEM_768_SHA256).is_ok());
+        assert!(resolve_kex_alg(KEX_ML_KEM_1024_SHA256).is_ok());
+    }
+
+    #[test]
+    fn resolve_kex_alg_unknown_returns_error() {
+        assert!(super::resolve_kex_alg("bogus-kex-alg").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // unstable feature (ML-DSA) tests
+    // -----------------------------------------------------------------------
+
+    #[cfg(feature = "unstable")]
+    #[test]
+    fn ml_dsa_sign_verify_ml_dsa_65_and_87() {
+        use aws_lc_rs::{
+            encoding::AsRawBytes as _,
+            signature::KeyPair as _,
+            unstable::signature::{ML_DSA_65_SIGNING, ML_DSA_87_SIGNING, PqdsaKeyPair},
+        };
+
+        let negotiated = NegotiatedAlgorithms {
+            kex: KEX_ML_KEM_768_SHA256.to_string(),
+            aead: AEAD_AES256_GCM_SIV.to_string(),
+            mac: MAC_HMAC_SHA512.to_string(),
+            kdf: KDF_HKDF_SHA256.to_string(),
+        };
+
+        for (signing_alg, alg_str) in [
+            (&ML_DSA_65_SIGNING, crate::KEY_ALGORITHM_ML_DSA_65),
+            (&ML_DSA_87_SIGNING, crate::KEY_ALGORITHM_ML_DSA_87),
+        ] {
+            let key_pair = PqdsaKeyPair::generate(signing_alg).unwrap();
+            let private_key = key_pair.private_key().as_raw_bytes().unwrap();
+            let public_key = key_pair.public_key().as_ref().to_vec();
+            let transcript = super::identity_transcript(&super::IdentityTranscriptParts {
+                role: b"client",
+                negotiated: &negotiated,
+                user: b"alice",
+                client_exchange: b"client-exchange",
+                client_identity: b"client-identity",
+                server_identity: b"server-identity",
+                server_exchange: b"server-exchange",
+                salt: b"salt",
+            })
+            .unwrap();
+            let signature =
+                super::sign_identity_transcript(alg_str, private_key.as_ref(), &transcript)
+                    .unwrap();
+            super::verify_identity_transcript(alg_str, &public_key, &transcript, &signature)
+                .unwrap();
+        }
+    }
+
+    #[cfg(feature = "unstable")]
+    #[test]
+    fn is_ml_dsa_algorithm_returns_true_for_ml_dsa() {
+        assert!(super::is_ml_dsa_algorithm(crate::KEY_ALGORITHM_ML_DSA_44));
+        assert!(super::is_ml_dsa_algorithm(crate::KEY_ALGORITHM_ML_DSA_65));
+        assert!(super::is_ml_dsa_algorithm(crate::KEY_ALGORITHM_ML_DSA_87));
+    }
+
+    #[cfg(feature = "unstable")]
+    #[test]
+    fn is_ml_dsa_algorithm_returns_false_for_ecdh() {
+        assert!(!super::is_ml_dsa_algorithm("X25519"));
+        assert!(!super::is_ml_dsa_algorithm("P384"));
+        assert!(!super::is_ml_dsa_algorithm("unknown"));
+    }
+
+    #[cfg(feature = "unstable")]
+    #[test]
+    fn parse_full_public_key_valid() {
+        let alg = b"X25519";
+        let pubkey = [0xABu8; 32];
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&u32::try_from(alg.len()).unwrap().to_be_bytes());
+        payload.extend_from_slice(alg);
+        payload.extend_from_slice(&u32::try_from(pubkey.len()).unwrap().to_be_bytes());
+        payload.extend_from_slice(&pubkey);
+        let b64 = STANDARD.encode(&payload);
+        let full_key = format!("moshpit {b64} user@host").into_bytes();
+        let (key_alg, key_bytes) = super::parse_full_public_key(&full_key).unwrap();
+        assert_eq!(key_alg, "X25519");
+        assert_eq!(key_bytes, pubkey);
+    }
+
+    #[cfg(feature = "unstable")]
+    #[test]
+    fn parse_full_public_key_wrong_part_count() {
+        let result = super::parse_full_public_key(b"moshpit only-two-parts");
+        assert!(result.is_err());
+    }
+
+    #[cfg(feature = "unstable")]
+    #[test]
+    fn parse_full_public_key_truncated_payload() {
+        let b64 = STANDARD.encode(b"abc");
+        let full_key = format!("moshpit {b64} user@host").into_bytes();
+        let result = super::parse_full_public_key(&full_key);
+        assert!(result.is_err());
+    }
+
+    #[cfg(feature = "unstable")]
+    #[test]
+    fn sign_identity_transcript_unknown_alg_errors() {
+        let result = super::sign_identity_transcript("X25519", &[], &[]);
+        assert!(result.is_err());
+    }
+
+    #[cfg(feature = "unstable")]
+    #[test]
+    fn verify_identity_transcript_unknown_alg_errors() {
+        let result = super::verify_identity_transcript("X25519", &[], &[], &[]);
+        assert!(result.is_err());
     }
 }

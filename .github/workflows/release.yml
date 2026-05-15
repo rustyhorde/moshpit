@@ -35,7 +35,7 @@ jobs:
 
       - name: Install Rust
         # stable
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
           toolchain: "1.91.1"
 
@@ -64,9 +64,25 @@ jobs:
         env:
           VERGEN_IDEMPOTENT: "1"
         run: |
+          # Standard build
           cross build --release --locked \
             --target x86_64-unknown-linux-musl \
             --bin mp --bin mps --bin mp-keygen
+
+          # Preserve standard binaries before the --features unstable build overwrites them
+          cp target/x86_64-unknown-linux-musl/release/mp        mp-x86_64-unknown-linux-musl
+          cp target/x86_64-unknown-linux-musl/release/mps       mps-x86_64-unknown-linux-musl
+          cp target/x86_64-unknown-linux-musl/release/mp-keygen mp-keygen-x86_64-unknown-linux-musl
+
+          # Unstable build (post-quantum ML-DSA identity key support)
+          cross build --release --locked \
+            --target x86_64-unknown-linux-musl \
+            --features unstable \
+            --bin mp --bin mps --bin mp-keygen
+
+          cp target/x86_64-unknown-linux-musl/release/mp        mp-unstable-x86_64-unknown-linux-musl
+          cp target/x86_64-unknown-linux-musl/release/mps       mps-unstable-x86_64-unknown-linux-musl
+          cp target/x86_64-unknown-linux-musl/release/mp-keygen mp-keygen-unstable-x86_64-unknown-linux-musl
 
       - name: Generate xtask dist artifacts
         run: |
@@ -84,13 +100,15 @@ jobs:
         run: |
           mkdir -p release-assets
 
-          # x86_64 static MUSL binaries
-          cp target/x86_64-unknown-linux-musl/release/mp \
-             release-assets/mp-x86_64-unknown-linux-musl
-          cp target/x86_64-unknown-linux-musl/release/mps \
-             release-assets/mps-x86_64-unknown-linux-musl
-          cp target/x86_64-unknown-linux-musl/release/mp-keygen \
-             release-assets/mp-keygen-x86_64-unknown-linux-musl
+          # x86_64 static MUSL binaries — standard
+          cp mp-x86_64-unknown-linux-musl        release-assets/
+          cp mps-x86_64-unknown-linux-musl       release-assets/
+          cp mp-keygen-x86_64-unknown-linux-musl release-assets/
+
+          # x86_64 static MUSL binaries — unstable (post-quantum ML-DSA support)
+          cp mp-unstable-x86_64-unknown-linux-musl        release-assets/
+          cp mps-unstable-x86_64-unknown-linux-musl       release-assets/
+          cp mp-keygen-unstable-x86_64-unknown-linux-musl release-assets/
 
           # dist tarballs (man pages + shell completions + licenses + example configs)
           cp dist-mp.tar.gz        release-assets/
@@ -205,6 +223,12 @@ jobs:
             >> "$GITHUB_OUTPUT"
           echo "x86_64_mpkeygen=$(sha256sum release-assets/mp-keygen-x86_64-unknown-linux-musl | awk '{print $1}')" \
             >> "$GITHUB_OUTPUT"
+          echo "x86_64_mp_unstable=$(sha256sum release-assets/mp-unstable-x86_64-unknown-linux-musl | awk '{print $1}')" \
+            >> "$GITHUB_OUTPUT"
+          echo "x86_64_mps_unstable=$(sha256sum release-assets/mps-unstable-x86_64-unknown-linux-musl | awk '{print $1}')" \
+            >> "$GITHUB_OUTPUT"
+          echo "x86_64_mpkeygen_unstable=$(sha256sum release-assets/mp-keygen-unstable-x86_64-unknown-linux-musl | awk '{print $1}')" \
+            >> "$GITHUB_OUTPUT"
           echo "dist_mp=$(sha256sum release-assets/dist-mp.tar.gz | awk '{print $1}')" \
             >> "$GITHUB_OUTPUT"
           echo "dist_mps=$(sha256sum release-assets/dist-mps.tar.gz | awk '{print $1}')" \
@@ -228,13 +252,16 @@ jobs:
 
       - name: Update binary PKGBUILDs
         env:
-          PKGVER:           ${{ needs.build.outputs.pkgver }}
-          X86_64_MP:        ${{ steps.binsums.outputs.x86_64_mp }}
-          X86_64_MPS:       ${{ steps.binsums.outputs.x86_64_mps }}
-          X86_64_MPKEYGEN:  ${{ steps.binsums.outputs.x86_64_mpkeygen }}
-          DIST_MP:          ${{ steps.binsums.outputs.dist_mp }}
-          DIST_MPS:         ${{ steps.binsums.outputs.dist_mps }}
-          DIST_MPKEYGEN:    ${{ steps.binsums.outputs.dist_mpkeygen }}
+          PKGVER:                   ${{ needs.build.outputs.pkgver }}
+          X86_64_MP:                ${{ steps.binsums.outputs.x86_64_mp }}
+          X86_64_MPS:               ${{ steps.binsums.outputs.x86_64_mps }}
+          X86_64_MPKEYGEN:          ${{ steps.binsums.outputs.x86_64_mpkeygen }}
+          X86_64_MP_UNSTABLE:       ${{ steps.binsums.outputs.x86_64_mp_unstable }}
+          X86_64_MPS_UNSTABLE:      ${{ steps.binsums.outputs.x86_64_mps_unstable }}
+          X86_64_MPKEYGEN_UNSTABLE: ${{ steps.binsums.outputs.x86_64_mpkeygen_unstable }}
+          DIST_MP:                  ${{ steps.binsums.outputs.dist_mp }}
+          DIST_MPS:                 ${{ steps.binsums.outputs.dist_mps }}
+          DIST_MPKEYGEN:            ${{ steps.binsums.outputs.dist_mpkeygen }}
         run: |
           # Replaces pkgver, pkgrel, and release-asset sha256 arrays in binary PKGBUILDs.
           # For sha256sums, only the first value (dist tarball) is replaced.
@@ -258,6 +285,18 @@ jobs:
           update_bin_pkgbuild \
             packaging/arch/moshpits-bin/PKGBUILD \
             "$DIST_MPS" "$X86_64_MPS"
+
+          update_bin_pkgbuild \
+            packaging/arch/moshpit-keygen-unstable-bin/PKGBUILD \
+            "$DIST_MPKEYGEN" "$X86_64_MPKEYGEN_UNSTABLE"
+
+          update_bin_pkgbuild \
+            packaging/arch/moshpit-unstable-bin/PKGBUILD \
+            "$DIST_MP" "$X86_64_MP_UNSTABLE"
+
+          update_bin_pkgbuild \
+            packaging/arch/moshpits-unstable-bin/PKGBUILD \
+            "$DIST_MPS" "$X86_64_MPS_UNSTABLE"
 
       - name: Upload updated PKGBUILDs as artifact
         # v7
@@ -302,6 +341,9 @@ jobs:
           - moshpit-keygen-bin
           - moshpit-bin
           - moshpits-bin
+          - moshpit-keygen-unstable-bin
+          - moshpit-unstable-bin
+          - moshpits-unstable-bin
     steps:
       - name: Download updated PKGBUILDs
         # v8
