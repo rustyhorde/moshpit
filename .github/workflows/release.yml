@@ -133,11 +133,23 @@ jobs:
               --packager "$packager" \
               --target release-assets/
             nfpm package \
+              --config packaging/nfpm/moshpit-keygen-unstable.yaml \
+              --packager "$packager" \
+              --target release-assets/
+            nfpm package \
               --config packaging/nfpm/moshpit.yaml \
               --packager "$packager" \
               --target release-assets/
             nfpm package \
+              --config packaging/nfpm/moshpit-unstable.yaml \
+              --packager "$packager" \
+              --target release-assets/
+            nfpm package \
               --config packaging/nfpm/moshpits.yaml \
+              --packager "$packager" \
+              --target release-assets/
+            nfpm package \
+              --config packaging/nfpm/moshpits-unstable.yaml \
               --packager "$packager" \
               --target release-assets/
           done
