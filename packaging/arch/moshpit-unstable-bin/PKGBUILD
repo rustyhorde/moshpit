@@ -9,6 +9,7 @@ url="https://github.com/rustyhorde/moshpit"
 license=('MIT' 'Apache-2.0')
 provides=('moshpit')
 conflicts=('moshpit' 'moshpit-bin')
+replaces=('moshpit-bin')
 depends=('moshpit-keygen')
 makedepends=()
 
