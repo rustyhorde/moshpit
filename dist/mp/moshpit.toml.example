@@ -31,9 +31,11 @@ server_destination = "192.168.1.10"
 max_reconnect_backoff_secs = 3600
 
 # ── Key files ─────────────────────────────────────────────────────────────────
-# Defaults to ~/.mp/id_ed25519 and ~/.mp/id_ed25519.pub when not set.
-# private_key_path = "/home/alice/.mp/id_ed25519"
-# public_key_path  = "/home/alice/.mp/id_ed25519.pub"
+# Defaults to ~/.mp/id_x25519 and ~/.mp/id_x25519.pub when not set (for the
+# default x25519 key type). The filename reflects the --key-type used at
+# generation time (e.g. id_p384, id_ml_dsa_65).
+# private_key_path = "/home/alice/.mp/id_x25519"
+# public_key_path  = "/home/alice/.mp/id_x25519.pub"
 
 # ── Tracing (log output) ──────────────────────────────────────────────────────
 # stdout layer — controls log line formatting when --enable-std-output is active

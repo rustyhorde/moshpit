@@ -363,6 +363,59 @@ sudo pacman -Rs moshpits moshpit moshpit-keygen
 
 ---
 
+## Installation (Debian / Ubuntu)
+
+Pre-built `.deb` packages for `amd64` are available as assets on each [GitHub release](https://github.com/rustyhorde/moshpit/releases).
+
+> **Note**: Place `.deb` files in `/tmp/` before installing with `apt`.  When accessing a local file `apt` drops privileges to the `_apt` system user, which cannot read files under `/home/`.  Using `/tmp/` (world-readable by default) avoids the resulting permission warning entirely.  Alternatively, use `dpkg -i` — it runs as root and has no sandboxing step.
+
+### Install with apt (recommended)
+
+```bash
+# Download the packages to /tmp (substitute the desired version)
+VERSION=0.8.0
+wget -P /tmp \
+    https://github.com/rustyhorde/moshpit/releases/download/v${VERSION}/moshpit-keygen_${VERSION}_amd64.deb \
+    https://github.com/rustyhorde/moshpit/releases/download/v${VERSION}/moshpits_${VERSION}_amd64.deb \
+    https://github.com/rustyhorde/moshpit/releases/download/v${VERSION}/moshpit_${VERSION}_amd64.deb
+
+# Install in dependency order — keygen first, then server, then client
+sudo apt install \
+    /tmp/moshpit-keygen_${VERSION}_amd64.deb \
+    /tmp/moshpits_${VERSION}_amd64.deb \
+    /tmp/moshpit_${VERSION}_amd64.deb
+```
+
+### Install with dpkg
+
+`dpkg -i` runs entirely as root and works with `.deb` files in any location:
+
+```bash
+VERSION=0.8.0
+sudo dpkg -i \
+    ~/moshpit-keygen_${VERSION}_amd64.deb \
+    ~/moshpits_${VERSION}_amd64.deb \
+    ~/moshpit_${VERSION}_amd64.deb
+
+# Resolve any missing dependencies
+sudo apt-get install -f
+```
+
+### Upgrading
+
+Re-running either install command above with a newer `.deb` upgrades an existing installation — both `apt` and `dpkg` handle the version replacement automatically.
+
+### Removing packages
+
+```bash
+sudo apt remove moshpit moshpits moshpit-keygen
+
+# Also remove configuration files
+sudo apt purge moshpit moshpits moshpit-keygen
+```
+
+---
+
 ## Installation (cargo)
 
 Requires a Rust toolchain (stable, 1.91.1 or later).  Install all three binaries directly from [crates.io](https://crates.io):
@@ -424,19 +477,23 @@ Default key locations when accepting the default path prompt:
 
 | Key | Default path |
 |-----|-------------|
-| Client private key | `~/.mp/id_ed25519` |
-| Client public key  | `~/.mp/id_ed25519.pub` |
-| Server private key | `~/.mp/mps_host_ed25519_key` |
-| Server public key  | `~/.mp/mps_host_ed25519_key.pub` |
+| Key | Default path |
+|-----|-------------|
+| Client private key (x25519) | `~/.mp/id_x25519` |
+| Client public key (x25519)  | `~/.mp/id_x25519.pub` |
+| Client private key (p384)   | `~/.mp/id_p384` |
+| Client public key (p384)    | `~/.mp/id_p384.pub` |
+| Server private key (x25519) | `~/.mp/mps_host_x25519_key` |
+| Server public key (x25519)  | `~/.mp/mps_host_x25519_key.pub` |
 
-> **Note**: The default file names use the `ed25519` naming convention for historical compatibility.  The actual key algorithm embedded in the file is determined by `--key-type` (default: `x25519`).  All supported identity key algorithms share the same file format and the paths can be freely overridden with `--output-path`.
+The default filename is derived from the chosen `--key-type`.  All supported identity key algorithms share the same file format and the paths can be freely overridden with `--output-path`.
 
 #### `fingerprint`
 
 Displays the SHA-256 fingerprint of a public key file.
 
 ```bash
-mp-keygen fingerprint ~/.mp/id_ed25519.pub
+mp-keygen fingerprint ~/.mp/id_x25519.pub
 ```
 
 #### `verify`
@@ -471,7 +528,7 @@ mp-keygen verify --randomart "+--[ED25519 256]--+ ..."
    mp-keygen generate --server
 
    # Non-interactive (e.g. during service setup):
-   mp-keygen generate --server --no-passphrase --output-path ~/.mp/mps_host_ed25519_key
+   mp-keygen generate --server --no-passphrase --output-path ~/.mp/mps_host_x25519_key
 
    # Use a P-384 key for a FIPS/compliance environment:
    mp-keygen generate --server --key-type p384 --output-path ~/.mp/mps_host_p384_key
@@ -566,10 +623,10 @@ ip   = "0.0.0.0"   # IP address to listen on
 port = 40404       # TCP port to listen on for client connections
 
 # ── Key files ─────────────────────────────────────────────────────────────────
-# Defaults to ~/.mp/mps_host_ed25519_key and ~/.mp/mps_host_ed25519_key.pub
+# Defaults to ~/.mp/mps_host_x25519_key and ~/.mp/mps_host_x25519_key.pub
 # when not set.
-# private_key_path = "/path/to/mps_host_ed25519_key"
-# public_key_path  = "/path/to/mps_host_ed25519_key.pub"
+# private_key_path = "/path/to/mps_host_x25519_key"
+# public_key_path  = "/path/to/mps_host_x25519_key.pub"
 
 # ── PTY environment ───────────────────────────────────────────────────────────
 # TERM environment variable to set for spawned shells. Default: xterm-256color.
@@ -639,7 +696,7 @@ with_level       = true
 1. Generate a client key pair (run once):
 
    ```bash
-   # X25519 (default) — accept the default path: ~/.mp/id_ed25519
+   # X25519 (default) — accept the default path: ~/.mp/id_x25519
    mp-keygen generate
 
    # Or choose a different algorithm:
@@ -649,11 +706,11 @@ with_level       = true
 
 2. Add the client's public key to the server's `authorized_keys` file.
 
-   On the **server**, append the contents of the client's public key (e.g. `~/.mp/id_ed25519.pub`) to `~$TARGET_USER/.mp/authorized_keys` (one key per line):
+   On the **server**, append the contents of the client's public key (e.g. `~/.mp/id_x25519.pub`) to `~$TARGET_USER/.mp/authorized_keys` (one key per line):
 
    ```bash
    # On the client — display the public key to copy
-   cat ~/.mp/id_ed25519.pub
+   cat ~/.mp/id_x25519.pub
 
    # On the server — create the directory and file with the correct permissions
    mkdir -p ~/.mp && chmod 700 ~/.mp
@@ -774,10 +831,9 @@ server_destination = "192.168.1.10" # "ip" or "user@ip"; overridden by the
 max_reconnect_backoff_secs = 3600
 
 # ── Key files ─────────────────────────────────────────────────────────────────
-# Defaults to ~/.mp/id_ed25519 and ~/.mp/id_ed25519.pub when not set
-# (regardless of which --key-type was used to generate the key pair).
-# private_key_path = "/home/alice/.mp/id_ed25519"
-# public_key_path  = "/home/alice/.mp/id_ed25519.pub"
+# Defaults to ~/.mp/id_x25519 and ~/.mp/id_x25519.pub when not set.
+# private_key_path = "/home/alice/.mp/id_x25519"
+# public_key_path  = "/home/alice/.mp/id_x25519.pub"
 
 # ── Local echo prediction ─────────────────────────────────────────────────────
 # Control client-side keystroke prediction: adaptive (default), always, or never.

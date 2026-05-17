@@ -79,17 +79,16 @@ with `mp-keygen` and loaded at runtime via `-p` (private key) and `-k` (public k
 
 | `--key-type` value(s) | Algorithm | Requires feature | Client default path | Server default path |
 |---|---|:---:|---|---|
-| `x25519` *(default)* | Curve25519 ECDH | — | `~/.mp/id_ed25519` | `~/.mp/mps_host_ed25519_key` |
-| `p384` | NIST P-384 ECDH | — | same | same |
-| `p256` | NIST P-256 ECDH | — | same | same |
-| `mldsa44` or `ml-dsa-44` | ML-DSA-44 (FIPS 204) | `pq-dsa-unstable` | same | same |
-| `mldsa65` or `ml-dsa-65` | ML-DSA-65 (FIPS 204) | `pq-dsa-unstable` | same | same |
-| `mldsa87` or `ml-dsa-87` | ML-DSA-87 (FIPS 204) | `pq-dsa-unstable` | same | same |
+| `x25519` *(default)* | Curve25519 ECDH | — | `~/.mp/id_x25519` | `~/.mp/mps_host_x25519_key` |
+| `p384` | NIST P-384 ECDH | — | `~/.mp/id_p384` | `~/.mp/mps_host_p384_key` |
+| `p256` | NIST P-256 ECDH | — | `~/.mp/id_p256` | `~/.mp/mps_host_p256_key` |
+| `mldsa44` or `ml-dsa-44` | ML-DSA-44 (FIPS 204) | `unstable` | `~/.mp/id_ml_dsa_44` | `~/.mp/mps_host_ml_dsa_44_key` |
+| `mldsa65` or `ml-dsa-65` | ML-DSA-65 (FIPS 204) | `unstable` | `~/.mp/id_ml_dsa_65` | `~/.mp/mps_host_ml_dsa_65_key` |
+| `mldsa87` or `ml-dsa-87` | ML-DSA-87 (FIPS 204) | `unstable` | `~/.mp/id_ml_dsa_87` | `~/.mp/mps_host_ml_dsa_87_key` |
 
-> **Note:** The default path names contain `ed25519` for historical reasons but the files hold
-> whatever algorithm was used to generate them.
+The default filename is derived from the chosen `--key-type` at generation time.  Override with `-o / --output-path` for any custom location.
 
-> **Note:** ML-DSA variants require the binary to be compiled with `--features pq-dsa-unstable`.
+> **Note:** ML-DSA variants require the binary to be compiled with `--features unstable`.
 
 ---
 

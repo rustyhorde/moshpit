@@ -23,10 +23,11 @@ ip   = "0.0.0.0"  # IP address to listen on for client connections
 port = 40404      # TCP port to listen on
 
 # ── Key files ─────────────────────────────────────────────────────────────────
-# Defaults to ~/.mp/mps_host_ed25519_key and ~/.mp/mps_host_ed25519_key.pub
-# when not set.
-# private_key_path = "/path/to/mps_host_ed25519_key"
-# public_key_path  = "/path/to/mps_host_ed25519_key.pub"
+# Defaults to ~/.mp/mps_host_x25519_key and ~/.mp/mps_host_x25519_key.pub
+# when not set (for the default x25519 key type). The filename reflects the
+# --key-type used at generation time (e.g. mps_host_p384_key, mps_host_ml_dsa_65_key).
+# private_key_path = "/path/to/mps_host_x25519_key"
+# public_key_path  = "/path/to/mps_host_x25519_key.pub"
 
 # ── Tracing (log output) ──────────────────────────────────────────────────────
 # stdout layer — controls log line formatting when --enable-std-output is active.

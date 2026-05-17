@@ -194,12 +194,12 @@ fn mps_command() -> Command {
 fn mp_keygen_command() -> Command {
     Command::new("mp-keygen")
         .version(env!("CARGO_PKG_VERSION"))
-        .about("Manage ed25519 key pairs for moshpit")
+        .about("Manage asymmetric key pairs for moshpit")
         .subcommand_required(true)
         .arg(verbose_arg())
         .arg(quiet_arg())
         .subcommand(
-            Command::new("generate").about("Generate a new ed25519 public/private key pair"),
+            Command::new("generate").about("Generate a new asymmetric public/private key pair"),
         )
         .subcommand(
             Command::new("verify")
