@@ -15,8 +15,8 @@ use std::{
 use anyhow::Result;
 use getset::{CloneGetters, CopyGetters, Getters, Setters};
 use libmoshpit::{
-    AlgorithmList, KexConfig, KexMode, KeyPair, Mps, SessionRegistry, Tracing, TracingConfigExt,
-    supported_algorithms,
+    AlgorithmList, KEY_ALGORITHM_X25519, KexConfig, KexMode, KeyPair, Mps, SessionRegistry,
+    Tracing, TracingConfigExt, supported_algorithms,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -122,7 +122,7 @@ impl Default for Config {
 impl Config {
     fn load_key_paths(&self) -> Result<(PathBuf, PathBuf)> {
         let (default_private_key_path, default_pub_key_ext) =
-            KeyPair::default_key_path_ext(self.mode)?;
+            KeyPair::default_key_path_ext(self.mode, KEY_ALGORITHM_X25519)?;
         let private_key_path = self
             .private_key_path
             .as_ref()

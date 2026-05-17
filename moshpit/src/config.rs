@@ -11,8 +11,8 @@ use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
 use anyhow::Result;
 use getset::{CopyGetters, Getters, Setters};
 use libmoshpit::{
-    AlgorithmList, DiffMode, DisplayPreference, KexConfig, KexMode, KeyPair, Tracing,
-    TracingConfigExt, supported_algorithms,
+    AlgorithmList, DiffMode, DisplayPreference, KEY_ALGORITHM_X25519, KexConfig, KexMode, KeyPair,
+    Tracing, TracingConfigExt, supported_algorithms,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -111,7 +111,7 @@ impl Config {
 
     fn load_key_paths(&self) -> Result<(PathBuf, PathBuf)> {
         let (default_private_key_path, default_pub_key_ext) =
-            KeyPair::default_key_path_ext(self.mode)?;
+            KeyPair::default_key_path_ext(self.mode, KEY_ALGORITHM_X25519)?;
         let private_key_path = self
             .private_key_path
             .as_ref()
@@ -263,8 +263,8 @@ mod tests {
         // Without explicit paths, it should fall back to default
         let config = Config::default();
         let (priv_path, pub_path) = config.load_key_paths()?;
-        assert!(priv_path.to_string_lossy().contains("id_ed25519"));
-        assert!(pub_path.to_string_lossy().contains("id_ed25519.pub"));
+        assert!(priv_path.to_string_lossy().contains("id_x25519"));
+        assert!(pub_path.to_string_lossy().contains("id_x25519.pub"));
 
         // With explicit paths
         let config = Config {

@@ -163,7 +163,8 @@ fn generate_keypair(
         KexMode::Client
     };
 
-    let (default_priv_key_path, default_pub_key_ext) = KeyPair::default_key_path_ext(mode)?;
+    let (default_priv_key_path, default_pub_key_ext) =
+        KeyPair::default_key_path_ext(mode, key_alg)?;
 
     let priv_key_path_input = if let Some(path) = output_path {
         path.to_string()

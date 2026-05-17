@@ -203,11 +203,12 @@ impl KeyPair {
     /// # Errors
     /// If the home directory cannot be determined, an error is returned.
     ///
-    pub fn default_key_path_ext(mode: KexMode) -> Result<(PathBuf, &'static str)> {
+    pub fn default_key_path_ext(mode: KexMode, key_alg: &str) -> Result<(PathBuf, &'static str)> {
         let base_dir = dirs2::home_dir().ok_or(MoshpitError::HomeDir)?.join(".mp");
+        let stem = key_alg.to_lowercase().replace('-', "_");
         Ok(match mode {
-            KexMode::Client => (base_dir.join("id_ed25519"), "pub"),
-            KexMode::Server(_socket_addr) => (base_dir.join("mps_host_ed25519_key"), "pub"),
+            KexMode::Client => (base_dir.join(format!("id_{stem}")), "pub"),
+            KexMode::Server(_socket_addr) => (base_dir.join(format!("mps_host_{stem}_key")), "pub"),
         })
     }
 
