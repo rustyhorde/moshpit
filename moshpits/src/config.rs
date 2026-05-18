@@ -280,11 +280,11 @@ mod test {
     fn config_load_key_paths_explicit() {
         let priv_path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../libmoshpit/tests/keys/id_ed25519_test"
+            "/../libmoshpit/tests/keys/id_x25519_test"
         );
         let pub_path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../libmoshpit/tests/keys/id_ed25519_test.pub"
+            "/../libmoshpit/tests/keys/id_x25519_test.pub"
         );
         let mut config = Config {
             private_key_path: Some(priv_path.to_string()),
@@ -301,7 +301,7 @@ mod test {
     fn config_load_key_paths_default_derives_pub() {
         let priv_path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../libmoshpit/tests/keys/id_ed25519_test"
+            "/../libmoshpit/tests/keys/id_x25519_test"
         );
         let mut config = Config {
             private_key_path: Some(priv_path.to_string()),

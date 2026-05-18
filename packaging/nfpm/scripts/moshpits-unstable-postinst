@@ -18,7 +18,7 @@ case "$1" in
 
         # Generate a passwordless ML-DSA-65 host key pair on first install.
         # ML-DSA-65 is the default for this post-quantum build; see the note
-        # below to switch to classical ed25519.
+        # below to switch to classical x25519.
         _key=/etc/moshpits/keys/mps_host_mldsa65_key
         if [ ! -f "$_key" ]; then
             mp-keygen generate \
@@ -43,9 +43,9 @@ case "$1" in
         echo "  And update --private-key-path / --public-key-path in:"
         echo "    /usr/lib/systemd/system/mps.service  (override with systemctl edit mps)"
         echo ""
-        echo "  To use a classical ed25519 key instead:"
+        echo "  To use a classical X25519 key instead:"
         echo "    mp-keygen generate --server --no-passphrase \\"
-        echo "        --output-path /etc/moshpits/keys/mps_host_ed25519_key --force"
+        echo "        --key-type x25519 --output-path /etc/moshpits/keys/mps_host_x25519_key --force"
         echo ""
         echo "  Review (and customise) the config file at:"
         echo "    /etc/moshpits/moshpits.toml"

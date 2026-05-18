@@ -3,7 +3,7 @@
 pkgname=moshpit-keygen-bin
 pkgver=0.8.1
 pkgrel=1
-pkgdesc="ed25519 key generation and inspection tool for moshpit (pre-compiled binary)"
+pkgdesc="Asymmetric key generation and inspection tool for moshpit (pre-compiled binary)"
 arch=('x86_64')
 url="https://github.com/rustyhorde/moshpit"
 license=('MIT' 'Apache-2.0')

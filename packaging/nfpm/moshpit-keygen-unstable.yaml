@@ -7,9 +7,9 @@ version_schema: semver
 section: net
 maintainer: Jason Ozias <jason.g.ozias@gmail.com>
 description: |
-  ed25519/ML-DSA key generation and inspection tool for moshpit — with post-quantum support.
+  Asymmetric key generation and inspection tool for moshpit — with post-quantum support.
   Generates and manages the key pairs used by both the moshpit client and the moshpits server
-  for mutual authentication. Includes ML-DSA-65 post-quantum identity key support.
+  for mutual authentication. Supports X25519, P-384, P-256, and ML-DSA-65 identity key types.
 homepage: https://github.com/rustyhorde/moshpit
 license: MIT OR Apache-2.0
 

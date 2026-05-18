@@ -7,7 +7,7 @@ version_schema: semver
 section: net
 maintainer: Jason Ozias <jason.g.ozias@gmail.com>
 description: |
-  ed25519 key generation and inspection tool for moshpit.
+  Asymmetric key generation and inspection tool for moshpit.
   Generates and manages the key pairs used by both the moshpit client and
   the moshpits server for mutual authentication.
 homepage: https://github.com/rustyhorde/moshpit

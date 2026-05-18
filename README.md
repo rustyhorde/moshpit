@@ -477,8 +477,6 @@ Default key locations when accepting the default path prompt:
 
 | Key | Default path |
 |-----|-------------|
-| Key | Default path |
-|-----|-------------|
 | Client private key (x25519) | `~/.mp/id_x25519` |
 | Client public key (x25519)  | `~/.mp/id_x25519.pub` |
 | Client private key (p384)   | `~/.mp/id_p384` |
@@ -498,15 +496,24 @@ mp-keygen fingerprint ~/.mp/id_x25519.pub
 
 #### `verify`
 
-Verifies a public key fingerprint string.  Pass `--randomart` to verify a randomart image instead.
+Compares a SHA-256 fingerprint string against a public key file and exits non-zero if they do not match.  Both the full `SHA256:<digest> user@host` form (as printed by `fingerprint`) and the bare `SHA256:<digest>` form are accepted.
 
 ```bash
-# Verify a fingerprint string
-mp-keygen verify "SHA256:..."
+# Verify that a fingerprint matches a key file
+mp-keygen verify "SHA256:S8hOl..." --key ~/.mp/id_x25519.pub
 
-# Verify a randomart image
-mp-keygen verify --randomart "+--[ED25519 256]--+ ..."
+# Verify and also display the randomart image for visual inspection
+mp-keygen verify "SHA256:S8hOl..." --key ~/.mp/id_x25519.pub --randomart
+
+# Capture the fingerprint and verify in one step
+FP=$(mp-keygen fingerprint ~/.mp/id_x25519.pub)
+mp-keygen verify "$FP" --key ~/.mp/id_x25519.pub
 ```
+
+| Flag | Short | Description |
+|------|-------|-------------|
+| `--key <PATH>` | `-k` | Path to the public key file to verify against (required) |
+| `--randomart` | `-r` | Also display the randomart image after a successful match |
 
 ### Global flags
 

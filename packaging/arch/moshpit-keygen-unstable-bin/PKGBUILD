@@ -3,7 +3,7 @@
 pkgname=moshpit-keygen-unstable-bin
 pkgver=0.8.1
 pkgrel=1
-pkgdesc="ed25519/ML-DSA key generation and inspection tool for moshpit — with post-quantum identity key support (pre-compiled binary)"
+pkgdesc="Asymmetric key generation and inspection tool for moshpit — X25519, P-384, P-256, and ML-DSA post-quantum identity keys (pre-compiled binary)"
 arch=('x86_64')
 url="https://github.com/rustyhorde/moshpit"
 license=('MIT' 'Apache-2.0')

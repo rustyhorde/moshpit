@@ -109,12 +109,19 @@ pub(crate) enum Commands {
         )]
         key_type: String,
     },
-    #[clap(about = "Verify a public key fingerprint or randomart image")]
+    #[clap(about = "Verify a public key fingerprint against a key file")]
     Verify {
-        #[clap(short, long, help = "Verify randomart", default_value_t = false)]
+        #[clap(help = "The SHA256 fingerprint to verify (e.g. SHA256:S8hOl...)")]
+        fingerprint: String,
+        #[clap(short, long, value_name = "PATH", help = "Path to the public key file")]
+        key: String,
+        #[clap(
+            short,
+            long,
+            help = "Also display the randomart image",
+            default_value_t = false
+        )]
         randomart: bool,
-        #[clap(help = "The signature or randomart to verify")]
-        signature: String,
     },
     #[clap(about = "Display the fingerprint of the given public key")]
     Fingerprint {
@@ -251,15 +258,24 @@ mod tests {
 
     #[test]
     fn verify_verify_command() -> anyhow::Result<()> {
-        let args = vec!["moshpit-keygen", "verify", "--randomart", "dummy_sig"];
+        let args = vec![
+            "moshpit-keygen",
+            "verify",
+            "--randomart",
+            "--key",
+            "some_key.pub",
+            "SHA256:dummy",
+        ];
         let cli = Cli::try_parse_from(args)?;
         match cli.command() {
             Commands::Verify {
+                fingerprint,
+                key,
                 randomart,
-                signature,
             } => {
                 assert!(randomart);
-                assert_eq!(signature, "dummy_sig");
+                assert_eq!(fingerprint, "SHA256:dummy");
+                assert_eq!(key, "some_key.pub");
             }
             _ => panic!("Expected Verify command"),
         }
