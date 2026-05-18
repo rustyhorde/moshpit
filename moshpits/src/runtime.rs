@@ -48,7 +48,9 @@ use tokio::{
     },
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, trace, warn};
+#[cfg(target_os = "linux")]
+use tracing::warn;
+use tracing::{error, info, trace};
 use uuid::Uuid;
 use zstd::encode_all;
 
@@ -1293,7 +1295,7 @@ fn spawn_pty(
     diff_mode: DiffMode,
     #[cfg_attr(not(unix), allow(unused_variables))] accepted_client_env: Vec<(String, String)>,
     #[cfg_attr(not(unix), allow(unused_variables))] pty_path: String,
-    #[cfg_attr(not(unix), allow(unused_variables))] namespace_escape: bool,
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] namespace_escape: bool,
 ) {
     let _term_handle = thread::spawn(move || {
         let pty_system = native_pty_system();
@@ -1444,7 +1446,7 @@ fn spawn_pty(
             };
 
             #[cfg(not(target_os = "linux"))]
-            let ns_escape_fd: Option<i32> = None;
+            let _ns_escape_fd: Option<i32> = None;
 
             let _ = unsafe {
                 cmd.pre_exec(move || {
