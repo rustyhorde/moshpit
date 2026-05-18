@@ -1382,7 +1382,6 @@ fn spawn_pty(
             let mut cmd = std::process::Command::new(&account.shell);
             let _ = cmd.arg("-li");
             let _ = cmd.env_clear();
-            let _ = cmd.current_dir(&account.home);
             let _ = cmd.env("HOME", &account.home);
             let _ = cmd.env("USER", &account.username);
             let _ = cmd.env("LOGNAME", &account.username);
@@ -1403,6 +1402,11 @@ fn spawn_pty(
                 }
                 let _ = cmd.env(k, v);
             }
+
+            let Ok(home_cstr) = CString::new(account.home) else {
+                error!("Home directory path for {user} contains a NUL byte");
+                return;
+            };
 
             let mut drop_creds: Option<(CString, libc::uid_t, libc::gid_t)> = None;
 
@@ -1482,6 +1486,11 @@ fn spawn_pty(
                             return Err(std::io::Error::last_os_error());
                         }
                     }
+
+                    // Set CWD to the user's home directory.
+                    // Runs after setns (correct namespace) and after setuid (correct user).
+                    // Non-fatal: if home doesn't exist the shell starts at '/', matching SSH.
+                    let _ = libc::chdir(home_cstr.as_ptr());
 
                     Ok(())
                 })
