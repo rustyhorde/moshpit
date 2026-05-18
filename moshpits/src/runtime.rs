@@ -48,7 +48,7 @@ use tokio::{
     },
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, trace};
+use tracing::{error, info, trace, warn};
 use uuid::Uuid;
 use zstd::encode_all;
 
@@ -359,6 +359,7 @@ async fn handle_connection(
     let accept_env = config.accept_env().clone();
     let server_path = config.server_path().clone();
     let path_locked = config.path_locked();
+    let namespace_escape = config.namespace_escape();
     let (kex, udp_arc, skex_opt) =
         run_key_exchange(config, sock_read, sock_write, || Ok(None), None, None).await?;
     info!("Key exchange completed with moshpit");
@@ -748,6 +749,7 @@ async fn handle_connection(
             diff_mode,
             accepted_client_env,
             pty_path,
+            namespace_escape,
         );
     }
 
@@ -1291,6 +1293,7 @@ fn spawn_pty(
     diff_mode: DiffMode,
     #[cfg_attr(not(unix), allow(unused_variables))] accepted_client_env: Vec<(String, String)>,
     #[cfg_attr(not(unix), allow(unused_variables))] pty_path: String,
+    #[cfg_attr(not(unix), allow(unused_variables))] namespace_escape: bool,
 ) {
     let _term_handle = thread::spawn(move || {
         let pty_system = native_pty_system();
@@ -1409,6 +1412,40 @@ fn spawn_pty(
                 drop_creds = Some((username_c, account.uid, account.gid));
             }
 
+            // Detect a restricted mount namespace (e.g. systemd ProtectSystem=) and
+            // open init's namespace fd so the child can escape into it via setns()
+            // before exec.  Only possible when running as root (CAP_SYS_ADMIN).
+            // The fd has O_CLOEXEC so it closes automatically at exec even if the
+            // child forgets to close it explicitly.
+            #[cfg(target_os = "linux")]
+            let ns_escape_fd: Option<i32> = if namespace_escape && daemon_uid == 0 {
+                use std::os::unix::fs::MetadataExt as _;
+                use std::os::unix::io::IntoRawFd as _;
+                let self_ino = std::fs::metadata("/proc/self/ns/mnt").ok().map(|m| m.ino());
+                let init_ino = std::fs::metadata("/proc/1/ns/mnt").ok().map(|m| m.ino());
+                if self_ino.is_some() && self_ino != init_ino {
+                    warn!(
+                        "Daemon is in a restricted mount namespace (inode {:?} vs PID 1 {:?}); \
+                         spawned shell will join the host mount namespace",
+                        self_ino, init_ino
+                    );
+                    match std::fs::File::open("/proc/1/ns/mnt") {
+                        Ok(f) => Some(f.into_raw_fd()),
+                        Err(e) => {
+                            warn!("Cannot open /proc/1/ns/mnt for namespace escape: {e}");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            #[cfg(not(target_os = "linux"))]
+            let ns_escape_fd: Option<i32> = None;
+
             let _ = unsafe {
                 cmd.pre_exec(move || {
                     let tiocsctty_request = tiocsctty_ioctl_request();
@@ -1418,6 +1455,15 @@ fn spawn_pty(
                     }
                     if libc::ioctl(0, tiocsctty_request, 0) < 0 {
                         return Err(std::io::Error::last_os_error());
+                    }
+
+                    // Escape restricted mount namespace before dropping root — setns(CLONE_NEWNS)
+                    // requires CAP_SYS_ADMIN which is lost after setuid().
+                    #[cfg(target_os = "linux")]
+                    if let Some(fd) = ns_escape_fd {
+                        // Non-fatal: if setns fails the shell still spawns in the restricted ns.
+                        let _ = libc::setns(fd, libc::CLONE_NEWNS);
+                        let _ = libc::close(fd);
                     }
 
                     if let Some((username_c, login_uid, primary_group_id)) = drop_creds.as_ref() {
