@@ -469,4 +469,52 @@ mod tests {
         assert!(got_old, "first frame did not reach original peer");
         assert!(got_new, "second frame did not reach roamed peer");
     }
+
+    /// A retransmit request received via `retransmit_rx` in Reliable mode arms the 20ms
+    /// deadline; when it fires the frame is re-sent to the wire and the deadline is parked.
+    #[tokio::test]
+    async fn retransmit_deadline_fires_after_nak_request() {
+        let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = server.local_addr().unwrap();
+        let send_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        send_socket.connect(server_addr).await.unwrap();
+        server
+            .connect(send_socket.local_addr().unwrap())
+            .await
+            .unwrap();
+
+        let (_ctrl_tx, ctrl_rx) = channel::<EncryptedFrame>(4);
+        let (frame_tx, frame_rx) = channel::<EncryptedFrame>(4);
+        let (retransmit_tx, retransmit_rx) = channel::<Vec<u64>>(4);
+        let token = CancellationToken::new();
+
+        let mut sender = make_sender(send_socket, ctrl_rx, frame_rx, retransmit_rx);
+        let token2 = token.clone();
+        let handle = tokio::spawn(async move { drop(sender.frame_loop(token2).await) });
+
+        // Send a data frame: populates retransmit_buffer[seq=0] and sends a wire packet.
+        frame_tx.send(EncryptedFrame::Keepalive(0)).await.unwrap();
+        let mut buf = vec![0u8; 65535];
+        let got_original = tokio::time::timeout(Duration::from_millis(200), server.recv(&mut buf))
+            .await
+            .is_ok();
+
+        // Send a NAK for seq=0: arms the 20ms retransmit deadline.
+        retransmit_tx.send(vec![0]).await.unwrap();
+
+        // Deadline fires after ~20ms and re-sends the stored wire bytes.
+        let got_retransmit =
+            tokio::time::timeout(Duration::from_millis(100), server.recv(&mut buf))
+                .await
+                .is_ok();
+
+        token.cancel();
+        drop(handle.await);
+
+        assert!(got_original, "original packet must reach server");
+        assert!(
+            got_retransmit,
+            "retransmit must fire within 100ms of NAK request"
+        );
+    }
 }
