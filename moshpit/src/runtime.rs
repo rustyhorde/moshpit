@@ -28,7 +28,7 @@ use clap::Parser as _;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use dialoguer::{Confirm, Password};
 use libmoshpit::{
-    DiffMode, DisplayPreference, Emulator, EncryptedFrame, KEY_ALGORITHM_X25519, Kex,
+    DiffMode, DisplayPreference, Emulator, EncryptedFrame, FileLayer, KEY_ALGORITHM_X25519, Kex,
     KexConfig as _, KexMode, KeyPair, MoshpitError, PredictionEngine, Renderer, UdpReader,
     UdpSender, UuidWrapper, init_tracing, load, paint_overlays_to_ansi, parse_server_destination,
     run_key_exchange,
@@ -46,7 +46,7 @@ use tokio::{
     time,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 use crate::{cli::Cli, config::Config};
@@ -64,7 +64,7 @@ where
     };
     let mut config =
         load::<Cli, Config, Cli>(&cli, &cli).with_context(|| MoshpitError::ConfigLoad)?;
-    init_tracing(&config, config.tracing().file(), &cli, None)
+    init_tracing(&FileLayer::default(), config.tracing().file(), &cli, None)
         .with_context(|| MoshpitError::TracingInit)?;
     maybe_generate_keypair(&config)?;
 
@@ -221,6 +221,7 @@ async fn run_escape_listener(
     }
 }
 
+#[cfg(not(unix))]
 fn encode_char_key(c: char, ctrl: bool, alt: bool) -> Vec<u8> {
     let mut out = Vec::new();
     if ctrl {
@@ -261,6 +262,7 @@ fn encode_char_key(c: char, ctrl: bool, alt: bool) -> Vec<u8> {
     out
 }
 
+#[cfg(not(unix))]
 fn encode_nav_key(
     code: crossterm::event::KeyCode,
     has_mod: bool,
@@ -344,6 +346,7 @@ fn encode_nav_key(
     Some(bytes)
 }
 
+#[cfg(not(unix))]
 fn encode_function_key(n: u8, has_mod: bool, mod_param: u8) -> Vec<u8> {
     match n {
         1 => {
@@ -441,6 +444,7 @@ fn encode_function_key(n: u8, has_mod: bool, mod_param: u8) -> Vec<u8> {
 /// On Windows the console API reports key presses as structured events; on Unix
 /// crossterm parses raw stdin bytes in raw mode.  Either way this re-encodes
 /// the event as ANSI bytes for forwarding to the server.
+#[cfg(not(unix))]
 fn key_event_to_bytes(event: crossterm::event::KeyEvent) -> Vec<u8> {
     use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
     // Only forward press events; Windows always reports both press and release.
@@ -483,29 +487,117 @@ fn with_cooked_term<T>(paused: &AtomicBool, f: impl FnOnce() -> T) -> T {
     result
 }
 
-/// Polls for crossterm key events and forwards their ANSI byte encoding to the
-/// keyboard channel.  When `paused` is set, idles so `with_cooked_term` can
-/// safely disable raw mode around interactive prompts.
+/// Unix: read raw bytes from stdin using `select(2)` + `read(2)` with a 50 ms
+/// timeout.  Raw mode is set by crossterm before this thread starts; the
+/// terminal therefore encodes every keypress as the correct byte sequence
+/// (including DECCKM application-cursor sequences when vi enables them) without
+/// any intermediate parsing layer.  The `Ctrl-^ .` disconnect sequence arrives
+/// as bytes `0x1E 0x2E` and is handled by the forwarder's escape state machine.
+///
+/// Using the raw fd bypasses crossterm's mio-based event reactor, which has
+/// been observed to silently exit or stop delivering events when vi enters
+/// alternate-screen mode, permanently freezing all keyboard input.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn stdin_reader_loop(kb_tx: &Sender<Vec<u8>>, paused: &AtomicBool) {
+    use std::os::unix::io::AsRawFd;
+    let stdin_fd = stdin().as_raw_fd();
+    let mut buf = [0u8; 256];
+    debug!("stdin reader thread started (raw-fd mode, fd={stdin_fd})");
+    loop {
+        while paused.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_millis(50));
+        }
+        // select() with 50 ms timeout so the paused flag is checked at least
+        // every 100 ms (sleep above + this timeout).
+        let ready = unsafe {
+            let mut read_set: libc::fd_set = std::mem::zeroed();
+            libc::FD_SET(stdin_fd, std::ptr::addr_of_mut!(read_set));
+            let mut tv = libc::timeval {
+                tv_sec: 0,
+                tv_usec: 50_000,
+            };
+            libc::select(
+                stdin_fd + 1,
+                std::ptr::addr_of_mut!(read_set),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::addr_of_mut!(tv),
+            )
+        };
+        if ready <= 0 {
+            continue; // timeout or EINTR on select
+        }
+        let n = unsafe { libc::read(stdin_fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+        match n {
+            n if n > 0 => {
+                if kb_tx
+                    .blocking_send(buf[..n.cast_unsigned()].to_vec())
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            0 => break, // EOF
+            _ => {
+                if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                    break;
+                }
+            }
+        }
+    }
+    warn!("stdin reader thread exited");
+}
+
+/// Windows: crossterm event-based stdin reader.  Polls for key events and
+/// forwards their ANSI byte encoding to the keyboard channel.  When `paused`
+/// is set, idles so `with_cooked_term` can safely disable raw mode around
+/// interactive prompts.
+///
+/// Also used on Unix when the raw-fd implementation is unavailable.  Includes
+/// diagnostic logging that identifies whether crossterm stops delivering events
+/// (log shows repeated `alive` heartbeats) or exits with a poll error.
+#[cfg(not(unix))]
 fn stdin_reader_loop(kb_tx: &Sender<Vec<u8>>, paused: &AtomicBool) {
     use crossterm::event::{Event, poll, read};
+    debug!("stdin reader thread started (crossterm mode)");
+    let mut idle_cycles: u32 = 0;
     loop {
         if paused.load(Ordering::Relaxed) {
+            idle_cycles = 0;
             thread::sleep(Duration::from_millis(50));
             continue;
         }
         match poll(Duration::from_millis(50)) {
             Ok(true) => {
-                if let Ok(Event::Key(ke)) = read() {
-                    let bytes = key_event_to_bytes(ke);
-                    if !bytes.is_empty() && kb_tx.blocking_send(bytes).is_err() {
-                        break;
+                idle_cycles = 0;
+                match read() {
+                    Ok(Event::Key(ke)) => {
+                        let bytes = key_event_to_bytes(ke);
+                        if !bytes.is_empty() && kb_tx.blocking_send(bytes).is_err() {
+                            debug!("stdin: channel closed, exiting");
+                            break;
+                        }
+                    }
+                    Ok(_other) => {}
+                    Err(e) => {
+                        warn!("stdin: read() error: {e}");
                     }
                 }
             }
-            Ok(false) => {}
-            Err(_) => break,
+            Ok(false) => {
+                idle_cycles += 1;
+                if idle_cycles % 20 == 0 {
+                    trace!("stdin: alive, {idle_cycles} idle cycles");
+                }
+            }
+            Err(e) => {
+                error!("stdin: poll() error: {e}, thread exiting");
+                break;
+            }
         }
     }
+    warn!("stdin reader thread exited");
 }
 
 /// Runs the reconnect countdown alongside an escape-sequence listener.
@@ -615,6 +707,11 @@ async fn run_session_loop(
                     return Err(e);
                 }
                 if exit_token.is_cancelled() {
+                    drop(crossterm::execute!(
+                        stdout(),
+                        crossterm::terminal::LeaveAlternateScreen,
+                        crossterm::cursor::Show,
+                    ));
                     drop(disable_raw_mode());
                     time::sleep(Duration::from_millis(100)).await;
                     std::process::exit(0);
@@ -684,6 +781,11 @@ async fn run_session_loop(
                     clear_reconnect_banner(&stdout_tx).await;
                     let msg = b"\r\n\x1b[0m[moshpit] Disconnected.\r\n";
                     drop(stdout_tx.send(msg.to_vec()).await);
+                    drop(crossterm::execute!(
+                        stdout(),
+                        crossterm::terminal::LeaveAlternateScreen,
+                        crossterm::cursor::Show,
+                    ));
                     drop(disable_raw_mode());
                     time::sleep(Duration::from_millis(100)).await;
                     std::process::exit(0);
@@ -948,6 +1050,7 @@ async fn run_udp_session(
         display_preference,
     )));
     let renderer = Arc::new(std::sync::Mutex::new(Renderer::new(rows, cols)));
+    let in_alt_screen = Arc::new(AtomicBool::new(false));
 
     let reader_token = token.clone();
     let emu_reader = emulator.clone();
@@ -955,6 +1058,7 @@ async fn run_udp_session(
     let rend_reader = renderer.clone();
     let stdout_tx_reader = stdout_tx.clone();
     let exit_token_reader = exit_token.clone();
+    let in_alt_screen_reader = Arc::clone(&in_alt_screen);
     let _reader = spawn(async move {
         udp_reader
             .client_frame_loop(
@@ -964,6 +1068,7 @@ async fn run_udp_session(
                 emu_reader,
                 pred_reader,
                 rend_reader,
+                in_alt_screen_reader,
             )
             .await;
     });
@@ -984,6 +1089,7 @@ async fn run_udp_session(
     let emu_fwd = emulator.clone();
     let pred_fwd = prediction.clone();
     let stdout_tx_fwd = stdout_tx;
+    let in_alt_screen_fwd = Arc::clone(&in_alt_screen);
     let _forwarder = spawn(async move {
         let mut rx = kb_rx.lock().await;
         let mut escape_state = EscapeState::Normal;
@@ -1030,18 +1136,25 @@ async fn run_udp_session(
                                 break;
                             }
                             // Local echo prediction: feed each byte to the engine.
-                            let (overlays, cursor) = {
-                                let emu = emu_fwd.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                                let screen = emu.screen();
-                                let mut pred = pred_fwd.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                                for byte in &to_forward {
-                                    pred.new_user_byte(*byte, screen);
+                            // Skip in alternate-screen mode (vi, htop, etc.) —
+                            // the app owns the screen and prediction adds only lock contention.
+                            // Use an atomic boolean updated by the frame loop so we never block
+                            // a Tokio worker thread on std::sync::Mutex during vi rendering bursts.
+                            let in_alt = in_alt_screen_fwd.load(Ordering::Relaxed);
+                            if !in_alt {
+                                let (overlays, cursor) = {
+                                    let emu = emu_fwd.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                                    let screen = emu.screen();
+                                    let mut pred = pred_fwd.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                                    for byte in &to_forward {
+                                        pred.new_user_byte(*byte, screen);
+                                    }
+                                    pred.apply(screen)
+                                };
+                                let preview = paint_overlays_to_ansi(&overlays, cursor);
+                                if !preview.is_empty() {
+                                    drop(stdout_tx_fwd.send(preview).await);
                                 }
-                                pred.apply(screen)
-                            };
-                            let preview = paint_overlays_to_ansi(&overlays, cursor);
-                            if !preview.is_empty() {
-                                drop(stdout_tx_fwd.send(preview).await);
                             }
                         }
                         if exit_requested {
@@ -1893,6 +2006,7 @@ mod tests {
 
     // crossterm's Unix parser maps 0x1C-0x1F bytes to Char('4'-'7') + CONTROL.
     // Verify that encode_char_key round-trips these correctly on all platforms.
+    #[cfg(not(unix))]
     #[test]
     fn ctrl_digit_aliases_produce_correct_control_codes() {
         use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
@@ -2013,6 +2127,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(unix))]
     mod key_encoding {
         use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 

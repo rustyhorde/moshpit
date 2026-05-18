@@ -31,8 +31,8 @@ use bytes::{Buf as _, BytesMut};
 use clap::Parser as _;
 use libmoshpit::{
     DiffMode, EncryptedFrame, KexMode, MAX_UDP_PAYLOAD, MoshpitError, SessionRegistry,
-    TerminalMessage, UdpReader, UdpSender, UuidWrapper, init_tracing, is_exit_title, load,
-    new_session_registry, run_key_exchange,
+    TerminalMessage, UdpReader, UdpSender, UuidWrapper, env_var_matches, init_tracing,
+    is_exit_title, load, new_session_registry, run_key_exchange,
 };
 #[cfg(windows)]
 use portable_pty::CommandBuilder;
@@ -356,6 +356,9 @@ async fn handle_connection(
     let pacing_delay =
         Duration::from_micros(config.pacing_delay_us().unwrap_or(DEFAULT_PACING_DELAY_US));
     let term_type = config.term_type().clone();
+    let accept_env = config.accept_env().clone();
+    let server_path = config.server_path().clone();
+    let path_locked = config.path_locked();
     let (kex, udp_arc, skex_opt) =
         run_key_exchange(config, sock_read, sock_write, || Ok(None), None, None).await?;
     info!("Key exchange completed with moshpit");
@@ -363,6 +366,19 @@ async fn handle_connection(
     let skex = skex_opt.ok_or_else(|| anyhow::anyhow!("missing server kex info"))?;
     let session_uuid = skex.session_uuid();
     let diff_mode = skex.diff_mode();
+
+    let accepted_client_env: Vec<(String, String)> = skex
+        .client_env()
+        .iter()
+        .filter(|(k, _)| env_var_matches(k, &accept_env))
+        .cloned()
+        .collect();
+    let server_base = server_path.join(":");
+    let pty_path = if path_locked || skex.client_extra_path().is_empty() {
+        server_base
+    } else {
+        format!("{}:{server_base}", skex.client_extra_path().join(":"))
+    };
 
     let udp_port = udp_arc.local_addr()?.port();
 
@@ -730,6 +746,8 @@ async fn handle_connection(
             full_registry,
             effective_mtu,
             diff_mode,
+            accepted_client_env,
+            pty_path,
         );
     }
 
@@ -1031,7 +1049,7 @@ async fn new_session(
 /// Scan a byte slice for Primary / Secondary DA query sequences (`ESC [ c` / `ESC [ > c`)
 /// emitted by the shell, and return the appropriate response bytes.  Used in `StateSync` mode
 /// so the server answers terminal queries locally instead of forwarding them to the client.
-fn server_intercept_queries(buf: &[u8]) -> Vec<u8> {
+fn server_intercept_queries(buf: &[u8], rows: u16, cols: u16) -> Vec<u8> {
     if !buf.contains(&0x1b) {
         return Vec::new();
     }
@@ -1058,6 +1076,16 @@ fn server_intercept_queries(buf: &[u8]) -> Vec<u8> {
                 match (marker, params, term) {
                     (None, b"" | b"0", b'c') => resp.extend_from_slice(b"\x1b[?62c"),
                     (Some(b'>'), b"" | b"0", b'c') => resp.extend_from_slice(b"\x1b[>1;10;0c"),
+                    (Some(b'='), b"" | b"0", b'c') => {
+                        resp.extend_from_slice(b"\x1bP!|00000000\x1b\\");
+                    }
+                    (None, b"5", b'n') => resp.extend_from_slice(b"\x1b[0n"),
+                    (Some(b'>'), _, b'q') => resp.extend_from_slice(b"\x1bP>|moshpit\x1b\\"),
+                    (None, b"18", b't') => {
+                        resp.extend_from_slice(format!("\x1b[8;{rows};{cols}t").as_bytes());
+                    }
+                    (None, b"14", b't') => resp.extend_from_slice(b"\x1b[4;0;0t"),
+                    (None, b"16", b't') => resp.extend_from_slice(b"\x1b[6;0;0t"),
                     _ => {}
                 }
             }
@@ -1120,7 +1148,9 @@ fn spawn_pty_reader(
                             // StateSync: statesync task handles delivery; only feed emulator.
                             // Intercept terminal queries and respond locally so the shell
                             // (e.g. fish) does not time out waiting for a DA response.
-                            let resp = server_intercept_queries(buf_slice);
+                            let (emu_rows, emu_cols) =
+                                server_emulator.blocking_lock().screen().size();
+                            let resp = server_intercept_queries(buf_slice, emu_rows, emu_cols);
                             if !resp.is_empty() {
                                 drop(term_tx.try_send(TerminalMessage::Input(resp)));
                             }
@@ -1223,6 +1253,9 @@ fn spawn_pty_reader(
     });
 }
 
+#[cfg(unix)]
+const PROTECTED_ENV: &[&str] = &["HOME", "USER", "LOGNAME", "SHELL", "TERM", "PATH"];
+
 /// Spawn the long-lived PTY OS thread for a new session.
 ///
 /// The thread owns the PTY master and keeps running until the shell exits, regardless of
@@ -1256,6 +1289,8 @@ fn spawn_pty(
     full_registry: FullSessionRegistry,
     effective_mtu: Arc<AtomicUsize>,
     diff_mode: DiffMode,
+    #[cfg_attr(not(unix), allow(unused_variables))] accepted_client_env: Vec<(String, String)>,
+    #[cfg_attr(not(unix), allow(unused_variables))] pty_path: String,
 ) {
     let _term_handle = thread::spawn(move || {
         let pty_system = native_pty_system();
@@ -1331,35 +1366,47 @@ fn spawn_pty(
                 }
             };
 
-            let mut cmd = std::process::Command::new(&shell);
+            let account = match resolve_user_account(&user, &shell) {
+                Ok(account) => account,
+                Err(e) => {
+                    error!("Failed to resolve target account for {user}: {e}");
+                    return;
+                }
+            };
+
+            let mut cmd = std::process::Command::new(&account.shell);
             let _ = cmd.arg("-li");
+            let _ = cmd.env_clear();
+            let _ = cmd.current_dir(&account.home);
+            let _ = cmd.env("HOME", &account.home);
+            let _ = cmd.env("USER", &account.username);
+            let _ = cmd.env("LOGNAME", &account.username);
+            let _ = cmd.env("SHELL", &account.shell);
+            let _ = cmd.env("TERM", &term_type);
+            let _ = cmd.env("PATH", &pty_path);
+
+            // XDG_RUNTIME_DIR is derived server-side from the resolved UID;
+            // it is needed by fish and other XDG-aware tools even after env_clear().
+            let xdg_path = format!("/run/user/{}", account.uid);
+            if std::path::Path::new(&xdg_path).exists() {
+                let _ = cmd.env("XDG_RUNTIME_DIR", &xdg_path);
+            }
+
+            for (k, v) in &accepted_client_env {
+                if PROTECTED_ENV.contains(&k.as_str()) {
+                    continue;
+                }
+                let _ = cmd.env(k, v);
+            }
 
             let mut drop_creds: Option<(CString, libc::uid_t, libc::gid_t)> = None;
 
             if daemon_uid == 0 {
-                let account = match resolve_user_account(&user, &shell) {
-                    Ok(account) => account,
-                    Err(e) => {
-                        error!("Failed to resolve target account for {user}: {e}");
-                        return;
-                    }
-                };
-
                 let Ok(username_c) = CString::new(account.username.clone()) else {
                     error!("Target username contains invalid NUL byte");
                     return;
                 };
-                let login_uid = account.uid;
-                let primary_group_id = account.gid;
-
-                let _ = cmd.current_dir(&account.home);
-                let _ = cmd.env("HOME", &account.home);
-                let _ = cmd.env("USER", &account.username);
-                let _ = cmd.env("LOGNAME", &account.username);
-                let _ = cmd.env("SHELL", &account.shell);
-                let _ = cmd.env("TERM", &term_type);
-
-                drop_creds = Some((username_c, login_uid, primary_group_id));
+                drop_creds = Some((username_c, account.uid, account.gid));
             }
 
             let _ = unsafe {
@@ -2175,33 +2222,80 @@ mod test {
 
     #[test]
     fn server_intercept_queries_no_escape_returns_empty() {
-        assert!(server_intercept_queries(b"hello world").is_empty());
+        assert!(server_intercept_queries(b"hello world", 24, 80).is_empty());
     }
 
     #[test]
     fn server_intercept_queries_primary_da_returns_vt220() {
-        assert_eq!(server_intercept_queries(b"\x1b[c"), b"\x1b[?62c");
-        assert_eq!(server_intercept_queries(b"\x1b[0c"), b"\x1b[?62c");
+        assert_eq!(server_intercept_queries(b"\x1b[c", 24, 80), b"\x1b[?62c");
+        assert_eq!(server_intercept_queries(b"\x1b[0c", 24, 80), b"\x1b[?62c");
     }
 
     #[test]
     fn server_intercept_queries_secondary_da_returns_response() {
-        assert_eq!(server_intercept_queries(b"\x1b[>c"), b"\x1b[>1;10;0c");
-        assert_eq!(server_intercept_queries(b"\x1b[>0c"), b"\x1b[>1;10;0c");
+        assert_eq!(
+            server_intercept_queries(b"\x1b[>c", 24, 80),
+            b"\x1b[>1;10;0c"
+        );
+        assert_eq!(
+            server_intercept_queries(b"\x1b[>0c", 24, 80),
+            b"\x1b[>1;10;0c"
+        );
+    }
+
+    #[test]
+    fn server_intercept_queries_tertiary_da_returns_response() {
+        assert_eq!(
+            server_intercept_queries(b"\x1b[=c", 24, 80),
+            b"\x1bP!|00000000\x1b\\"
+        );
+        assert_eq!(
+            server_intercept_queries(b"\x1b[=0c", 24, 80),
+            b"\x1bP!|00000000\x1b\\"
+        );
+    }
+
+    #[test]
+    fn server_intercept_queries_dsr_returns_device_ok() {
+        assert_eq!(server_intercept_queries(b"\x1b[5n", 24, 80), b"\x1b[0n");
+    }
+
+    #[test]
+    fn server_intercept_queries_xtversion_returns_identity() {
+        let resp = server_intercept_queries(b"\x1b[>q", 24, 80);
+        assert_eq!(resp, b"\x1bP>|moshpit\x1b\\");
+    }
+
+    #[test]
+    fn server_intercept_queries_xtwinops_18_returns_terminal_size() {
+        let resp = server_intercept_queries(b"\x1b[18t", 30, 120);
+        assert_eq!(resp, b"\x1b[8;30;120t");
+    }
+
+    #[test]
+    fn server_intercept_queries_xtwinops_pixel_sizes_return_zeros() {
+        assert_eq!(
+            server_intercept_queries(b"\x1b[14t", 24, 80),
+            b"\x1b[4;0;0t"
+        );
+        assert_eq!(
+            server_intercept_queries(b"\x1b[16t", 24, 80),
+            b"\x1b[6;0;0t"
+        );
     }
 
     #[test]
     fn server_intercept_queries_unknown_sequence_returns_empty() {
-        // Mode set — not a DA query
-        assert!(server_intercept_queries(b"\x1b[?25h").is_empty());
-        // Cursor position report — not a DA query
-        assert!(server_intercept_queries(b"\x1b[6n").is_empty());
+        // Mode set — not a query
+        assert!(server_intercept_queries(b"\x1b[?25h", 24, 80).is_empty());
+        // Cursor position report — handled client-side, not server-side
+        assert!(server_intercept_queries(b"\x1b[6n", 24, 80).is_empty());
     }
 
     #[test]
     fn server_intercept_queries_multiple_queries_returns_both_responses() {
         let input = b"\x1b[c\x1b[>c";
-        let resp = server_intercept_queries(input);
+        let resp = server_intercept_queries(input, 24, 80);
         assert!(
             resp.starts_with(b"\x1b[?62c"),
             "missing primary DA response"

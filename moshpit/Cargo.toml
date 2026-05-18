@@ -34,9 +34,12 @@ terminal_size = "0.4.4"
 tokio = { workspace = true, features = ["io-std", "signal", "sync", "time"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber-init = { workspace = true }
 uuid = { workspace = true }
 vergen-pretty = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "1.0.0-alpha.3"
+
 [build-dependencies]
 anyhow = { workspace = true }
 rustversion = { workspace = true }

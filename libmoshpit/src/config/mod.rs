@@ -88,6 +88,18 @@ pub trait KexConfig {
     fn preferred_algorithms(&self) -> AlgorithmList {
         supported_algorithms()
     }
+    /// Environment variable name patterns to send to the server via `ClientEnv`.
+    /// Supports exact names (`LANG`) and suffix wildcards (`LC_*`).
+    /// Returns an empty list by default; client implementations override this.
+    fn send_env(&self) -> Vec<String> {
+        vec![]
+    }
+    /// Additional PATH directories to prepend to the server's `server_path`.
+    /// Sent via `ClientEnv`; ignored by the server when `path_locked = true`.
+    /// Returns an empty list by default; client implementations override this.
+    fn send_path(&self) -> Vec<String> {
+        vec![]
+    }
 }
 
 /// Load the configuration

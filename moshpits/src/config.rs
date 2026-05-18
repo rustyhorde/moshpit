@@ -92,6 +92,21 @@ pub(crate) struct Config {
     /// Per-category algorithm overrides from TOML `[preferred_algorithms]` or CLI flags.
     #[serde(default)]
     preferred_algorithms: AlgorithmPreferences,
+    /// Environment variable name patterns accepted from the client via `ClientEnv`.
+    /// Supports exact names (`LANG`) and suffix wildcards (`LC_*`).
+    /// Variables not matching this list are discarded even if the client sends them.
+    #[serde(default = "Config::default_accept_env")]
+    #[getset(get = "pub(crate)")]
+    accept_env: Vec<String>,
+    /// Base PATH set for all spawned shells.
+    /// Client `send_path` entries are prepended to this unless `path_locked = true`.
+    #[serde(default = "Config::default_server_path")]
+    #[getset(get = "pub(crate)")]
+    server_path: Vec<String>,
+    /// If `true`, ignore client `send_path` additions and use only `server_path`.
+    #[serde(default)]
+    #[getset(get_copy = "pub(crate)")]
+    path_locked: bool,
 }
 
 fn default_term_type() -> String {
@@ -115,11 +130,29 @@ impl Default for Config {
             pacing_delay_us: None,
             term_type: default_term_type(),
             preferred_algorithms: AlgorithmPreferences::default(),
+            accept_env: Self::default_accept_env(),
+            server_path: Self::default_server_path(),
+            path_locked: false,
         }
     }
 }
 
 impl Config {
+    fn default_accept_env() -> Vec<String> {
+        vec!["LANG".into(), "LC_*".into(), "TZ".into()]
+    }
+
+    fn default_server_path() -> Vec<String> {
+        vec![
+            "/usr/local/sbin".into(),
+            "/usr/local/bin".into(),
+            "/usr/sbin".into(),
+            "/usr/bin".into(),
+            "/sbin".into(),
+            "/bin".into(),
+        ]
+    }
+
     fn load_key_paths(&self) -> Result<(PathBuf, PathBuf)> {
         let (default_private_key_path, default_pub_key_ext) =
             KeyPair::default_key_path_ext(self.mode, KEY_ALGORITHM_X25519)?;

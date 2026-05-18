@@ -8,7 +8,7 @@
 
 use std::{io::Cursor, sync::LazyLock};
 
-use clap::{ArgAction, Parser};
+use clap::Parser;
 use config::{ConfigError, Map, Source, Value, ValueKind};
 use getset::{CopyGetters, Getters};
 use libmoshpit::PathDefaults;
@@ -29,26 +29,6 @@ static LONG_VERSION: LazyLock<String> = LazyLock::new(|| {
 #[derive(Clone, CopyGetters, Debug, Getters, Parser)]
 #[command(author, version, about, long_version = LONG_VERSION.as_str(), long_about = None)]
 pub(crate) struct Cli {
-    /// Set logging verbosity.  More v's, more verbose.
-    #[clap(
-        short,
-        long,
-        action = ArgAction::Count,
-        help = "Turn up logging verbosity (multiple will turn it up more)",
-        conflicts_with = "quiet",
-    )]
-    #[getset(get_copy = "pub(crate)")]
-    verbose: u8,
-    /// Set logging quietness.  More q's, more quiet.
-    #[clap(
-        short,
-        long,
-        action = ArgAction::Count,
-        help = "Turn down logging verbosity (multiple will turn it down more)",
-        conflicts_with = "verbose",
-    )]
-    #[getset(get_copy = "pub(crate)")]
-    quiet: u8,
     /// The absolute path to a non-standard config file
     #[clap(short, long, help = "Specify the absolute path to the config file")]
     #[getset(get = "pub(crate)")]
@@ -209,14 +189,6 @@ impl Source for Cli {
     fn collect(&self) -> Result<Map<String, Value>, ConfigError> {
         let mut map = Map::new();
         let origin = String::from("command line");
-        let _old = map.insert(
-            "verbose".to_string(),
-            Value::new(Some(&origin), ValueKind::U64(u8::into(self.verbose))),
-        );
-        let _old = map.insert(
-            "quiet".to_string(),
-            Value::new(Some(&origin), ValueKind::U64(u8::into(self.quiet))),
-        );
         if let Some(config_path) = &self.config_absolute_path {
             let _old = map.insert(
                 "config_path".to_string(),
@@ -323,8 +295,6 @@ mod tests {
     #[test]
     fn test_cli_defaults() -> anyhow::Result<()> {
         let cli = Cli::try_parse_from(["moshpit", "user@host"])?;
-        assert_eq!(cli.verbose(), 0);
-        assert_eq!(cli.quiet(), 0);
         assert_eq!(cli.config_absolute_path(), &None);
         assert_eq!(cli.tracing_absolute_path(), &None);
         assert_eq!(cli.private_key_path(), &None);
@@ -339,7 +309,6 @@ mod tests {
     fn test_cli_parsing() -> anyhow::Result<()> {
         let cli = Cli::try_parse_from([
             "moshpit",
-            "-vv",
             "-c",
             "/tmp/config",
             "-t",
@@ -354,8 +323,6 @@ mod tests {
             "always",
             "admin@10.0.0.1",
         ])?;
-        assert_eq!(cli.verbose(), 2);
-        assert_eq!(cli.quiet(), 0);
         assert_eq!(cli.config_absolute_path().as_deref(), Some("/tmp/config"));
         assert_eq!(cli.tracing_absolute_path().as_deref(), Some("/tmp/trace"));
         assert_eq!(cli.private_key_path().as_deref(), Some("/tmp/priv"));
@@ -367,30 +334,10 @@ mod tests {
     }
 
     #[test]
-    fn test_cli_quiet() -> anyhow::Result<()> {
-        let cli = Cli::try_parse_from(["moshpit", "-qqq", "host"])?;
-        assert_eq!(cli.quiet(), 3);
-        assert_eq!(cli.verbose(), 0);
-        Ok(())
-    }
-
-    #[test]
     fn test_source_impl() -> anyhow::Result<()> {
         let cli = Cli::try_parse_from(["moshpit", "host"])?;
         let map = cli.collect()?;
 
-        assert!(matches!(
-            map.get("verbose")
-                .ok_or_else(|| anyhow::anyhow!("\"verbose\" not found in map"))?
-                .kind,
-            ValueKind::U64(0)
-        ));
-        assert!(matches!(
-            map.get("quiet")
-                .ok_or_else(|| anyhow::anyhow!("\"quiet\" not found in map"))?
-                .kind,
-            ValueKind::U64(0)
-        ));
         assert!(matches!(
             map.get("server_port")
                 .ok_or_else(|| anyhow::anyhow!("\"server_port\" not found in map"))?

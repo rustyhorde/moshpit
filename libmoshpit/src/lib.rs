@@ -268,6 +268,7 @@ pub use self::kex::KexState;
 pub use self::kex::KexStateMachine;
 pub use self::kex::ServerKex;
 pub use self::kex::TofuFn;
+pub use self::kex::env_var_matches;
 pub use self::kex::negotiate::AEAD_AES128_GCM_SIV;
 pub use self::kex::negotiate::AEAD_AES256_GCM;
 pub use self::kex::negotiate::AEAD_AES256_GCM_SIV;

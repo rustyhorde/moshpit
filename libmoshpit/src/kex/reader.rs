@@ -328,6 +328,14 @@ pub struct KexReader {
     #[cfg(feature = "unstable")]
     #[builder(default)]
     client_identity_private_key: Vec<u8>,
+    /// Environment variable pairs to send to the server via `ClientEnv` (client mode only).
+    /// Filtered from the client's environment using the `send_env` config patterns.
+    #[builder(default)]
+    send_env: Vec<(String, String)>,
+    /// Additional PATH directories to prepend to the server's `server_path` (client mode only).
+    /// Sent via the `ClientEnv` frame; ignored by the server when `path_locked = true`.
+    #[builder(default)]
+    send_path: Vec<String>,
 }
 
 impl std::fmt::Debug for KexReader {
@@ -359,7 +367,9 @@ impl std::fmt::Debug for KexReader {
             .field("client_algos", &self.client_algos)
             .field("server_preferred_algos", &self.server_preferred_algos)
             .field("user", &self.user)
-            .field("full_public_key_bytes", &"<redacted>");
+            .field("full_public_key_bytes", &"<redacted>")
+            .field("send_env", &"<redacted>")
+            .field("send_path", &self.send_path);
         #[cfg(feature = "unstable")]
         let _ = debug
             .field(
@@ -610,6 +620,12 @@ impl KexReader {
                     DiffMode::StateSync => self.tx.send(Frame::ClientOptions(2))?,
                     DiffMode::Reliable => {}
                 }
+                if !self.send_env.is_empty() || !self.send_path.is_empty() {
+                    self.tx.send(Frame::ClientEnv(
+                        self.send_env.clone(),
+                        self.send_path.clone(),
+                    ))?;
+                }
                 self.tx.send(Frame::Check(nonce_bytes, check))?;
                 trace!("client_kex: key exchange secret established, Check frame sent");
             }
@@ -842,10 +858,12 @@ impl KexReader {
                 }
             };
 
-        // Read the next frame: clients that requested datagram mode send
-        // `ClientOptions` before `Check`; older/reliable clients send `Check`
-        // directly.  Any other frame type is a protocol error.
-        trace!("server_kex: waiting for ClientOptions or Check frame");
+        // Read the next frame: clients may send `ClientOptions` (diff mode),
+        // `ClientEnv` (env/path passthrough), both in that order, or go straight
+        // to `Check`.  Any other frame type is a protocol error.
+        trace!("server_kex: waiting for ClientOptions, ClientEnv, or Check frame");
+        let mut client_env: Vec<(String, String)> = Vec::new();
+        let mut client_extra_path: Vec<String> = Vec::new();
         let negotiated_diff_mode = match self.reader.read_frame().await? {
             Some(Frame::ClientOptions(mode_byte)) => {
                 let mode = match mode_byte {
@@ -862,8 +880,38 @@ impl KexReader {
                         DiffMode::Reliable
                     }
                 };
-                // Now read the Check frame
+                // After ClientOptions, expect ClientEnv or Check
                 match self.reader.read_frame().await? {
+                    Some(Frame::ClientEnv(env, path)) => {
+                        trace!(
+                            "server_kex: received ClientEnv ({} vars, {} path entries) after ClientOptions",
+                            env.len(),
+                            path.len()
+                        );
+                        client_env = env;
+                        client_extra_path = path;
+                        // Now read Check
+                        match self.reader.read_frame().await? {
+                            Some(Frame::Check(nonce, enc)) => {
+                                trace!(
+                                    "server_kex: received Check frame after ClientEnv, verifying"
+                                );
+                                self.handle_check(&rnk, nonce, enc, &self.tx_event.clone())?;
+                                trace!("server_kex: Check verified, KeyAgreement sent");
+                            }
+                            Some(other) => {
+                                error!(
+                                    "server_kex: expected Check after ClientEnv but got frame id={}",
+                                    other.id()
+                                );
+                                return Err(MoshpitError::InvalidFrame.into());
+                            }
+                            None => {
+                                error!("server_kex: client closed connection after ClientEnv");
+                                return Err(MoshpitError::InvalidFrame.into());
+                            }
+                        }
+                    }
                     Some(Frame::Check(nonce, enc)) => {
                         trace!("server_kex: received Check frame after ClientOptions, verifying");
                         self.handle_check(&rnk, nonce, enc, &self.tx_event.clone())?;
@@ -871,7 +919,7 @@ impl KexReader {
                     }
                     Some(other) => {
                         error!(
-                            "server_kex: expected Check after ClientOptions but got frame id={}",
+                            "server_kex: expected ClientEnv or Check after ClientOptions but got frame id={}",
                             other.id()
                         );
                         return Err(MoshpitError::InvalidFrame.into());
@@ -883,15 +931,44 @@ impl KexReader {
                 }
                 mode
             }
+            Some(Frame::ClientEnv(env, path)) => {
+                trace!(
+                    "server_kex: received ClientEnv ({} vars, {} path entries)",
+                    env.len(),
+                    path.len()
+                );
+                client_env = env;
+                client_extra_path = path;
+                // Now read Check
+                match self.reader.read_frame().await? {
+                    Some(Frame::Check(nonce, enc)) => {
+                        trace!("server_kex: received Check frame after ClientEnv, verifying");
+                        self.handle_check(&rnk, nonce, enc, &self.tx_event.clone())?;
+                        trace!("server_kex: Check verified, KeyAgreement sent");
+                    }
+                    Some(other) => {
+                        error!(
+                            "server_kex: expected Check after ClientEnv but got frame id={}",
+                            other.id()
+                        );
+                        return Err(MoshpitError::InvalidFrame.into());
+                    }
+                    None => {
+                        error!("server_kex: client closed connection after ClientEnv");
+                        return Err(MoshpitError::InvalidFrame.into());
+                    }
+                }
+                DiffMode::Reliable
+            }
             Some(Frame::Check(nonce, enc)) => {
-                trace!("server_kex: received Check frame (no ClientOptions), verifying");
+                trace!("server_kex: received Check frame (no ClientOptions/ClientEnv), verifying");
                 self.handle_check(&rnk, nonce, enc, &self.tx_event.clone())?;
                 trace!("server_kex: Check verified, KeyAgreement sent");
                 DiffMode::Reliable
             }
             Some(other) => {
                 error!(
-                    "server_kex: expected ClientOptions or Check but got frame id={}",
+                    "server_kex: expected ClientOptions, ClientEnv, or Check but got frame id={}",
                     other.id()
                 );
                 return Err(MoshpitError::InvalidFrame.into());
@@ -940,6 +1017,8 @@ impl KexReader {
             .is_resume(is_resume)
             .diff_mode(negotiated_diff_mode)
             .negotiated_algorithms(negotiated)
+            .client_env(client_env)
+            .client_extra_path(client_extra_path)
             .build();
 
         Ok((skex, udp_arc))
