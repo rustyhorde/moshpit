@@ -1445,7 +1445,6 @@ fn spawn_pty(
                 None
             };
 
-
             let _ = unsafe {
                 cmd.pre_exec(move || {
                     let tiocsctty_request = tiocsctty_ioctl_request();
