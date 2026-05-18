@@ -88,6 +88,18 @@ pub trait KexConfig {
     fn preferred_algorithms(&self) -> AlgorithmList {
         supported_algorithms()
     }
+    /// Environment variable name patterns to send to the server via `ClientEnv`.
+    /// Supports exact names (`LANG`) and suffix wildcards (`LC_*`).
+    /// Returns an empty list by default; client implementations override this.
+    fn send_env(&self) -> Vec<String> {
+        vec![]
+    }
+    /// Additional PATH directories to prepend to the server's `server_path`.
+    /// Sent via `ClientEnv`; ignored by the server when `path_locked = true`.
+    /// Returns an empty list by default; client implementations override this.
+    fn send_path(&self) -> Vec<String> {
+        vec![]
+    }
 }
 
 /// Load the configuration
@@ -274,6 +286,24 @@ mod tests {
             path,
             PathBuf::from("/tmp/my-moshpit-config.toml"),
             "config_file_path must return the exact absolute path from config_absolute_path()"
+        );
+    }
+
+    #[test]
+    fn kex_config_send_env_default_is_empty() {
+        let cfg = TestKexConfig;
+        assert!(
+            cfg.send_env().is_empty(),
+            "send_env() default must return an empty Vec"
+        );
+    }
+
+    #[test]
+    fn kex_config_send_path_default_is_empty() {
+        let cfg = TestKexConfig;
+        assert!(
+            cfg.send_path().is_empty(),
+            "send_path() default must return an empty Vec"
         );
     }
 }

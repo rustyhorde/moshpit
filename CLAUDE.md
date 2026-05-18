@@ -70,7 +70,7 @@ All binaries depend on `libmoshpit`. The three application crates have the same 
 
 **Phase 1 — TCP key exchange** (`libmoshpit/src/kex/`, `libmoshpit/src/tcp/`):
 - Client connects on a configurable TCP port (default 40404)
-- Mutual ed25519 authentication with TOFU on first connect
+- Mutual asymmetric key authentication (X25519, P-384, P-256, or ML-DSA) with TOFU on first connect
 - Derives a per-session AES-256-GCM-SIV key via Argon2 KDF
 - TCP connection closes immediately after key exchange completes
 

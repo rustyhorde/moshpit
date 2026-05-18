@@ -10,7 +10,7 @@ license = "MIT OR Apache-2.0"
 name = "moshpits"
 readme = "../README.md"
 repository = "https://github.com/rustyhorde/moshpit"
-version = "0.8.0"
+version = "0.8.1"
 rust-version = "1.91.1"
 
 [[bin]]
@@ -26,7 +26,7 @@ bytes = { workspace = true }
 clap = { workspace = true }
 config = { workspace = true }
 getset = { workspace = true }
-libmoshpit = { version = "0.8.0", path = "../libmoshpit" }
+libmoshpit = { version = "0.8.1", path = "../libmoshpit" }
 zstd = { workspace = true }
 portable-pty = "0.9.0"
 serde = { workspace = true }
@@ -39,7 +39,7 @@ vergen-pretty = { workspace = true }
 vt100 = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2.186"
+libc = "1.0.0-alpha.3"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }

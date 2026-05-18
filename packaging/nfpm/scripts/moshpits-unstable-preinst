@@ -1,0 +1,22 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    install|upgrade)
+        if dpkg-query -W -f='${Status}' moshpits 2>/dev/null \
+            | grep -q 'install ok installed'; then
+            echo ""
+            echo "  ── moshpits-unstable: replacing stable installation ──────────────────────"
+            echo ""
+            echo "  moshpits (stable) is currently installed and will be replaced"
+            echo "  by moshpits-unstable (post-quantum build)."
+            echo ""
+            echo "  Your /etc/moshpits/ configuration and keys are preserved."
+            echo "  After install, update private_key_path / public_key_path in"
+            echo "  /etc/moshpits/moshpits.toml if switching to an ML-DSA-65 key."
+            echo ""
+            echo "  ─────────────────────────────────────────────────────────────────────────"
+            echo ""
+        fi
+        ;;
+esac

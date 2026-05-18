@@ -1,0 +1,63 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        # Create the log directory
+        install -d -m 755 -o root -g root /var/log/moshpits
+
+        # Create the key directory with restricted permissions
+        install -d -m 700 -o root -g root /etc/moshpits/keys
+
+        # Install a starter config if none is present
+        if [ ! -f /etc/moshpits/moshpits.toml ]; then
+            install -m 644 -o root -g root \
+                /usr/share/doc/moshpits-unstable/examples/moshpits.toml.example \
+                /etc/moshpits/moshpits.toml
+        fi
+
+        # Generate a passwordless ML-DSA-65 host key pair on first install.
+        # ML-DSA-65 is the default for this post-quantum build; see the note
+        # below to switch to classical ed25519.
+        _key=/etc/moshpits/keys/mps_host_mldsa65_key
+        if [ ! -f "$_key" ]; then
+            mp-keygen generate \
+                --server \
+                --no-passphrase \
+                --key-type mldsa65 \
+                --output-path "$_key" \
+                --force
+        fi
+
+        systemctl daemon-reload || true
+
+        echo ""
+        echo "  ── moshpits post-install notes ──────────────────────────────────────────"
+        echo ""
+        echo "  A passwordless ML-DSA-65 host key pair has been generated at:"
+        echo "    /etc/moshpits/keys/mps_host_mldsa65_key"
+        echo "    /etc/moshpits/keys/mps_host_mldsa65_key.pub"
+        echo ""
+        echo "  Update private_key_path / public_key_path in:"
+        echo "    /etc/moshpits/moshpits.toml"
+        echo "  And update --private-key-path / --public-key-path in:"
+        echo "    /usr/lib/systemd/system/mps.service  (override with systemctl edit mps)"
+        echo ""
+        echo "  To use a classical ed25519 key instead:"
+        echo "    mp-keygen generate --server --no-passphrase \\"
+        echo "        --output-path /etc/moshpits/keys/mps_host_ed25519_key --force"
+        echo ""
+        echo "  Review (and customise) the config file at:"
+        echo "    /etc/moshpits/moshpits.toml"
+        echo ""
+        echo "  Open the required ports in your firewall:"
+        echo "    TCP inbound:  40404          (control / key-exchange channel)"
+        echo "    UDP inbound:  50000-59999    (encrypted terminal data)"
+        echo ""
+        echo "  Enable and start the service:"
+        echo "    systemctl enable --now mps"
+        echo ""
+        echo "  ─────────────────────────────────────────────────────────────────────────"
+        echo ""
+        ;;
+esac

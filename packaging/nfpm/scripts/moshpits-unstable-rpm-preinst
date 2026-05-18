@@ -1,0 +1,23 @@
+#!/bin/sh
+set -e
+
+# $1 == 1: fresh install (including when replacing an obsoleted package)
+# $1 == 2: upgrade of moshpits-unstable itself
+case "$1" in
+    1)
+        if rpm -q moshpits 2>/dev/null | grep -qv 'not installed'; then
+            echo ""
+            echo "  ── moshpits-unstable: replacing stable installation ──────────────────────"
+            echo ""
+            echo "  moshpits (stable) is currently installed and will be replaced"
+            echo "  by moshpits-unstable (post-quantum build)."
+            echo ""
+            echo "  Your /etc/moshpits/ configuration and keys are preserved."
+            echo "  After install, update private_key_path / public_key_path in"
+            echo "  /etc/moshpits/moshpits.toml if switching to an ML-DSA-65 key."
+            echo ""
+            echo "  ─────────────────────────────────────────────────────────────────────────"
+            echo ""
+        fi
+        ;;
+esac

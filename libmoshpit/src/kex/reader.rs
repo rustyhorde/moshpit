@@ -328,6 +328,14 @@ pub struct KexReader {
     #[cfg(feature = "unstable")]
     #[builder(default)]
     client_identity_private_key: Vec<u8>,
+    /// Environment variable pairs to send to the server via `ClientEnv` (client mode only).
+    /// Filtered from the client's environment using the `send_env` config patterns.
+    #[builder(default)]
+    send_env: Vec<(String, String)>,
+    /// Additional PATH directories to prepend to the server's `server_path` (client mode only).
+    /// Sent via the `ClientEnv` frame; ignored by the server when `path_locked = true`.
+    #[builder(default)]
+    send_path: Vec<String>,
 }
 
 impl std::fmt::Debug for KexReader {
@@ -359,7 +367,9 @@ impl std::fmt::Debug for KexReader {
             .field("client_algos", &self.client_algos)
             .field("server_preferred_algos", &self.server_preferred_algos)
             .field("user", &self.user)
-            .field("full_public_key_bytes", &"<redacted>");
+            .field("full_public_key_bytes", &"<redacted>")
+            .field("send_env", &"<redacted>")
+            .field("send_path", &self.send_path);
         #[cfg(feature = "unstable")]
         let _ = debug
             .field(
@@ -610,6 +620,12 @@ impl KexReader {
                     DiffMode::StateSync => self.tx.send(Frame::ClientOptions(2))?,
                     DiffMode::Reliable => {}
                 }
+                if !self.send_env.is_empty() || !self.send_path.is_empty() {
+                    self.tx.send(Frame::ClientEnv(
+                        self.send_env.clone(),
+                        self.send_path.clone(),
+                    ))?;
+                }
                 self.tx.send(Frame::Check(nonce_bytes, check))?;
                 trace!("client_kex: key exchange secret established, Check frame sent");
             }
@@ -842,10 +858,12 @@ impl KexReader {
                 }
             };
 
-        // Read the next frame: clients that requested datagram mode send
-        // `ClientOptions` before `Check`; older/reliable clients send `Check`
-        // directly.  Any other frame type is a protocol error.
-        trace!("server_kex: waiting for ClientOptions or Check frame");
+        // Read the next frame: clients may send `ClientOptions` (diff mode),
+        // `ClientEnv` (env/path passthrough), both in that order, or go straight
+        // to `Check`.  Any other frame type is a protocol error.
+        trace!("server_kex: waiting for ClientOptions, ClientEnv, or Check frame");
+        let mut client_env: Vec<(String, String)> = Vec::new();
+        let mut client_extra_path: Vec<String> = Vec::new();
         let negotiated_diff_mode = match self.reader.read_frame().await? {
             Some(Frame::ClientOptions(mode_byte)) => {
                 let mode = match mode_byte {
@@ -862,8 +880,38 @@ impl KexReader {
                         DiffMode::Reliable
                     }
                 };
-                // Now read the Check frame
+                // After ClientOptions, expect ClientEnv or Check
                 match self.reader.read_frame().await? {
+                    Some(Frame::ClientEnv(env, path)) => {
+                        trace!(
+                            "server_kex: received ClientEnv ({} vars, {} path entries) after ClientOptions",
+                            env.len(),
+                            path.len()
+                        );
+                        client_env = env;
+                        client_extra_path = path;
+                        // Now read Check
+                        match self.reader.read_frame().await? {
+                            Some(Frame::Check(nonce, enc)) => {
+                                trace!(
+                                    "server_kex: received Check frame after ClientEnv, verifying"
+                                );
+                                self.handle_check(&rnk, nonce, enc, &self.tx_event.clone())?;
+                                trace!("server_kex: Check verified, KeyAgreement sent");
+                            }
+                            Some(other) => {
+                                error!(
+                                    "server_kex: expected Check after ClientEnv but got frame id={}",
+                                    other.id()
+                                );
+                                return Err(MoshpitError::InvalidFrame.into());
+                            }
+                            None => {
+                                error!("server_kex: client closed connection after ClientEnv");
+                                return Err(MoshpitError::InvalidFrame.into());
+                            }
+                        }
+                    }
                     Some(Frame::Check(nonce, enc)) => {
                         trace!("server_kex: received Check frame after ClientOptions, verifying");
                         self.handle_check(&rnk, nonce, enc, &self.tx_event.clone())?;
@@ -871,7 +919,7 @@ impl KexReader {
                     }
                     Some(other) => {
                         error!(
-                            "server_kex: expected Check after ClientOptions but got frame id={}",
+                            "server_kex: expected ClientEnv or Check after ClientOptions but got frame id={}",
                             other.id()
                         );
                         return Err(MoshpitError::InvalidFrame.into());
@@ -883,15 +931,44 @@ impl KexReader {
                 }
                 mode
             }
+            Some(Frame::ClientEnv(env, path)) => {
+                trace!(
+                    "server_kex: received ClientEnv ({} vars, {} path entries)",
+                    env.len(),
+                    path.len()
+                );
+                client_env = env;
+                client_extra_path = path;
+                // Now read Check
+                match self.reader.read_frame().await? {
+                    Some(Frame::Check(nonce, enc)) => {
+                        trace!("server_kex: received Check frame after ClientEnv, verifying");
+                        self.handle_check(&rnk, nonce, enc, &self.tx_event.clone())?;
+                        trace!("server_kex: Check verified, KeyAgreement sent");
+                    }
+                    Some(other) => {
+                        error!(
+                            "server_kex: expected Check after ClientEnv but got frame id={}",
+                            other.id()
+                        );
+                        return Err(MoshpitError::InvalidFrame.into());
+                    }
+                    None => {
+                        error!("server_kex: client closed connection after ClientEnv");
+                        return Err(MoshpitError::InvalidFrame.into());
+                    }
+                }
+                DiffMode::Reliable
+            }
             Some(Frame::Check(nonce, enc)) => {
-                trace!("server_kex: received Check frame (no ClientOptions), verifying");
+                trace!("server_kex: received Check frame (no ClientOptions/ClientEnv), verifying");
                 self.handle_check(&rnk, nonce, enc, &self.tx_event.clone())?;
                 trace!("server_kex: Check verified, KeyAgreement sent");
                 DiffMode::Reliable
             }
             Some(other) => {
                 error!(
-                    "server_kex: expected ClientOptions or Check but got frame id={}",
+                    "server_kex: expected ClientOptions, ClientEnv, or Check but got frame id={}",
                     other.id()
                 );
                 return Err(MoshpitError::InvalidFrame.into());
@@ -940,6 +1017,8 @@ impl KexReader {
             .is_resume(is_resume)
             .diff_mode(negotiated_diff_mode)
             .negotiated_algorithms(negotiated)
+            .client_env(client_env)
+            .client_extra_path(client_extra_path)
             .build();
 
         Ok((skex, udp_arc))
@@ -1869,6 +1948,89 @@ mod tests {
         assert!(
             !result,
             "world-readable authorized_keys must be rejected (permission check)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Algorithm resolution helper tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_kex_alg_dh_algorithms_succeed() {
+        use crate::kex::negotiate::{KEX_P256_SHA256, KEX_P384_SHA384, KEX_X25519_SHA256};
+        for kex in [KEX_X25519_SHA256, KEX_P384_SHA384, KEX_P256_SHA256] {
+            let result = super::resolve_kex_alg(kex);
+            assert!(result.is_ok(), "{kex} should resolve OK");
+            assert!(
+                matches!(result.unwrap(), super::ResolvedKexAlgorithm::Dh(_)),
+                "{kex} should map to a DH algorithm"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_kex_alg_kem_algorithms_succeed() {
+        for kex in [
+            KEX_ML_KEM_512_SHA256,
+            KEX_ML_KEM_768_SHA256,
+            KEX_ML_KEM_1024_SHA256,
+        ] {
+            let result = super::resolve_kex_alg(kex);
+            assert!(result.is_ok(), "{kex} should resolve OK");
+            assert!(
+                matches!(result.unwrap(), super::ResolvedKexAlgorithm::Kem(_)),
+                "{kex} should map to a KEM algorithm"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_hkdf_alg_all_supported_succeed() {
+        use crate::kex::negotiate::{KDF_HKDF_SHA384, KDF_HKDF_SHA512};
+        for kdf in [KDF_HKDF_SHA256, KDF_HKDF_SHA384, KDF_HKDF_SHA512] {
+            assert!(
+                super::resolve_hkdf_alg(kdf).is_ok(),
+                "{kdf} should resolve OK"
+            );
+        }
+        assert!(
+            super::resolve_hkdf_alg("unknown-kdf").is_err(),
+            "unknown KDF must return an error"
+        );
+    }
+
+    #[test]
+    fn resolve_aead_alg_all_supported_succeed() {
+        use crate::kex::negotiate::{AEAD_AES128_GCM_SIV, AEAD_AES256_GCM, AEAD_CHACHA20_POLY1305};
+        for aead in [
+            AEAD_AES256_GCM_SIV,
+            AEAD_AES256_GCM,
+            AEAD_CHACHA20_POLY1305,
+            AEAD_AES128_GCM_SIV,
+        ] {
+            assert!(
+                super::resolve_aead_alg(aead).is_ok(),
+                "{aead} should resolve OK"
+            );
+        }
+        assert!(
+            super::resolve_aead_alg("unknown-aead").is_err(),
+            "unknown AEAD must return an error"
+        );
+    }
+
+    #[test]
+    fn resolve_hmac_key_type_all_supported_succeed() {
+        use crate::kex::negotiate::MAC_HMAC_SHA256;
+        for mac in [MAC_HMAC_SHA512, MAC_HMAC_SHA256] {
+            assert!(
+                super::resolve_hmac_key_type(mac).is_ok(),
+                "{mac} should resolve OK"
+            );
+        }
+        assert!(
+            super::resolve_hmac_key_type("unknown-mac").is_err(),
+            "unknown MAC must return an error"
         );
     }
 

@@ -6,17 +6,6 @@
 #   2. Command-line flags
 #   3. This config file
 
-# ── Logging ───────────────────────────────────────────────────────────────────
-# Each increment of verbose adds one level of detail, each increment of quiet
-# removes one level.  The effective log level for the tracing file is:
-#   0 quiet  + 0 verbose -> INFO
-#   0 quiet  + 1 verbose -> DEBUG
-#   0 quiet  + 2 verbose -> TRACE
-#   1 quiet  + 0 verbose -> WARN
-#   2 quiet  + 0 verbose -> ERROR
-verbose = 0
-quiet   = 0
-
 # ── Server connection ─────────────────────────────────────────────────────────
 # TCP port that the moshpits server is listening on.
 server_port = 40404
@@ -31,23 +20,31 @@ server_destination = "192.168.1.10"
 max_reconnect_backoff_secs = 3600
 
 # ── Key files ─────────────────────────────────────────────────────────────────
-# Defaults to ~/.mp/id_ed25519 and ~/.mp/id_ed25519.pub when not set.
-# private_key_path = "/home/alice/.mp/id_ed25519"
-# public_key_path  = "/home/alice/.mp/id_ed25519.pub"
+# Defaults to ~/.mp/id_x25519 and ~/.mp/id_x25519.pub when not set (for the
+# default x25519 key type). The filename reflects the --key-type used at
+# generation time (e.g. id_p384, id_ml_dsa_65).
+# private_key_path = "/home/alice/.mp/id_x25519"
+# public_key_path  = "/home/alice/.mp/id_x25519.pub"
+
+# ── Environment & PATH passthrough ────────────────────────────────────────────
+# Environment variable name patterns to send to the server via ClientEnv.
+# Supports exact names ("LANG") and suffix wildcards ("LC_*").
+# The server's accept_env list gates which variables are actually applied.
+# HOME, USER, LOGNAME, SHELL, TERM, and PATH are always server-authoritative
+# and cannot be overridden via this list even if matched here.
+# Default: ["LANG", "LC_*", "TZ"]
+send_env = ["LANG", "LC_*", "TZ"]
+
+# Additional directories to prepend to the server's PATH (in order).
+# Ignored if the server has path_locked = true.
+# Default: []
+# send_path = ["/home/alice/.cargo/bin", "/home/alice/.local/bin"]
 
 # ── Tracing (log output) ──────────────────────────────────────────────────────
-# stdout layer — controls log line formatting when --enable-std-output is active
-# (not applicable to mp, but kept for consistency with moshpits).
-[tracing.stdout]
-with_target       = false  # include the Rust module path in each log line
-with_thread_ids   = false  # include the thread ID
-with_thread_names = false  # include the thread name
-with_line_number  = false  # include the source file line number
-with_level        = true   # include the log level (ERROR, WARN, INFO, …)
-# directives = "moshpit=debug,libmoshpit=info"  # optional tracing filter override
-
-# file layer — controls the format and level written to the persistent log file.
-# Default log file: ~/.config/moshpit/logs/moshpit.log
+# mp never writes to stdout (doing so would corrupt the terminal session).
+# All log output goes exclusively to the file layer below.
+# -v / -vv CLI flags have no effect on the file log level; set verbose here.
+# Default log file: ~/.local/share/moshpit/logs/moshpit.log
 [tracing.file]
 quiet   = 0
 verbose = 0

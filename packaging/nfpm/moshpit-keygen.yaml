@@ -21,7 +21,7 @@ rpm:
 
 contents:
   # Binary
-  - src: target/x86_64-unknown-linux-musl/release/mp-keygen
+  - src: mp-keygen-x86_64-unknown-linux-musl
     dst: /usr/bin/mp-keygen
     file_info:
       mode: 0755

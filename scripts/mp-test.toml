@@ -4,14 +4,6 @@ max_reconnect_backoff_secs = 3600   # 1 hour
 ip = "127.0.0.1"
 port = 40406
 
-[tracing.stdout]
-with_target = false
-with_thread_ids = false
-with_thread_names = false
-with_line_number = false
-with_level = true
-directives = "mio=error,neli=error"
-
 [tracing.file]
 quiet = 0
 verbose = 3

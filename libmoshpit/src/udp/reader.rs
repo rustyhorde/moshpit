@@ -13,7 +13,7 @@ use std::{
     process,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -30,7 +30,7 @@ use tokio::{
     net::UdpSocket,
     select,
     sync::{mpsc::Sender, oneshot},
-    time::{Instant as TokioInstant, sleep, sleep_until},
+    time::{Instant as TokioInstant, sleep_until},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -390,6 +390,22 @@ impl UdpReader {
             (None, b"" | b"0", b'c') => Some(b"\x1b[?62c".to_vec()),
             (Some(b'>'), b"" | b"0", b'c') => Some(b"\x1b[>1;10;0c".to_vec()),
             (Some(b'='), b"" | b"0", b'c') => Some(b"\x1bP!|00000000\x1b\\".to_vec()),
+            // DSR — device status (vi, htop, etc. probe this at startup)
+            (None, b"5", b'n') => Some(b"\x1b[0n".to_vec()),
+            // XTVERSION — terminal identity (vim, neovim)
+            (Some(b'>'), _, b'q') => Some(b"\x1bP>|moshpit\x1b\\".to_vec()),
+            // XTWINOPS — terminal size in characters
+            (None, b"18", b't') => {
+                let (rows, cols) = emulator
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .screen()
+                    .size();
+                Some(format!("\x1b[8;{rows};{cols}t").into_bytes())
+            }
+            // XTWINOPS — window/cell pixel sizes (unknown to the proxy → 0)
+            (None, b"14", b't') => Some(b"\x1b[4;0;0t".to_vec()),
+            (None, b"16", b't') => Some(b"\x1b[6;0;0t".to_vec()),
             _ => {
                 out.extend_from_slice(&bytes[seq_start..*i]);
                 None
@@ -1041,7 +1057,7 @@ impl UdpReader {
     ///   arrive so that confirmed/invalidated overlays are reconciled.
     /// * `renderer` – differential renderer; used to emit a single clean
     ///   repaint after a scrollback replay block completes.
-    #[cfg_attr(nightly, allow(clippy::too_many_lines))]
+    #[cfg_attr(nightly, allow(clippy::too_many_lines, clippy::too_many_arguments))]
     pub async fn client_frame_loop(
         &mut self,
         token: CancellationToken,
@@ -1050,6 +1066,7 @@ impl UdpReader {
         emulator: Arc<Mutex<Emulator>>,
         prediction: Arc<Mutex<PredictionEngine>>,
         renderer: Arc<Mutex<Renderer>>,
+        in_alt_screen: Arc<AtomicBool>,
     ) {
         let mut prev_bytes = BytesMut::with_capacity(1024);
         let mut osc_started = false;
@@ -1072,7 +1089,7 @@ impl UdpReader {
 
         'session: loop {
             select! {
-                () = token.cancelled() => process::exit(0),
+                () = token.cancelled() => break 'session,
                 () = sleep_until(nak_check_deadline) => {
                     for ready in self.check_nak_timeouts() {
                         match ready {
@@ -1084,9 +1101,10 @@ impl UdpReader {
                                     &mut osc_started,
                                     &stdout_tx,
                                     scrollback_mode,
-                                    &token,
+                                    &exit_token,
                                     &emulator,
                                     &prediction,
+                                    &in_alt_screen,
                                 )
                                 .await;
                             }
@@ -1133,6 +1151,10 @@ impl UdpReader {
                                 };
                                 let mut tmp = vt100::Parser::new(rows, cols, 0);
                                 tmp.process(&payload);
+                                in_alt_screen.store(
+                                    tmp.screen().alternate_screen(),
+                                    Ordering::Relaxed,
+                                );
                                 let repaint = {
                                     let mut rend = renderer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                                     rend.invalidate();
@@ -1153,8 +1175,9 @@ impl UdpReader {
                                         };
                                         let mut tmp = vt100::Parser::new(rows, cols, 0);
                                         tmp.process(&payload);
+                                        let is_alt = tmp.screen().alternate_screen();
+                                        in_alt_screen.store(is_alt, Ordering::Relaxed);
                                         if self.diff_mode == DiffMode::StateSync {
-                                            let is_alt = tmp.screen().alternate_screen();
                                             let mut ack = tmp.screen().contents_formatted();
                                             if is_alt {
                                                 let mut prefixed = b"\x1b[?1049h".to_vec();
@@ -1210,9 +1233,10 @@ impl UdpReader {
                                             &mut osc_started,
                                             &stdout_tx,
                                             scrollback_mode,
-                                            &token,
+                                            &exit_token,
                                             &emulator,
                                             &prediction,
+                                            &in_alt_screen,
                                         )
                                         .await;
                                     }
@@ -1293,6 +1317,10 @@ impl UdpReader {
                                         };
                                         let mut tmp = vt100::Parser::new(rows, cols, 0);
                                         tmp.process(&payload);
+                                        in_alt_screen.store(
+                                            tmp.screen().alternate_screen(),
+                                            Ordering::Relaxed,
+                                        );
                                         let repaint = {
                                             let mut rend = renderer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                                             rend.invalidate();
@@ -1313,8 +1341,9 @@ impl UdpReader {
                                                 };
                                                 let mut tmp = vt100::Parser::new(rows, cols, 0);
                                                 tmp.process(&payload);
+                                                let is_alt = tmp.screen().alternate_screen();
+                                                in_alt_screen.store(is_alt, Ordering::Relaxed);
                                                 if self.diff_mode == DiffMode::StateSync {
-                                                    let is_alt = tmp.screen().alternate_screen();
                                                     let mut ack = tmp.screen().contents_formatted();
                                                     if is_alt {
                                                         let mut prefixed = b"\x1b[?1049h".to_vec();
@@ -1353,9 +1382,10 @@ impl UdpReader {
                                                     &mut osc_started,
                                                     &stdout_tx,
                                                     scrollback_mode,
-                                                    &token,
+                                                    &exit_token,
                                                     &emulator,
                                                     &prediction,
+                                                    &in_alt_screen,
                                                 )
                                                 .await;
                                             }
@@ -1373,9 +1403,10 @@ impl UdpReader {
                                             &mut osc_started,
                                             &stdout_tx,
                                             scrollback_mode,
-                                            &token,
+                                            &exit_token,
                                             &emulator,
                                             &prediction,
+                                            &in_alt_screen,
                                         )
                                         .await;
                                     }
@@ -1399,6 +1430,7 @@ impl UdpReader {
                                                     }
                                                     tmp.process(&diff_bytes);
                                                     let is_alt = tmp.screen().alternate_screen();
+                                                    in_alt_screen.store(is_alt, Ordering::Relaxed);
                                                     let mut new_ack = tmp.screen().contents_formatted();
                                                     if is_alt {
                                                         let mut prefixed = b"\x1b[?1049h".to_vec();
@@ -1494,9 +1526,10 @@ async fn process_bytes_with_prediction(
     stdout_tx: &Sender<Vec<u8>>,
     // When true, raw bytes are silently fed into the emulator only; no stdout output is produced.
     scrollback_mode: bool,
-    token: &CancellationToken,
+    exit_token: &CancellationToken,
     emulator: &Arc<Mutex<Emulator>>,
     prediction: &Arc<Mutex<PredictionEngine>>,
+    in_alt_screen: &Arc<AtomicBool>,
 ) {
     // ── 1. OSC exit detection ─────────────────────────────────────────────
     let message = if prev_bytes.is_empty() {
@@ -1521,8 +1554,7 @@ async fn process_bytes_with_prediction(
         match part {
             Token::String(osc_cmd_string) => {
                 if *osc_started && is_exit_title(osc_cmd_string, false) {
-                    sleep(Duration::from_millis(500)).await;
-                    token.cancel();
+                    exit_token.cancel();
                 }
             }
             Token::ControlFunction(control_function) => {
@@ -1547,17 +1579,29 @@ async fn process_bytes_with_prediction(
     }
 
     // ── 3. Feed raw bytes into the emulator ──────────────────────────────
-    {
+    let was_alt = in_alt_screen.load(Ordering::Relaxed);
+    let is_alt = {
         let mut emu = emulator
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         emu.process(&raw);
+        let is_alt = emu.screen().alternate_screen();
+        in_alt_screen.store(is_alt, Ordering::Relaxed);
+        is_alt
+    };
+    // A full-screen app (vi, htop) entering alternate screen can leave the OSC
+    // state machine in a stuck state if its escape output spans frame boundaries.
+    // Reset on entry to prevent a spurious exit detection after the app quits.
+    if is_alt && !was_alt {
+        *osc_started = false;
     }
 
     // ── 4+5. Cull predictions and paint overlays ─────────────────────────
     // Skip overlay painting while absorbing scrollback — there are no active
     // predictions during reconnect and we do not want flickering output.
-    if !scrollback_mode {
+    // Also skip when in alternate-screen mode (vi, htop, etc.) — the app
+    // manages its own screen state and prediction adds only contention.
+    if !scrollback_mode && !is_alt {
         let (overlays, cursor) = {
             let emu = emulator
                 .lock()
@@ -2000,6 +2044,80 @@ mod tests {
             panic!("expected Bytes frame");
         };
         assert_eq!(resp, b"\x1bP!|00000000\x1b\\");
+    }
+
+    // --- CSI DSR (ESC[5n) ---
+
+    #[tokio::test]
+    async fn intercept_queries_csi_dsr_status_sends_device_ok() {
+        let (reader, mut rx) = make_reader_with_response_rx().await;
+        let emu = make_emulator();
+        let out = reader.intercept_queries(b"\x1b[5n", &emu);
+        assert!(out.is_empty(), "DSR query must not pass through");
+        let frame = rx.try_recv().expect("expected DSR response");
+        let EncryptedFrame::Bytes((_id, resp)) = frame else {
+            panic!("expected Bytes frame");
+        };
+        assert_eq!(resp, b"\x1b[0n");
+    }
+
+    // --- XTVERSION (ESC[>q) ---
+
+    #[tokio::test]
+    async fn intercept_queries_csi_xtversion_sends_identity() {
+        let (reader, mut rx) = make_reader_with_response_rx().await;
+        let emu = make_emulator();
+        let out = reader.intercept_queries(b"\x1b[>q", &emu);
+        assert!(out.is_empty(), "XTVERSION query must not pass through");
+        let frame = rx.try_recv().expect("expected XTVERSION response");
+        let EncryptedFrame::Bytes((_id, resp)) = frame else {
+            panic!("expected Bytes frame");
+        };
+        assert_eq!(resp, b"\x1bP>|moshpit\x1b\\");
+    }
+
+    // --- XTWINOPS terminal size (ESC[18t) ---
+
+    #[tokio::test]
+    async fn intercept_queries_csi_xtwinops_18_sends_terminal_size() {
+        let (reader, mut rx) = make_reader_with_response_rx().await;
+        let emu = make_emulator();
+        let out = reader.intercept_queries(b"\x1b[18t", &emu);
+        assert!(out.is_empty(), "XTWINOPS 18t must not pass through");
+        let frame = rx.try_recv().expect("expected XTWINOPS 18t response");
+        let EncryptedFrame::Bytes((_id, resp)) = frame else {
+            panic!("expected Bytes frame");
+        };
+        let s = String::from_utf8(resp).unwrap();
+        assert!(
+            s.starts_with("\x1b[8;"),
+            "response must start with ESC[8; — got {s:?}"
+        );
+        assert!(s.ends_with('t'), "response must end with 't'");
+    }
+
+    // --- XTWINOPS pixel sizes (ESC[14t, ESC[16t) ---
+
+    #[tokio::test]
+    async fn intercept_queries_csi_xtwinops_pixel_sizes_return_zeros() {
+        let (reader, mut rx) = make_reader_with_response_rx().await;
+        let emu = make_emulator();
+
+        let out14 = reader.intercept_queries(b"\x1b[14t", &emu);
+        assert!(out14.is_empty(), "XTWINOPS 14t must not pass through");
+        let frame14 = rx.try_recv().expect("expected XTWINOPS 14t response");
+        let EncryptedFrame::Bytes((_id, resp14)) = frame14 else {
+            panic!("expected Bytes frame");
+        };
+        assert_eq!(resp14, b"\x1b[4;0;0t");
+
+        let out16 = reader.intercept_queries(b"\x1b[16t", &emu);
+        assert!(out16.is_empty(), "XTWINOPS 16t must not pass through");
+        let frame16 = rx.try_recv().expect("expected XTWINOPS 16t response");
+        let EncryptedFrame::Bytes((_id, resp16)) = frame16 else {
+            panic!("expected Bytes frame");
+        };
+        assert_eq!(resp16, b"\x1b[6;0;0t");
     }
 
     // --- unrecognised CSI passes through ---
@@ -2566,6 +2684,134 @@ mod tests {
         );
         assert_eq!(reader.next_seq, 7);
         assert!(reader.recv_buffer.is_empty());
+    }
+
+    // ── process_bytes_with_prediction: alternate screen tracking ─────────────
+
+    type PredState = (
+        Sender<Vec<u8>>,
+        tokio::sync::mpsc::Receiver<Vec<u8>>,
+        Arc<Mutex<Emulator>>,
+        Arc<Mutex<PredictionEngine>>,
+        Arc<AtomicBool>,
+        CancellationToken,
+    );
+
+    /// Helper: build the shared state needed to call `process_bytes_with_prediction`.
+    fn make_prediction_state() -> PredState {
+        use crate::DisplayPreference;
+        let (stdout_tx, stdout_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let emulator = make_emulator();
+        let prediction = Arc::new(Mutex::new(PredictionEngine::new(DisplayPreference::Never)));
+        let in_alt_screen = Arc::new(AtomicBool::new(false));
+        let exit_token = CancellationToken::new();
+        (
+            stdout_tx,
+            stdout_rx,
+            emulator,
+            prediction,
+            in_alt_screen,
+            exit_token,
+        )
+    }
+
+    #[tokio::test]
+    async fn process_bytes_with_prediction_sets_in_alt_screen_on_entry() {
+        let (stdout_tx, _rx, emulator, prediction, in_alt_screen, exit_token) =
+            make_prediction_state();
+        let mut prev_bytes = BytesMut::new();
+        let mut osc_started = false;
+
+        // DECSET 1049 enters the alternate screen buffer
+        process_bytes_with_prediction(
+            b"\x1b[?1049h".to_vec(),
+            &mut prev_bytes,
+            &mut osc_started,
+            &stdout_tx,
+            false,
+            &exit_token,
+            &emulator,
+            &prediction,
+            &in_alt_screen,
+        )
+        .await;
+
+        assert!(
+            in_alt_screen.load(Ordering::Relaxed),
+            "in_alt_screen must be true after ESC[?1049h"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_bytes_with_prediction_clears_in_alt_screen_on_exit() {
+        let (stdout_tx, _rx, emulator, prediction, in_alt_screen, exit_token) =
+            make_prediction_state();
+        let mut prev_bytes = BytesMut::new();
+        let mut osc_started = false;
+
+        // Enter alternate screen
+        process_bytes_with_prediction(
+            b"\x1b[?1049h".to_vec(),
+            &mut prev_bytes,
+            &mut osc_started,
+            &stdout_tx,
+            false,
+            &exit_token,
+            &emulator,
+            &prediction,
+            &in_alt_screen,
+        )
+        .await;
+        assert!(
+            in_alt_screen.load(Ordering::Relaxed),
+            "precondition: must be in alt screen"
+        );
+
+        // Exit alternate screen
+        process_bytes_with_prediction(
+            b"\x1b[?1049l".to_vec(),
+            &mut prev_bytes,
+            &mut osc_started,
+            &stdout_tx,
+            false,
+            &exit_token,
+            &emulator,
+            &prediction,
+            &in_alt_screen,
+        )
+        .await;
+
+        assert!(
+            !in_alt_screen.load(Ordering::Relaxed),
+            "in_alt_screen must be false after ESC[?1049l"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_bytes_with_prediction_resets_osc_started_on_alt_screen_entry() {
+        let (stdout_tx, _rx, emulator, prediction, in_alt_screen, exit_token) =
+            make_prediction_state();
+        let mut prev_bytes = BytesMut::new();
+        let mut osc_started = true; // simulate a stuck OSC state machine
+
+        // Entering alt screen must reset the stuck state
+        process_bytes_with_prediction(
+            b"\x1b[?1049h".to_vec(),
+            &mut prev_bytes,
+            &mut osc_started,
+            &stdout_tx,
+            false,
+            &exit_token,
+            &emulator,
+            &prediction,
+            &in_alt_screen,
+        )
+        .await;
+
+        assert!(
+            !osc_started,
+            "osc_started must be reset to false on alternate screen entry"
+        );
     }
 
     #[tokio::test]

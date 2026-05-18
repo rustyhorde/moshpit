@@ -1,0 +1,19 @@
+#!/bin/sh
+set -e
+
+# $1 == 1: fresh install (including when replacing an obsoleted package)
+# $1 == 2: upgrade of moshpit-keygen-unstable itself
+case "$1" in
+    1)
+        if rpm -q moshpit-keygen 2>/dev/null | grep -qv 'not installed'; then
+            echo ""
+            echo "  ── moshpit-keygen-unstable: replacing stable installation ────────────────"
+            echo ""
+            echo "  moshpit-keygen (stable) is currently installed and will be replaced"
+            echo "  by moshpit-keygen-unstable (post-quantum build)."
+            echo ""
+            echo "  ─────────────────────────────────────────────────────────────────────────"
+            echo ""
+        fi
+        ;;
+esac

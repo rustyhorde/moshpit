@@ -67,6 +67,21 @@ struct HostKeyCallbacks {
 }
 
 pub(crate) mod negotiate;
+
+/// Returns `true` if `name` matches any pattern in `patterns`.
+///
+/// Patterns support exact names (`LANG`) and suffix wildcards (`LC_*`).
+/// A trailing `*` matches any suffix; all other characters are matched literally.
+#[must_use]
+pub fn env_var_matches(name: &str, patterns: &[String]) -> bool {
+    patterns.iter().any(|pat| {
+        if let Some(prefix) = pat.strip_suffix('*') {
+            name.starts_with(prefix)
+        } else {
+            name == pat.as_str()
+        }
+    })
+}
 pub(crate) mod reader;
 pub(crate) mod sender;
 
@@ -249,6 +264,16 @@ pub struct ServerKex {
     #[getset(get = "pub")]
     #[builder(default)]
     negotiated_algorithms: NegotiatedAlgorithms,
+    /// Environment variable pairs received from the client via `ClientEnv`.
+    /// The server applies only those matching its `accept_env` config patterns.
+    #[getset(get = "pub")]
+    #[builder(default)]
+    client_env: Vec<(String, String)>,
+    /// Additional PATH directories received from the client via `ClientEnv`.
+    /// Prepended to the server's `server_path`; ignored when `path_locked = true`.
+    #[getset(get = "pub")]
+    #[builder(default)]
+    client_extra_path: Vec<String>,
 }
 
 impl KexStateMachine {
@@ -464,6 +489,11 @@ async fn run_client_kex<T: KexConfig>(
     let diff_mode = config.diff_mode();
     let client_algos = config.preferred_algorithms();
     let user = config.user().unwrap_or_default();
+    let send_env_patterns = config.send_env();
+    let send_env: Vec<(String, String)> = std::env::vars()
+        .filter(|(k, _)| env_var_matches(k, &send_env_patterns))
+        .collect();
+    let send_path = config.send_path();
     #[cfg(feature = "unstable")]
     let client_identity_key_algorithm = identity_key.key_algorithm().clone();
     #[cfg(feature = "unstable")]
@@ -484,6 +514,8 @@ async fn run_client_kex<T: KexConfig>(
             .full_public_key_bytes(full_public_key_bytes)
             .client_identity_key_algorithm(client_identity_key_algorithm)
             .client_identity_private_key(client_identity_private_key)
+            .send_env(send_env)
+            .send_path(send_path)
             .build();
         #[cfg(not(feature = "unstable"))]
         let mut frame_reader = KexReader::builder()
@@ -498,6 +530,8 @@ async fn run_client_kex<T: KexConfig>(
             .client_algos(client_algos)
             .user(user)
             .full_public_key_bytes(full_public_key_bytes)
+            .send_env(send_env)
+            .send_path(send_path)
             .build();
         if let Err(e) = frame_reader.client_kex().await {
             error!("client_kex failed: {e}");

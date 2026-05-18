@@ -61,6 +61,15 @@ pub enum Frame {
     KexInit(AlgorithmList),
     /// Experimental identity-key proof over the key-exchange transcript.
     IdentityProof(Vec<u8>),
+    /// Environment variable passthrough and PATH additions from the client.
+    /// Sent after [`ClientOptions`](Frame::ClientOptions) (if any) and before
+    /// [`Check`](Frame::Check).
+    /// Fields: (`env_vars`, `extra_path`)
+    /// - `env_vars`: `(name, value)` pairs filtered by the client's `send_env` config;
+    ///   the server applies only those matching its own `accept_env` list.
+    /// - `extra_path`: directories to prepend to the server's base `server_path`;
+    ///   ignored when the server has `path_locked = true`.
+    ClientEnv(Vec<(String, String)>, Vec<String>),
 }
 
 impl Frame {
@@ -79,6 +88,7 @@ impl Frame {
             Frame::ClientOptions(_) => 8,
             Frame::KexInit(_) => 9,
             Frame::IdentityProof(_) => 10,
+            Frame::ClientEnv(_, _) => 11,
         }
     }
 
@@ -89,7 +99,7 @@ impl Frame {
     ///
     pub fn parse(src: &mut Cursor<&[u8]>) -> Result<Option<Self>> {
         match get_u8(src) {
-            Some(0..=10) => {
+            Some(0..=11) => {
                 if let Some(length_slice) = get_usize(src)? {
                     let length = usize::from_be_bytes(length_slice.try_into()?);
                     if length > MAX_FRAME_LENGTH {
@@ -158,6 +168,12 @@ impl Display for Frame {
             Frame::IdentityProof(signature) => {
                 write!(f, "IdentityProof({} bytes)", signature.len())
             }
+            Frame::ClientEnv(env_vars, extra_path) => write!(
+                f,
+                "ClientEnv({} vars, {} path entries)",
+                env_vars.len(),
+                extra_path.len()
+            ),
         }
     }
 }
@@ -373,8 +389,8 @@ mod tests {
 
     #[test]
     fn test_parse_unknown_frame_id_returns_none() {
-        // Frame IDs 0-10 are known; anything above 10 must be silently ignored (Ok(None)).
-        let all_data = [11u8, 0, 0, 0, 0, 0, 0, 0, 0]; // id=11, length=0, no payload
+        // Frame IDs 0-11 are known; anything above 11 must be silently ignored (Ok(None)).
+        let all_data = [12u8, 0, 0, 0, 0, 0, 0, 0, 0]; // id=12, length=0, no payload
         let mut cursor = Cursor::new(&all_data[..]);
         let result = Frame::parse(&mut cursor);
         assert!(result.is_ok(), "unknown frame id must not be an error");
