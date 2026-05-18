@@ -46,6 +46,7 @@ use tokio::{
         mpsc::{Receiver, Sender, channel},
         oneshot,
     },
+    time::{Instant as TokioInstant, sleep_until},
 };
 use tokio_util::sync::CancellationToken;
 #[cfg(target_os = "linux")]
@@ -84,6 +85,14 @@ const MTU_PROBE_QUIET_TICKS: u32 = 300;
 const MTU_PROBE_SUCCESS_TICKS: u32 = 150;
 /// NAK delta in a single 200 ms window that signals the larger MTU caused a black hole.
 const MTU_PROBE_FAIL_THRESHOLD: u64 = 3;
+/// Consecutive zero-NAK-delta ticks before the connection-health task starts backing off
+/// its poll interval (5 ticks × 200 ms = 1 s of idle before first slowdown).
+const HEALTH_BACKOFF_TICKS: u32 = 5;
+/// Maximum poll interval for the connection-health task during prolonged idle.  The interval
+/// doubles every quiet tick (200 ms → 400 → 800 → 1600 → 2000 ms), reducing the combined
+/// MTU probe + proactive-repaint wakeup rate from 5 Hz to 0.5 Hz after ~2 s of silence.
+/// Any NAK activity snaps it back to [`MTU_POLL_INTERVAL`] immediately.
+const HEALTH_MAX_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Normal screen-sync interval when the terminal is idle.
 const SCREEN_SYNC_IDLE_INTERVAL: Duration = Duration::from_millis(50);
@@ -925,8 +934,6 @@ fn spawn_connection_health_task(
     server_emulator: Arc<Mutex<vt100::Parser>>,
 ) {
     let _task = spawn(async move {
-        let mut ticker = tokio::time::interval(MTU_POLL_INTERVAL);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // MTU probe state
         let mut tier: usize = 0;
         let mut last_nak: u64 = 0;
@@ -935,10 +942,14 @@ fn spawn_connection_health_task(
         let mut probing = false;
         // Proactive repaint state
         let mut repaint_last_count: u64 = 0;
+        // Backoff state: double the poll interval on each all-quiet tick, up to HEALTH_MAX_INTERVAL.
+        let mut health_interval = MTU_POLL_INTERVAL;
+        let mut health_quiet_ticks: u32 = 0;
+        let mut next_wakeup = TokioInstant::now() + health_interval;
         loop {
             select! {
                 () = token.cancelled() => break,
-                _ = ticker.tick() => {
+                () = sleep_until(next_wakeup) => {
                     let current = nak_received_count.load(Ordering::Relaxed);
                     // ── MTU probe ─────────────────────────────────────────────────
                     if let Some(new_mtu) = mtu_probe_step(
@@ -969,6 +980,22 @@ fn spawn_connection_health_task(
                             break;
                         }
                     }
+                    // ── Adaptive backoff ───────────────────────────────────────────
+                    // Any NAK activity this window snaps the interval back to the base
+                    // rate.  Sustained silence doubles it up to HEALTH_MAX_INTERVAL,
+                    // reducing the combined MTU-probe + repaint wakeup rate from 5 Hz
+                    // to 0.5 Hz after a few seconds of idle.
+                    if delta > 0 {
+                        health_quiet_ticks = 0;
+                        health_interval = MTU_POLL_INTERVAL;
+                    } else {
+                        health_quiet_ticks = health_quiet_ticks.saturating_add(1);
+                        if health_quiet_ticks >= HEALTH_BACKOFF_TICKS {
+                            health_interval =
+                                (health_interval * 2).min(HEALTH_MAX_INTERVAL);
+                        }
+                    }
+                    next_wakeup = TokioInstant::now() + health_interval;
                 }
             }
         }
