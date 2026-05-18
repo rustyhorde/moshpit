@@ -651,6 +651,16 @@ term_type = "xterm-256color"
 # NAT devices. Default: 1000 (1 ms). Set to 0 to disable pacing.
 # pacing_delay_us = 1000
 
+# ── Mount namespace escape (Linux only) ───────────────────────────────────────
+# When the daemon runs in a restricted mount namespace (e.g. a systemd unit with
+# ProtectSystem= or inside a container), spawned shells inherit read-only mounts,
+# causing write operations to /usr, /etc, etc. to fail with EROFS even for
+# sudoers.  With namespace_escape = true (the default), moshpits detects the
+# restriction and joins the host mount namespace before spawning each shell,
+# giving users the same filesystem view as an SSH login session.
+# Requires the daemon to run as root.  Set to false to disable.
+# namespace_escape = true
+
 # ── Algorithm preferences (optional) ─────────────────────────────────────────
 # Override the server's preferred algorithm order.  The server's order wins
 # during negotiation — the first algorithm from this list that the connecting

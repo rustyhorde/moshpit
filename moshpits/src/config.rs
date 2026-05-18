@@ -107,10 +107,21 @@ pub(crate) struct Config {
     #[serde(default)]
     #[getset(get_copy = "pub(crate)")]
     path_locked: bool,
+    /// Attempt to join the host mount namespace when the daemon is running in a
+    /// restricted one (e.g. a systemd service with `ProtectSystem=` or inside a
+    /// container).  Requires the daemon to run as root (`CAP_SYS_ADMIN`).
+    /// Only active on Linux.  Default: `true`.
+    #[serde(default = "default_true")]
+    #[getset(get_copy = "pub(crate)")]
+    namespace_escape: bool,
 }
 
 fn default_term_type() -> String {
     String::from("xterm-256color")
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for Config {
@@ -133,6 +144,7 @@ impl Default for Config {
             accept_env: Self::default_accept_env(),
             server_path: Self::default_server_path(),
             path_locked: false,
+            namespace_escape: true,
         }
     }
 }
