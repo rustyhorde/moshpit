@@ -2134,7 +2134,7 @@ checksum = "e136bfa874086c78f34d6eba98c423fefe464ce57f38164d16893ba8ed358e70"
 
 [[package]]
 name = "libmoshpit"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "ansi-control-codes",
  "anyhow",
@@ -2256,7 +2256,7 @@ dependencies = [
 
 [[package]]
 name = "moshpit"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -2280,7 +2280,7 @@ dependencies = [
 
 [[package]]
 name = "moshpit-keygen"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -2294,7 +2294,7 @@ dependencies = [
 
 [[package]]
 name = "moshpits"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2375,9 +2375,9 @@ dependencies = [
 
 [[package]]
 name = "num-conv"
-version = "0.2.1"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c6673768db2d862beb9b39a78fdcb1a69439615d5794a1be50caa9bc92c81967"
+checksum = "521739c6d2bac4aa25192232afe6841231376b2b26d4d9fae5ecf8ca5772e441"
 
 [[package]]
 name = "num-traits"
@@ -4132,7 +4132,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "anyhow",
  "clap",

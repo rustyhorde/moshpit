@@ -29,6 +29,12 @@ case "$1" in
 
         systemctl daemon-reload || true
 
+        # On upgrade ($2 is the old version), restart if the service is enabled
+        if [ -n "$2" ] && systemctl is-enabled --quiet mps.service 2>/dev/null; then
+            systemctl restart mps.service || true
+            echo "  mps restarted."
+        fi
+
         echo ""
         echo "  ── moshpits post-install notes ──────────────────────────────────────────"
         echo ""
