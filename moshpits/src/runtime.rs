@@ -91,6 +91,11 @@ const SCREEN_SYNC_IDLE_INTERVAL: Duration = Duration::from_millis(50);
 const SCREEN_SYNC_BURST_INTERVAL: Duration = Duration::from_millis(10);
 /// Dirty-counter delta threshold above which a tick is classified as a burst.
 const SCREEN_SYNC_BURST_DIRTY_THRESHOLD: u64 = 5;
+/// Maximum screen-sync sleep when the terminal has been quiet for several consecutive
+/// ticks.  The interval doubles on each zero-delta tick (50 ms → 100 → 200 → … → 2 s),
+/// reducing wakeups from 20 Hz to 0.5 Hz after ~3 s of inactivity.  The next non-zero
+/// delta resets it to [`SCREEN_SYNC_IDLE_INTERVAL`] immediately.
+const MAX_SCREEN_SYNC_IDLE_INTERVAL: Duration = Duration::from_secs(2);
 /// Interval between periodic full `ScreenStateCompressed` pushes in datagram mode.
 /// Since the client never sends NAKs, this push is the only recovery mechanism for
 /// lost diff packets.  150 ms gives a good balance between recovery latency and
@@ -635,14 +640,18 @@ async fn handle_connection(
                     () = tokio::time::sleep(interval) => {
                         let current = sync_dirty.load(Ordering::Relaxed);
                         let delta = current.wrapping_sub(last_dirty);
+                        if delta == 0 {
+                            // No PTY output since last tick — double the sleep up to the
+                            // maximum, reducing wakeups from 20 Hz toward 0.5 Hz.
+                            interval = (interval * 2).min(MAX_SCREEN_SYNC_IDLE_INTERVAL);
+                            continue;
+                        }
+                        // PTY output detected — snap back to the appropriate interval.
                         interval = if delta >= SCREEN_SYNC_BURST_DIRTY_THRESHOLD {
                             SCREEN_SYNC_BURST_INTERVAL
                         } else {
                             SCREEN_SYNC_IDLE_INTERVAL
                         };
-                        if delta == 0 {
-                            continue;
-                        }
                         if sync_diff.swap(false, Ordering::Relaxed) {
                             last_dirty = current;
                             continue;
