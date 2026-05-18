@@ -53,5 +53,9 @@ case "$1" in
         ;;
     2)
         systemctl daemon-reload || true
+        if systemctl is-enabled --quiet mps.service 2>/dev/null; then
+            systemctl restart mps.service || true
+            echo "  mps restarted."
+        fi
         ;;
 esac
