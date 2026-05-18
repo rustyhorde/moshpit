@@ -2686,6 +2686,134 @@ mod tests {
         assert!(reader.recv_buffer.is_empty());
     }
 
+    // ── process_bytes_with_prediction: alternate screen tracking ─────────────
+
+    type PredState = (
+        Sender<Vec<u8>>,
+        tokio::sync::mpsc::Receiver<Vec<u8>>,
+        Arc<Mutex<Emulator>>,
+        Arc<Mutex<PredictionEngine>>,
+        Arc<AtomicBool>,
+        CancellationToken,
+    );
+
+    /// Helper: build the shared state needed to call `process_bytes_with_prediction`.
+    fn make_prediction_state() -> PredState {
+        use crate::DisplayPreference;
+        let (stdout_tx, stdout_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        let emulator = make_emulator();
+        let prediction = Arc::new(Mutex::new(PredictionEngine::new(DisplayPreference::Never)));
+        let in_alt_screen = Arc::new(AtomicBool::new(false));
+        let exit_token = CancellationToken::new();
+        (
+            stdout_tx,
+            stdout_rx,
+            emulator,
+            prediction,
+            in_alt_screen,
+            exit_token,
+        )
+    }
+
+    #[tokio::test]
+    async fn process_bytes_with_prediction_sets_in_alt_screen_on_entry() {
+        let (stdout_tx, _rx, emulator, prediction, in_alt_screen, exit_token) =
+            make_prediction_state();
+        let mut prev_bytes = BytesMut::new();
+        let mut osc_started = false;
+
+        // DECSET 1049 enters the alternate screen buffer
+        process_bytes_with_prediction(
+            b"\x1b[?1049h".to_vec(),
+            &mut prev_bytes,
+            &mut osc_started,
+            &stdout_tx,
+            false,
+            &exit_token,
+            &emulator,
+            &prediction,
+            &in_alt_screen,
+        )
+        .await;
+
+        assert!(
+            in_alt_screen.load(Ordering::Relaxed),
+            "in_alt_screen must be true after ESC[?1049h"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_bytes_with_prediction_clears_in_alt_screen_on_exit() {
+        let (stdout_tx, _rx, emulator, prediction, in_alt_screen, exit_token) =
+            make_prediction_state();
+        let mut prev_bytes = BytesMut::new();
+        let mut osc_started = false;
+
+        // Enter alternate screen
+        process_bytes_with_prediction(
+            b"\x1b[?1049h".to_vec(),
+            &mut prev_bytes,
+            &mut osc_started,
+            &stdout_tx,
+            false,
+            &exit_token,
+            &emulator,
+            &prediction,
+            &in_alt_screen,
+        )
+        .await;
+        assert!(
+            in_alt_screen.load(Ordering::Relaxed),
+            "precondition: must be in alt screen"
+        );
+
+        // Exit alternate screen
+        process_bytes_with_prediction(
+            b"\x1b[?1049l".to_vec(),
+            &mut prev_bytes,
+            &mut osc_started,
+            &stdout_tx,
+            false,
+            &exit_token,
+            &emulator,
+            &prediction,
+            &in_alt_screen,
+        )
+        .await;
+
+        assert!(
+            !in_alt_screen.load(Ordering::Relaxed),
+            "in_alt_screen must be false after ESC[?1049l"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_bytes_with_prediction_resets_osc_started_on_alt_screen_entry() {
+        let (stdout_tx, _rx, emulator, prediction, in_alt_screen, exit_token) =
+            make_prediction_state();
+        let mut prev_bytes = BytesMut::new();
+        let mut osc_started = true; // simulate a stuck OSC state machine
+
+        // Entering alt screen must reset the stuck state
+        process_bytes_with_prediction(
+            b"\x1b[?1049h".to_vec(),
+            &mut prev_bytes,
+            &mut osc_started,
+            &stdout_tx,
+            false,
+            &exit_token,
+            &emulator,
+            &prediction,
+            &in_alt_screen,
+        )
+        .await;
+
+        assert!(
+            !osc_started,
+            "osc_started must be reset to false on alternate screen entry"
+        );
+    }
+
     #[tokio::test]
     async fn handle_arrival_screen_state_compressed_also_obsoletes_gaps() {
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());

@@ -288,4 +288,22 @@ mod tests {
             "config_file_path must return the exact absolute path from config_absolute_path()"
         );
     }
+
+    #[test]
+    fn kex_config_send_env_default_is_empty() {
+        let cfg = TestKexConfig;
+        assert!(
+            cfg.send_env().is_empty(),
+            "send_env() default must return an empty Vec"
+        );
+    }
+
+    #[test]
+    fn kex_config_send_path_default_is_empty() {
+        let cfg = TestKexConfig;
+        assert!(
+            cfg.send_path().is_empty(),
+            "send_path() default must return an empty Vec"
+        );
+    }
 }

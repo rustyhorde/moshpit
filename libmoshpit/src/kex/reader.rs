@@ -1952,6 +1952,89 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Algorithm resolution helper tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_kex_alg_dh_algorithms_succeed() {
+        use crate::kex::negotiate::{KEX_P256_SHA256, KEX_P384_SHA384, KEX_X25519_SHA256};
+        for kex in [KEX_X25519_SHA256, KEX_P384_SHA384, KEX_P256_SHA256] {
+            let result = super::resolve_kex_alg(kex);
+            assert!(result.is_ok(), "{kex} should resolve OK");
+            assert!(
+                matches!(result.unwrap(), super::ResolvedKexAlgorithm::Dh(_)),
+                "{kex} should map to a DH algorithm"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_kex_alg_kem_algorithms_succeed() {
+        for kex in [
+            KEX_ML_KEM_512_SHA256,
+            KEX_ML_KEM_768_SHA256,
+            KEX_ML_KEM_1024_SHA256,
+        ] {
+            let result = super::resolve_kex_alg(kex);
+            assert!(result.is_ok(), "{kex} should resolve OK");
+            assert!(
+                matches!(result.unwrap(), super::ResolvedKexAlgorithm::Kem(_)),
+                "{kex} should map to a KEM algorithm"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_hkdf_alg_all_supported_succeed() {
+        use crate::kex::negotiate::{KDF_HKDF_SHA384, KDF_HKDF_SHA512};
+        for kdf in [KDF_HKDF_SHA256, KDF_HKDF_SHA384, KDF_HKDF_SHA512] {
+            assert!(
+                super::resolve_hkdf_alg(kdf).is_ok(),
+                "{kdf} should resolve OK"
+            );
+        }
+        assert!(
+            super::resolve_hkdf_alg("unknown-kdf").is_err(),
+            "unknown KDF must return an error"
+        );
+    }
+
+    #[test]
+    fn resolve_aead_alg_all_supported_succeed() {
+        use crate::kex::negotiate::{AEAD_AES128_GCM_SIV, AEAD_AES256_GCM, AEAD_CHACHA20_POLY1305};
+        for aead in [
+            AEAD_AES256_GCM_SIV,
+            AEAD_AES256_GCM,
+            AEAD_CHACHA20_POLY1305,
+            AEAD_AES128_GCM_SIV,
+        ] {
+            assert!(
+                super::resolve_aead_alg(aead).is_ok(),
+                "{aead} should resolve OK"
+            );
+        }
+        assert!(
+            super::resolve_aead_alg("unknown-aead").is_err(),
+            "unknown AEAD must return an error"
+        );
+    }
+
+    #[test]
+    fn resolve_hmac_key_type_all_supported_succeed() {
+        use crate::kex::negotiate::MAC_HMAC_SHA256;
+        for mac in [MAC_HMAC_SHA512, MAC_HMAC_SHA256] {
+            assert!(
+                super::resolve_hmac_key_type(mac).is_ok(),
+                "{mac} should resolve OK"
+            );
+        }
+        assert!(
+            super::resolve_hmac_key_type("unknown-mac").is_err(),
+            "unknown MAC must return an error"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Helpers for KexReader / client_kex / handle_check / handle_udp_setup tests
     // -----------------------------------------------------------------------
 
