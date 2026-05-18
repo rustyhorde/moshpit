@@ -1445,8 +1445,6 @@ fn spawn_pty(
                 None
             };
 
-            #[cfg(not(target_os = "linux"))]
-            let _ns_escape_fd: Option<i32> = None;
 
             let _ = unsafe {
                 cmd.pre_exec(move || {
