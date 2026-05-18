@@ -587,7 +587,7 @@ fn stdin_reader_loop(kb_tx: &Sender<Vec<u8>>, paused: &AtomicBool) {
             }
             Ok(false) => {
                 idle_cycles += 1;
-                if idle_cycles % 20 == 0 {
+                if idle_cycles.is_multiple_of(20) {
                     trace!("stdin: alive, {idle_cycles} idle cycles");
                 }
             }
