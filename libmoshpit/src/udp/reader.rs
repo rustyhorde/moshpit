@@ -850,6 +850,11 @@ impl UdpReader {
             peer_addr
         };
 
+        // Park the NAK deadline far in the future when gap_first_seen is empty — there
+        // is nothing to retransmit, so firing every 12.5 ms is pure overhead.  The
+        // deadline is reset to nak_check_interval() each time a frame arrives (which
+        // may open new gaps) or when gaps remain after check_nak_timeouts fires.
+        let nak_park = Duration::from_hours(24);
         let mut nak_check_deadline = TokioInstant::now() + self.nak_check_interval();
         loop {
             select! {
@@ -889,7 +894,11 @@ impl UdpReader {
                             | EncryptedFrame::ClientAck(_) => {}
                         }
                     }
-                    nak_check_deadline = TokioInstant::now() + self.nak_check_interval();
+                    nak_check_deadline = TokioInstant::now() + if self.gap_first_seen.is_empty() {
+                        nak_park
+                    } else {
+                        self.nak_check_interval()
+                    };
                 },
                 frame_res = self.recv_frame_from() => {
                     match frame_res {
@@ -946,6 +955,9 @@ impl UdpReader {
                                     }
                                 }
                             }
+                            // A new frame may have opened gaps — rearm the NAK deadline so
+                            // check_nak_timeouts fires promptly if needed.
+                            nak_check_deadline = TokioInstant::now() + self.nak_check_interval();
                         }
                         Ok(None) => break,
                         Err(e) => {
@@ -1249,7 +1261,11 @@ impl UdpReader {
                     }
                     nak_check_deadline = TokioInstant::now()
                         + if self.diff_mode == DiffMode::Reliable {
-                            self.nak_check_interval()
+                            if self.gap_first_seen.is_empty() {
+                                nak_park
+                            } else {
+                                self.nak_check_interval()
+                            }
                         } else {
                             nak_park
                         };
@@ -1489,6 +1505,12 @@ impl UdpReader {
                                         .await;
                                     }
                                 }
+                            }
+                            // A new frame may have opened gaps — rearm the NAK deadline so
+                            // check_nak_timeouts fires promptly if needed.
+                            if self.diff_mode == DiffMode::Reliable {
+                                nak_check_deadline =
+                                    TokioInstant::now() + self.nak_check_interval();
                             }
                         }
                         Ok(None) => {
