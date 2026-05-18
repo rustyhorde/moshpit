@@ -18,12 +18,13 @@ case "$1" in
                 /etc/moshpits/moshpits.toml
         fi
 
-        # Generate a passwordless host key pair on first install
-        _key=/etc/moshpits/keys/mps_host_ed25519_key
+        # Generate a passwordless X25519 host key pair on first install
+        _key=/etc/moshpits/keys/mps_host_x25519_key
         if [ ! -f "$_key" ]; then
             mp-keygen generate \
                 --server \
                 --no-passphrase \
+                --key-type x25519 \
                 --output-path "$_key" \
                 --force
         fi
@@ -33,9 +34,9 @@ case "$1" in
         echo ""
         echo "  ── moshpits post-install notes ──────────────────────────────────────────"
         echo ""
-        echo "  A passwordless host key pair has been generated at:"
-        echo "    /etc/moshpits/keys/mps_host_ed25519_key"
-        echo "    /etc/moshpits/keys/mps_host_ed25519_key.pub"
+        echo "  A passwordless X25519 host key pair has been generated at:"
+        echo "    /etc/moshpits/keys/mps_host_x25519_key"
+        echo "    /etc/moshpits/keys/mps_host_x25519_key.pub"
         echo ""
         echo "  Review (and customise) the config file at:"
         echo "    /etc/moshpits/moshpits.toml"

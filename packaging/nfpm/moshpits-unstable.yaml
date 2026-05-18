@@ -64,8 +64,8 @@ contents:
   - src: dist/mps/mps.fish
     dst: /usr/share/fish/vendor_completions.d/mps.fish
 
-  # systemd service unit (reused from Arch binary package)
-  - src: packaging/arch/moshpits-bin/mps.service
+  # systemd service unit (reused from Arch unstable binary package)
+  - src: packaging/arch/moshpits-unstable-bin/mps.service
     dst: /usr/lib/systemd/system/mps.service
 
   # Example configuration

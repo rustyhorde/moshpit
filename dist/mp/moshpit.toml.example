@@ -26,6 +26,25 @@ max_reconnect_backoff_secs = 3600
 # private_key_path = "/home/alice/.mp/id_x25519"
 # public_key_path  = "/home/alice/.mp/id_x25519.pub"
 
+# ── Local echo prediction ─────────────────────────────────────────────────────
+# Control client-side keystroke prediction: adaptive (default), always, or never.
+# Adaptive enables prediction on high-latency connections; 'never' disables it.
+predict = "adaptive"
+
+# ── NAT traversal (optional) ──────────────────────────────────────────────────
+# Send warmup keepalives before UDP session starts to establish NAT bindings.
+# Only useful on NAT paths; adds one round-trip of startup latency.
+# nat_warmup = false
+# nat_warmup_count = 3  # Number of keepalive frames to send (default: 3)
+
+# ── UDP diff transport mode ───────────────────────────────────────────────────
+# reliable   (default): NAK-based selective retransmission; best for low-loss networks.
+# datagram:             Fire-and-forget diffs; server sends periodic full-screen snapshots.
+#                       Eliminates head-of-line blocking on flaky or high-loss connections.
+# statesync:            Mosh-style ack-based diffs; each packet is self-contained.
+#                       No NAKs, no reorder buffer; best for moderate-loss, low-bandwidth links.
+# diff_mode = "reliable"
+
 # ── Environment & PATH passthrough ────────────────────────────────────────────
 # Environment variable name patterns to send to the server via ClientEnv.
 # Supports exact names ("LANG") and suffix wildcards ("LC_*").
@@ -39,6 +58,20 @@ send_env = ["LANG", "LC_*", "TZ"]
 # Ignored if the server has path_locked = true.
 # Default: []
 # send_path = ["/home/alice/.cargo/bin", "/home/alice/.local/bin"]
+
+# ── Algorithm preferences (optional) ─────────────────────────────────────────
+# Override the negotiated algorithms for key exchange, encryption, MAC, and KDF.
+# Lists are ordered by preference; the first mutually supported algorithm wins.
+# Omit any category to use the built-in defaults.
+# NOTE: this section must stay below all bare keys above — TOML table headers
+# ([preferred_algorithms]) absorb all following keys until the next header.
+#
+# [preferred_algorithms]
+# kex  = ["x25519-sha256"]      # also: ml-kem-768-sha256, ml-kem-512-sha256,
+#                               #       ml-kem-1024-sha256, p384-sha384, p256-sha256
+# aead = ["aes256-gcm-siv"]     # also: aes256-gcm, chacha20-poly1305, aes128-gcm-siv
+# mac  = ["hmac-sha512"]        # also: hmac-sha256
+# kdf  = ["hkdf-sha256"]        # also: hkdf-sha384, hkdf-sha512
 
 # ── Tracing (log output) ──────────────────────────────────────────────────────
 # mp never writes to stdout (doing so would corrupt the terminal session).

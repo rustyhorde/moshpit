@@ -61,8 +61,9 @@ pub fn randomart(key_bytes: &[u8]) -> String {
         bottom_text: "SHA256".to_string(),
         ..Default::default()
     };
+    let digest = digest::digest(&SHA256, key_bytes);
     let mut art = BishopArt::new();
-    art.input(key_bytes);
+    art.input(digest.as_ref());
     art.draw_with_opts(&draw_opts).clone()
 }
 

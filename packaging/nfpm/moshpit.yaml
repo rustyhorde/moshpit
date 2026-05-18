@@ -8,7 +8,7 @@ section: net
 maintainer: Jason Ozias <jason.g.ozias@gmail.com>
 description: |
   SSH and Mosh inspired remote terminal client.
-  Connects to a moshpits server over an encrypted channel using ed25519
+  Connects to a moshpits server over an encrypted channel using asymmetric
   mutual authentication and AES-256-GCM-SIV UDP transport.
 homepage: https://github.com/rustyhorde/moshpit
 license: MIT OR Apache-2.0

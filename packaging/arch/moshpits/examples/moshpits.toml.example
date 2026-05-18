@@ -5,6 +5,10 @@
 #   1. Environment variables with the MOSHPITS_ prefix (e.g. MOSHPITS_MPS_PORT=40404)
 #   2. Command-line flags
 #   3. This config file
+#
+# IMPORTANT: TOML table headers ([mps], [tracing.*]) absorb all following
+# bare keys until the next header. All root-level Config fields must appear
+# BEFORE the first table header below.
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 # Each increment of verbose adds one level of detail, each increment of quiet
@@ -17,16 +21,12 @@
 verbose = 0
 quiet   = 0
 
-# ── Server listen address ─────────────────────────────────────────────────────
-[mps]
-ip   = "0.0.0.0"  # IP address to listen on for client connections
-port = 40404      # TCP port to listen on
-
 # ── Key files ─────────────────────────────────────────────────────────────────
-# Defaults to ~/.mp/mps_host_ed25519_key and ~/.mp/mps_host_ed25519_key.pub
-# when not set.
-# private_key_path = "/path/to/mps_host_ed25519_key"
-# public_key_path  = "/path/to/mps_host_ed25519_key.pub"
+# Defaults to ~/.mp/mps_host_x25519_key and ~/.mp/mps_host_x25519_key.pub
+# when not set (for the default x25519 key type). The filename reflects the
+# --key-type used at generation time (e.g. mps_host_p384_key, mps_host_ml_dsa_65_key).
+# private_key_path = "/path/to/mps_host_x25519_key"
+# public_key_path  = "/path/to/mps_host_x25519_key.pub"
 
 # ── PTY environment ───────────────────────────────────────────────────────────
 # TERM environment variable to set for spawned shells. Default: xterm-256color.
@@ -44,6 +44,41 @@ term_type = "xterm-256color"
 # NAT devices. Default: 1000 (1 ms). Set to 0 to disable pacing.
 # pacing_delay_us = 1000
 
+# ── Environment & PATH passthrough ────────────────────────────────────────────
+# Environment variable name patterns accepted from the client via ClientEnv.
+# Supports exact names ("LANG") and suffix wildcards ("LC_*").
+# Variables not matching this list are silently discarded even if the client sends them.
+# HOME, USER, LOGNAME, SHELL, TERM, and PATH are always server-authoritative
+# and cannot be overridden via this list even if matched by the client.
+# Default: ["LANG", "LC_*", "TZ"]
+accept_env = ["LANG", "LC_*", "TZ"]
+
+# Base PATH set for all spawned shells.
+# Client send_path entries are prepended to this (unless path_locked = true).
+# Default: ["/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"]
+server_path = ["/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"]
+
+# Lock the PATH: if true, client send_path additions are ignored entirely.
+# Default: false
+path_locked = false
+
+# ── Server listen address ─────────────────────────────────────────────────────
+[mps]
+ip   = "0.0.0.0"  # IP address to listen on for client connections
+port = 40404      # TCP port to listen on
+
+# ── Algorithm preferences (optional) ─────────────────────────────────────────
+# Override the negotiated algorithms for key exchange, encryption, MAC, and KDF.
+# Lists are ordered by preference; the first mutually supported algorithm wins.
+# Omit any category to use the built-in defaults.
+#
+# [preferred_algorithms]
+# kex  = ["x25519-sha256"]      # also: ml-kem-768-sha256, ml-kem-512-sha256,
+#                               #       ml-kem-1024-sha256, p384-sha384, p256-sha256
+# aead = ["aes256-gcm-siv"]     # also: aes256-gcm, chacha20-poly1305, aes128-gcm-siv
+# mac  = ["hmac-sha512"]        # also: hmac-sha256
+# kdf  = ["hkdf-sha256"]        # also: hkdf-sha384, hkdf-sha512
+
 # ── Tracing (log output) ──────────────────────────────────────────────────────
 # stdout layer — controls log line formatting when --enable-std-output is active.
 # NOTE: --enable-std-output should not be used when running as a daemon/service.
@@ -56,7 +91,9 @@ with_level        = true   # include the log level (ERROR, WARN, INFO, …)
 # directives = "moshpits=debug,libmoshpit=info"  # optional tracing filter override
 
 # file layer — controls the format and level written to the persistent log file.
-# Default log file: ~/.config/moshpits/logs/moshpits.log
+# Default log file: ~/.local/share/moshpits/logs/moshpits.log
+# Note: -v / -vv CLI flags only affect stdout output. To increase file log
+# verbosity, set verbose here (e.g. verbose = 2 for TRACE).
 [tracing.file]
 quiet   = 0
 verbose = 0

@@ -199,23 +199,75 @@ fn mp_keygen_command() -> Command {
         .arg(verbose_arg())
         .arg(quiet_arg())
         .subcommand(
-            Command::new("generate").about("Generate a new asymmetric public/private key pair"),
+            Command::new("generate")
+                .about("Generate a new identity public/private key pair")
+                .arg(
+                    Arg::new("no-passphrase")
+                        .short('n')
+                        .long("no-passphrase")
+                        .action(ArgAction::SetTrue)
+                        .help("Skip the passphrase prompt and create an unencrypted key"),
+                )
+                .arg(
+                    Arg::new("output-path")
+                        .short('o')
+                        .long("output-path")
+                        .value_name("PATH")
+                        .help("Write keys to this path (skips the interactive path prompt)"),
+                )
+                .arg(
+                    Arg::new("force")
+                        .short('f')
+                        .long("force")
+                        .action(ArgAction::SetTrue)
+                        .help("Overwrite existing key files without confirmation"),
+                )
+                .arg(
+                    Arg::new("server")
+                        .short('s')
+                        .long("server")
+                        .action(ArgAction::SetTrue)
+                        .help("Generate a server host key (allows unencrypted keys)"),
+                )
+                .arg(
+                    Arg::new("passphrase-stdin")
+                        .long("passphrase-stdin")
+                        .action(ArgAction::SetTrue)
+                        .help("Read passphrase from stdin instead of prompting")
+                        .conflicts_with("no-passphrase"),
+                )
+                .arg(
+                    Arg::new("key-type")
+                        .short('k')
+                        .long("key-type")
+                        .value_name("TYPE")
+                        .default_value("x25519")
+                        .help("Identity key algorithm: x25519 (default), p384, p256; with unstable: mldsa44, mldsa65, mldsa87"),
+                ),
         )
         .subcommand(
             Command::new("verify")
-                .about("Verify a public key fingerprint or randomart image")
+                .about("Verify a public key fingerprint against a key file")
+                .arg(
+                    Arg::new("fingerprint")
+                        .value_name("FINGERPRINT")
+                        .required(true)
+                        .help("The SHA256 fingerprint to verify (e.g. SHA256:S8hOl...)"),
+                )
+                .arg(
+                    Arg::new("key")
+                        .short('k')
+                        .long("key")
+                        .value_name("PATH")
+                        .required(true)
+                        .help("Path to the public key file"),
+                )
                 .arg(
                     Arg::new("randomart")
                         .short('r')
                         .long("randomart")
                         .action(ArgAction::SetTrue)
-                        .help("Verify a randomart image instead of a fingerprint"),
-                )
-                .arg(
-                    Arg::new("signature")
-                        .value_name("SIGNATURE")
-                        .required(true)
-                        .help("The fingerprint or randomart to verify"),
+                        .help("Also display the randomart image"),
                 ),
         )
         .subcommand(

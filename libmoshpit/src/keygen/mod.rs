@@ -844,7 +844,7 @@ mod tests {
     //
     #[test]
     fn test_load_private_key_unenc() {
-        let priv_key_path = PathBuf::from("tests/keys/id_ed25519_test");
+        let priv_key_path = PathBuf::from("tests/keys/id_x25519_test");
         let result = load_private_key(&priv_key_path);
         assert!(result.is_ok());
         let (unencrypted_key_pair_opt, encrypted_key_pair_opt) = result.unwrap();
@@ -862,7 +862,7 @@ mod tests {
 
     #[test]
     fn test_load_private_key_enc() -> Result<()> {
-        let priv_key_path = PathBuf::from("tests/keys/id_ed25519_test_enc");
+        let priv_key_path = PathBuf::from("tests/keys/id_x25519_test_enc");
         let result = load_private_key(&priv_key_path);
         assert!(result.is_ok());
         let (unencrypted_key_pair_opt, encrypted_key_pair_opt) = result.unwrap();
@@ -946,7 +946,7 @@ mod tests {
 
     #[test]
     fn test_load_identity_key_unenc_x25519() {
-        let path = PathBuf::from("tests/keys/id_ed25519_test");
+        let path = PathBuf::from("tests/keys/id_x25519_test");
         let key = load_identity_key(&path, None).expect("load unencrypted key");
         assert_eq!(key.key_algorithm(), super::KEY_ALGORITHM_X25519);
         let expected = vec![
@@ -960,7 +960,7 @@ mod tests {
 
     #[test]
     fn test_load_identity_key_enc_x25519() {
-        let path = PathBuf::from("tests/keys/id_ed25519_test_enc");
+        let path = PathBuf::from("tests/keys/id_x25519_test_enc");
         let key = load_identity_key(&path, Some("test")).expect("load encrypted key");
         assert_eq!(key.key_algorithm(), super::KEY_ALGORITHM_X25519);
         let expected = vec![
@@ -974,13 +974,13 @@ mod tests {
 
     #[test]
     fn test_load_identity_key_enc_wrong_passphrase() {
-        let path = PathBuf::from("tests/keys/id_ed25519_test_enc");
+        let path = PathBuf::from("tests/keys/id_x25519_test_enc");
         assert!(load_identity_key(&path, Some("wrong")).is_err());
     }
 
     #[test]
     fn test_load_identity_key_enc_no_passphrase() {
-        let path = PathBuf::from("tests/keys/id_ed25519_test_enc");
+        let path = PathBuf::from("tests/keys/id_x25519_test_enc");
         assert!(load_identity_key(&path, None).is_err());
     }
 
@@ -997,7 +997,7 @@ mod tests {
 
     #[test]
     fn test_validate_identity_key_pair_mismatch() -> Result<()> {
-        let key = load_identity_key(&PathBuf::from("tests/keys/id_ed25519_test"), None)?;
+        let key = load_identity_key(&PathBuf::from("tests/keys/id_x25519_test"), None)?;
         let wrong_pub = vec![0u8; 32];
         assert!(
             validate_identity_key_pair(key.key_algorithm(), &wrong_pub, key.private_key()).is_err()

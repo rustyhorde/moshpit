@@ -1761,8 +1761,8 @@ mod tests {
     fn test_maybe_generate_keypair_existing() -> Result<()> {
         let dir = std::env::temp_dir().join(Uuid::new_v4().to_string());
         std::fs::create_dir_all(&dir)?;
-        let priv_path = dir.join("id_ed25519");
-        let pub_path = dir.join("id_ed25519.pub");
+        let priv_path = dir.join("id_x25519");
+        let pub_path = dir.join("id_x25519.pub");
         let config_path = dir.join("config.toml");
 
         std::fs::write(&priv_path, "fake private key")?;
@@ -1923,7 +1923,7 @@ mod tests {
     #[test]
     fn fatal_kex_error_display_includes_error_and_path() {
         use libmoshpit::MoshpitError;
-        let key_path = PathBuf::from("/home/user/.mp/id_ed25519");
+        let key_path = PathBuf::from("/home/user/.mp/id_x25519");
         let fatal = FatalKexError {
             inner: MoshpitError::KeyFileMissing,
             key_path: key_path.clone(),
@@ -1934,7 +1934,7 @@ mod tests {
             "display should contain error message, got: {display}"
         );
         assert!(
-            display.contains("/home/user/.mp/id_ed25519"),
+            display.contains("/home/user/.mp/id_x25519"),
             "display should contain key path, got: {display}"
         );
     }
@@ -1945,8 +1945,8 @@ mod tests {
         let home = TestHome::new();
         let config_path = home.path().join("config.toml");
         // Non-existent key paths
-        let priv_path = home.path().join("nonexistent_id_ed25519");
-        let pub_path = home.path().join("nonexistent_id_ed25519.pub");
+        let priv_path = home.path().join("nonexistent_id_x25519");
+        let pub_path = home.path().join("nonexistent_id_x25519.pub");
         std::fs::write(
             &config_path,
             "[tracing.stdout]\n\

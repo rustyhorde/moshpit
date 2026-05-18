@@ -8,7 +8,7 @@ section: net
 maintainer: Jason Ozias <jason.g.ozias@gmail.com>
 description: |
   moshpit client with post-quantum support — SSH and Mosh inspired remote terminal client.
-  Connects to a moshpits server over an encrypted channel using ed25519 mutual authentication
+  Connects to a moshpits server over an encrypted channel using asymmetric mutual authentication
   and AES-256-GCM-SIV UDP transport. Includes ML-DSA-65 post-quantum identity key support.
 homepage: https://github.com/rustyhorde/moshpit
 license: MIT OR Apache-2.0

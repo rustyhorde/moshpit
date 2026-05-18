@@ -23,7 +23,7 @@ use dialoguer::{Confirm, Input, Password};
 use libmoshpit::{KEY_ALGORITHM_ML_DSA_44, KEY_ALGORITHM_ML_DSA_65, KEY_ALGORITHM_ML_DSA_87};
 use libmoshpit::{
     KEY_ALGORITHM_P256, KEY_ALGORITHM_P384, KEY_ALGORITHM_X25519, KexMode, KeyPair,
-    extract_public_key_bytes, fingerprint,
+    extract_public_key_bytes, fingerprint, randomart, verify_fingerprint,
 };
 
 use crate::cli::{Cli, Commands};
@@ -73,9 +73,10 @@ where
             )
         }
         Commands::Verify {
-            randomart: _,
-            signature: _,
-        } => Ok(()),
+            fingerprint: fp,
+            key,
+            randomart: show_randomart,
+        } => verify_key(fp, key, *show_randomart),
         Commands::Fingerprint { public_key } => display_fingerprint(public_key),
     }
 }
@@ -287,6 +288,30 @@ fn generate_and_write_keys_inner(
     Ok(())
 }
 
+fn verify_key(fingerprint: &str, key_path: &str, show_randomart: bool) -> Result<()> {
+    let public_key_file = OpenOptions::new().read(true).open(key_path)?;
+    let key_bytes = extract_public_key_bytes(public_key_file)?;
+
+    // Accept "SHA256:<digest>" or "SHA256:<digest> user@host" — strip prefix and trailing comment
+    let digest_part = fingerprint
+        .strip_prefix("SHA256:")
+        .unwrap_or(fingerprint)
+        .split_whitespace()
+        .next()
+        .unwrap_or(fingerprint);
+
+    if verify_fingerprint(digest_part, &key_bytes) {
+        println!("Fingerprint matches. Key is authentic.");
+        if show_randomart {
+            println!("The key's randomart image is:");
+            print!("{}", randomart(&key_bytes));
+        }
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("Fingerprint mismatch. Key does not match."))
+    }
+}
+
 fn display_fingerprint(public_key_path: &str) -> Result<()> {
     let public_key_file = OpenOptions::new().read(true).open(public_key_path)?;
     let public_key_bytes = extract_public_key_bytes(public_key_file)?;
@@ -402,6 +427,54 @@ mod tests {
         let dir = get_temp_dir();
         let missing_file = dir.join("missing.pub");
         let res = display_fingerprint(missing_file.to_str().expect("path is valid UTF-8"));
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_verify_key_match() -> Result<()> {
+        let dir = get_temp_dir();
+        fs::create_dir_all(&dir)?;
+        let priv_path = dir.join("key");
+        let pub_path = dir.join("key.pub");
+
+        let server_addr = "0.0.0.0:0".parse().expect("hardcoded address is valid");
+        let keypair =
+            KeyPair::generate_key_pair(None, KexMode::Server(server_addr), KEY_ALGORITHM_X25519)?;
+        generate_and_write_keys_inner(&priv_path, &pub_path, &keypair)?;
+
+        let fp = keypair.fingerprint()?;
+        let pub_path_str = pub_path.to_str().expect("valid UTF-8");
+
+        verify_key(&fp, pub_path_str, false)?;
+        let fp_no_host = fp.split_whitespace().next().unwrap();
+        verify_key(fp_no_host, pub_path_str, false)?;
+        verify_key(&fp, pub_path_str, true)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_verify_key_mismatch() -> Result<()> {
+        let dir = get_temp_dir();
+        fs::create_dir_all(&dir)?;
+        let pub_path = dir.join("key.pub");
+
+        let server_addr = "0.0.0.0:0".parse().expect("hardcoded address is valid");
+        let keypair =
+            KeyPair::generate_key_pair(None, KexMode::Server(server_addr), KEY_ALGORITHM_X25519)?;
+        generate_and_write_keys_inner(&dir.join("key"), &pub_path, &keypair)?;
+
+        let res = verify_key(
+            "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            pub_path.to_str().unwrap(),
+            false,
+        );
+        assert!(res.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_verify_key_missing_file() {
+        let res = verify_key("SHA256:foo", "/nonexistent/path.pub", false);
         assert!(res.is_err());
     }
 }
