@@ -84,6 +84,36 @@ jobs:
           cp target/x86_64-unknown-linux-musl/release/mps       mps-unstable-x86_64-unknown-linux-musl
           cp target/x86_64-unknown-linux-musl/release/mp-keygen mp-keygen-unstable-x86_64-unknown-linux-musl
 
+      - name: Build aarch64 cross Docker image
+        run: |
+          docker build \
+            -t moshpit-cross-aarch64 \
+            -f docker/Dockerfile.aarch64-unknown-linux-musl \
+            docker/
+
+      - name: Build aarch64-unknown-linux-musl
+        env:
+          VERGEN_IDEMPOTENT: "1"
+        run: |
+          # Standard build
+          cross build --release --locked \
+            --target aarch64-unknown-linux-musl \
+            --bin mp --bin mps --bin mp-keygen
+
+          cp target/aarch64-unknown-linux-musl/release/mp        mp-aarch64-unknown-linux-musl
+          cp target/aarch64-unknown-linux-musl/release/mps       mps-aarch64-unknown-linux-musl
+          cp target/aarch64-unknown-linux-musl/release/mp-keygen mp-keygen-aarch64-unknown-linux-musl
+
+          # Unstable build (post-quantum ML-DSA identity key support)
+          cross build --release --locked \
+            --target aarch64-unknown-linux-musl \
+            --features unstable \
+            --bin mp --bin mps --bin mp-keygen
+
+          cp target/aarch64-unknown-linux-musl/release/mp        mp-unstable-aarch64-unknown-linux-musl
+          cp target/aarch64-unknown-linux-musl/release/mps       mps-unstable-aarch64-unknown-linux-musl
+          cp target/aarch64-unknown-linux-musl/release/mp-keygen mp-keygen-unstable-aarch64-unknown-linux-musl
+
       - name: Generate xtask dist artifacts
         run: |
           cargo xtask dist mp
@@ -109,6 +139,16 @@ jobs:
           cp mp-unstable-x86_64-unknown-linux-musl        release-assets/
           cp mps-unstable-x86_64-unknown-linux-musl       release-assets/
           cp mp-keygen-unstable-x86_64-unknown-linux-musl release-assets/
+
+          # aarch64 static MUSL binaries — standard
+          cp mp-aarch64-unknown-linux-musl        release-assets/
+          cp mps-aarch64-unknown-linux-musl       release-assets/
+          cp mp-keygen-aarch64-unknown-linux-musl release-assets/
+
+          # aarch64 static MUSL binaries — unstable (post-quantum ML-DSA support)
+          cp mp-unstable-aarch64-unknown-linux-musl        release-assets/
+          cp mps-unstable-aarch64-unknown-linux-musl       release-assets/
+          cp mp-keygen-unstable-aarch64-unknown-linux-musl release-assets/
 
           # dist tarballs (man pages + shell completions + licenses + example configs)
           cp dist-mp.tar.gz        release-assets/
@@ -150,6 +190,30 @@ jobs:
               --target release-assets/
             nfpm package \
               --config packaging/nfpm/moshpits-unstable.yaml \
+              --packager "$packager" \
+              --target release-assets/
+            nfpm package \
+              --config packaging/nfpm/moshpit-keygen-aarch64.yaml \
+              --packager "$packager" \
+              --target release-assets/
+            nfpm package \
+              --config packaging/nfpm/moshpit-keygen-unstable-aarch64.yaml \
+              --packager "$packager" \
+              --target release-assets/
+            nfpm package \
+              --config packaging/nfpm/moshpit-aarch64.yaml \
+              --packager "$packager" \
+              --target release-assets/
+            nfpm package \
+              --config packaging/nfpm/moshpit-unstable-aarch64.yaml \
+              --packager "$packager" \
+              --target release-assets/
+            nfpm package \
+              --config packaging/nfpm/moshpits-aarch64.yaml \
+              --packager "$packager" \
+              --target release-assets/
+            nfpm package \
+              --config packaging/nfpm/moshpits-unstable-aarch64.yaml \
               --packager "$packager" \
               --target release-assets/
           done
@@ -241,6 +305,18 @@ jobs:
             >> "$GITHUB_OUTPUT"
           echo "x86_64_mpkeygen_unstable=$(sha256sum release-assets/mp-keygen-unstable-x86_64-unknown-linux-musl | awk '{print $1}')" \
             >> "$GITHUB_OUTPUT"
+          echo "aarch64_mp=$(sha256sum release-assets/mp-aarch64-unknown-linux-musl | awk '{print $1}')" \
+            >> "$GITHUB_OUTPUT"
+          echo "aarch64_mps=$(sha256sum release-assets/mps-aarch64-unknown-linux-musl | awk '{print $1}')" \
+            >> "$GITHUB_OUTPUT"
+          echo "aarch64_mpkeygen=$(sha256sum release-assets/mp-keygen-aarch64-unknown-linux-musl | awk '{print $1}')" \
+            >> "$GITHUB_OUTPUT"
+          echo "aarch64_mp_unstable=$(sha256sum release-assets/mp-unstable-aarch64-unknown-linux-musl | awk '{print $1}')" \
+            >> "$GITHUB_OUTPUT"
+          echo "aarch64_mps_unstable=$(sha256sum release-assets/mps-unstable-aarch64-unknown-linux-musl | awk '{print $1}')" \
+            >> "$GITHUB_OUTPUT"
+          echo "aarch64_mpkeygen_unstable=$(sha256sum release-assets/mp-keygen-unstable-aarch64-unknown-linux-musl | awk '{print $1}')" \
+            >> "$GITHUB_OUTPUT"
           echo "dist_mp=$(sha256sum release-assets/dist-mp.tar.gz | awk '{print $1}')" \
             >> "$GITHUB_OUTPUT"
           echo "dist_mps=$(sha256sum release-assets/dist-mps.tar.gz | awk '{print $1}')" \
@@ -264,51 +340,58 @@ jobs:
 
       - name: Update binary PKGBUILDs
         env:
-          PKGVER:                   ${{ needs.build.outputs.pkgver }}
-          X86_64_MP:                ${{ steps.binsums.outputs.x86_64_mp }}
-          X86_64_MPS:               ${{ steps.binsums.outputs.x86_64_mps }}
-          X86_64_MPKEYGEN:          ${{ steps.binsums.outputs.x86_64_mpkeygen }}
-          X86_64_MP_UNSTABLE:       ${{ steps.binsums.outputs.x86_64_mp_unstable }}
-          X86_64_MPS_UNSTABLE:      ${{ steps.binsums.outputs.x86_64_mps_unstable }}
-          X86_64_MPKEYGEN_UNSTABLE: ${{ steps.binsums.outputs.x86_64_mpkeygen_unstable }}
-          DIST_MP:                  ${{ steps.binsums.outputs.dist_mp }}
-          DIST_MPS:                 ${{ steps.binsums.outputs.dist_mps }}
-          DIST_MPKEYGEN:            ${{ steps.binsums.outputs.dist_mpkeygen }}
+          PKGVER:                     ${{ needs.build.outputs.pkgver }}
+          X86_64_MP:                  ${{ steps.binsums.outputs.x86_64_mp }}
+          X86_64_MPS:                 ${{ steps.binsums.outputs.x86_64_mps }}
+          X86_64_MPKEYGEN:            ${{ steps.binsums.outputs.x86_64_mpkeygen }}
+          X86_64_MP_UNSTABLE:         ${{ steps.binsums.outputs.x86_64_mp_unstable }}
+          X86_64_MPS_UNSTABLE:        ${{ steps.binsums.outputs.x86_64_mps_unstable }}
+          X86_64_MPKEYGEN_UNSTABLE:   ${{ steps.binsums.outputs.x86_64_mpkeygen_unstable }}
+          AARCH64_MP:                 ${{ steps.binsums.outputs.aarch64_mp }}
+          AARCH64_MPS:                ${{ steps.binsums.outputs.aarch64_mps }}
+          AARCH64_MPKEYGEN:           ${{ steps.binsums.outputs.aarch64_mpkeygen }}
+          AARCH64_MP_UNSTABLE:        ${{ steps.binsums.outputs.aarch64_mp_unstable }}
+          AARCH64_MPS_UNSTABLE:       ${{ steps.binsums.outputs.aarch64_mps_unstable }}
+          AARCH64_MPKEYGEN_UNSTABLE:  ${{ steps.binsums.outputs.aarch64_mpkeygen_unstable }}
+          DIST_MP:                    ${{ steps.binsums.outputs.dist_mp }}
+          DIST_MPS:                   ${{ steps.binsums.outputs.dist_mps }}
+          DIST_MPKEYGEN:              ${{ steps.binsums.outputs.dist_mpkeygen }}
         run: |
           # Replaces pkgver, pkgrel, and release-asset sha256 arrays in binary PKGBUILDs.
           # For sha256sums, only the first value (dist tarball) is replaced.
           # Additional local sidecar file entries remain SKIP by design.
           update_bin_pkgbuild() {
-            local pb="$1" dist_hash="$2" x86_64_hash="$3"
-            sed -i "s/^pkgver=.*/pkgver=${PKGVER}/"                                    "$pb"
-            sed -i "s/^pkgrel=.*/pkgrel=1/"                                            "$pb"
-            sed -i "s/^sha256sums=('[^']*'/sha256sums=('${dist_hash}'/"                "$pb"
-            sed -i "s/^sha256sums_x86_64=('[^']*'/sha256sums_x86_64=('${x86_64_hash}'/" "$pb"
+            local pb="$1" dist_hash="$2" x86_64_hash="$3" aarch64_hash="$4"
+            sed -i "s/^pkgver=.*/pkgver=${PKGVER}/"                                        "$pb"
+            sed -i "s/^pkgrel=.*/pkgrel=1/"                                                "$pb"
+            sed -i "s/^sha256sums=('[^']*'/sha256sums=('${dist_hash}'/"                    "$pb"
+            sed -i "s/^sha256sums_x86_64=('[^']*'/sha256sums_x86_64=('${x86_64_hash}'/"   "$pb"
+            sed -i "s/^sha256sums_aarch64=('[^']*'/sha256sums_aarch64=('${aarch64_hash}'/" "$pb"
           }
 
           update_bin_pkgbuild \
             packaging/arch/moshpit-keygen-bin/PKGBUILD \
-            "$DIST_MPKEYGEN" "$X86_64_MPKEYGEN"
+            "$DIST_MPKEYGEN" "$X86_64_MPKEYGEN" "$AARCH64_MPKEYGEN"
 
           update_bin_pkgbuild \
             packaging/arch/moshpit-bin/PKGBUILD \
-            "$DIST_MP" "$X86_64_MP"
+            "$DIST_MP" "$X86_64_MP" "$AARCH64_MP"
 
           update_bin_pkgbuild \
             packaging/arch/moshpits-bin/PKGBUILD \
-            "$DIST_MPS" "$X86_64_MPS"
+            "$DIST_MPS" "$X86_64_MPS" "$AARCH64_MPS"
 
           update_bin_pkgbuild \
             packaging/arch/moshpit-keygen-unstable-bin/PKGBUILD \
-            "$DIST_MPKEYGEN" "$X86_64_MPKEYGEN_UNSTABLE"
+            "$DIST_MPKEYGEN" "$X86_64_MPKEYGEN_UNSTABLE" "$AARCH64_MPKEYGEN_UNSTABLE"
 
           update_bin_pkgbuild \
             packaging/arch/moshpit-unstable-bin/PKGBUILD \
-            "$DIST_MP" "$X86_64_MP_UNSTABLE"
+            "$DIST_MP" "$X86_64_MP_UNSTABLE" "$AARCH64_MP_UNSTABLE"
 
           update_bin_pkgbuild \
             packaging/arch/moshpits-unstable-bin/PKGBUILD \
-            "$DIST_MPS" "$X86_64_MPS_UNSTABLE"
+            "$DIST_MPS" "$X86_64_MPS_UNSTABLE" "$AARCH64_MPS_UNSTABLE"
 
       - name: Upload updated PKGBUILDs as artifact
         # v7
