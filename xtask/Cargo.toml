@@ -4,7 +4,7 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 name = "xtask"
 publish = false
-version = "0.8.3"
+version = "0.8.4"
 
 [[bin]]
 name = "xtask"

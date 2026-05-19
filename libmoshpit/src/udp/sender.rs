@@ -26,7 +26,7 @@ use tokio::{
     net::UdpSocket,
     select,
     sync::{mpsc::Receiver, oneshot},
-    time::{interval, sleep},
+    time::{Instant as TokioInstant, sleep, sleep_until},
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -130,10 +130,12 @@ impl UdpSender {
         }
         let mut retransmit_active = true;
         let mut control_active = true;
-        // Drain pending_retransmit at the same cadence as NAK_CHECK_INTERVAL on the
-        // reader side, so retransmits are coalesced across multiple NAK messages that
-        // arrived for the same sequence number before it could be re-sent.
-        let mut retransmit_tick = interval(Duration::from_millis(20));
+        // Retransmit deadline: parked far in the future when pending_retransmit is empty
+        // so the branch never fires during idle.  Armed to now+20ms the first time items
+        // are enqueued, then parked again after each drain.  This eliminates the 50 Hz
+        // wakeup from the old unconditional interval when no retransmits are pending.
+        let retransmit_park = Duration::from_hours(24);
+        let mut retransmit_deadline = TokioInstant::now() + retransmit_park;
         loop {
             select! {
                 // biased poll order: cancel > control > retransmit > data.
@@ -168,14 +170,21 @@ impl UdpSender {
                     match seqs {
                         Some(seqs) => {
                             if self.diff_mode == DiffMode::Reliable {
+                                let was_empty = self.pending_retransmit.is_empty();
                                 self.pending_retransmit.extend(seqs);
+                                // Arm the deadline on the first enqueue so the drain fires
+                                // ~20 ms later, coalescing any NAKs that arrive in the interim.
+                                if was_empty && !self.pending_retransmit.is_empty() {
+                                    retransmit_deadline =
+                                        TokioInstant::now() + Duration::from_millis(20);
+                                }
                             }
                         }
                         None => retransmit_active = false,
                     }
                 },
-                // Drain the deduplicated pending set once per tick.
-                _ = retransmit_tick.tick(), if !self.pending_retransmit.is_empty() => {
+                // Drain the deduplicated pending set once the deadline fires.
+                () = sleep_until(retransmit_deadline) => {
                     self.drain_roam_updates(&mut current_peer);
                     let pending: Vec<u64> = self.pending_retransmit.drain().collect();
                     for seq in pending {
@@ -184,6 +193,8 @@ impl UdpSender {
                             self.send_wire(&wire, current_peer).await?;
                         }
                     }
+                    // Park until the next retransmit request arrives.
+                    retransmit_deadline = TokioInstant::now() + retransmit_park;
                 },
                 frame_opt = self.rx.recv() => {
                     match frame_opt {
@@ -457,5 +468,53 @@ mod tests {
 
         assert!(got_old, "first frame did not reach original peer");
         assert!(got_new, "second frame did not reach roamed peer");
+    }
+
+    /// A retransmit request received via `retransmit_rx` in Reliable mode arms the 20ms
+    /// deadline; when it fires the frame is re-sent to the wire and the deadline is parked.
+    #[tokio::test]
+    async fn retransmit_deadline_fires_after_nak_request() {
+        let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = server.local_addr().unwrap();
+        let send_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        send_socket.connect(server_addr).await.unwrap();
+        server
+            .connect(send_socket.local_addr().unwrap())
+            .await
+            .unwrap();
+
+        let (_ctrl_tx, ctrl_rx) = channel::<EncryptedFrame>(4);
+        let (frame_tx, frame_rx) = channel::<EncryptedFrame>(4);
+        let (retransmit_tx, retransmit_rx) = channel::<Vec<u64>>(4);
+        let token = CancellationToken::new();
+
+        let mut sender = make_sender(send_socket, ctrl_rx, frame_rx, retransmit_rx);
+        let token2 = token.clone();
+        let handle = tokio::spawn(async move { drop(sender.frame_loop(token2).await) });
+
+        // Send a data frame: populates retransmit_buffer[seq=0] and sends a wire packet.
+        frame_tx.send(EncryptedFrame::Keepalive(0)).await.unwrap();
+        let mut buf = vec![0u8; 65535];
+        let got_original = tokio::time::timeout(Duration::from_millis(200), server.recv(&mut buf))
+            .await
+            .is_ok();
+
+        // Send a NAK for seq=0: arms the 20ms retransmit deadline.
+        retransmit_tx.send(vec![0]).await.unwrap();
+
+        // Deadline fires after ~20ms and re-sends the stored wire bytes.
+        let got_retransmit =
+            tokio::time::timeout(Duration::from_millis(100), server.recv(&mut buf))
+                .await
+                .is_ok();
+
+        token.cancel();
+        drop(handle.await);
+
+        assert!(got_original, "original packet must reach server");
+        assert!(
+            got_retransmit,
+            "retransmit must fire within 100ms of NAK request"
+        );
     }
 }

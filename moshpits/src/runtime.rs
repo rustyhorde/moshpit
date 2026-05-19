@@ -46,6 +46,7 @@ use tokio::{
         mpsc::{Receiver, Sender, channel},
         oneshot,
     },
+    time::{Instant as TokioInstant, sleep_until},
 };
 use tokio_util::sync::CancellationToken;
 #[cfg(target_os = "linux")]
@@ -84,6 +85,14 @@ const MTU_PROBE_QUIET_TICKS: u32 = 300;
 const MTU_PROBE_SUCCESS_TICKS: u32 = 150;
 /// NAK delta in a single 200 ms window that signals the larger MTU caused a black hole.
 const MTU_PROBE_FAIL_THRESHOLD: u64 = 3;
+/// Consecutive zero-NAK-delta ticks before the connection-health task starts backing off
+/// its poll interval (5 ticks × 200 ms = 1 s of idle before first slowdown).
+const HEALTH_BACKOFF_TICKS: u32 = 5;
+/// Maximum poll interval for the connection-health task during prolonged idle.  The interval
+/// doubles every quiet tick (200 ms → 400 → 800 → 1600 → 2000 ms), reducing the combined
+/// MTU probe + proactive-repaint wakeup rate from 5 Hz to 0.5 Hz after ~2 s of silence.
+/// Any NAK activity snaps it back to [`MTU_POLL_INTERVAL`] immediately.
+const HEALTH_MAX_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Normal screen-sync interval when the terminal is idle.
 const SCREEN_SYNC_IDLE_INTERVAL: Duration = Duration::from_millis(50);
@@ -91,6 +100,11 @@ const SCREEN_SYNC_IDLE_INTERVAL: Duration = Duration::from_millis(50);
 const SCREEN_SYNC_BURST_INTERVAL: Duration = Duration::from_millis(10);
 /// Dirty-counter delta threshold above which a tick is classified as a burst.
 const SCREEN_SYNC_BURST_DIRTY_THRESHOLD: u64 = 5;
+/// Maximum screen-sync sleep when the terminal has been quiet for several consecutive
+/// ticks.  The interval doubles on each zero-delta tick (50 ms → 100 → 200 → … → 2 s),
+/// reducing wakeups from 20 Hz to 0.5 Hz after ~3 s of inactivity.  The next non-zero
+/// delta resets it to [`SCREEN_SYNC_IDLE_INTERVAL`] immediately.
+const MAX_SCREEN_SYNC_IDLE_INTERVAL: Duration = Duration::from_secs(2);
 /// Interval between periodic full `ScreenStateCompressed` pushes in datagram mode.
 /// Since the client never sends NAKs, this push is the only recovery mechanism for
 /// lost diff packets.  150 ms gives a good balance between recovery latency and
@@ -422,7 +436,6 @@ async fn handle_connection(
     let (repaint_tx, mut repaint_rx) = channel::<()>(1);
     let (client_ack_tx, mut client_ack_rx) = channel::<u64>(16);
     let nak_received_count = Arc::new(AtomicU64::new(0));
-    let nak_received_count_for_mtu = nak_received_count.clone();
     let last_rx_us = Arc::new(AtomicU64::new(now_micros()));
     let mac_tag_len = kex.mac_tag_len();
     let mut udp_reader = UdpReader::builder()
@@ -635,14 +648,18 @@ async fn handle_connection(
                     () = tokio::time::sleep(interval) => {
                         let current = sync_dirty.load(Ordering::Relaxed);
                         let delta = current.wrapping_sub(last_dirty);
+                        if delta == 0 {
+                            // No PTY output since last tick — double the sleep up to the
+                            // maximum, reducing wakeups from 20 Hz toward 0.5 Hz.
+                            interval = (interval * 2).min(MAX_SCREEN_SYNC_IDLE_INTERVAL);
+                            continue;
+                        }
+                        // PTY output detected — snap back to the appropriate interval.
                         interval = if delta >= SCREEN_SYNC_BURST_DIRTY_THRESHOLD {
                             SCREEN_SYNC_BURST_INTERVAL
                         } else {
                             SCREEN_SYNC_IDLE_INTERVAL
                         };
-                        if delta == 0 {
-                            continue;
-                        }
                         if sync_diff.swap(false, Ordering::Relaxed) {
                             last_dirty = current;
                             continue;
@@ -716,17 +733,12 @@ async fn handle_connection(
         }
     }
 
-    spawn_proactive_repaint_watchdog(
+    spawn_connection_health_task(
         data_tx.clone(),
         conn_token.clone(),
         nak_received_count,
-        server_emulator.clone(),
-    );
-
-    spawn_mtu_probe_task(
-        conn_token.clone(),
-        nak_received_count_for_mtu,
         effective_mtu.clone(),
+        server_emulator.clone(),
     );
 
     // For new sessions, spawn the long-lived PTY thread.
@@ -904,28 +916,42 @@ fn mtu_probe_step(
     (*tier != prev_tier).then_some(MTU_TIERS[*tier])
 }
 
-/// Spawn a watchdog task that adaptively adjusts the maximum PTY-chunk payload size.
+/// Spawn a unified connection-health watchdog that combines two 200 ms tasks into one,
+/// eliminating a tokio task and timer per connection.
 ///
-/// Probes successively larger MTU tiers after [`MTU_PROBE_QUIET_TICKS`] × 200 ms of
-/// zero NAK traffic, and reverts on loss spikes (see [`mtu_probe_step`]).
-fn spawn_mtu_probe_task(
+/// Per tick it:
+/// 1. **MTU probe** — adaptively adjusts the maximum PTY-chunk payload size, probing
+///    successively larger tiers after [`MTU_PROBE_QUIET_TICKS`] × 200 ms of zero NAK
+///    traffic and reverting on loss spikes (see [`mtu_probe_step`]).
+/// 2. **Proactive repaint** — pushes a `ScreenStateCompressed` frame when the NAK delta
+///    over the 200 ms window reaches [`PROACTIVE_REPAINT_NAK_THRESHOLD`], breaking the
+///    dependency on a `RepaintRequest` that may itself be lost under high-loss conditions.
+fn spawn_connection_health_task(
+    tx: Sender<EncryptedFrame>,
     token: CancellationToken,
     nak_received_count: Arc<AtomicU64>,
     effective_mtu: Arc<AtomicUsize>,
+    server_emulator: Arc<Mutex<vt100::Parser>>,
 ) {
     let _task = spawn(async move {
-        let mut ticker = tokio::time::interval(MTU_POLL_INTERVAL);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // MTU probe state
         let mut tier: usize = 0;
         let mut last_nak: u64 = 0;
         let mut quiet_ticks: u32 = 0;
         let mut probe_ticks: u32 = 0;
         let mut probing = false;
+        // Proactive repaint state
+        let mut repaint_last_count: u64 = 0;
+        // Backoff state: double the poll interval on each all-quiet tick, up to HEALTH_MAX_INTERVAL.
+        let mut health_interval = MTU_POLL_INTERVAL;
+        let mut health_quiet_ticks: u32 = 0;
+        let mut next_wakeup = TokioInstant::now() + health_interval;
         loop {
             select! {
                 () = token.cancelled() => break,
-                _ = ticker.tick() => {
+                () = sleep_until(next_wakeup) => {
                     let current = nak_received_count.load(Ordering::Relaxed);
+                    // ── MTU probe ─────────────────────────────────────────────────
                     if let Some(new_mtu) = mtu_probe_step(
                         current,
                         &mut last_nak,
@@ -936,36 +962,9 @@ fn spawn_mtu_probe_task(
                     ) {
                         effective_mtu.store(new_mtu, Ordering::Relaxed);
                     }
-                }
-            }
-        }
-    });
-}
-
-/// Spawn a watchdog task that proactively pushes a `ScreenStateCompressed` frame when the
-/// server receives an elevated rate of NAK frames from the client.
-///
-/// When NAK delta over a 200 ms window reaches [`PROACTIVE_REPAINT_NAK_THRESHOLD`], a
-/// `RepaintRequest` may itself be lost (the same loss condition that prompted the NAKs can
-/// affect control frames too).  This watchdog breaks the dependency by pushing the screen
-/// state unconditionally, without waiting for the client to ask.
-fn spawn_proactive_repaint_watchdog(
-    tx: Sender<EncryptedFrame>,
-    token: CancellationToken,
-    nak_received_count: Arc<AtomicU64>,
-    server_emulator: Arc<Mutex<vt100::Parser>>,
-) {
-    let _watchdog = spawn(async move {
-        let mut last_count: u64 = 0;
-        let mut ticker = tokio::time::interval(Duration::from_millis(200));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            select! {
-                () = token.cancelled() => break,
-                _ = ticker.tick() => {
-                    let current = nak_received_count.load(Ordering::Relaxed);
-                    let delta = current.wrapping_sub(last_count);
-                    last_count = current;
+                    // ── Proactive repaint ──────────────────────────────────────────
+                    let delta = current.wrapping_sub(repaint_last_count);
+                    repaint_last_count = current;
                     if delta >= PROACTIVE_REPAINT_NAK_THRESHOLD {
                         let contents = {
                             let emu = server_emulator.lock().await;
@@ -981,6 +980,22 @@ fn spawn_proactive_repaint_watchdog(
                             break;
                         }
                     }
+                    // ── Adaptive backoff ───────────────────────────────────────────
+                    // Any NAK activity this window snaps the interval back to the base
+                    // rate.  Sustained silence doubles it up to HEALTH_MAX_INTERVAL,
+                    // reducing the combined MTU-probe + repaint wakeup rate from 5 Hz
+                    // to 0.5 Hz after a few seconds of idle.
+                    if delta > 0 {
+                        health_quiet_ticks = 0;
+                        health_interval = MTU_POLL_INTERVAL;
+                    } else {
+                        health_quiet_ticks = health_quiet_ticks.saturating_add(1);
+                        if health_quiet_ticks >= HEALTH_BACKOFF_TICKS {
+                            health_interval =
+                                (health_interval * 2).min(HEALTH_MAX_INTERVAL);
+                        }
+                    }
+                    next_wakeup = TokioInstant::now() + health_interval;
                 }
             }
         }
@@ -1382,7 +1397,6 @@ fn spawn_pty(
             let mut cmd = std::process::Command::new(&account.shell);
             let _ = cmd.arg("-li");
             let _ = cmd.env_clear();
-            let _ = cmd.current_dir(&account.home);
             let _ = cmd.env("HOME", &account.home);
             let _ = cmd.env("USER", &account.username);
             let _ = cmd.env("LOGNAME", &account.username);
@@ -1403,6 +1417,11 @@ fn spawn_pty(
                 }
                 let _ = cmd.env(k, v);
             }
+
+            let Ok(home_cstr) = CString::new(account.home) else {
+                error!("Home directory path for {user} contains a NUL byte");
+                return;
+            };
 
             let mut drop_creds: Option<(CString, libc::uid_t, libc::gid_t)> = None;
 
@@ -1482,6 +1501,11 @@ fn spawn_pty(
                             return Err(std::io::Error::last_os_error());
                         }
                     }
+
+                    // Set CWD to the user's home directory.
+                    // Runs after setns (correct namespace) and after setuid (correct user).
+                    // Non-fatal: if home doesn't exist the shell starts at '/', matching SSH.
+                    let _ = libc::chdir(home_cstr.as_ptr());
 
                     Ok(())
                 })
@@ -1675,8 +1699,8 @@ mod test {
         MAX_STATESYNC_DIFF_BYTES, MTU_PROBE_FAIL_THRESHOLD, MTU_PROBE_QUIET_TICKS,
         MTU_PROBE_SUCCESS_TICKS, MTU_TIERS, PROACTIVE_REPAINT_NAK_THRESHOLD, STATE_CHUNK_SIZE,
         mtu_probe_step, new_full_registry, new_session, now_micros, resolve_session,
-        send_state_chunked, server_intercept_queries, spawn_connection_watchdogs,
-        spawn_mtu_probe_task, spawn_proactive_repaint_watchdog, spawn_silence_watchdog,
+        send_state_chunked, server_intercept_queries, spawn_connection_health_task,
+        spawn_connection_watchdogs, spawn_silence_watchdog,
     };
 
     #[cfg(unix)]
@@ -2137,24 +2161,39 @@ mod test {
 
     #[tokio::test]
     async fn mtu_probe_task_starts_at_base_mtu() {
+        let (tx, _rx) = channel::<EncryptedFrame>(4);
         let token = CancellationToken::new();
         let nak_count = Arc::new(AtomicU64::new(0));
         let effective_mtu = Arc::new(AtomicUsize::new(MTU_TIERS[0]));
-        spawn_mtu_probe_task(token.clone(), nak_count, effective_mtu.clone());
+        let emulator = Arc::new(tokio::sync::Mutex::new(vt100::Parser::new(24, 80, 0)));
+        spawn_connection_health_task(
+            tx,
+            token.clone(),
+            nak_count,
+            effective_mtu.clone(),
+            emulator,
+        );
         token.cancel();
         assert_eq!(effective_mtu.load(Ordering::Relaxed), MTU_TIERS[0]);
     }
 
-    // ── Phase 8: spawn_proactive_repaint_watchdog ──────────────────────────────
+    // ── Phase 8: spawn_connection_health_task (proactive repaint) ─────────────
 
     #[tokio::test]
     async fn proactive_repaint_fires_on_nak_saturation() {
         let (tx, mut rx) = channel::<EncryptedFrame>(4);
         let token = CancellationToken::new();
         let nak_count = Arc::new(AtomicU64::new(0));
+        let effective_mtu = Arc::new(AtomicUsize::new(MTU_TIERS[0]));
         let emulator = Arc::new(tokio::sync::Mutex::new(vt100::Parser::new(24, 80, 0)));
 
-        spawn_proactive_repaint_watchdog(tx, token.clone(), nak_count.clone(), emulator);
+        spawn_connection_health_task(
+            tx,
+            token.clone(),
+            nak_count.clone(),
+            effective_mtu,
+            emulator,
+        );
 
         // Bump the counter above the threshold so the first watchdog tick triggers a push.
         nak_count.store(PROACTIVE_REPAINT_NAK_THRESHOLD, Ordering::Relaxed);
@@ -2174,9 +2213,16 @@ mod test {
         let (tx, mut rx) = channel::<EncryptedFrame>(4);
         let token = CancellationToken::new();
         let nak_count = Arc::new(AtomicU64::new(0));
+        let effective_mtu = Arc::new(AtomicUsize::new(MTU_TIERS[0]));
         let emulator = Arc::new(tokio::sync::Mutex::new(vt100::Parser::new(24, 80, 0)));
 
-        spawn_proactive_repaint_watchdog(tx, token.clone(), nak_count.clone(), emulator);
+        spawn_connection_health_task(
+            tx,
+            token.clone(),
+            nak_count.clone(),
+            effective_mtu,
+            emulator,
+        );
 
         // Set count one below the threshold.
         nak_count.store(PROACTIVE_REPAINT_NAK_THRESHOLD - 1, Ordering::Relaxed);
@@ -2196,9 +2242,10 @@ mod test {
         let (tx, mut rx) = channel::<EncryptedFrame>(4);
         let token = CancellationToken::new();
         let nak_count = Arc::new(AtomicU64::new(PROACTIVE_REPAINT_NAK_THRESHOLD));
+        let effective_mtu = Arc::new(AtomicUsize::new(MTU_TIERS[0]));
         let emulator = Arc::new(tokio::sync::Mutex::new(vt100::Parser::new(24, 80, 0)));
 
-        spawn_proactive_repaint_watchdog(tx, token.clone(), nak_count, emulator);
+        spawn_connection_health_task(tx, token.clone(), nak_count, effective_mtu, emulator);
 
         // Cancel immediately before any tick fires.
         token.cancel();

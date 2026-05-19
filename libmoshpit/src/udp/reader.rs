@@ -850,6 +850,11 @@ impl UdpReader {
             peer_addr
         };
 
+        // Park the NAK deadline far in the future when gap_first_seen is empty — there
+        // is nothing to retransmit, so firing every 12.5 ms is pure overhead.  The
+        // deadline is reset to nak_check_interval() each time a frame arrives (which
+        // may open new gaps) or when gaps remain after check_nak_timeouts fires.
+        let nak_park = Duration::from_hours(24);
         let mut nak_check_deadline = TokioInstant::now() + self.nak_check_interval();
         loop {
             select! {
@@ -889,7 +894,11 @@ impl UdpReader {
                             | EncryptedFrame::ClientAck(_) => {}
                         }
                     }
-                    nak_check_deadline = TokioInstant::now() + self.nak_check_interval();
+                    nak_check_deadline = TokioInstant::now() + if self.gap_first_seen.is_empty() {
+                        nak_park
+                    } else {
+                        self.nak_check_interval()
+                    };
                 },
                 frame_res = self.recv_frame_from() => {
                     match frame_res {
@@ -946,6 +955,9 @@ impl UdpReader {
                                     }
                                 }
                             }
+                            // A new frame may have opened gaps — rearm the NAK deadline so
+                            // check_nak_timeouts fires promptly if needed.
+                            nak_check_deadline = TokioInstant::now() + self.nak_check_interval();
                         }
                         Ok(None) => break,
                         Err(e) => {
@@ -1249,7 +1261,11 @@ impl UdpReader {
                     }
                     nak_check_deadline = TokioInstant::now()
                         + if self.diff_mode == DiffMode::Reliable {
-                            self.nak_check_interval()
+                            if self.gap_first_seen.is_empty() {
+                                nak_park
+                            } else {
+                                self.nak_check_interval()
+                            }
                         } else {
                             nak_park
                         };
@@ -1489,6 +1505,12 @@ impl UdpReader {
                                         .await;
                                     }
                                 }
+                            }
+                            // A new frame may have opened gaps — rearm the NAK deadline so
+                            // check_nak_timeouts fires promptly if needed.
+                            if self.diff_mode == DiffMode::Reliable {
+                                nak_check_deadline =
+                                    TokioInstant::now() + self.nak_check_interval();
                             }
                         }
                         Ok(None) => {
@@ -3066,5 +3088,164 @@ mod tests {
             matches!(frame, EncryptedFrame::RepaintRequest),
             "expected RepaintRequest after out-of-order chunk"
         );
+    }
+
+    // ── server_frame_loop / client_frame_loop integration tests ──────────────
+
+    /// `server_frame_loop` parks the NAK deadline when no gaps exist after the timer fires
+    /// and rearms it when a subsequent frame arrives.
+    #[tokio::test]
+    async fn server_frame_loop_parks_nak_when_no_gaps() {
+        use crate::UdpSender;
+        use tokio::sync::mpsc::channel as mpsc_channel;
+
+        let key_bytes = [0u8; 32];
+        let hmac_bytes = [0u8; 64];
+        let session_id = Uuid::new_v4();
+
+        // Server socket: unconnected so recv_from can capture the client's address.
+        let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = server_sock.local_addr().unwrap();
+
+        // Client socket: connected to server — sender uses send() without an explicit peer.
+        let client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        client_sock.connect(server_addr).await.unwrap();
+
+        let (term_tx, _term_rx) = mpsc_channel::<TerminalMessage>(16);
+        let token = CancellationToken::new();
+
+        let mut reader = UdpReader::builder()
+            .socket(server_sock)
+            .id(session_id)
+            .rnk(LessSafeKey::new(
+                UnboundKey::new(&AES_256_GCM_SIV, &key_bytes).unwrap(),
+            ))
+            .hmac(Key::new(HMAC_SHA512, &hmac_bytes))
+            .build();
+
+        let (_ctrl_tx, ctrl_rx) = mpsc_channel::<EncryptedFrame>(4);
+        let (frame_tx, frame_rx) = mpsc_channel::<EncryptedFrame>(4);
+        let (_ret_tx, ret_rx) = mpsc_channel::<Vec<u64>>(4);
+
+        let mut sender = UdpSender::builder()
+            .id(session_id)
+            .rnk(LessSafeKey::new(
+                UnboundKey::new(&AES_256_GCM_SIV, &key_bytes).unwrap(),
+            ))
+            .hmac(Key::new(HMAC_SHA512, &hmac_bytes))
+            .socket(client_sock)
+            .control_rx(ctrl_rx)
+            .rx(frame_rx)
+            .retransmit_rx(ret_rx)
+            .build();
+
+        let t_sender = token.clone();
+        let t_reader = token.clone();
+
+        let sender_handle = tokio::spawn(async move { drop(sender.frame_loop(t_sender).await) });
+        let reader_handle =
+            tokio::spawn(async move { reader.server_frame_loop(t_reader, term_tx).await });
+
+        // First Keepalive triggers initial peer-discovery recv_from and enters the loop.
+        frame_tx.send(EncryptedFrame::Keepalive(0)).await.unwrap();
+
+        // Allow time for the NAK timer to fire (≥1 tick at nak_check_interval ≈ 5–12ms)
+        // and park the deadline because gap_first_seen is empty.
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        // Second Keepalive exercises the rearm-on-recv path inside the main loop.
+        frame_tx.send(EncryptedFrame::Keepalive(0)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        token.cancel();
+        drop(sender_handle.await);
+        let result = reader_handle.await.unwrap();
+        assert!(result.is_ok());
+    }
+
+    /// In `DiffMode::Datagram` the NAK deadline is parked immediately (24-hour horizon)
+    /// so the timer branch never fires.  This exercises the `else { nak_park }` branch
+    /// in `client_frame_loop` initialization.
+    #[tokio::test]
+    async fn client_frame_loop_nak_deadline_parked_in_datagram_mode() {
+        use crate::DisplayPreference;
+        use std::sync::atomic::AtomicBool;
+        use tokio::sync::mpsc::channel as mpsc_channel;
+
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let token = CancellationToken::new();
+        let exit_token = CancellationToken::new();
+
+        let mut reader = UdpReader::builder()
+            .socket(socket)
+            .id(Uuid::new_v4())
+            .rnk(LessSafeKey::new(
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+            ))
+            .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
+            .diff_mode(DiffMode::Datagram)
+            .build();
+
+        let (stdout_tx, _stdout_rx) = mpsc_channel::<Vec<u8>>(4);
+        let emulator = Arc::new(Mutex::new(Emulator::new(24, 80)));
+        let prediction = Arc::new(Mutex::new(PredictionEngine::new(
+            DisplayPreference::default(),
+        )));
+        let renderer = Arc::new(Mutex::new(Renderer::new(24, 80)));
+        let in_alt = Arc::new(AtomicBool::new(false));
+
+        // Cancel before the loop starts so we don't block on recv_buf.
+        token.cancel();
+        reader
+            .client_frame_loop(
+                token, exit_token, stdout_tx, emulator, prediction, renderer, in_alt,
+            )
+            .await;
+    }
+
+    /// In `DiffMode::Reliable` the NAK check timer fires and parks the deadline when
+    /// `gap_first_seen` is empty, exercising the parking logic inside `client_frame_loop`.
+    #[tokio::test]
+    async fn client_frame_loop_parks_nak_deadline_when_no_gaps() {
+        use crate::DisplayPreference;
+        use std::sync::atomic::AtomicBool;
+        use tokio::sync::mpsc::channel as mpsc_channel;
+
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let token = CancellationToken::new();
+        let exit_token = CancellationToken::new();
+
+        let mut reader = UdpReader::builder()
+            .socket(socket)
+            .id(Uuid::new_v4())
+            .rnk(LessSafeKey::new(
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+            ))
+            .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
+            .build();
+
+        let (stdout_tx, _stdout_rx) = mpsc_channel::<Vec<u8>>(4);
+        let emulator = Arc::new(Mutex::new(Emulator::new(24, 80)));
+        let prediction = Arc::new(Mutex::new(PredictionEngine::new(
+            DisplayPreference::default(),
+        )));
+        let renderer = Arc::new(Mutex::new(Renderer::new(24, 80)));
+        let in_alt = Arc::new(AtomicBool::new(false));
+
+        let t = token.clone();
+        let handle = tokio::spawn(async move {
+            reader
+                .client_frame_loop(
+                    t, exit_token, stdout_tx, emulator, prediction, renderer, in_alt,
+                )
+                .await;
+        });
+
+        // Let the NAK timer fire at least once (nak_check_interval ≈ 5–12ms on loopback)
+        // and execute the parking logic (gap_first_seen is empty → park to 24h).
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        token.cancel();
+        handle.await.unwrap();
     }
 }
