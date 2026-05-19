@@ -1,2 +1,5 @@
 [build.env]
 passthrough = ["VERGEN_IDEMPOTENT"]
+
+[target.aarch64-unknown-linux-musl]
+image = "moshpit-cross-aarch64"
