@@ -4,7 +4,7 @@ pkgname=moshpits-unstable-bin
 pkgver=0.8.3
 pkgrel=1
 pkgdesc="moshpits server with post-quantum support — SSH and Mosh inspired remote terminal server (pre-compiled binary)"
-arch=('x86_64')
+arch=('x86_64' 'aarch64')
 url="https://github.com/rustyhorde/moshpit"
 license=('MIT' 'Apache-2.0')
 provides=('moshpits')
@@ -18,12 +18,14 @@ _base="https://github.com/rustyhorde/moshpit/releases/download/v${pkgver}"
 
 source=("${_base}/dist-mps.tar.gz" "mps.service")
 source_x86_64=("mps-unstable-x86_64::${_base}/mps-unstable-x86_64-unknown-linux-musl")
+source_aarch64=("mps-unstable-aarch64::${_base}/mps-unstable-aarch64-unknown-linux-musl")
 # First entry is the release dist tarball; local sidecar file is intentionally SKIP.
 sha256sums=('e7342a3f3588bb8c664b8464a0c200c52eb8c3353966bad18dd58dc42aa74218' 'SKIP')
 sha256sums_x86_64=('61a3ac14a589df5dd313373438d2632718f70e465cfa252870b84f0236528484')
+sha256sums_aarch64=('PLACEHOLDER')
 
 package() {
-    install -Dm755 mps-unstable-x86_64 "$pkgdir/usr/bin/mps"
+    install -Dm755 "mps-unstable-${CARCH}" "$pkgdir/usr/bin/mps"
 
     # Man page
     install -Dm644 mps/mps.1 "$pkgdir/usr/share/man/man1/mps.1"

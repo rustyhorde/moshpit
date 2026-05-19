@@ -1,0 +1,96 @@
+# nfpm package configuration for moshpits-unstable (server, arm64, post-quantum)
+# Build with: VERSION=<ver> nfpm package --config packaging/nfpm/moshpits-unstable-aarch64.yaml --packager deb|rpm --target release-assets/
+name: moshpits-unstable
+arch: arm64
+version: ${VERSION}
+version_schema: semver
+section: net
+maintainer: Jason Ozias <jason.g.ozias@gmail.com>
+description: |
+  moshpits server with post-quantum support — SSH and Mosh inspired remote terminal server.
+  Listens for moshpit client connections, manages PTYs, and streams encrypted terminal state
+  over UDP using AES-256-GCM-SIV. Includes ML-DSA-65 post-quantum identity key support.
+homepage: https://github.com/rustyhorde/moshpit
+license: MIT OR Apache-2.0
+
+depends:
+  - moshpit-keygen
+
+conflicts:
+  - moshpits
+
+replaces:
+  - moshpits
+
+provides:
+  - moshpits
+
+deb:
+  compression: xz
+
+rpm:
+  compression: xz
+
+overrides:
+  deb:
+    scripts:
+      preinstall: packaging/nfpm/scripts/moshpits-unstable-preinst
+      postinstall: packaging/nfpm/scripts/moshpits-unstable-postinst
+      preremove: packaging/nfpm/scripts/moshpits-prerm
+  rpm:
+    scripts:
+      preinstall: packaging/nfpm/scripts/moshpits-unstable-rpm-preinst
+      postinstall: packaging/nfpm/scripts/moshpits-unstable-rpm-postinst
+      preremove: packaging/nfpm/scripts/moshpits-rpm-prerm
+
+contents:
+  # Binary
+  - src: mps-unstable-aarch64-unknown-linux-musl
+    dst: /usr/bin/mps
+    file_info:
+      mode: 0755
+
+  # Man page
+  - src: dist/mps/mps.1
+    dst: /usr/share/man/man1/mps.1
+
+  # Shell completions
+  - src: dist/mps/mps.bash
+    dst: /usr/share/bash-completion/completions/mps
+
+  - src: dist/mps/_mps
+    dst: /usr/share/zsh/vendor-completions/_mps
+
+  - src: dist/mps/mps.fish
+    dst: /usr/share/fish/vendor_completions.d/mps.fish
+
+  # systemd service unit (reused from Arch unstable binary package)
+  - src: packaging/arch/moshpits-unstable-bin/mps.service
+    dst: /usr/lib/systemd/system/mps.service
+
+  # Example configuration
+  - src: dist/mps/moshpits.toml.example
+    dst: /usr/share/doc/moshpits-unstable/examples/moshpits.toml.example
+
+  # Licenses
+  - src: dist/mps/LICENSE-MIT
+    dst: /usr/share/doc/moshpits-unstable/LICENSE-MIT
+
+  - src: dist/mps/LICENSE-APACHE
+    dst: /usr/share/doc/moshpits-unstable/LICENSE-APACHE
+
+  # Managed directories (created by postinst, listed here so dpkg tracks them)
+  - dst: /etc/moshpits
+    type: dir
+    file_info:
+      mode: 0755
+
+  - dst: /etc/moshpits/keys
+    type: dir
+    file_info:
+      mode: 0700
+
+  - dst: /var/log/moshpits
+    type: dir
+    file_info:
+      mode: 0755

@@ -1,0 +1,48 @@
+# nfpm package configuration for moshpit-keygen (arm64)
+# Build with: VERSION=<ver> nfpm package --config packaging/nfpm/moshpit-keygen-aarch64.yaml --packager deb|rpm --target release-assets/
+name: moshpit-keygen
+arch: arm64
+version: ${VERSION}
+version_schema: semver
+section: net
+maintainer: Jason Ozias <jason.g.ozias@gmail.com>
+description: |
+  Asymmetric key generation and inspection tool for moshpit.
+  Generates and manages the key pairs used by both the moshpit client and
+  the moshpits server for mutual authentication.
+homepage: https://github.com/rustyhorde/moshpit
+license: MIT OR Apache-2.0
+
+deb:
+  compression: xz
+
+rpm:
+  compression: xz
+
+contents:
+  # Binary
+  - src: mp-keygen-aarch64-unknown-linux-musl
+    dst: /usr/bin/mp-keygen
+    file_info:
+      mode: 0755
+
+  # Man page
+  - src: dist/mp-keygen/mp-keygen.1
+    dst: /usr/share/man/man1/mp-keygen.1
+
+  # Shell completions
+  - src: dist/mp-keygen/mp-keygen.bash
+    dst: /usr/share/bash-completion/completions/mp-keygen
+
+  - src: dist/mp-keygen/_mp-keygen
+    dst: /usr/share/zsh/vendor-completions/_mp-keygen
+
+  - src: dist/mp-keygen/mp-keygen.fish
+    dst: /usr/share/fish/vendor_completions.d/mp-keygen.fish
+
+  # Licenses
+  - src: dist/mp-keygen/LICENSE-MIT
+    dst: /usr/share/doc/moshpit-keygen/LICENSE-MIT
+
+  - src: dist/mp-keygen/LICENSE-APACHE
+    dst: /usr/share/doc/moshpit-keygen/LICENSE-APACHE
