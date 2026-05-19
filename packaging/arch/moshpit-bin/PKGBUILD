@@ -4,7 +4,7 @@ pkgname=moshpit-bin
 pkgver=0.8.4
 pkgrel=1
 pkgdesc="moshpit client — SSH and Mosh inspired remote terminal client (pre-compiled binary)"
-arch=('x86_64')
+arch=('x86_64' 'aarch64')
 url="https://github.com/rustyhorde/moshpit"
 license=('MIT' 'Apache-2.0')
 provides=('moshpit')
@@ -16,11 +16,13 @@ _base="https://github.com/rustyhorde/moshpit/releases/download/v${pkgver}"
 
 source=("${_base}/dist-mp.tar.gz")
 source_x86_64=("mp-x86_64::${_base}/mp-x86_64-unknown-linux-musl")
+source_aarch64=("mp-aarch64::${_base}/mp-aarch64-unknown-linux-musl")
 sha256sums=('68e4ffbe6ee8bb5cbef34bfec816af1a9a64f661b4230313f9c61ad9ac5f36ea')
 sha256sums_x86_64=('1029d7ab5ecc1192351ae37f43266c84be19795d5849af53f8113fbc41444f8f')
+sha256sums_aarch64=('PLACEHOLDER')
 
 package() {
-    install -Dm755 mp-x86_64 "$pkgdir/usr/bin/mp"
+    install -Dm755 "mp-${CARCH}" "$pkgdir/usr/bin/mp"
 
     # Man page
     install -Dm644 mp/mp.1 "$pkgdir/usr/share/man/man1/mp.1"
