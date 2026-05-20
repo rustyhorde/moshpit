@@ -36,9 +36,9 @@ use tracing::{debug, error, info, trace};
 use uuid::Uuid;
 
 use crate::{
-    ConnectionReader, ConnectionWriter, Frame, KexConfig, KexReader, KexSender, MoshpitError,
-    UuidWrapper, kex::negotiate::NegotiatedAlgorithms, load_identity_key, load_public_key,
-    udp::DiffMode,
+    AgentClient, ConnectionReader, ConnectionWriter, Frame, KexConfig, KexReader, KexSender,
+    MoshpitError, UuidWrapper, kex::negotiate::NegotiatedAlgorithms, load_identity_key,
+    load_public_key, udp::DiffMode,
 };
 
 fn fmt_hex(bytes: &[u8]) -> String {
@@ -427,54 +427,109 @@ async fn run_client_kex<T: KexConfig>(
     passphrase_fn: impl Fn() -> Result<Option<String>>,
     callbacks: HostKeyCallbacks,
 ) -> Result<(Kex, Arc<UdpSocket>, Option<ServerKex>)> {
-    let (private_key_path, public_key_path) = config.key_pair_paths()?;
-    info!("Loading private key from {}", private_key_path.display());
-    info!("Loading public key from {}", public_key_path.display());
+    let agent_socket = config.agent_socket();
 
-    let (full_public_key_bytes, public_key_bytes) = load_public_key(&public_key_path)
-        .inspect_err(|e| {
+    // Resolve identity: either from a running agent or directly from key files.
+    let (full_public_key_bytes, agent_fingerprint) = if let Some(ref socket) = agent_socket {
+        info!("Agent socket configured — loading identity from moshpit-agent");
+        let client = AgentClient::new(socket.clone());
+        let ids = client.list_identities().await.map_err(|e| {
+            error!("Failed to list agent identities: {e}");
+            MoshpitError::KeyFileMissing
+        })?;
+        if ids.is_empty() {
+            error!("Agent has no loaded identities — run `mpa add-key <path>` first");
+            return Err(MoshpitError::KeyFileMissing.into());
+        }
+        let id = &ids[0];
+        info!(
+            "Using agent identity: {} ({})",
+            id.fingerprint, id.algorithm
+        );
+        let pk_bytes = client.get_public_key(&id.fingerprint).await.map_err(|e| {
+            error!("Failed to get public key from agent: {e}");
+            MoshpitError::KeyFileMissing
+        })?;
+        (pk_bytes, Some(id.fingerprint.clone()))
+    } else {
+        let (private_key_path, public_key_path) = config.key_pair_paths()?;
+        info!("Loading private key from {}", private_key_path.display());
+        info!("Loading public key from {}", public_key_path.display());
+
+        let (full_pub_bytes, public_key_bytes) = load_public_key(&public_key_path)
+            .inspect_err(|e| {
+                error!(
+                    "Failed to load public key from {}: {e}",
+                    public_key_path.display()
+                );
+            })
+            .map_err(|_| MoshpitError::KeyFileMissing)?;
+        if !private_key_path.try_exists().unwrap_or(false) {
             error!(
-                "Failed to load public key from {}: {e}",
+                "Failed to load private key from {}: file does not exist",
+                private_key_path.display()
+            );
+            return Err(MoshpitError::KeyFileMissing.into());
+        }
+
+        let identity_key = if let Ok(identity_key) = load_identity_key(&private_key_path, None) {
+            info!("Private key is unencrypted — no passphrase needed");
+            identity_key
+        } else {
+            info!("Private key may be encrypted — invoking passphrase prompt");
+            let passphrase = passphrase_fn().map_err(|e| {
+                error!("Passphrase prompt failed: {e}");
+                e
+            })?;
+            let Some(passphrase) = passphrase else {
+                error!("Passphrase prompt returned no input — cannot decrypt key");
+                return Err(MoshpitError::KeyCorrupt.into());
+            };
+            load_identity_key(&private_key_path, Some(&passphrase))
+                .inspect_err(|e| error!("Private key validation failed: {e}"))
+                .map_err(|_| MoshpitError::KeyCorrupt)?
+        };
+        if identity_key.public_key().as_slice() != public_key_bytes.as_slice() {
+            error!(
+                "Computed public key does not match stored public key at {}",
                 public_key_path.display()
             );
-        })
-        .map_err(|_| MoshpitError::KeyFileMissing)?;
-    if !private_key_path.try_exists().unwrap_or(false) {
-        error!(
-            "Failed to load private key from {}: file does not exist",
-            private_key_path.display()
+            return Err(MoshpitError::KeyPairMismatch.into());
+        }
+        info!(
+            "Private identity key ({}) verified successfully",
+            identity_key.key_algorithm()
         );
-        return Err(MoshpitError::KeyFileMissing.into());
-    }
 
-    let identity_key = if let Ok(identity_key) = load_identity_key(&private_key_path, None) {
-        info!("Private key is unencrypted — no passphrase needed");
-        identity_key
-    } else {
-        info!("Private key may be encrypted — invoking passphrase prompt");
-        let passphrase = passphrase_fn().map_err(|e| {
-            error!("Passphrase prompt failed: {e}");
-            e
-        })?;
-        let Some(passphrase) = passphrase else {
-            error!("Passphrase prompt returned no input — cannot decrypt key");
-            return Err(MoshpitError::KeyCorrupt.into());
-        };
-        load_identity_key(&private_key_path, Some(&passphrase))
-            .inspect_err(|e| error!("Private key validation failed: {e}"))
-            .map_err(|_| MoshpitError::KeyCorrupt)?
+        #[cfg(feature = "unstable")]
+        {
+            // Store algorithm and private key for later use below.
+            (full_pub_bytes, None)
+        }
+        #[cfg(not(feature = "unstable"))]
+        (full_pub_bytes, None)
     };
-    if identity_key.public_key().as_slice() != public_key_bytes.as_slice() {
-        error!(
-            "Computed public key does not match stored public key at {}",
-            public_key_path.display()
-        );
-        return Err(MoshpitError::KeyPairMismatch.into());
-    }
-    info!(
-        "Private identity key ({}) verified successfully",
-        identity_key.key_algorithm()
-    );
+
+    // For file-based path, we need the identity_key for unstable signing.
+    // Re-load it here (only in the non-agent branch that reaches this point).
+    #[cfg(feature = "unstable")]
+    let (client_identity_key_algorithm, client_identity_private_key) = if agent_socket.is_some() {
+        // Agent holds the private key; algorithm is looked up from fingerprint.
+        // The `agent_fingerprint` carries the algorithm at signing time.
+        (String::new(), vec![])
+    } else {
+        let (private_key_path, _) = config.key_pair_paths()?;
+        let identity_key = load_identity_key(&private_key_path, None).or_else(|_| {
+            let passphrase = passphrase_fn()?;
+            let p = passphrase.ok_or(MoshpitError::KeyCorrupt)?;
+            load_identity_key(&private_key_path, Some(&p))
+                .map_err(|_| anyhow::anyhow!(MoshpitError::KeyCorrupt))
+        })?;
+        (
+            identity_key.key_algorithm().clone(),
+            identity_key.private_key().clone(),
+        )
+    };
 
     // Setup the TCP frame reader
     let tx_c = tx.clone();
@@ -494,10 +549,6 @@ async fn run_client_kex<T: KexConfig>(
         .filter(|(k, _)| env_var_matches(k, &send_env_patterns))
         .collect();
     let send_path = config.send_path();
-    #[cfg(feature = "unstable")]
-    let client_identity_key_algorithm = identity_key.key_algorithm().clone();
-    #[cfg(feature = "unstable")]
-    let client_identity_private_key = identity_key.private_key().clone();
     let _read_handle = spawn(async move {
         #[cfg(feature = "unstable")]
         let mut frame_reader = KexReader::builder()
@@ -514,6 +565,8 @@ async fn run_client_kex<T: KexConfig>(
             .full_public_key_bytes(full_public_key_bytes)
             .client_identity_key_algorithm(client_identity_key_algorithm)
             .client_identity_private_key(client_identity_private_key)
+            .maybe_agent_socket(agent_socket)
+            .maybe_agent_fingerprint(agent_fingerprint)
             .send_env(send_env)
             .send_path(send_path)
             .build();
@@ -530,6 +583,8 @@ async fn run_client_kex<T: KexConfig>(
             .client_algos(client_algos)
             .user(user)
             .full_public_key_bytes(full_public_key_bytes)
+            .maybe_agent_socket(agent_socket)
+            .maybe_agent_fingerprint(agent_fingerprint)
             .send_env(send_env)
             .send_path(send_path)
             .build();

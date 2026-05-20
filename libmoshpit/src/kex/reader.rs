@@ -336,6 +336,11 @@ pub struct KexReader {
     /// Sent via the `ClientEnv` frame; ignored by the server when `path_locked = true`.
     #[builder(default)]
     send_path: Vec<String>,
+    /// Agent socket path.  When set, identity-key operations (signing) are
+    /// delegated to the running `mpa` agent instead of using a local private key.
+    agent_socket: Option<PathBuf>,
+    /// Fingerprint of the agent identity to use for signing.
+    agent_fingerprint: Option<String>,
 }
 
 impl std::fmt::Debug for KexReader {
@@ -377,6 +382,9 @@ impl std::fmt::Debug for KexReader {
                 &self.client_identity_key_algorithm,
             )
             .field("client_identity_private_key", &"<redacted>");
+        let _ = debug
+            .field("agent_socket", &self.agent_socket)
+            .field("agent_fingerprint", &self.agent_fingerprint);
         debug.finish()
     }
 }
@@ -554,11 +562,20 @@ impl KexReader {
                         server_exchange: &ephemeral_pk,
                         salt: &salt_bytes,
                     })?;
-                    let signature = sign_identity_transcript(
-                        &self.client_identity_key_algorithm,
-                        &self.client_identity_private_key,
-                        &transcript,
-                    )?;
+                    let signature = if let (Some(socket), Some(fp)) =
+                        (&self.agent_socket, &self.agent_fingerprint)
+                    {
+                        // Delegate signing to the agent — private key stays in agent memory.
+                        crate::agent::client::AgentClient::new(socket.clone())
+                            .sign(fp, &transcript)
+                            .await?
+                    } else {
+                        sign_identity_transcript(
+                            &self.client_identity_key_algorithm,
+                            &self.client_identity_private_key,
+                            &transcript,
+                        )?
+                    };
                     self.tx.send(Frame::IdentityProof(signature))?;
                 }
 

@@ -37,6 +37,7 @@ moshpit is a suite of tools for establishing encrypted, resilient remote termina
 | `mps` | moshpits | Server — listens for incoming connections and spawns PTYs |
 | `mp` | moshpit | Client — connects to a running `mps` server |
 | `mp-keygen` | moshpit-keygen | Key management — generates and inspects asymmetric key pairs (X25519, P-384, or P-256) |
+| `mpa` | moshpit-agent | Agent daemon — holds decrypted identity keys in memory, serves them over a Unix socket so `mp` never prompts for passphrases after first unlock |
 
 Sessions are authenticated with asymmetric key pairs (X25519 by default; P-384 and P-256 are also supported).  TCP is used only for the initial key exchange; once the exchange completes the connection switches to UDP exclusively (ports 50000–59999) for all terminal I/O.  The server tracks full terminal screen state with a server-side vt100 emulator; on reconnect the client receives a single clean screen snapshot and repaints instantly rather than replaying raw scrollback history.
 
@@ -908,6 +909,200 @@ with_level       = true
 1. Environment variables (`MOSHPIT_*`)
 2. Command-line flags
 3. Config file values
+
+---
+
+## moshpit agent (`mpa`)
+
+`mpa` is an optional key-agent daemon, similar in role to `ssh-agent`.  Once running, it holds your decrypted identity keys in memory and serves signing and public-key requests to `mp` over a Unix domain socket.  You unlock once (at login or on demand) and all subsequent `mp` connections proceed without passphrase prompts.
+
+Private keys **never** cross the socket.  Only public keys and signatures leave the agent.
+
+### How it fits in
+
+```
+mp ──MOSHPIT_AGENT_SOCK──► mpa (daemon)
+                              │
+                          vault (encrypted at rest)
+                              │
+                     identity key files (read once at add-key)
+```
+
+Set `MOSHPIT_AGENT_SOCK` in your environment to point `mp` at a running agent.  When the variable is set and the socket is reachable, `mp` delegates all identity-key operations to the agent; if the agent is unavailable it falls back to reading key files directly.
+
+### Quick start
+
+1. Start the agent and export its socket path:
+
+   ```bash
+   # bash / zsh
+   eval $(mpa start)
+
+   # fish
+   mpa start | source
+   ```
+
+   `mpa start` prints `export MOSHPIT_AGENT_SOCK=<path>` (or the fish equivalent) so the `eval`/`source` wires up the variable for the current shell session.
+
+2. Add your identity key:
+
+   ```bash
+   # Unencrypted key — no prompt
+   mpa add-key ~/.mp/id_x25519
+
+   # Encrypted key — prompts for the key passphrase once, then stores it in the vault
+   mpa add-key ~/.mp/id_x25519
+
+   # Read passphrase from stdin (useful in scripts)
+   echo "mypassphrase" | mpa add-key --passphrase-stdin ~/.mp/id_x25519
+   ```
+
+3. Connect — no passphrase prompt:
+
+   ```bash
+   mp user@192.168.1.10
+   ```
+
+### Command-line usage
+
+```
+mpa [OPTIONS] <COMMAND>
+
+Commands:
+  start       Start the agent daemon
+  add-key     Add an identity key to the agent
+  list        List identities held by the agent
+  remove-key  Remove an identity from the agent
+  lock        Lock the agent (clear keys from memory)
+  unlock      Unlock the agent (reload keys from vault)
+
+Options:
+  -v, --verbose   Turn up logging verbosity (repeatable)
+  -q, --quiet     Turn down logging verbosity (repeatable)
+  -h, --help      Print help
+  -V, --version   Print version
+```
+
+#### `mpa start`
+
+```
+mpa start [OPTIONS]
+
+Options:
+  -s, --socket <PATH>   Override the Unix socket path
+                        (default: $XDG_RUNTIME_DIR/moshpit-agent-<uid>.sock)
+      --vault <PATH>    Path to the vault file (default: ~/.mp/agent-vault)
+      --foreground      Run in the foreground instead of daemonizing
+```
+
+#### `mpa add-key`
+
+```
+mpa add-key [OPTIONS] <KEY_PATH>
+
+Arguments:
+  <KEY_PATH>   Path to the private key file to add
+
+Options:
+      --passphrase-stdin   Read the key passphrase from stdin instead of prompting
+```
+
+#### `mpa list`
+
+Lists each identity held in memory, one per line: fingerprint and key algorithm.
+
+```bash
+mpa list
+# SHA256:AbCdEf...  x25519
+```
+
+#### `mpa remove-key`
+
+```
+mpa remove-key <FINGERPRINT>
+
+Arguments:
+  <FINGERPRINT>   SHA256 fingerprint of the key to remove (from mpa list)
+```
+
+#### `mpa lock` / `mpa unlock`
+
+`lock` clears all keys from the agent's memory (the encrypted vault is kept on disk).  
+`unlock` prompts for the master credential and reloads keys from the vault.
+
+```bash
+mpa lock
+mpa unlock          # prompts for master passphrase (or uses the configured unlock backend)
+```
+
+### Socket path and environment variable
+
+The socket path defaults to `$XDG_RUNTIME_DIR/moshpit-agent-<uid>.sock` and falls back to `~/.mp/agent.sock`.  `mpa start` always prints the exact path so `eval $(mpa start)` captures it correctly.
+
+`mp` reads `MOSHPIT_AGENT_SOCK` — the same pattern as `SSH_AUTH_SOCK` for ssh-agent.  Set it in your shell profile or via `eval $(mpa start)` to make it permanent.
+
+```bash
+# Permanent (bash ~/.bashrc or zsh ~/.zshrc)
+eval $(mpa start)
+
+# Fish (~/.config/fish/config.fish)
+mpa start | source
+
+# Permanent via environment variable (bypass agent for a single invocation)
+MOSHPIT_AGENT_SOCK= mp --private-key-path ~/.mp/id_x25519 user@host
+```
+
+### Vault
+
+The vault stores each key's path and passphrase encrypted with AES-256-GCM-SIV + HKDF-SHA512 + Argon2id under a master credential.  It lives at `~/.mp/agent-vault` by default (mode 0600).
+
+Keys are loaded into memory once at `add-key` or `unlock` time.  On `lock`, memory is zeroed.  The vault is never rewritten unless you add or remove a key.
+
+### Unlock backends
+
+`mpa` ships several unlock backends selectable at **compile time** via Cargo feature flags.  The `passphrase` backend is always compiled in and is the fallback when no other backend is configured.
+
+| Feature flag | Backend | Notes |
+|---|---|---|
+| *(none)* | **Passphrase** | Interactive prompt at `start`/`unlock` |
+| `fido2` | **FIDO2 / YubiKey** | Hardware key challenge-response (stub — full impl pending) |
+| `systemd-creds` | **systemd credentials** | Vault key via `$CREDENTIALS_DIRECTORY`; seamless under a systemd user service |
+| `ssh-agent-piggyback` | **SSH agent** | Derives unlock key from an SSH challenge-response; seamless when `ssh-agent` is running |
+| `secret-service` | **Secret Service** | GNOME Keyring / KWallet; auto-unlocks at desktop login |
+| `tpm` | **TPM 2.0** | Machine-bound sealing; requires `libtss2` (stub — full impl pending) |
+| `fprintd` | **Fingerprint (fprintd)** | Biometric via fprintd D-Bus; requires `fprintd` system package (stub — full impl pending) |
+
+Pre-compiled release binaries are provided for each feature variant:
+
+| Binary | Enabled unlock methods |
+|---|---|
+| `mpa` | Passphrase |
+| `mpa-fido2` | Passphrase + FIDO2 |
+| `mpa-systemd-creds` | Passphrase + systemd credentials |
+| `mpa-ssh-agent-piggyback` | Passphrase + SSH agent |
+| `mpa-full` | Passphrase + FIDO2 + systemd-creds + SSH agent *(MUSL-portable)* |
+
+The `secret-service`, `tpm`, and `fprintd` backends require glibc system libraries and are available via the AUR source packages (`moshpit-agent-secret-service`, `moshpit-agent-tpm`, `moshpit-agent-fprintd`, `moshpit-agent-full`).
+
+### systemd user service
+
+A systemd user unit is included in the dist tarball and in the `moshpit-agent` AUR/DEB/RPM packages.
+
+```bash
+# Install (if not done by the package manager)
+install -Dm644 dist/mpa/moshpit-agent.service \
+    ~/.config/systemd/user/moshpit-agent.service
+install -Dm644 dist/mpa/moshpit-agent.socket \
+    ~/.config/systemd/user/moshpit-agent.socket
+
+# Enable and start
+systemctl --user enable --now moshpit-agent.service
+
+# The service sets MOSHPIT_AGENT_SOCK automatically; add this to your shell profile:
+export MOSHPIT_AGENT_SOCK="${XDG_RUNTIME_DIR}/moshpit-agent-$(id -u).sock"
+```
+
+The `moshpit-agent.socket` unit provides socket-activation support for future releases.
 
 ---
 
