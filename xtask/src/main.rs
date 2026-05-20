@@ -17,6 +17,7 @@
 //! cargo xtask dist mp
 //! cargo xtask dist mps
 //! cargo xtask dist mp-keygen
+//! cargo xtask dist mpa
 //! ```
 
 use std::{
@@ -57,7 +58,8 @@ fn dist(binary: &str) -> Result<()> {
         "mp" => mp_command(),
         "mps" => mps_command(),
         "mp-keygen" => mp_keygen_command(),
-        other => bail!("unknown binary '{other}'; expected one of: mp, mps, mp-keygen"),
+        "mpa" => mpa_command(),
+        other => bail!("unknown binary '{other}'; expected one of: mp, mps, mp-keygen, mpa"),
     };
 
     let out_dir = PathBuf::from("dist").join(binary);
@@ -68,6 +70,7 @@ fn dist(binary: &str) -> Result<()> {
     generate_man_page(&cmd, &out_dir)?;
     copy_licenses(&out_dir)?;
     copy_example_config(binary, &out_dir)?;
+    copy_systemd_units(binary, &out_dir)?;
 
     println!("Artifacts written to {}", out_dir.display());
     Ok(())
@@ -90,6 +93,18 @@ fn copy_example_config(binary: &str, out_dir: &Path) -> Result<()> {
     let src = PathBuf::from(format!("packaging/arch/{pkg}/examples/{cfg}"));
     if src.exists() {
         fs::copy(&src, out_dir.join(cfg))
+            .with_context(|| format!("failed to copy {}", src.display()))?;
+    }
+    Ok(())
+}
+
+fn copy_systemd_units(binary: &str, out_dir: &Path) -> Result<()> {
+    if binary != "mpa" {
+        return Ok(());
+    }
+    for unit in ["moshpit-agent.service", "moshpit-agent.socket"] {
+        let src = PathBuf::from("packaging/systemd").join(unit);
+        fs::copy(&src, out_dir.join(unit))
             .with_context(|| format!("failed to copy {}", src.display()))?;
     }
     Ok(())
@@ -280,6 +295,68 @@ fn mp_keygen_command() -> Command {
                         .help("Path to the public key file"),
                 ),
         )
+}
+
+/// `mpa` — moshpit agent daemon
+fn mpa_command() -> Command {
+    Command::new("mpa")
+        .version(env!("CARGO_PKG_VERSION"))
+        .about("Moshpit agent — holds identity keys in memory and serves them over a Unix socket")
+        .arg(verbose_arg())
+        .arg(quiet_arg())
+        .subcommand_required(true)
+        .subcommand(
+            Command::new("start")
+                .about("Start the agent daemon")
+                .arg(
+                    Arg::new("socket")
+                        .short('s')
+                        .long("socket")
+                        .value_name("PATH")
+                        .help("Override the Unix socket path (default: $XDG_RUNTIME_DIR/moshpit-agent-<uid>.sock)"),
+                )
+                .arg(
+                    Arg::new("vault")
+                        .long("vault")
+                        .value_name("PATH")
+                        .help("Path to the vault file (default: ~/.mp/agent-vault)"),
+                )
+                .arg(
+                    Arg::new("foreground")
+                        .long("foreground")
+                        .action(ArgAction::SetTrue)
+                        .help("Run in the foreground instead of daemonizing"),
+                ),
+        )
+        .subcommand(
+            Command::new("add-key")
+                .about("Add an identity key to the agent")
+                .arg(
+                    Arg::new("key-path")
+                        .value_name("KEY_PATH")
+                        .required(true)
+                        .help("Path to the private key file to add"),
+                )
+                .arg(
+                    Arg::new("passphrase-stdin")
+                        .long("passphrase-stdin")
+                        .action(ArgAction::SetTrue)
+                        .help("Read the key passphrase from stdin instead of prompting"),
+                ),
+        )
+        .subcommand(Command::new("list").about("List identities held by the agent"))
+        .subcommand(
+            Command::new("remove-key")
+                .about("Remove an identity from the agent")
+                .arg(
+                    Arg::new("fingerprint")
+                        .value_name("FINGERPRINT")
+                        .required(true)
+                        .help("SHA256 fingerprint of the key to remove"),
+                ),
+        )
+        .subcommand(Command::new("lock").about("Lock the agent (clear keys from memory)"))
+        .subcommand(Command::new("unlock").about("Unlock the agent (reload keys from vault)"))
 }
 
 // ── Shared argument helpers ───────────────────────────────────────────────────

@@ -6,7 +6,7 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-//! libmoshpit - moshpit library
+//! moshpit-agent — key agent for moshpit
 
 // rustc lints
 #![cfg_attr(
@@ -215,8 +215,6 @@
         unqualified_local_imports,
     )
 )]
-// Allow unsafe code on Windows (required for Windows Security API calls)
-#![cfg_attr(all(nightly, windows), allow(unsafe_code, unsafe_op_in_unsafe_fn))]
 // clippy lints
 #![cfg_attr(nightly, deny(clippy::all, clippy::pedantic))]
 // rustdoc lints
@@ -235,106 +233,26 @@
 #![cfg_attr(all(docsrs), feature(doc_cfg))]
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
-pub mod agent;
-mod config;
-mod error;
-mod frames;
-mod kex;
-mod keygen;
-mod session;
-mod tcp;
-mod term;
-mod tracing;
-mod udp;
-mod utils;
-mod uuid;
+use std::process::exit;
 
-pub use self::agent::AgentClient;
-pub use self::agent::AgentIdentityInfo;
-pub use self::agent::AgentRequest;
-pub use self::agent::AgentResponse;
-pub use self::config::KexConfig;
-pub use self::config::PathDefaults;
-pub use self::config::load;
-pub use self::config::mps::Mps;
-pub use self::config::tracing::FileLayer;
-pub use self::config::tracing::Layer;
-pub use self::config::tracing::Tracing;
-pub use self::error::Error as MoshpitError;
-pub use self::error::clap_or_error;
-pub use self::error::success;
-pub use self::frames::encframe::EncryptedFrame;
-pub use self::frames::frame::Frame;
-pub use self::kex::HostKeyMismatchFn;
-pub use self::kex::Kex;
-pub use self::kex::KexEvent;
-pub use self::kex::KexMode;
-pub use self::kex::KexState;
-pub use self::kex::KexStateMachine;
-pub use self::kex::ServerKex;
-pub use self::kex::TofuFn;
-pub use self::kex::env_var_matches;
-pub use self::kex::negotiate::AEAD_AES128_GCM_SIV;
-pub use self::kex::negotiate::AEAD_AES256_GCM;
-pub use self::kex::negotiate::AEAD_AES256_GCM_SIV;
-pub use self::kex::negotiate::AEAD_CHACHA20_POLY1305;
-pub use self::kex::negotiate::AlgorithmList;
-pub use self::kex::negotiate::KDF_HKDF_SHA256;
-pub use self::kex::negotiate::KDF_HKDF_SHA384;
-pub use self::kex::negotiate::KDF_HKDF_SHA512;
-pub use self::kex::negotiate::KEX_ML_KEM_512_SHA256;
-pub use self::kex::negotiate::KEX_ML_KEM_768_SHA256;
-pub use self::kex::negotiate::KEX_ML_KEM_1024_SHA256;
-pub use self::kex::negotiate::KEX_P256_SHA256;
-pub use self::kex::negotiate::KEX_P384_SHA384;
-pub use self::kex::negotiate::KEX_X25519_SHA256;
-pub use self::kex::negotiate::MAC_HMAC_SHA256;
-pub use self::kex::negotiate::MAC_HMAC_SHA512;
-pub use self::kex::negotiate::NegotiatedAlgorithms;
-pub use self::kex::negotiate::negotiate;
-pub use self::kex::negotiate::supported_algorithms;
-pub use self::kex::reader::KexReader;
-pub use self::kex::run_key_exchange;
-pub use self::kex::sender::KexSender;
-pub use self::keygen::AEADCipher;
-pub use self::keygen::EncryptedKeyPair;
-pub use self::keygen::IdentityKeyPair;
-#[cfg(feature = "unstable")]
-pub use self::keygen::KEY_ALGORITHM_ML_DSA_44;
-#[cfg(feature = "unstable")]
-pub use self::keygen::KEY_ALGORITHM_ML_DSA_65;
-#[cfg(feature = "unstable")]
-pub use self::keygen::KEY_ALGORITHM_ML_DSA_87;
-pub use self::keygen::KEY_ALGORITHM_P256;
-pub use self::keygen::KEY_ALGORITHM_P384;
-pub use self::keygen::KEY_ALGORITHM_X25519;
-pub use self::keygen::KeyPair;
-pub use self::keygen::UnencryptedKeyPair;
-pub use self::keygen::decrypt_private_key;
-pub use self::keygen::load_identity_key;
-pub use self::keygen::load_private_key;
-pub use self::keygen::load_public_key;
-pub use self::keygen::pk::extract_public_key_bytes;
-pub use self::keygen::pk::fingerprint;
-pub use self::keygen::pk::randomart;
-pub use self::keygen::pk::verify_fingerprint;
-pub use self::keygen::validate_identity_key_pair;
-pub use self::session::SessionRegistry;
-pub use self::session::new_session_registry;
-pub use self::tcp::reader::ConnectionReader;
-pub use self::tcp::writer::ConnectionWriter;
-pub use self::term::TerminalMessage;
-pub use self::term::{
-    DisplayPreference, Emulator, OverlayCell, OverlayCursor, PredictionEngine, Renderer,
-    paint_overlays_to_ansi,
-};
-pub use self::tracing::{TracingConfigExt, init_tracing};
-pub use self::udp::DiffMode;
-pub use self::udp::UdpClient;
-pub use self::udp::reader::UdpReader;
-pub use self::udp::sender::MAX_UDP_PAYLOAD;
-pub use self::udp::sender::UdpSender;
-pub use self::utils::is_exit_title;
-pub use self::utils::parse_server_destination;
-pub use self::utils::to_path_buf;
-pub use self::uuid::UuidWrapper;
+use libmoshpit::{clap_or_error, success};
+
+use crate::runtime::run;
+
+mod cli;
+mod config;
+mod runtime;
+mod unlock;
+mod vault;
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn main() {
+    exit(
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime")
+            .block_on(run::<Vec<&str>, &str>(None))
+            .map_or_else(clap_or_error, success),
+    )
+}

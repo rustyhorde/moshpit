@@ -62,9 +62,10 @@ rustversion = { workspace = true }
 vergen-gix = { workspace = true }
 
 [dev-dependencies]
+bincode-next = "3.0.0-rc.14"
 proptest = "1.11.0"
 tempfile = "3.27.0"
-tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "time"] }
 
 [package.metadata.docs.rs]
 all-features = true

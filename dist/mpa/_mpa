@@ -1,0 +1,223 @@
+#compdef mpa
+
+autoload -U is-at-least
+
+_mpa() {
+    typeset -A opt_args
+    typeset -a _arguments_options
+    local ret=1
+
+    if is-at-least 5.2; then
+        _arguments_options=(-s -S -C)
+    else
+        _arguments_options=(-s -C)
+    fi
+
+    local context curcontext="$curcontext" state line
+    _arguments "${_arguments_options[@]}" : \
+'(-q --quiet)*-v[Turn up logging verbosity (multiple will turn it up more)]' \
+'(-q --quiet)*--verbose[Turn up logging verbosity (multiple will turn it up more)]' \
+'(-v --verbose)*-q[Turn down logging verbosity (multiple will turn it down more)]' \
+'(-v --verbose)*--quiet[Turn down logging verbosity (multiple will turn it down more)]' \
+'-h[Print help]' \
+'--help[Print help]' \
+'-V[Print version]' \
+'--version[Print version]' \
+":: :_mpa_commands" \
+"*::: :->mpa" \
+&& ret=0
+    case $state in
+    (mpa)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:mpa-command-$line[1]:"
+        case $line[1] in
+            (start)
+_arguments "${_arguments_options[@]}" : \
+'-s+[Override the Unix socket path (default\: \$XDG_RUNTIME_DIR/moshpit-agent-<uid>.sock)]:PATH:_default' \
+'--socket=[Override the Unix socket path (default\: \$XDG_RUNTIME_DIR/moshpit-agent-<uid>.sock)]:PATH:_default' \
+'--vault=[Path to the vault file (default\: ~/.mp/agent-vault)]:PATH:_default' \
+'--foreground[Run in the foreground instead of daemonizing]' \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(add-key)
+_arguments "${_arguments_options[@]}" : \
+'--passphrase-stdin[Read the key passphrase from stdin instead of prompting]' \
+'-h[Print help]' \
+'--help[Print help]' \
+':key-path -- Path to the private key file to add:_default' \
+&& ret=0
+;;
+(list)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(remove-key)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+':fingerprint -- SHA256 fingerprint of the key to remove:_default' \
+&& ret=0
+;;
+(lock)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(unlock)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+":: :_mpa__subcmd__help_commands" \
+"*::: :->help" \
+&& ret=0
+
+    case $state in
+    (help)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:mpa-help-command-$line[1]:"
+        case $line[1] in
+            (start)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(add-key)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(list)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(remove-key)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(lock)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(unlock)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(help)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+;;
+        esac
+    ;;
+esac
+}
+
+(( $+functions[_mpa_commands] )) ||
+_mpa_commands() {
+    local commands; commands=(
+'start:Start the agent daemon' \
+'add-key:Add an identity key to the agent' \
+'list:List identities held by the agent' \
+'remove-key:Remove an identity from the agent' \
+'lock:Lock the agent (clear keys from memory)' \
+'unlock:Unlock the agent (reload keys from vault)' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'mpa commands' commands "$@"
+}
+(( $+functions[_mpa__subcmd__add-key_commands] )) ||
+_mpa__subcmd__add-key_commands() {
+    local commands; commands=()
+    _describe -t commands 'mpa add-key commands' commands "$@"
+}
+(( $+functions[_mpa__subcmd__help_commands] )) ||
+_mpa__subcmd__help_commands() {
+    local commands; commands=(
+'start:Start the agent daemon' \
+'add-key:Add an identity key to the agent' \
+'list:List identities held by the agent' \
+'remove-key:Remove an identity from the agent' \
+'lock:Lock the agent (clear keys from memory)' \
+'unlock:Unlock the agent (reload keys from vault)' \
+'help:Print this message or the help of the given subcommand(s)' \
+    )
+    _describe -t commands 'mpa help commands' commands "$@"
+}
+(( $+functions[_mpa__subcmd__help__subcmd__add-key_commands] )) ||
+_mpa__subcmd__help__subcmd__add-key_commands() {
+    local commands; commands=()
+    _describe -t commands 'mpa help add-key commands' commands "$@"
+}
+(( $+functions[_mpa__subcmd__help__subcmd__help_commands] )) ||
+_mpa__subcmd__help__subcmd__help_commands() {
+    local commands; commands=()
+    _describe -t commands 'mpa help help commands' commands "$@"
+}
+(( $+functions[_mpa__subcmd__help__subcmd__list_commands] )) ||
+_mpa__subcmd__help__subcmd__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'mpa help list commands' commands "$@"
+}
+(( $+functions[_mpa__subcmd__help__subcmd__lock_commands] )) ||
+_mpa__subcmd__help__subcmd__lock_commands() {
+    local commands; commands=()
+    _describe -t commands 'mpa help lock commands' commands "$@"
+}
+(( $+functions[_mpa__subcmd__help__subcmd__remove-key_commands] )) ||
+_mpa__subcmd__help__subcmd__remove-key_commands() {
+    local commands; commands=()
+    _describe -t commands 'mpa help remove-key commands' commands "$@"
+}
+(( $+functions[_mpa__subcmd__help__subcmd__start_commands] )) ||
+_mpa__subcmd__help__subcmd__start_commands() {
+    local commands; commands=()
+    _describe -t commands 'mpa help start commands' commands "$@"
+}
+(( $+functions[_mpa__subcmd__help__subcmd__unlock_commands] )) ||
+_mpa__subcmd__help__subcmd__unlock_commands() {
+    local commands; commands=()
+    _describe -t commands 'mpa help unlock commands' commands "$@"
+}
+(( $+functions[_mpa__subcmd__list_commands] )) ||
+_mpa__subcmd__list_commands() {
+    local commands; commands=()
+    _describe -t commands 'mpa list commands' commands "$@"
+}
+(( $+functions[_mpa__subcmd__lock_commands] )) ||
+_mpa__subcmd__lock_commands() {
+    local commands; commands=()
+    _describe -t commands 'mpa lock commands' commands "$@"
+}
+(( $+functions[_mpa__subcmd__remove-key_commands] )) ||
+_mpa__subcmd__remove-key_commands() {
+    local commands; commands=()
+    _describe -t commands 'mpa remove-key commands' commands "$@"
+}
+(( $+functions[_mpa__subcmd__start_commands] )) ||
+_mpa__subcmd__start_commands() {
+    local commands; commands=()
+    _describe -t commands 'mpa start commands' commands "$@"
+}
+(( $+functions[_mpa__subcmd__unlock_commands] )) ||
+_mpa__subcmd__unlock_commands() {
+    local commands; commands=()
+    _describe -t commands 'mpa unlock commands' commands "$@"
+}
+
+if [ "$funcstack[1]" = "_mpa" ]; then
+    _mpa "$@"
+else
+    compdef _mpa mpa
+fi

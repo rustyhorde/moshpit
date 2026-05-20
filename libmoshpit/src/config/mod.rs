@@ -100,6 +100,15 @@ pub trait KexConfig {
     fn send_path(&self) -> Vec<String> {
         vec![]
     }
+    /// Path to the moshpit-agent Unix socket.
+    ///
+    /// When `Some`, `run_client_kex` will use the agent for all identity-key
+    /// operations instead of reading key files directly.  Returns `None` by
+    /// default; client implementations override this to check
+    /// `$MOSHPIT_AGENT_SOCK`.
+    fn agent_socket(&self) -> Option<PathBuf> {
+        None
+    }
 }
 
 /// Load the configuration
@@ -304,6 +313,16 @@ mod tests {
         assert!(
             cfg.send_path().is_empty(),
             "send_path() default must return an empty Vec"
+        );
+    }
+
+    #[test]
+    fn kex_config_agent_socket_default_is_none() {
+        // The default impl always returns None, independent of env vars.
+        let cfg = TestKexConfig;
+        assert!(
+            cfg.agent_socket().is_none(),
+            "agent_socket() default must return None"
         );
     }
 }

@@ -1,0 +1,46 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH mpa 1  "mpa 0.8.6" 
+.SH NAME
+mpa \- Moshpit agent — holds identity keys in memory and serves them over a Unix socket
+.SH SYNOPSIS
+\fBmpa\fR [\fB\-v\fR|\fB\-\-verbose\fR]... [\fB\-q\fR|\fB\-\-quiet\fR]... [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] <\fIsubcommands\fR>
+.SH DESCRIPTION
+Moshpit agent — holds identity keys in memory and serves them over a Unix socket
+.SH OPTIONS
+.TP
+\fB\-v\fR, \fB\-\-verbose\fR
+Turn up logging verbosity (multiple will turn it up more)
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+Turn down logging verbosity (multiple will turn it down more)
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Print version
+.SH SUBCOMMANDS
+.TP
+mpa\-start(1)
+Start the agent daemon
+.TP
+mpa\-add\-key(1)
+Add an identity key to the agent
+.TP
+mpa\-list(1)
+List identities held by the agent
+.TP
+mpa\-remove\-key(1)
+Remove an identity from the agent
+.TP
+mpa\-lock(1)
+Lock the agent (clear keys from memory)
+.TP
+mpa\-unlock(1)
+Unlock the agent (reload keys from vault)
+.TP
+mpa\-help(1)
+Print this message or the help of the given subcommand(s)
+.SH VERSION
+v0.8.6
