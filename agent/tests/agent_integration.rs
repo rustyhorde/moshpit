@@ -6,6 +6,7 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
+#![cfg(unix)]
 //! Integration tests for the `mpa` agent daemon.
 //!
 //! These tests start the agent as a child process (using the compiled binary

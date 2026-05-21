@@ -32,17 +32,22 @@ use tokio::{
     sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
     task::JoinHandle,
 };
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, trace};
+#[cfg(unix)]
+use tracing::warn;
 use uuid::Uuid;
 
+#[cfg(unix)]
+use crate::AgentClient;
 use crate::{
-    AgentClient, ConnectionReader, ConnectionWriter, Frame, KexConfig, KexReader, KexSender,
+    ConnectionReader, ConnectionWriter, Frame, KexConfig, KexReader, KexSender,
     MoshpitError, UuidWrapper,
     kex::negotiate::NegotiatedAlgorithms,
-    keygen::{SUPPORTED_IDENTITY_ALGORITHMS, algorithm_strength_rank},
     load_identity_key, load_public_key,
     udp::DiffMode,
 };
+#[cfg(unix)]
+use crate::keygen::{SUPPORTED_IDENTITY_ALGORITHMS, algorithm_strength_rank};
 
 fn fmt_hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
@@ -434,6 +439,7 @@ async fn run_client_kex<T: KexConfig>(
 
     // Resolve identity: try agent first, fall back to key files if agent is
     // unavailable or has no compatible identities.
+    #[cfg(unix)]
     let agent_result: Option<(Vec<u8>, String)> = if let Some(ref socket) = agent_socket {
         info!("Agent socket configured — loading identity from moshpit-agent");
         let client = AgentClient::new(socket.clone());
@@ -474,6 +480,8 @@ async fn run_client_kex<T: KexConfig>(
     } else {
         None
     };
+    #[cfg(not(unix))]
+    let agent_result: Option<(Vec<u8>, String)> = None;
 
     let (full_public_key_bytes, agent_fingerprint) = if let Some((pk_bytes, fp)) = agent_result {
         (pk_bytes, Some(fp))

@@ -62,6 +62,7 @@ pub const KEY_ALGORITHM_ML_DSA_87: &str = "ML-DSA-87";
 ///
 /// Used by the client to select the strongest available identity from the agent
 /// when multiple keys are loaded. Unknown algorithms rank lowest (0).
+#[cfg(unix)]
 pub(crate) fn algorithm_strength_rank(alg: &str) -> u8 {
     match alg {
         "ML-DSA-87" => 6,
@@ -78,12 +79,12 @@ pub(crate) fn algorithm_strength_rank(alg: &str) -> u8 {
 ///
 /// Passed to [`crate::agent::client::AgentClient::list_supported_identities`] so the
 /// agent returns only keys this client can actually use.
-#[cfg(not(feature = "unstable"))]
+#[cfg(all(unix, not(feature = "unstable")))]
 pub(crate) const SUPPORTED_IDENTITY_ALGORITHMS: &[&str] =
     &[KEY_ALGORITHM_X25519, KEY_ALGORITHM_P256, KEY_ALGORITHM_P384];
 
 /// Identity key algorithms supported by this build of libmoshpit (unstable variant).
-#[cfg(feature = "unstable")]
+#[cfg(all(unix, feature = "unstable"))]
 pub(crate) const SUPPORTED_IDENTITY_ALGORITHMS: &[&str] = &[
     KEY_ALGORITHM_X25519,
     KEY_ALGORITHM_P256,
@@ -1159,6 +1160,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn algorithm_strength_rank_ordering() {
         use super::algorithm_strength_rank;

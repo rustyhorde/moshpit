@@ -232,6 +232,8 @@
 )]
 #![cfg_attr(all(docsrs), feature(doc_cfg))]
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+// On non-Unix platforms the agent is a stub; suppress lint noise from unix-only deps.
+#![cfg_attr(not(unix), allow(unused_crate_dependencies))]
 
 #[cfg(unix)]
 use std::process::exit;
@@ -243,10 +245,13 @@ use libmoshpit::{clap_or_error, success};
 use crate::runtime::run;
 
 mod cli;
+#[cfg(unix)]
 mod config;
 #[cfg(unix)]
 mod runtime;
+#[cfg(unix)]
 mod unlock;
+#[cfg(unix)]
 mod vault;
 
 #[cfg_attr(coverage_nightly, coverage(off))]

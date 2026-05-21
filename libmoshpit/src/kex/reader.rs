@@ -568,6 +568,7 @@ impl KexReader {
                             server_exchange: &ephemeral_pk,
                             salt: &salt_bytes,
                         })?;
+                        #[cfg(unix)]
                         let signature = if let (Some(socket), Some(fp)) =
                             (&self.agent_socket, &self.agent_fingerprint)
                         {
@@ -582,6 +583,12 @@ impl KexReader {
                                 &transcript,
                             )?
                         };
+                        #[cfg(not(unix))]
+                        let signature = sign_identity_transcript(
+                            &effective_alg,
+                            &self.client_identity_private_key,
+                            &transcript,
+                        )?;
                         self.tx.send(Frame::IdentityProof(signature))?;
                     }
                 }
