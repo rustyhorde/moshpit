@@ -23,7 +23,8 @@ jobs:
   rustfmt:
     name: 📌 Formatting 📌
     # main
-    uses: rustyhorde/workflows/.github/workflows/rustfmt.yml@459530a22cfadc1731716c91d8331eb27776c5a4
+    uses: rustyhorde/workflows/.github/workflows/rustfmt.yml@8e51586c8533d90c84d23cd9ac94ec2e3eb7afc1
+    secrets: inherit
 
   lints-linux:
     name: 🕳️ Clippy (Linux) 🕳️
@@ -250,7 +251,7 @@ jobs:
     name: 🧱 Coverage (Linux) 🧱
     needs: test-linux
     # main
-    uses: rustyhorde/workflows/.github/workflows/coverage.yml@459530a22cfadc1731716c91d8331eb27776c5a4
+    uses: rustyhorde/workflows/.github/workflows/coverage.yml@8e51586c8533d90c84d23cd9ac94ec2e3eb7afc1
     with:
       os: ubuntu-latest
       channel: nightly
@@ -264,7 +265,7 @@ jobs:
     name: 🧱 Coverage (MacOS) 🧱
     needs: test-macos
     # main
-    uses: rustyhorde/workflows/.github/workflows/coverage.yml@459530a22cfadc1731716c91d8331eb27776c5a4
+    uses: rustyhorde/workflows/.github/workflows/coverage.yml@8e51586c8533d90c84d23cd9ac94ec2e3eb7afc1
     with:
       os: macos-latest
       channel: nightly
@@ -281,7 +282,7 @@ jobs:
       matrix:
         target: [x86_64-pc-windows-gnu, x86_64-pc-windows-msvc]
     # main
-    uses: rustyhorde/workflows/.github/workflows/coverage.yml@459530a22cfadc1731716c91d8331eb27776c5a4
+    uses: rustyhorde/workflows/.github/workflows/coverage.yml@8e51586c8533d90c84d23cd9ac94ec2e3eb7afc1
     with:
       os: windows-latest
       channel: nightly
