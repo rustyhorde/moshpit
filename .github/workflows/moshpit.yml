@@ -48,8 +48,8 @@ jobs:
         with:
           key: x86_64-unknown-linux-gnu
           cache-all-crates: true
-      - name: 🔧 Install libfido2 🔧
-        run: sudo apt-get update && sudo apt-get install -y libfido2-dev
+      - name: 🔧 Install libfido2 + libtpm2-tss 🔧
+        run: sudo apt-get update && sudo apt-get install -y libfido2-dev libtpm2-tss-dev
       - name: 💾 Install (cargo-binstall) 💾
         uses: cargo-bins/cargo-binstall@main
       - name: 💾 Install (cargo-matrix) 💾
@@ -59,7 +59,7 @@ jobs:
           cargo binstall --no-confirm --no-symlinks --no-discover-github-token cargo-matrix --force
           rustup override remove
       - name: 📎 Clippy 📎
-        run: cargo matrix clippy --all-targets -- -Dwarnings
+        run: cargo matrix --channel linux clippy --all-targets -- -Dwarnings
 
   lints-macos:
     name: 🕳️ Clippy (MacOS) 🕳️
@@ -90,7 +90,7 @@ jobs:
           cargo install cargo-matrix --force
           rustup override remove
       - name: 📎 Clippy 📎
-        run: cargo matrix clippy --all-targets -- -Dwarnings
+        run: cargo matrix --channel macos clippy --all-targets -- -Dwarnings
 
   lints-windows:
     name: 🕳️ Clippy (Windows) 🕳️
@@ -122,7 +122,7 @@ jobs:
           cargo install cargo-matrix --force
           rustup override remove
       - name: 📎 Clippy 📎
-        run: cargo matrix --channel no-fido2 clippy --all-targets -- -Dwarnings
+        run: cargo matrix --channel windows clippy --all-targets -- -Dwarnings
 
   test-linux:
     name: 🧪 Test (Linux) 🧪
@@ -152,8 +152,8 @@ jobs:
         with:
           key: ${{ matrix.target }}
           cache-all-crates: true
-      - name: 🔧 Install libfido2 🔧
-        run: sudo apt-get update && sudo apt-get install -y libfido2-dev
+      - name: 🔧 Install libfido2 + libtpm2-tss 🔧
+        run: sudo apt-get update && sudo apt-get install -y libfido2-dev libtpm2-tss-dev
       - name: 💾 Install (cargo-binstall) 💾
         uses: cargo-bins/cargo-binstall@main
       - name: 💾 Install (cargo-matrix) 💾
@@ -163,7 +163,7 @@ jobs:
           cargo binstall --no-confirm --no-symlinks --no-discover-github-token cargo-matrix --force
           rustup override remove
       - name: 🧪 Test 🧪
-        run: cargo matrix test
+        run: cargo matrix --channel linux test
 
   test-macos:
     name: 🧪 Test (MacOS) 🧪
@@ -199,7 +199,7 @@ jobs:
           cargo install cargo-matrix --force
           rustup override remove
       - name: 🧪 Test 🧪
-        run: cargo matrix test
+        run: cargo matrix --channel macos test
 
   test-windows:
     name: 🧪 Test (Windows) 🧪
@@ -236,7 +236,7 @@ jobs:
           cargo install cargo-matrix --force
           rustup override remove
       - name: 🧪 Test 🧪
-        run: cargo matrix --channel no-fido2 test
+        run: cargo matrix --channel windows test
 
   coverage-linux:
     name: 🧱 Coverage (Linux) 🧱
