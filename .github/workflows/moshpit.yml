@@ -28,32 +28,101 @@ jobs:
   lints-linux:
     name: 🕳️ Clippy (Linux) 🕳️
     needs: rustfmt
-    # main
-    uses: rustyhorde/workflows/.github/workflows/clippy-all-features.yml@459530a22cfadc1731716c91d8331eb27776c5a4
-    with:
-      os: ubuntu-latest
-      channel: nightly
-      target: x86_64-unknown-linux-gnu
+    runs-on: ubuntu-latest
+    steps:
+      - name: ✅ Checkout ✅
+        uses: actions/checkout@v4
+      - name: 🧹 Cleanup 🧹
+        run: |
+          rm -rf /home/runner/.cargo/bin/rustfmt
+          rm -rf /home/runner/.cargo/bin/cargo-fmt
+          rm -rf /home/runner/.cargo/bin/rust-analyzer
+      - name: 🧰 Toolchain 🧰
+        run: |
+          rustup toolchain remove nightly
+          rustup toolchain install nightly --profile default --no-self-update
+          rustup default nightly
+      - name: 💵 Rust Cache 💵
+        uses: Swatinem/rust-cache@v2
+        if: ${{ github.event_name != 'pull_request' || ! github.event.pull_request.head.repo.fork }}
+        with:
+          key: x86_64-unknown-linux-gnu
+          cache-all-crates: true
+      - name: 🔧 Install libfido2 🔧
+        run: sudo apt-get update && sudo apt-get install -y libfido2-dev
+      - name: 💾 Install (cargo-binstall) 💾
+        uses: cargo-bins/cargo-binstall@main
+      - name: 💾 Install (cargo-matrix) 💾
+        run: |
+          rustup toolchain install nightly
+          rustup override set nightly
+          cargo binstall --no-confirm --no-symlinks --no-discover-github-token cargo-matrix --force
+          rustup override remove
+      - name: 📎 Clippy 📎
+        run: cargo matrix clippy --all-targets -- -Dwarnings
 
   lints-macos:
     name: 🕳️ Clippy (MacOS) 🕳️
     needs: rustfmt
-    # main
-    uses: rustyhorde/workflows/.github/workflows/clippy-all-features.yml@459530a22cfadc1731716c91d8331eb27776c5a4
-    with:
-      os: macos-latest
-      channel: nightly
-      target: apple-darwin
+    runs-on: macos-latest
+    steps:
+      - name: ✅ Checkout ✅
+        uses: actions/checkout@v4
+      - name: 🧰 Toolchain 🧰
+        run: |
+          rustup toolchain remove nightly
+          rustup toolchain install nightly --profile default --no-self-update
+          rustup default nightly
+      - name: 💵 Rust Cache 💵
+        uses: Swatinem/rust-cache@v2
+        if: ${{ github.event_name != 'pull_request' || ! github.event.pull_request.head.repo.fork }}
+        with:
+          key: apple-darwin
+          cache-all-crates: true
+      - name: 🔧 Install libfido2 🔧
+        run: |
+          brew install libfido2
+          echo "PKG_CONFIG_PATH=$(brew --prefix libfido2)/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" >> "$GITHUB_ENV"
+      - name: 💾 Install (cargo-matrix) 💾
+        run: |
+          rustup toolchain install nightly
+          rustup override set nightly
+          cargo install cargo-matrix --force
+          rustup override remove
+      - name: 📎 Clippy 📎
+        run: cargo matrix clippy --all-targets -- -Dwarnings
 
   lints-windows:
     name: 🕳️ Clippy (Windows) 🕳️
     needs: rustfmt
-    # main
-    uses: rustyhorde/workflows/.github/workflows/clippy-all-features.yml@459530a22cfadc1731716c91d8331eb27776c5a4
-    with:
-      os: windows-latest
-      channel: nightly
-      target: x86_64-pc-windows-gnu
+    runs-on: windows-latest
+    steps:
+      - name: ✅ Checkout ✅
+        uses: actions/checkout@v4
+      - name: 🧹 Cleanup 🧹
+        run: |
+          If (Test-Path C:\Users\runneradmin\.cargo\bin\rustfmt.exe) { Remove-Item C:\Users\runneradmin\.cargo\bin\rustfmt.exe }
+          If (Test-Path C:\Users\runneradmin\.cargo\bin\cargo-fmt.exe) { Remove-Item C:\Users\runneradmin\.cargo\bin\cargo-fmt.exe }
+          If (Test-Path C:\Users\runneradmin\.cargo\bin\rust-analyzer.exe) { Remove-Item C:\Users\runneradmin\.cargo\bin\rust-analyzer.exe }
+      - name: 🧰 Toolchain 🧰
+        run: |
+          rustup toolchain remove nightly
+          rustup toolchain install nightly --profile default --no-self-update
+          rustup default nightly
+      - name: 💵 Rust Cache 💵
+        uses: Swatinem/rust-cache@v2
+        if: ${{ github.event_name != 'pull_request' || ! github.event.pull_request.head.repo.fork }}
+        with:
+          key: x86_64-pc-windows-gnu
+          cache-all-crates: true
+      - name: 💾 Install (cargo-matrix) 💾
+        run: |
+          rustup toolchain install nightly
+          rustup override set nightly
+          cargo install cargo-matrix --force
+          rustup override remove
+      - name: 📎 Clippy 📎
+        run: cargo matrix --channel no-fido2 clippy --all-targets -- -Dwarnings
 
   test-linux:
     name: 🧪 Test (Linux) 🧪
@@ -63,12 +132,38 @@ jobs:
         os: [ubuntu-latest]
         channel: ["1.91.1", "stable", "beta", "nightly"]
         target: [x86_64-unknown-linux-gnu]
-    # main
-    uses: rustyhorde/workflows/.github/workflows/test-all-features.yml@459530a22cfadc1731716c91d8331eb27776c5a4
-    with:
-      os: ${{ matrix.os }}
-      channel: ${{ matrix.channel }}
-      target: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: ✅ Checkout ✅
+        uses: actions/checkout@v4
+      - name: 🧹 Cleanup 🧹
+        run: |
+          rm -rf /home/runner/.cargo/bin/rustfmt
+          rm -rf /home/runner/.cargo/bin/cargo-fmt
+          rm -rf /home/runner/.cargo/bin/rust-analyzer
+      - name: 🧰 Toolchain 🧰
+        run: |
+          rustup toolchain remove ${{ matrix.channel }}-${{ matrix.target }}
+          rustup toolchain install ${{ matrix.channel }}-${{ matrix.target }} --profile minimal --no-self-update
+          rustup default ${{ matrix.channel }}
+      - name: 💵 Rust Cache 💵
+        uses: Swatinem/rust-cache@v2
+        if: ${{ github.event_name != 'pull_request' || ! github.event.pull_request.head.repo.fork }}
+        with:
+          key: ${{ matrix.target }}
+          cache-all-crates: true
+      - name: 🔧 Install libfido2 🔧
+        run: sudo apt-get update && sudo apt-get install -y libfido2-dev
+      - name: 💾 Install (cargo-binstall) 💾
+        uses: cargo-bins/cargo-binstall@main
+      - name: 💾 Install (cargo-matrix) 💾
+        run: |
+          rustup toolchain install nightly
+          rustup override set nightly
+          cargo binstall --no-confirm --no-symlinks --no-discover-github-token cargo-matrix --force
+          rustup override remove
+      - name: 🧪 Test 🧪
+        run: cargo matrix test
 
   test-macos:
     name: 🧪 Test (MacOS) 🧪
@@ -78,12 +173,33 @@ jobs:
         os: [macos-latest]
         channel: ["1.91.1", "stable", "beta", "nightly"]
         target: [apple-darwin]
-    # main
-    uses: rustyhorde/workflows/.github/workflows/test-all-features.yml@459530a22cfadc1731716c91d8331eb27776c5a4
-    with:
-      os: ${{ matrix.os }}
-      channel: ${{ matrix.channel }}
-      target: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: ✅ Checkout ✅
+        uses: actions/checkout@v4
+      - name: 🧰 Toolchain 🧰
+        run: |
+          rustup toolchain remove ${{ matrix.channel }}-${{ matrix.target }}
+          rustup toolchain install ${{ matrix.channel }}-${{ matrix.target }} --profile minimal --no-self-update
+          rustup default ${{ matrix.channel }}
+      - name: 💵 Rust Cache 💵
+        uses: Swatinem/rust-cache@v2
+        if: ${{ github.event_name != 'pull_request' || ! github.event.pull_request.head.repo.fork }}
+        with:
+          key: ${{ matrix.target }}
+          cache-all-crates: true
+      - name: 🔧 Install libfido2 🔧
+        run: |
+          brew install libfido2
+          echo "PKG_CONFIG_PATH=$(brew --prefix libfido2)/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" >> "$GITHUB_ENV"
+      - name: 💾 Install (cargo-matrix) 💾
+        run: |
+          rustup toolchain install nightly
+          rustup override set nightly
+          cargo install cargo-matrix --force
+          rustup override remove
+      - name: 🧪 Test 🧪
+        run: cargo matrix test
 
   test-windows:
     name: 🧪 Test (Windows) 🧪
@@ -93,12 +209,34 @@ jobs:
         os: [windows-latest]
         channel: ["1.91.1", "stable", "beta", "nightly"]
         target: [x86_64-pc-windows-gnu, x86_64-pc-windows-msvc]
-    # main
-    uses: rustyhorde/workflows/.github/workflows/test-all-features.yml@459530a22cfadc1731716c91d8331eb27776c5a4
-    with:
-      os: ${{ matrix.os }}
-      channel: ${{ matrix.channel }}
-      target: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: ✅ Checkout ✅
+        uses: actions/checkout@v4
+      - name: 🧹 Cleanup 🧹
+        run: |
+          If (Test-Path C:\Users\runneradmin\.cargo\bin\rustfmt.exe) { Remove-Item C:\Users\runneradmin\.cargo\bin\rustfmt.exe }
+          If (Test-Path C:\Users\runneradmin\.cargo\bin\cargo-fmt.exe) { Remove-Item C:\Users\runneradmin\.cargo\bin\cargo-fmt.exe }
+          If (Test-Path C:\Users\runneradmin\.cargo\bin\rust-analyzer.exe) { Remove-Item C:\Users\runneradmin\.cargo\bin\rust-analyzer.exe }
+      - name: 🧰 Toolchain 🧰
+        run: |
+          rustup toolchain remove ${{ matrix.channel }}-${{ matrix.target }}
+          rustup toolchain install ${{ matrix.channel }}-${{ matrix.target }} --profile minimal --no-self-update
+          rustup default ${{ matrix.channel }}
+      - name: 💵 Rust Cache 💵
+        uses: Swatinem/rust-cache@v2
+        if: ${{ github.event_name != 'pull_request' || ! github.event.pull_request.head.repo.fork }}
+        with:
+          key: ${{ matrix.target }}
+          cache-all-crates: true
+      - name: 💾 Install (cargo-matrix) 💾
+        run: |
+          rustup toolchain install nightly
+          rustup override set nightly
+          cargo install cargo-matrix --force
+          rustup override remove
+      - name: 🧪 Test 🧪
+        run: cargo matrix --channel no-fido2 test
 
   coverage-linux:
     name: 🧱 Coverage (Linux) 🧱

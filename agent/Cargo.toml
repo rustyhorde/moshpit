@@ -87,3 +87,19 @@ mutually_exclusive = [
     "tpm",
   ],
 ]
+
+[[package.metadata.cargo-matrix.channel]]
+name = "no-fido2"
+# Used on CI runners without libfido2 (e.g. Windows). Same as default minus fido2.
+include_optional = ["secret-service"]
+always_deny = ["fido2"]
+mutually_exclusive = [
+  [
+    "fprintd",
+    "macos-keychain",
+    "secret-service",
+    "ssh-agent-piggyback",
+    "systemd-creds",
+    "tpm",
+  ],
+]
