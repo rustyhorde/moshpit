@@ -227,6 +227,7 @@ fn sign_data(id: &Identity, data: &[u8]) -> AgentResponse {
     }
 }
 
+#[cfg_attr(nightly, allow(clippy::too_many_lines))]
 async fn dispatch_request(
     request: AgentRequest,
     identities: &IdentityMap,
@@ -239,6 +240,22 @@ async fn dispatch_request(
             let map = identities.lock().await;
             let ids: Vec<AgentIdentityInfo> = map
                 .values()
+                .map(|id| AgentIdentityInfo {
+                    algorithm: id.algorithm.clone(),
+                    fingerprint: id.fingerprint.clone(),
+                    comment: String::new(),
+                })
+                .collect();
+            AgentResponse::Identities(ids)
+        }
+
+        AgentRequest::ListSupportedIdentities {
+            supported_algorithms,
+        } => {
+            let map = identities.lock().await;
+            let ids: Vec<AgentIdentityInfo> = map
+                .values()
+                .filter(|id| supported_algorithms.contains(&id.algorithm))
                 .map(|id| AgentIdentityInfo {
                     algorithm: id.algorithm.clone(),
                     fingerprint: id.fingerprint.clone(),
@@ -396,6 +413,12 @@ async fn send_to_agent(socket_path: &Path, request: AgentRequest) -> Result<Agen
     client.send(&request).await
 }
 
+fn read_passphrase_stdin() -> Result<String> {
+    let mut line = String::new();
+    let _n = std::io::stdin().lock().read_line(&mut line)?;
+    Ok(line.trim_end_matches(['\n', '\r']).to_string())
+}
+
 fn read_key_passphrase(from_stdin: bool, key_path: &str) -> Result<Option<String>> {
     if from_stdin {
         let mut line = String::new();
@@ -415,7 +438,45 @@ fn read_key_passphrase(from_stdin: bool, key_path: &str) -> Result<Option<String
     }
 }
 
+/// Algorithms in preference order (strongest first), filtered to those supported by this build.
+#[cfg(not(feature = "unstable"))]
+const PREFERENCE_ORDER: &[&str] = &["P384", "P256", "X25519"];
+#[cfg(feature = "unstable")]
+const PREFERENCE_ORDER: &[&str] = &[
+    "ML-DSA-87",
+    "ML-DSA-65",
+    "ML-DSA-44",
+    "P384",
+    "P256",
+    "X25519",
+];
+
+/// Returns the identity that would be selected (highest-ranked algorithm).
+fn best_identity(ids: &[AgentIdentityInfo]) -> &AgentIdentityInfo {
+    for alg in PREFERENCE_ORDER {
+        if let Some(id) = ids.iter().find(|id| id.algorithm == *alg) {
+            return id;
+        }
+    }
+    &ids[0]
+}
+
+/// Prints the key-selection hint to stderr when multiple keys are loaded.
+fn print_selection_hint(ids: &[AgentIdentityInfo], command: &str) {
+    let best = best_identity(ids);
+    let hierarchy = PREFERENCE_ORDER.join(" > ");
+    eprintln!(
+        "note: {} keys loaded — {} ({}) will be used (strongest available).",
+        ids.len(),
+        best.fingerprint,
+        best.algorithm
+    );
+    eprintln!("      preference: {hierarchy}");
+    eprintln!("      pass --no-hint to {command} to suppress");
+}
+
 #[cfg_attr(coverage_nightly, coverage(off))]
+#[cfg_attr(nightly, allow(clippy::too_many_lines))]
 pub(crate) async fn run<I, T>(args: Option<I>) -> Result<()>
 where
     I: IntoIterator<Item = T>,
@@ -433,18 +494,21 @@ where
             vault,
             foreground,
             backend,
+            passphrase_stdin,
         } => {
             run_daemon(
                 socket.as_deref(),
                 vault.as_deref(),
                 *foreground,
                 backend.clone(),
+                *passphrase_stdin,
             )
             .await
         }
         Commands::AddKey {
             key_path,
             passphrase_stdin,
+            no_hint,
         } => {
             let passphrase = read_key_passphrase(*passphrase_stdin, key_path)?;
             let socket_path = socket_from_env()?;
@@ -457,13 +521,24 @@ where
             )
             .await?;
             match resp {
-                AgentResponse::Ok => println!("Identity added."),
+                AgentResponse::Ok => {
+                    println!("Identity added.");
+                    if !no_hint {
+                        let list_resp =
+                            send_to_agent(&socket_path, AgentRequest::ListIdentities).await?;
+                        if let AgentResponse::Identities(ids) = list_resp
+                            && ids.len() > 1
+                        {
+                            print_selection_hint(&ids, "add-key");
+                        }
+                    }
+                }
                 AgentResponse::Error(e) => return Err(anyhow!("agent error: {e}")),
                 _ => return Err(anyhow!("unexpected response")),
             }
             Ok(())
         }
-        Commands::List => {
+        Commands::List { no_hint } => {
             let socket_path = socket_from_env()?;
             let resp = send_to_agent(&socket_path, AgentRequest::ListIdentities).await?;
             match resp {
@@ -473,6 +548,9 @@ where
                     } else {
                         for id in &ids {
                             println!("{} {} {}", id.fingerprint, id.algorithm, id.comment);
+                        }
+                        if !no_hint && ids.len() > 1 {
+                            print_selection_hint(&ids, "list");
                         }
                     }
                 }
@@ -570,6 +648,7 @@ async fn run_daemon(
     vault_override: Option<&str>,
     foreground: bool,
     backend: String,
+    passphrase_stdin: bool,
 ) -> Result<()> {
     let config = AgentConfig::resolve(socket_override, vault_override, foreground, backend);
 
@@ -594,9 +673,13 @@ async fn run_daemon(
     }
 
     let backend = unlock_backend(&config);
-    let needs_passphrase = config.vault_path.exists() || config.backend == "fido2";
-    let master_passphrase = if needs_passphrase {
+    let vault_exists = config.vault_path.exists();
+    let master_passphrase = if passphrase_stdin && config.backend == "passphrase" {
+        read_passphrase_stdin()?
+    } else if vault_exists {
         backend.retrieve_passphrase()?
+    } else if config.backend == "fido2" || config.backend == "passphrase" {
+        backend.set_passphrase()?
     } else {
         String::new()
     };

@@ -45,11 +45,20 @@ use anyhow::Result;
     allow(multiple_supertrait_upcastable)
 )]
 pub(crate) trait UnlockBackend: Send + Sync {
-    /// Retrieve the master passphrase.
+    /// Retrieve the master passphrase for an existing vault.
     ///
     /// Returns the passphrase string on success, or an error if the backend
     /// failed, is unavailable, or the user cancelled.
     fn retrieve_passphrase(&self) -> Result<String>;
+
+    /// Set the master passphrase when creating a new vault (first launch).
+    ///
+    /// The default implementation delegates to [`retrieve_passphrase`].
+    /// Backends that support interactive setup (e.g. passphrase with
+    /// confirmation) should override this.
+    fn set_passphrase(&self) -> Result<String> {
+        self.retrieve_passphrase()
+    }
 
     /// A human-readable name for this backend (used in log messages).
     #[allow(dead_code)]

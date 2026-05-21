@@ -23,6 +23,13 @@ impl UnlockBackend for PassphraseBackend {
             .interact()?)
     }
 
+    fn set_passphrase(&self) -> Result<String> {
+        Ok(Password::new()
+            .with_prompt("Set moshpit-agent master passphrase")
+            .with_confirmation("Confirm master passphrase", "Passphrases do not match")
+            .interact()?)
+    }
+
     fn name(&self) -> &'static str {
         "passphrase"
     }

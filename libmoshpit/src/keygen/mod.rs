@@ -57,6 +57,42 @@ pub const KEY_ALGORITHM_ML_DSA_65: &str = "ML-DSA-65";
 /// The experimental key algorithm string for ML-DSA-87 identity keys.
 #[cfg(feature = "unstable")]
 pub const KEY_ALGORITHM_ML_DSA_87: &str = "ML-DSA-87";
+
+/// Returns a numeric strength rank for a key algorithm (higher = stronger).
+///
+/// Used by the client to select the strongest available identity from the agent
+/// when multiple keys are loaded. Unknown algorithms rank lowest (0).
+pub(crate) fn algorithm_strength_rank(alg: &str) -> u8 {
+    match alg {
+        "ML-DSA-87" => 6,
+        "ML-DSA-65" => 5,
+        "ML-DSA-44" => 4,
+        KEY_ALGORITHM_P384 => 3,
+        KEY_ALGORITHM_P256 => 2,
+        KEY_ALGORITHM_X25519 => 1,
+        _ => 0,
+    }
+}
+
+/// Identity key algorithms supported by this build of libmoshpit.
+///
+/// Passed to [`crate::agent::client::AgentClient::list_supported_identities`] so the
+/// agent returns only keys this client can actually use.
+#[cfg(not(feature = "unstable"))]
+pub(crate) const SUPPORTED_IDENTITY_ALGORITHMS: &[&str] =
+    &[KEY_ALGORITHM_X25519, KEY_ALGORITHM_P256, KEY_ALGORITHM_P384];
+
+/// Identity key algorithms supported by this build of libmoshpit (unstable variant).
+#[cfg(feature = "unstable")]
+pub(crate) const SUPPORTED_IDENTITY_ALGORITHMS: &[&str] = &[
+    KEY_ALGORITHM_X25519,
+    KEY_ALGORITHM_P256,
+    KEY_ALGORITHM_P384,
+    KEY_ALGORITHM_ML_DSA_44,
+    KEY_ALGORITHM_ML_DSA_65,
+    KEY_ALGORITHM_ML_DSA_87,
+];
+
 const NONE_CIPHER: &str = "none";
 const NONE_KDF: &str = "none";
 const KEY_CIPHER: &str = "aes-256-gcm-siv";
@@ -1121,5 +1157,19 @@ mod tests {
         assert!(!loaded.public_key().is_empty());
         assert!(!loaded.private_key().is_empty());
         Ok(())
+    }
+
+    #[test]
+    fn algorithm_strength_rank_ordering() {
+        use super::algorithm_strength_rank;
+        // Stronger algorithms rank higher.
+        assert!(algorithm_strength_rank("P384") > algorithm_strength_rank("P256"));
+        assert!(algorithm_strength_rank("P256") > algorithm_strength_rank("X25519"));
+        assert!(algorithm_strength_rank("ML-DSA-87") > algorithm_strength_rank("ML-DSA-65"));
+        assert!(algorithm_strength_rank("ML-DSA-65") > algorithm_strength_rank("ML-DSA-44"));
+        assert!(algorithm_strength_rank("ML-DSA-44") > algorithm_strength_rank("P384"));
+        // Unknown algorithms rank lowest.
+        assert_eq!(algorithm_strength_rank("unknown"), 0);
+        assert!(algorithm_strength_rank("X25519") > algorithm_strength_rank("unknown"));
     }
 }

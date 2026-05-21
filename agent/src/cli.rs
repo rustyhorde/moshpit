@@ -75,6 +75,10 @@ pub(crate) enum Commands {
         /// binary.
         #[clap(long, value_name = "BACKEND", default_value_t = default_backend())]
         backend: String,
+        /// Read the vault master passphrase from stdin instead of prompting
+        /// (useful for scripting and non-interactive environments).
+        #[clap(long, default_value_t = false)]
+        passphrase_stdin: bool,
     },
     /// Add an identity key to the running agent.
     #[clap(about = "Add an identity key to the agent")]
@@ -85,10 +89,17 @@ pub(crate) enum Commands {
         /// Read the key passphrase from stdin instead of prompting.
         #[clap(long, default_value_t = false)]
         passphrase_stdin: bool,
+        /// Suppress the key-selection hint shown when multiple keys are loaded.
+        #[clap(long, default_value_t = false)]
+        no_hint: bool,
     },
     /// List identities held by the running agent.
     #[clap(about = "List identities held by the agent")]
-    List,
+    List {
+        /// Suppress the key-selection hint shown when multiple keys are loaded.
+        #[clap(long, default_value_t = false)]
+        no_hint: bool,
+    },
     /// Remove an identity from the running agent.
     #[clap(about = "Remove an identity from the agent")]
     RemoveKey {
@@ -164,7 +175,7 @@ mod tests {
     #[test]
     fn list_command() -> anyhow::Result<()> {
         let cli = Cli::try_parse_from(["mpa", "list"])?;
-        assert!(matches!(cli.command(), Commands::List));
+        assert!(matches!(cli.command(), Commands::List { .. }));
         Ok(())
     }
 

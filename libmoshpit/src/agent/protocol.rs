@@ -35,6 +35,15 @@ pub struct AgentIdentityInfo {
 pub enum AgentRequest {
     /// List all identities currently held in memory.
     ListIdentities,
+    /// List identities whose algorithm appears in `supported_algorithms`.
+    ///
+    /// Use this instead of [`AgentRequest::ListIdentities`] when the caller may not
+    /// support every algorithm the agent holds (e.g. a client built without the
+    /// `unstable` feature cannot use ML-DSA keys).
+    ListSupportedIdentities {
+        /// Algorithm strings the caller supports (e.g. `["P384", "P256", "X25519"]`).
+        supported_algorithms: Vec<String>,
+    },
     /// Return the full public key file bytes for the identity with the given fingerprint.
     ///
     /// The fingerprint is the `SHA256:<base64>` form without trailing comment.

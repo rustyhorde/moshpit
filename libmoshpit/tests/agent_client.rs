@@ -68,6 +68,33 @@ async fn agent_client_list_identities() {
 }
 
 #[tokio::test]
+async fn agent_client_list_supported_identities() {
+    let path = temp_socket_path("list-supported");
+    let server_path = path.clone();
+    let expected = vec![AgentIdentityInfo {
+        algorithm: "P384".into(),
+        fingerprint: "SHA256:filtered".into(),
+        comment: String::new(),
+    }];
+    let server_response = AgentResponse::Identities(expected.clone());
+
+    let server = tokio::spawn(run_one_shot_server(server_path, server_response));
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let client = libmoshpit::AgentClient::new(path.clone());
+    let ids = client
+        .list_supported_identities(&["P384", "P256", "X25519"])
+        .await
+        .unwrap();
+    assert_eq!(ids.len(), 1);
+    assert_eq!(ids[0].algorithm, "P384");
+    assert_eq!(ids[0].fingerprint, "SHA256:filtered");
+
+    server.await.unwrap();
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
 async fn agent_client_get_public_key() {
     let path = temp_socket_path("pubkey");
     let server_path = path.clone();

@@ -51,20 +51,31 @@ fn temp_vault(name: &str) -> PathBuf {
 }
 
 /// Start the agent in foreground mode and return the child process.
+///
+/// Passes `--passphrase-stdin` with an empty passphrase so the daemon starts
+/// non-interactively in test environments.
 fn start_agent(socket: &Path, vault: &Path) -> Child {
-    Command::new(agent_binary())
+    use std::io::Write as _;
+    let mut child = Command::new(agent_binary())
         .args([
             "start",
             "--foreground",
+            "--passphrase-stdin",
             "--socket",
             socket.to_str().unwrap(),
             "--vault",
             vault.to_str().unwrap(),
         ])
+        .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .expect("failed to start mpa")
+        .expect("failed to start mpa");
+    // Write empty passphrase (newline) then close stdin so the daemon doesn't block.
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(b"\n");
+    }
+    child
 }
 
 async fn wait_for_socket(socket: &Path, timeout: Duration) -> bool {

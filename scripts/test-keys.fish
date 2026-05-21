@@ -26,7 +26,18 @@ set -g MP_CONF     "scripts/mp-test.toml"
 set -g MP_BIN      "$REPO_DIR/target/debug/mp"
 set -g MPS_BIN     "$REPO_DIR/target/debug/mps"
 set -g KEYGEN_BIN  "$REPO_DIR/target/debug/mp-keygen"
+set -g MPA_BIN     "$REPO_DIR/target/debug/mpa"
+set -g AGENT_SOCK  /tmp/test-keys-agent.sock
+set -g AGENT_VAULT /tmp/test-keys-agent-vault
+set -g AGENT_PASS  test-agent-pass
 set SESSION_NAME   moshpit-keytest
+
+# ── Command-line flags ────────────────────────────────────────────────────────
+
+set -g USE_AGENT 0
+if contains -- --agent $argv
+    set -g USE_AGENT 1
+end
 
 # Parallel arrays tracking results for the final summary.
 set -g RESULT_LABELS
@@ -37,7 +48,7 @@ set -g RESULT_STATUSES
 if not set -q TMUX; or test (tmux display-message -p '#S') != $SESSION_NAME
     tmux kill-session -t $SESSION_NAME 2>/dev/null
     tmux new-session -d -s $SESSION_NAME -x 220 -y 50 -c $REPO_DIR
-    tmux send-keys -t "$SESSION_NAME:0" "fish $SCRIPT_DIR/test-keys.fish" Enter
+    tmux send-keys -t "$SESSION_NAME:0" "fish $SCRIPT_DIR/test-keys.fish "(string join " " -- $argv)"" Enter
     if set -q TMUX
         tmux switch-client -t $SESSION_NAME
     else
@@ -78,6 +89,7 @@ mkdir -p $LOGS_DIR
 set -g TODAY     (date +%Y-%m-%d)
 set -g LOG_MPS   "$LOGS_DIR/mps.log.$TODAY"
 set -g LOG_MP    "$LOGS_DIR/mp.log.$TODAY"
+set -g LOG_MPA   "$LOGS_DIR/mpa.log.$TODAY"
 touch $LOG_MPS $LOG_MP
 
 tmux send-keys -t $LOG_LEFT  "tail -F $LOG_MPS" Enter
@@ -157,6 +169,11 @@ end
 function cleanup
     echo ""
     echo "═══ Cleaning up ═══"
+    if test $USE_AGENT -eq 1
+        pkill -f $AGENT_SOCK 2>/dev/null; or true
+        rm -f $AGENT_VAULT $AGENT_SOCK
+        echo "  ✓ Agent stopped and vault removed."
+    end
     remove_client_keys
     rm -rf $KEYS_DIR
     echo "  ✓ $KEYS_DIR removed."
@@ -345,10 +362,22 @@ for pkg in moshpit moshpits moshpit-keygen
     end
 end
 
+if test $USE_AGENT -eq 1
+    echo "  cargo build -p moshpit-agent --features unstable"
+    cargo build -p moshpit-agent --features unstable
+    or begin
+        echo "  Build failed for moshpit-agent — aborting."
+        exit 1
+    end
+end
+
 echo ""
-echo "  ✓ mp:       $MP_BIN"
-echo "  ✓ mps:      $MPS_BIN"
+echo "  ✓ mp:        $MP_BIN"
+echo "  ✓ mps:       $MPS_BIN"
 echo "  ✓ mp-keygen: $KEYGEN_BIN"
+if test $USE_AGENT -eq 1
+    echo "  ✓ mpa:       $MPA_BIN"
+end
 
 # ── Key Generation (fully automatic) ─────────────────────────────────────────
 
@@ -379,6 +408,49 @@ echo ""
 echo "  ✓ All keys written to $KEYS_DIR"
 echo "  ✓ Client public keys registered in $AUTH_KEYS"
 
+# ── Agent Setup ───────────────────────────────────────────────────────────────
+
+if test $USE_AGENT -eq 1
+    banner "Starting mpa agent (unstable)"
+    rm -f $AGENT_VAULT $AGENT_SOCK
+    touch $LOG_MPA
+
+    echo $AGENT_PASS | $MPA_BIN start \
+        --foreground \
+        --backend passphrase \
+        --passphrase-stdin \
+        --vault $AGENT_VAULT \
+        --socket $AGENT_SOCK > $LOG_MPA 2>&1 &
+    set -gx MOSHPIT_AGENT_SOCK $AGENT_SOCK
+
+    # Wait for the socket to appear (up to 3 s, 15 × 0.2 s).
+    set -l attempts 0
+    while not test -S $AGENT_SOCK
+        sleep 0.2
+        set attempts (math $attempts + 1)
+        if test $attempts -ge 15
+            echo "  ✗ Agent socket did not appear after 3 s — aborting."
+            exit_with_failure
+        end
+    end
+
+    echo "  Loading all client keys into agent..."
+    for kt in x25519 p384 p256 mldsa44 mldsa65 mldsa87
+        echo "    add-key $kt"
+        echo "test" | $MPA_BIN add-key "$KEYS_DIR/client_$kt" --passphrase-stdin
+        or begin
+            echo "  ✗ Failed to add $kt key to agent — aborting."
+            pkill -f $AGENT_SOCK 2>/dev/null; or true
+            exit_with_failure
+        end
+    end
+
+    $MPA_BIN list
+    echo ""
+    echo "  ✓ Agent running:  $AGENT_SOCK"
+    echo "  ✓ Agent log:      $LOG_MPA"
+end
+
 # ── Test Selection ────────────────────────────────────────────────────────────
 
 banner "Test Selection"
@@ -399,7 +471,7 @@ end
 echo "  $tbl_line"
 echo ""
 echo "  Enter a single test number, a comma-separated list (e.g. 1,3,13),"
-echo "  or 'all' to run every test."
+echo "  a range (e.g. 10-15), a mix (e.g. 10-15,25), or 'all'."
 echo ""
 
 # Loop until a valid selection is entered.
@@ -418,19 +490,42 @@ while true
     set -l parsed
 
     for part in $parts
-        set -l n (string trim -- $part)
-        if not string match -qr '^[0-9]+$' -- $n
-            echo "  ✗ '$n' is not a valid number — try again."
+        set -l token (string trim -- $part)
+
+        if string match -qr '^[0-9]+-[0-9]+$' -- $token
+            # Range token: N-M
+            set -l bounds (string split "-" -- $token)
+            set -l lo $bounds[1]
+            set -l hi $bounds[2]
+            if test $lo -ge $hi
+                echo "  ✗ Range '$token' must be ascending (low-high) — try again."
+                set valid 0
+                break
+            end
+            if test $lo -lt 1 -o $hi -gt $TOTAL_TESTS
+                echo "  ✗ Range '$token' out of bounds (1–$TOTAL_TESTS) — try again."
+                set valid 0
+                break
+            end
+            for n in (seq $lo $hi)
+                if not contains -- $n $parsed
+                    set -a parsed $n
+                end
+            end
+        else if string match -qr '^[0-9]+$' -- $token
+            # Single number
+            if test $token -lt 1 -o $token -gt $TOTAL_TESTS
+                echo "  ✗ $token is out of range (1–$TOTAL_TESTS) — try again."
+                set valid 0
+                break
+            end
+            if not contains -- $token $parsed
+                set -a parsed $token
+            end
+        else
+            echo "  ✗ '$token' is not a valid number or range — try again."
             set valid 0
             break
-        end
-        if test $n -lt 1 -o $n -gt $TOTAL_TESTS
-            echo "  ✗ $n is out of range (1–$TOTAL_TESTS) — try again."
-            set valid 0
-            break
-        end
-        if not contains -- $n $parsed
-            set -a parsed $n
         end
     end
 
@@ -456,6 +551,10 @@ banner "Connection Tests ($n_sel selected)"
 echo "  mps starts first, then mp connects after 1 s."
 echo "  Stop both panes (Ctrl-C) when done, then answer pass/fail here."
 echo "  Logs: $LOGS_DIR"
+if test $USE_AGENT -eq 1
+    echo "  Mode: agent (identity provided by mpa — no passphrase prompt)"
+    echo "  Agent: $AGENT_SOCK  (log: $LOG_MPA)"
+end
 echo ""
 read -P "  Press Enter to begin..." _begin
 
@@ -469,7 +568,12 @@ for i in $SELECTED_TESTS
     set -l label  (printf "[%02d/%02d]  %s" $i $TOTAL_TESTS "$ALL_LABELS[$i]")
 
     set -l this_mps "$MPS_BASE $mflag -p $KEYS_DIR/server_$key -k $KEYS_DIR/server_$key.pub"
-    set -l this_mp  "$MP_BASE $pflag -p $KEYS_DIR/client_$key -k $KEYS_DIR/client_$key.pub 127.0.0.1"
+    set -l this_mp ""
+    if test $USE_AGENT -eq 1
+        set this_mp "env MOSHPIT_AGENT_SOCK=$AGENT_SOCK $MP_BASE $pflag 127.0.0.1"
+    else
+        set this_mp "$MP_BASE $pflag -p $KEYS_DIR/client_$key -k $KEYS_DIR/client_$key.pub 127.0.0.1"
+    end
 
     run_test "$label" "$ALL_EXPECT_FAIL[$i]" "$this_mps" "$this_mp"
     or begin; exit_with_failure; end

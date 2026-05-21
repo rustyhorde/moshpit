@@ -551,32 +551,39 @@ impl KexReader {
                 }
 
                 #[cfg(feature = "unstable")]
-                if is_ml_dsa_algorithm(&self.client_identity_key_algorithm) {
-                    let transcript = identity_transcript(&IdentityTranscriptParts {
-                        role: b"client",
-                        negotiated: &negotiated,
-                        user: &transcript_user,
-                        client_exchange: &transcript_client_exchange,
-                        client_identity: &self.full_public_key_bytes,
-                        server_identity: &identity_pk,
-                        server_exchange: &ephemeral_pk,
-                        salt: &salt_bytes,
-                    })?;
-                    let signature = if let (Some(socket), Some(fp)) =
-                        (&self.agent_socket, &self.agent_fingerprint)
-                    {
-                        // Delegate signing to the agent — private key stays in agent memory.
-                        crate::agent::client::AgentClient::new(socket.clone())
-                            .sign(fp, &transcript)
-                            .await?
-                    } else {
-                        sign_identity_transcript(
-                            &self.client_identity_key_algorithm,
-                            &self.client_identity_private_key,
-                            &transcript,
-                        )?
-                    };
-                    self.tx.send(Frame::IdentityProof(signature))?;
+                {
+                    // Derive the algorithm from the public-key bytes rather than from
+                    // client_identity_key_algorithm, which is empty on the agent path.
+                    let effective_alg = parse_full_public_key(&self.full_public_key_bytes)
+                        .map(|(alg, _)| alg)
+                        .unwrap_or_default();
+                    if is_ml_dsa_algorithm(&effective_alg) {
+                        let transcript = identity_transcript(&IdentityTranscriptParts {
+                            role: b"client",
+                            negotiated: &negotiated,
+                            user: &transcript_user,
+                            client_exchange: &transcript_client_exchange,
+                            client_identity: &self.full_public_key_bytes,
+                            server_identity: &identity_pk,
+                            server_exchange: &ephemeral_pk,
+                            salt: &salt_bytes,
+                        })?;
+                        let signature = if let (Some(socket), Some(fp)) =
+                            (&self.agent_socket, &self.agent_fingerprint)
+                        {
+                            // Delegate signing to the agent — private key stays in agent memory.
+                            crate::agent::client::AgentClient::new(socket.clone())
+                                .sign(fp, &transcript)
+                                .await?
+                        } else {
+                            sign_identity_transcript(
+                                &effective_alg,
+                                &self.client_identity_private_key,
+                                &transcript,
+                            )?
+                        };
+                        self.tx.send(Frame::IdentityProof(signature))?;
+                    }
                 }
 
                 let shared_secret = match client_ephemeral {

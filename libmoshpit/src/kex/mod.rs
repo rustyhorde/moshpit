@@ -32,13 +32,16 @@ use tokio::{
     sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
     task::JoinHandle,
 };
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 use crate::{
     AgentClient, ConnectionReader, ConnectionWriter, Frame, KexConfig, KexReader, KexSender,
-    MoshpitError, UuidWrapper, kex::negotiate::NegotiatedAlgorithms, load_identity_key,
-    load_public_key, udp::DiffMode,
+    MoshpitError, UuidWrapper,
+    kex::negotiate::NegotiatedAlgorithms,
+    keygen::{SUPPORTED_IDENTITY_ALGORITHMS, algorithm_strength_rank},
+    load_identity_key, load_public_key,
+    udp::DiffMode,
 };
 
 fn fmt_hex(bytes: &[u8]) -> String {
@@ -429,32 +432,57 @@ async fn run_client_kex<T: KexConfig>(
 ) -> Result<(Kex, Arc<UdpSocket>, Option<ServerKex>)> {
     let agent_socket = config.agent_socket();
 
-    // Resolve identity: either from a running agent or directly from key files.
-    let (full_public_key_bytes, agent_fingerprint) = if let Some(ref socket) = agent_socket {
+    // Resolve identity: try agent first, fall back to key files if agent is
+    // unavailable or has no compatible identities.
+    let agent_result: Option<(Vec<u8>, String)> = if let Some(ref socket) = agent_socket {
         info!("Agent socket configured — loading identity from moshpit-agent");
         let client = AgentClient::new(socket.clone());
-        let ids = client.list_identities().await.map_err(|e| {
-            error!("Failed to list agent identities: {e}");
-            MoshpitError::KeyFileMissing
-        })?;
-        if ids.is_empty() {
-            error!("Agent has no loaded identities — run `mpa add-key <path>` first");
-            return Err(MoshpitError::KeyFileMissing.into());
+        match client
+            .list_supported_identities(SUPPORTED_IDENTITY_ALGORITHMS)
+            .await
+        {
+            Ok(mut ids) if !ids.is_empty() => {
+                ids.sort_by_key(|id| std::cmp::Reverse(algorithm_strength_rank(&id.algorithm)));
+                let id = &ids[0];
+                info!(
+                    "Using agent identity: {} ({})",
+                    id.fingerprint, id.algorithm
+                );
+                match client.get_public_key(&id.fingerprint).await {
+                    Ok(pk_bytes) => Some((pk_bytes, id.fingerprint.clone())),
+                    Err(e) => {
+                        warn!(
+                            "Failed to get public key from agent ({e}) — falling back to key file"
+                        );
+                        None
+                    }
+                }
+            }
+            Ok(_) => {
+                warn!(
+                    "Agent has no identities with algorithms supported by this client \
+                     (supported: {}) — falling back to key file",
+                    SUPPORTED_IDENTITY_ALGORITHMS.join(", ")
+                );
+                None
+            }
+            Err(e) => {
+                warn!("Failed to contact agent ({e}) — falling back to key file");
+                None
+            }
         }
-        let id = &ids[0];
-        info!(
-            "Using agent identity: {} ({})",
-            id.fingerprint, id.algorithm
-        );
-        let pk_bytes = client.get_public_key(&id.fingerprint).await.map_err(|e| {
-            error!("Failed to get public key from agent: {e}");
-            MoshpitError::KeyFileMissing
-        })?;
-        (pk_bytes, Some(id.fingerprint.clone()))
+    } else {
+        None
+    };
+
+    let (full_public_key_bytes, agent_fingerprint) = if let Some((pk_bytes, fp)) = agent_result {
+        (pk_bytes, Some(fp))
     } else {
         let (private_key_path, public_key_path) = config.key_pair_paths()?;
-        info!("Loading private key from {}", private_key_path.display());
-        info!("Loading public key from {}", public_key_path.display());
+        info!(
+            "Agent not configured (or fell back) — loading identity from key file: {}",
+            private_key_path.display()
+        );
 
         let (full_pub_bytes, public_key_bytes) = load_public_key(&public_key_path)
             .inspect_err(|e| {
@@ -497,7 +525,8 @@ async fn run_client_kex<T: KexConfig>(
             return Err(MoshpitError::KeyPairMismatch.into());
         }
         info!(
-            "Private identity key ({}) verified successfully",
+            "Using file identity: {} ({})",
+            public_key_path.display(),
             identity_key.key_algorithm()
         );
 
@@ -513,23 +542,24 @@ async fn run_client_kex<T: KexConfig>(
     // For file-based path, we need the identity_key for unstable signing.
     // Re-load it here (only in the non-agent branch that reaches this point).
     #[cfg(feature = "unstable")]
-    let (client_identity_key_algorithm, client_identity_private_key) = if agent_socket.is_some() {
-        // Agent holds the private key; algorithm is looked up from fingerprint.
-        // The `agent_fingerprint` carries the algorithm at signing time.
-        (String::new(), vec![])
-    } else {
-        let (private_key_path, _) = config.key_pair_paths()?;
-        let identity_key = load_identity_key(&private_key_path, None).or_else(|_| {
-            let passphrase = passphrase_fn()?;
-            let p = passphrase.ok_or(MoshpitError::KeyCorrupt)?;
-            load_identity_key(&private_key_path, Some(&p))
-                .map_err(|_| anyhow::anyhow!(MoshpitError::KeyCorrupt))
-        })?;
-        (
-            identity_key.key_algorithm().clone(),
-            identity_key.private_key().clone(),
-        )
-    };
+    let (client_identity_key_algorithm, client_identity_private_key) =
+        if agent_fingerprint.is_some() {
+            // Agent holds the private key; algorithm is looked up from fingerprint.
+            // The `agent_fingerprint` carries the algorithm at signing time.
+            (String::new(), vec![])
+        } else {
+            let (private_key_path, _) = config.key_pair_paths()?;
+            let identity_key = load_identity_key(&private_key_path, None).or_else(|_| {
+                let passphrase = passphrase_fn()?;
+                let p = passphrase.ok_or(MoshpitError::KeyCorrupt)?;
+                load_identity_key(&private_key_path, Some(&p))
+                    .map_err(|_| anyhow::anyhow!(MoshpitError::KeyCorrupt))
+            })?;
+            (
+                identity_key.key_algorithm().clone(),
+                identity_key.private_key().clone(),
+            )
+        };
 
     // Setup the TCP frame reader
     let tx_c = tx.clone();

@@ -64,6 +64,37 @@ impl AgentClient {
         }
     }
 
+    /// List only identities whose algorithm the client supports.
+    ///
+    /// Prefer this over [`AgentClient::list_identities`] when the caller may not support all
+    /// algorithms the agent holds; the agent filters the response so only usable
+    /// identities are returned.
+    ///
+    /// Pass `libmoshpit::keygen::SUPPORTED_IDENTITY_ALGORITHMS` to advertise the
+    /// compile-time capability set of this build.
+    ///
+    /// # Errors
+    /// Returns an error if the agent is unreachable or returns an error response.
+    pub async fn list_supported_identities(
+        &self,
+        supported_algorithms: &[&str],
+    ) -> Result<Vec<AgentIdentityInfo>> {
+        let supported_algorithms = supported_algorithms
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        match self
+            .send(&AgentRequest::ListSupportedIdentities {
+                supported_algorithms,
+            })
+            .await?
+        {
+            AgentResponse::Identities(ids) => Ok(ids),
+            AgentResponse::Error(e) => Err(anyhow!("agent error: {e}")),
+            other => Err(anyhow!("unexpected agent response: {other:?}")),
+        }
+    }
+
     /// Fetch the full public key file bytes for the given fingerprint.
     ///
     /// # Errors
