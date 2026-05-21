@@ -40,7 +40,7 @@ jobs:
           toolchain: "1.91.1"
 
       - name: 💾 Install (cargo-binstall) 💾
-        uses: cargo-bins/cargo-binstall@main
+        uses: cargo-bins/cargo-binstall@1c2b96c2b86875d56caeec7b7ee9980812daf0d9 # main
 
       - name: 💾 Install (cross) 💾
         run: cargo binstall --no-confirm --no-symlinks --no-discover-github-token cross --version 0.2.5

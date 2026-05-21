@@ -34,7 +34,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
 
       - name: 💾 Install (cargo-binstall) 💾
-        uses: cargo-bins/cargo-binstall@main
+        uses: cargo-bins/cargo-binstall@1c2b96c2b86875d56caeec7b7ee9980812daf0d9 # main
 
       - name: 📦 Install cargo-audit 📦
         run: cargo binstall --no-confirm --no-symlinks --no-discover-github-token cargo-audit

@@ -31,7 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: ✅ Checkout ✅
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: 🧹 Cleanup 🧹
         run: |
           rm -rf /home/runner/.cargo/bin/rustfmt
@@ -43,7 +43,7 @@ jobs:
           rustup toolchain install nightly --profile default --no-self-update
           rustup default nightly
       - name: 💵 Rust Cache 💵
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         if: ${{ github.event_name != 'pull_request' || ! github.event.pull_request.head.repo.fork }}
         with:
           key: x86_64-unknown-linux-gnu
@@ -51,7 +51,7 @@ jobs:
       - name: 🔧 Install libfido2 + libtpm2-tss 🔧
         run: sudo apt-get update && sudo apt-get install -y libfido2-dev libtss2-dev
       - name: 💾 Install (cargo-binstall) 💾
-        uses: cargo-bins/cargo-binstall@main
+        uses: cargo-bins/cargo-binstall@1c2b96c2b86875d56caeec7b7ee9980812daf0d9 # main
       - name: 💾 Install (cargo-matrix) 💾
         run: |
           rustup toolchain install nightly
@@ -67,14 +67,14 @@ jobs:
     runs-on: macos-latest
     steps:
       - name: ✅ Checkout ✅
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: 🧰 Toolchain 🧰
         run: |
           rustup toolchain remove nightly
           rustup toolchain install nightly --profile default --no-self-update
           rustup default nightly
       - name: 💵 Rust Cache 💵
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         if: ${{ github.event_name != 'pull_request' || ! github.event.pull_request.head.repo.fork }}
         with:
           key: apple-darwin
@@ -84,7 +84,7 @@ jobs:
           brew install libfido2
           echo "PKG_CONFIG_PATH=$(brew --prefix libfido2)/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" >> "$GITHUB_ENV"
       - name: 💾 Install (cargo-binstall) 💾
-        uses: cargo-bins/cargo-binstall@main
+        uses: cargo-bins/cargo-binstall@1c2b96c2b86875d56caeec7b7ee9980812daf0d9 # main
       - name: 💾 Install (cargo-matrix) 💾
         run: |
           rustup toolchain install nightly
@@ -100,7 +100,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: ✅ Checkout ✅
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: 🧹 Cleanup 🧹
         run: |
           If (Test-Path C:\Users\runneradmin\.cargo\bin\rustfmt.exe) { Remove-Item C:\Users\runneradmin\.cargo\bin\rustfmt.exe }
@@ -112,13 +112,13 @@ jobs:
           rustup toolchain install nightly --profile default --no-self-update
           rustup default nightly
       - name: 💵 Rust Cache 💵
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         if: ${{ github.event_name != 'pull_request' || ! github.event.pull_request.head.repo.fork }}
         with:
           key: x86_64-pc-windows-gnu
           cache-all-crates: true
       - name: 💾 Install (cargo-binstall) 💾
-        uses: cargo-bins/cargo-binstall@main
+        uses: cargo-bins/cargo-binstall@1c2b96c2b86875d56caeec7b7ee9980812daf0d9 # main
       - name: 💾 Install (cargo-matrix) 💾
         run: |
           rustup toolchain install nightly
@@ -139,7 +139,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: ✅ Checkout ✅
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: 🧹 Cleanup 🧹
         run: |
           rm -rf /home/runner/.cargo/bin/rustfmt
@@ -151,7 +151,7 @@ jobs:
           rustup toolchain install ${{ matrix.channel }}-${{ matrix.target }} --profile minimal --no-self-update
           rustup default ${{ matrix.channel }}
       - name: 💵 Rust Cache 💵
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         if: ${{ github.event_name != 'pull_request' || ! github.event.pull_request.head.repo.fork }}
         with:
           key: ${{ matrix.target }}
@@ -159,7 +159,7 @@ jobs:
       - name: 🔧 Install libfido2 + libtpm2-tss 🔧
         run: sudo apt-get update && sudo apt-get install -y libfido2-dev libtss2-dev
       - name: 💾 Install (cargo-binstall) 💾
-        uses: cargo-bins/cargo-binstall@main
+        uses: cargo-bins/cargo-binstall@1c2b96c2b86875d56caeec7b7ee9980812daf0d9 # main
       - name: 💾 Install (cargo-matrix) 💾
         run: |
           rustup toolchain install nightly
@@ -180,14 +180,14 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: ✅ Checkout ✅
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: 🧰 Toolchain 🧰
         run: |
           rustup toolchain remove ${{ matrix.channel }}-${{ matrix.target }}
           rustup toolchain install ${{ matrix.channel }}-${{ matrix.target }} --profile minimal --no-self-update
           rustup default ${{ matrix.channel }}
       - name: 💵 Rust Cache 💵
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         if: ${{ github.event_name != 'pull_request' || ! github.event.pull_request.head.repo.fork }}
         with:
           key: ${{ matrix.target }}
@@ -197,7 +197,7 @@ jobs:
           brew install libfido2
           echo "PKG_CONFIG_PATH=$(brew --prefix libfido2)/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" >> "$GITHUB_ENV"
       - name: 💾 Install (cargo-binstall) 💾
-        uses: cargo-bins/cargo-binstall@main
+        uses: cargo-bins/cargo-binstall@1c2b96c2b86875d56caeec7b7ee9980812daf0d9 # main
       - name: 💾 Install (cargo-matrix) 💾
         run: |
           rustup toolchain install nightly
@@ -218,7 +218,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: ✅ Checkout ✅
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: 🧹 Cleanup 🧹
         run: |
           If (Test-Path C:\Users\runneradmin\.cargo\bin\rustfmt.exe) { Remove-Item C:\Users\runneradmin\.cargo\bin\rustfmt.exe }
@@ -230,13 +230,13 @@ jobs:
           rustup toolchain install ${{ matrix.channel }}-${{ matrix.target }} --profile minimal --no-self-update
           rustup default ${{ matrix.channel }}
       - name: 💵 Rust Cache 💵
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         if: ${{ github.event_name != 'pull_request' || ! github.event.pull_request.head.repo.fork }}
         with:
           key: ${{ matrix.target }}
           cache-all-crates: true
       - name: 💾 Install (cargo-binstall) 💾
-        uses: cargo-bins/cargo-binstall@main
+        uses: cargo-bins/cargo-binstall@1c2b96c2b86875d56caeec7b7ee9980812daf0d9 # main
       - name: 💾 Install (cargo-matrix) 💾
         run: |
           rustup toolchain install nightly
