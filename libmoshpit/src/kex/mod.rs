@@ -32,22 +32,20 @@ use tokio::{
     sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
     task::JoinHandle,
 };
-use tracing::{debug, error, info, trace};
 #[cfg(unix)]
 use tracing::warn;
+use tracing::{debug, error, info, trace};
 use uuid::Uuid;
 
 #[cfg(unix)]
 use crate::AgentClient;
-use crate::{
-    ConnectionReader, ConnectionWriter, Frame, KexConfig, KexReader, KexSender,
-    MoshpitError, UuidWrapper,
-    kex::negotiate::NegotiatedAlgorithms,
-    load_identity_key, load_public_key,
-    udp::DiffMode,
-};
 #[cfg(unix)]
 use crate::keygen::{SUPPORTED_IDENTITY_ALGORITHMS, algorithm_strength_rank};
+use crate::{
+    ConnectionReader, ConnectionWriter, Frame, KexConfig, KexReader, KexSender, MoshpitError,
+    UuidWrapper, kex::negotiate::NegotiatedAlgorithms, load_identity_key, load_public_key,
+    udp::DiffMode,
+};
 
 fn fmt_hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
