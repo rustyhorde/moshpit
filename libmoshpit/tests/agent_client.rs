@@ -6,6 +6,8 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
+#![cfg(unix)]
+
 //! Integration tests for the libmoshpit agent client/protocol.
 //!
 //! These tests spin up a minimal in-process agent server to verify the full

@@ -8,8 +8,10 @@
 
 //! moshpit agent protocol types and async Unix-socket client.
 
+#[cfg(unix)]
 pub mod client;
 pub mod protocol;
 
+#[cfg(unix)]
 pub use self::client::AgentClient;
 pub use self::protocol::{AgentIdentityInfo, AgentRequest, AgentResponse};

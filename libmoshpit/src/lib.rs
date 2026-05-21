@@ -249,6 +249,7 @@ mod udp;
 mod utils;
 mod uuid;
 
+#[cfg(unix)]
 pub use self::agent::AgentClient;
 pub use self::agent::AgentIdentityInfo;
 pub use self::agent::AgentRequest;

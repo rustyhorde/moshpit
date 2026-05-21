@@ -233,20 +233,25 @@
 #![cfg_attr(all(docsrs), feature(doc_cfg))]
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
+#[cfg(unix)]
 use std::process::exit;
 
+#[cfg(unix)]
 use libmoshpit::{clap_or_error, success};
 
+#[cfg(unix)]
 use crate::runtime::run;
 
 mod cli;
 mod config;
+#[cfg(unix)]
 mod runtime;
 mod unlock;
 mod vault;
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 fn main() {
+    #[cfg(unix)]
     exit(
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -254,5 +259,9 @@ fn main() {
             .expect("tokio runtime")
             .block_on(run::<Vec<&str>, &str>(None))
             .map_or_else(clap_or_error, success),
-    )
+    );
+    #[cfg(not(unix))]
+    {
+        eprintln!("mpa agent is not supported on non-Unix platforms");
+    }
 }
