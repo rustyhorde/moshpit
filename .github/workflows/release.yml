@@ -39,17 +39,11 @@ jobs:
         with:
           toolchain: "1.91.1"
 
-      - name: Cache cross binary
-        id: cache-cross
-        # v5
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
-        with:
-          path: ~/.cargo/bin/cross
-          key: cross-v0.2.5
+      - name: 💾 Install (cargo-binstall) 💾
+        uses: cargo-bins/cargo-binstall@main
 
-      - name: Install cross
-        if: steps.cache-cross.outputs.cache-hit != 'true'
-        run: cargo install cross --version 0.2.5 --locked
+      - name: 💾 Install (cross) 💾
+        run: cargo binstall --no-confirm --no-symlinks --no-discover-github-token cross --version 0.2.5
 
       - name: Cache cargo registry
         # v5

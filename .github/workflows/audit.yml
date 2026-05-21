@@ -33,8 +33,11 @@ jobs:
         # v6.0.2
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
 
+      - name: 💾 Install (cargo-binstall) 💾
+        uses: cargo-bins/cargo-binstall@main
+
       - name: 📦 Install cargo-audit 📦
-        run: cargo install cargo-audit --locked
+        run: cargo binstall --no-confirm --no-symlinks --no-discover-github-token cargo-audit
 
       - name: 💣 cargo audit 💣
         id: audit

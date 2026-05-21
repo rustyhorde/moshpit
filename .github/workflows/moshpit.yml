@@ -83,11 +83,13 @@ jobs:
         run: |
           brew install libfido2
           echo "PKG_CONFIG_PATH=$(brew --prefix libfido2)/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" >> "$GITHUB_ENV"
+      - name: 💾 Install (cargo-binstall) 💾
+        uses: cargo-bins/cargo-binstall@main
       - name: 💾 Install (cargo-matrix) 💾
         run: |
           rustup toolchain install nightly
           rustup override set nightly
-          cargo install cargo-matrix --force
+          cargo binstall --no-confirm --no-symlinks --no-discover-github-token cargo-matrix --force
           rustup override remove
       - name: 📎 Clippy 📎
         run: cargo matrix --channel macos clippy --all-targets -- -Dwarnings
@@ -115,11 +117,13 @@ jobs:
         with:
           key: x86_64-pc-windows-gnu
           cache-all-crates: true
+      - name: 💾 Install (cargo-binstall) 💾
+        uses: cargo-bins/cargo-binstall@main
       - name: 💾 Install (cargo-matrix) 💾
         run: |
           rustup toolchain install nightly
           rustup override set nightly
-          cargo install cargo-matrix --force
+          cargo binstall --no-confirm --no-symlinks --no-discover-github-token cargo-matrix --force
           rustup override remove
       - name: 📎 Clippy 📎
         run: cargo matrix --channel windows clippy --all-targets -- -Dwarnings
@@ -192,11 +196,13 @@ jobs:
         run: |
           brew install libfido2
           echo "PKG_CONFIG_PATH=$(brew --prefix libfido2)/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" >> "$GITHUB_ENV"
+      - name: 💾 Install (cargo-binstall) 💾
+        uses: cargo-bins/cargo-binstall@main
       - name: 💾 Install (cargo-matrix) 💾
         run: |
           rustup toolchain install nightly
           rustup override set nightly
-          cargo install cargo-matrix --force
+          cargo binstall --no-confirm --no-symlinks --no-discover-github-token cargo-matrix --force
           rustup override remove
       - name: 🧪 Test 🧪
         run: cargo matrix --channel macos test
@@ -229,11 +235,13 @@ jobs:
         with:
           key: ${{ matrix.target }}
           cache-all-crates: true
+      - name: 💾 Install (cargo-binstall) 💾
+        uses: cargo-bins/cargo-binstall@main
       - name: 💾 Install (cargo-matrix) 💾
         run: |
           rustup toolchain install nightly
           rustup override set nightly
-          cargo install cargo-matrix --force
+          cargo binstall --no-confirm --no-symlinks --no-discover-github-token cargo-matrix --force
           rustup override remove
       - name: 🧪 Test 🧪
         run: cargo matrix --channel windows test
