@@ -118,6 +118,7 @@ pub(crate) enum Commands {
 /// Returns the backend name that matches the compile-time feature set.
 /// For multi-backend builds (e.g. the `full` binary) the first match wins.
 #[allow(unreachable_code)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn default_backend() -> String {
     #[cfg(feature = "fido2")]
     return "fido2".to_string();

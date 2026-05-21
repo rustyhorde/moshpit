@@ -64,3 +64,30 @@ pub(crate) trait UnlockBackend: Send + Sync {
     #[allow(dead_code)]
     fn name(&self) -> &'static str;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::UnlockBackend;
+
+    struct AlwaysOkBackend;
+
+    impl UnlockBackend for AlwaysOkBackend {
+        fn retrieve_passphrase(&self) -> anyhow::Result<String> {
+            Ok("the-passphrase".to_string())
+        }
+
+        fn name(&self) -> &'static str {
+            "always-ok"
+        }
+    }
+
+    #[test]
+    fn default_set_passphrase_delegates_to_retrieve() {
+        assert_eq!(AlwaysOkBackend.set_passphrase().unwrap(), "the-passphrase");
+    }
+
+    #[test]
+    fn backend_name_returns_correct_str() {
+        assert_eq!(AlwaysOkBackend.name(), "always-ok");
+    }
+}

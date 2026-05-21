@@ -804,4 +804,220 @@ mod tests {
             "Server(127.0.0.1:12345)"
         );
     }
+
+    #[test]
+    fn env_var_matches_exact() {
+        assert!(env_var_matches("LANG", &["LANG".to_string()]));
+    }
+
+    #[test]
+    fn env_var_matches_wildcard() {
+        assert!(env_var_matches("LC_ALL", &["LC_*".to_string()]));
+    }
+
+    #[test]
+    fn env_var_matches_no_match() {
+        assert!(!env_var_matches(
+            "PATH",
+            &["LANG".to_string(), "LC_*".to_string()]
+        ));
+    }
+
+    #[test]
+    fn env_var_matches_empty_patterns() {
+        assert!(!env_var_matches("LANG", &[]));
+    }
+
+    #[test]
+    fn kex_default_has_empty_keys_and_nil_uuid() {
+        use crate::kex::negotiate::NegotiatedAlgorithms;
+        let kex = Kex::default();
+        assert!(kex.key().is_empty());
+        assert!(kex.hmac_key().is_empty());
+        assert_eq!(kex.uuid(), Uuid::nil());
+        assert!(kex.moshpits_addr().is_none());
+        assert!(kex.session_uuid().is_none());
+        assert!(!kex.is_resume());
+        drop(NegotiatedAlgorithms::default());
+    }
+
+    #[test]
+    fn build_aead_key_aes256_gcm_siv() {
+        use crate::kex::negotiate::{AEAD_AES256_GCM_SIV, NegotiatedAlgorithms};
+        let kex = Kex {
+            key: vec![0u8; 32],
+            hmac_key: Vec::new(),
+            uuid: Uuid::nil(),
+            moshpits_addr: None,
+            session_uuid: None,
+            is_resume: false,
+            negotiated_algorithms: NegotiatedAlgorithms {
+                aead: AEAD_AES256_GCM_SIV.to_string(),
+                ..NegotiatedAlgorithms::default()
+            },
+        };
+        assert!(kex.build_aead_key().is_ok());
+    }
+
+    #[test]
+    fn build_aead_key_aes256_gcm() {
+        use crate::kex::negotiate::{AEAD_AES256_GCM, NegotiatedAlgorithms};
+        let kex = Kex {
+            key: vec![0u8; 32],
+            hmac_key: Vec::new(),
+            uuid: Uuid::nil(),
+            moshpits_addr: None,
+            session_uuid: None,
+            is_resume: false,
+            negotiated_algorithms: NegotiatedAlgorithms {
+                aead: AEAD_AES256_GCM.to_string(),
+                ..NegotiatedAlgorithms::default()
+            },
+        };
+        assert!(kex.build_aead_key().is_ok());
+    }
+
+    #[test]
+    fn build_aead_key_chacha20_poly1305() {
+        use crate::kex::negotiate::{AEAD_CHACHA20_POLY1305, NegotiatedAlgorithms};
+        let kex = Kex {
+            key: vec![0u8; 32],
+            hmac_key: Vec::new(),
+            uuid: Uuid::nil(),
+            moshpits_addr: None,
+            session_uuid: None,
+            is_resume: false,
+            negotiated_algorithms: NegotiatedAlgorithms {
+                aead: AEAD_CHACHA20_POLY1305.to_string(),
+                ..NegotiatedAlgorithms::default()
+            },
+        };
+        assert!(kex.build_aead_key().is_ok());
+    }
+
+    #[test]
+    fn build_aead_key_aes128_gcm_siv() {
+        use crate::kex::negotiate::{AEAD_AES128_GCM_SIV, NegotiatedAlgorithms};
+        let kex = Kex {
+            key: vec![0u8; 16],
+            hmac_key: Vec::new(),
+            uuid: Uuid::nil(),
+            moshpits_addr: None,
+            session_uuid: None,
+            is_resume: false,
+            negotiated_algorithms: NegotiatedAlgorithms {
+                aead: AEAD_AES128_GCM_SIV.to_string(),
+                ..NegotiatedAlgorithms::default()
+            },
+        };
+        assert!(kex.build_aead_key().is_ok());
+    }
+
+    #[test]
+    fn build_aead_key_unknown_returns_err() {
+        use crate::kex::negotiate::NegotiatedAlgorithms;
+        let kex = Kex {
+            key: vec![0u8; 32],
+            hmac_key: Vec::new(),
+            uuid: Uuid::nil(),
+            moshpits_addr: None,
+            session_uuid: None,
+            is_resume: false,
+            negotiated_algorithms: NegotiatedAlgorithms {
+                aead: "unknown-cipher".to_string(),
+                ..NegotiatedAlgorithms::default()
+            },
+        };
+        assert!(kex.build_aead_key().is_err());
+    }
+
+    #[test]
+    fn mac_tag_len_sha256_is_32() {
+        use crate::kex::negotiate::{MAC_HMAC_SHA256, NegotiatedAlgorithms};
+        let kex = Kex {
+            key: Vec::new(),
+            hmac_key: vec![0u8; 32],
+            uuid: Uuid::nil(),
+            moshpits_addr: None,
+            session_uuid: None,
+            is_resume: false,
+            negotiated_algorithms: NegotiatedAlgorithms {
+                mac: MAC_HMAC_SHA256.to_string(),
+                ..NegotiatedAlgorithms::default()
+            },
+        };
+        assert_eq!(kex.mac_tag_len(), 32);
+    }
+
+    #[test]
+    fn mac_tag_len_sha512_is_64() {
+        use crate::kex::negotiate::{MAC_HMAC_SHA512, NegotiatedAlgorithms};
+        let kex = Kex {
+            key: Vec::new(),
+            hmac_key: vec![0u8; 64],
+            uuid: Uuid::nil(),
+            moshpits_addr: None,
+            session_uuid: None,
+            is_resume: false,
+            negotiated_algorithms: NegotiatedAlgorithms {
+                mac: MAC_HMAC_SHA512.to_string(),
+                ..NegotiatedAlgorithms::default()
+            },
+        };
+        assert_eq!(kex.mac_tag_len(), 64);
+    }
+
+    #[test]
+    fn build_hmac_sha256_produces_key() {
+        use crate::kex::negotiate::{MAC_HMAC_SHA256, NegotiatedAlgorithms};
+        let kex = Kex {
+            key: Vec::new(),
+            hmac_key: vec![0u8; 32],
+            uuid: Uuid::nil(),
+            moshpits_addr: None,
+            session_uuid: None,
+            is_resume: false,
+            negotiated_algorithms: NegotiatedAlgorithms {
+                mac: MAC_HMAC_SHA256.to_string(),
+                ..NegotiatedAlgorithms::default()
+            },
+        };
+        let _key = kex.build_hmac(); // verify it doesn't panic
+        assert_eq!(kex.mac_tag_len(), 32);
+    }
+
+    #[test]
+    fn build_hmac_sha512_produces_key() {
+        use crate::kex::negotiate::{MAC_HMAC_SHA512, NegotiatedAlgorithms};
+        let kex = Kex {
+            key: Vec::new(),
+            hmac_key: vec![0u8; 64],
+            uuid: Uuid::nil(),
+            moshpits_addr: None,
+            session_uuid: None,
+            is_resume: false,
+            negotiated_algorithms: NegotiatedAlgorithms {
+                mac: MAC_HMAC_SHA512.to_string(),
+                ..NegotiatedAlgorithms::default()
+            },
+        };
+        let _key = kex.build_hmac(); // verify it doesn't panic
+        assert_eq!(kex.mac_tag_len(), 64);
+    }
+
+    #[tokio::test]
+    async fn kex_state_machine_no_common_algorithm_returns_error() {
+        let (tx, rx) = unbounded_channel();
+        let mut sm = KexStateMachine::builder().rx_event(rx).build();
+        tx.send(KexEvent::NoCommonAlgorithm).unwrap();
+        drop(tx);
+        let result = sm.handle_events(true).await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .downcast_ref::<MoshpitError>()
+                .is_some_and(|e| *e == MoshpitError::NoCommonAlgorithm),
+        );
+    }
 }

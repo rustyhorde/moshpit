@@ -413,12 +413,14 @@ async fn send_to_agent(socket_path: &Path, request: AgentRequest) -> Result<Agen
     client.send(&request).await
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn read_passphrase_stdin() -> Result<String> {
     let mut line = String::new();
     let _n = std::io::stdin().lock().read_line(&mut line)?;
     Ok(line.trim_end_matches(['\n', '\r']).to_string())
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn read_key_passphrase(from_stdin: bool, key_path: &str) -> Result<Option<String>> {
     if from_stdin {
         let mut line = String::new();
@@ -462,6 +464,7 @@ fn best_identity(ids: &[AgentIdentityInfo]) -> &AgentIdentityInfo {
 }
 
 /// Prints the key-selection hint to stderr when multiple keys are loaded.
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn print_selection_hint(ids: &[AgentIdentityInfo], command: &str) {
     let best = best_identity(ids);
     let hierarchy = PREFERENCE_ORDER.join(" > ");
@@ -752,5 +755,488 @@ async fn run_daemon(
             }
             Err(e) => error!("accept error: {e}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    use super::*;
+
+    const TEST_KEY_PATH: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../libmoshpit/tests/keys/id_x25519_test"
+    );
+
+    fn dummy_identity(fp: &str, algorithm: &str) -> Identity {
+        Identity {
+            full_pub_key_bytes: b"dummy pub key bytes".to_vec(),
+            algorithm: algorithm.to_string(),
+            fingerprint: fp.to_string(),
+            private_key: vec![0u8; 32],
+        }
+    }
+
+    fn empty_vault() -> Arc<Mutex<Option<Vault>>> {
+        Arc::new(Mutex::new(None))
+    }
+
+    fn empty_passphrase() -> Arc<Mutex<String>> {
+        Arc::new(Mutex::new(String::new()))
+    }
+
+    #[test]
+    fn new_identity_map_is_empty() {
+        let map = new_identity_map();
+        assert_eq!(Arc::strong_count(&map), 1);
+    }
+
+    #[tokio::test]
+    async fn dispatch_list_identities_empty() {
+        let ids = new_identity_map();
+        let vault = empty_vault();
+        let vault_path = PathBuf::from("/tmp/nonexistent-vault-agent-test");
+        let mp = empty_passphrase();
+        let resp =
+            dispatch_request(AgentRequest::ListIdentities, &ids, &vault, &vault_path, &mp).await;
+        assert!(matches!(resp, AgentResponse::Identities(v) if v.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn dispatch_list_identities_populated() {
+        let ids = new_identity_map();
+        let fp = "SHA256:aaaabbbb".to_string();
+        drop(
+            ids.lock()
+                .await
+                .insert(fp.clone(), dummy_identity(&fp, "X25519")),
+        );
+        let vault = empty_vault();
+        let vault_path = PathBuf::from("/tmp/nonexistent-vault-agent-test");
+        let mp = empty_passphrase();
+        let resp =
+            dispatch_request(AgentRequest::ListIdentities, &ids, &vault, &vault_path, &mp).await;
+        match resp {
+            AgentResponse::Identities(list) => {
+                assert_eq!(list.len(), 1);
+                assert_eq!(list[0].fingerprint, fp);
+                assert_eq!(list[0].algorithm, "X25519");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_list_supported_identities_filtered() {
+        let ids = new_identity_map();
+        let fp1 = "SHA256:fp1".to_string();
+        let fp2 = "SHA256:fp2".to_string();
+        drop(
+            ids.lock()
+                .await
+                .insert(fp1.clone(), dummy_identity(&fp1, "X25519")),
+        );
+        drop(
+            ids.lock()
+                .await
+                .insert(fp2.clone(), dummy_identity(&fp2, "P384")),
+        );
+        let vault = empty_vault();
+        let vault_path = PathBuf::from("/tmp/nonexistent-vault-agent-test");
+        let mp = empty_passphrase();
+        let resp = dispatch_request(
+            AgentRequest::ListSupportedIdentities {
+                supported_algorithms: vec!["P384".to_string()],
+            },
+            &ids,
+            &vault,
+            &vault_path,
+            &mp,
+        )
+        .await;
+        match resp {
+            AgentResponse::Identities(list) => {
+                assert_eq!(list.len(), 1);
+                assert_eq!(list[0].algorithm, "P384");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_get_public_key_found() {
+        let ids = new_identity_map();
+        let fp = "SHA256:found".to_string();
+        drop(
+            ids.lock()
+                .await
+                .insert(fp.clone(), dummy_identity(&fp, "X25519")),
+        );
+        let vault = empty_vault();
+        let vault_path = PathBuf::from("/tmp/nonexistent-vault-agent-test");
+        let mp = empty_passphrase();
+        let resp = dispatch_request(
+            AgentRequest::GetPublicKey(fp.clone()),
+            &ids,
+            &vault,
+            &vault_path,
+            &mp,
+        )
+        .await;
+        assert!(matches!(resp, AgentResponse::PublicKey(b) if b == b"dummy pub key bytes"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_get_public_key_not_found() {
+        let ids = new_identity_map();
+        let vault = empty_vault();
+        let vault_path = PathBuf::from("/tmp/nonexistent-vault-agent-test");
+        let mp = empty_passphrase();
+        let resp = dispatch_request(
+            AgentRequest::GetPublicKey("SHA256:missing".to_string()),
+            &ids,
+            &vault,
+            &vault_path,
+            &mp,
+        )
+        .await;
+        assert!(matches!(resp, AgentResponse::Error(_)));
+    }
+
+    #[tokio::test]
+    async fn dispatch_sign_not_found() {
+        let ids = new_identity_map();
+        let vault = empty_vault();
+        let vault_path = PathBuf::from("/tmp/nonexistent-vault-agent-test");
+        let mp = empty_passphrase();
+        let resp = dispatch_request(
+            AgentRequest::Sign {
+                fingerprint: "SHA256:nosuchkey".to_string(),
+                data: b"hello".to_vec(),
+            },
+            &ids,
+            &vault,
+            &vault_path,
+            &mp,
+        )
+        .await;
+        assert!(matches!(resp, AgentResponse::Error(_)));
+    }
+
+    #[tokio::test]
+    async fn dispatch_sign_key_exists_non_unstable() {
+        let ids = new_identity_map();
+        let fp = "SHA256:signing".to_string();
+        drop(
+            ids.lock()
+                .await
+                .insert(fp.clone(), dummy_identity(&fp, "X25519")),
+        );
+        let vault = empty_vault();
+        let vault_path = PathBuf::from("/tmp/nonexistent-vault-agent-test");
+        let mp = empty_passphrase();
+        let resp = dispatch_request(
+            AgentRequest::Sign {
+                fingerprint: fp.clone(),
+                data: b"some data".to_vec(),
+            },
+            &ids,
+            &vault,
+            &vault_path,
+            &mp,
+        )
+        .await;
+        // In non-unstable builds sign_data always returns an error
+        assert!(matches!(resp, AgentResponse::Error(_)));
+    }
+
+    #[test]
+    fn sign_data_non_unstable_returns_error() {
+        let id = dummy_identity("SHA256:test", "X25519");
+        let resp = sign_data(&id, b"data");
+        assert!(
+            matches!(resp, AgentResponse::Error(ref msg) if msg.contains("does not support signing"))
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_add_identity() {
+        let ids = new_identity_map();
+        let vault = empty_vault();
+        let dir = tempdir().unwrap();
+        let vault_path = dir.path().join("vault");
+        let mp = empty_passphrase();
+        let resp = dispatch_request(
+            AgentRequest::AddIdentity {
+                key_path: TEST_KEY_PATH.to_string(),
+                passphrase: None,
+            },
+            &ids,
+            &vault,
+            &vault_path,
+            &mp,
+        )
+        .await;
+        assert!(matches!(resp, AgentResponse::Ok));
+        assert_eq!(ids.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dispatch_add_identity_bad_path() {
+        let ids = new_identity_map();
+        let vault = empty_vault();
+        let vault_path = PathBuf::from("/tmp/nonexistent-vault-agent-test");
+        let mp = empty_passphrase();
+        let resp = dispatch_request(
+            AgentRequest::AddIdentity {
+                key_path: "/nonexistent/key/path".to_string(),
+                passphrase: None,
+            },
+            &ids,
+            &vault,
+            &vault_path,
+            &mp,
+        )
+        .await;
+        assert!(matches!(resp, AgentResponse::Error(_)));
+    }
+
+    #[tokio::test]
+    async fn dispatch_remove_identity_found() {
+        let ids = new_identity_map();
+        let fp = "SHA256:removeme".to_string();
+        drop(
+            ids.lock()
+                .await
+                .insert(fp.clone(), dummy_identity(&fp, "X25519")),
+        );
+        let vault = empty_vault();
+        let vault_path = PathBuf::from("/tmp/nonexistent-vault-agent-test");
+        let mp = empty_passphrase();
+        let resp = dispatch_request(
+            AgentRequest::RemoveIdentity(fp.clone()),
+            &ids,
+            &vault,
+            &vault_path,
+            &mp,
+        )
+        .await;
+        assert!(matches!(resp, AgentResponse::Ok));
+        assert!(ids.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_remove_identity_not_found() {
+        let ids = new_identity_map();
+        let vault = empty_vault();
+        let vault_path = PathBuf::from("/tmp/nonexistent-vault-agent-test");
+        let mp = empty_passphrase();
+        let resp = dispatch_request(
+            AgentRequest::RemoveIdentity("SHA256:nosuch".to_string()),
+            &ids,
+            &vault,
+            &vault_path,
+            &mp,
+        )
+        .await;
+        assert!(matches!(resp, AgentResponse::Error(_)));
+    }
+
+    #[tokio::test]
+    async fn dispatch_remove_all_identities() {
+        let ids = new_identity_map();
+        let fp1 = "SHA256:one".to_string();
+        let fp2 = "SHA256:two".to_string();
+        drop(
+            ids.lock()
+                .await
+                .insert(fp1.clone(), dummy_identity(&fp1, "X25519")),
+        );
+        drop(
+            ids.lock()
+                .await
+                .insert(fp2.clone(), dummy_identity(&fp2, "P384")),
+        );
+        let vault = empty_vault();
+        let vault_path = PathBuf::from("/tmp/nonexistent-vault-agent-test");
+        let mp = empty_passphrase();
+        let resp = dispatch_request(
+            AgentRequest::RemoveAllIdentities,
+            &ids,
+            &vault,
+            &vault_path,
+            &mp,
+        )
+        .await;
+        assert!(matches!(resp, AgentResponse::Ok));
+        assert!(ids.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_lock() {
+        let ids = new_identity_map();
+        let fp = "SHA256:lockme".to_string();
+        drop(
+            ids.lock()
+                .await
+                .insert(fp.clone(), dummy_identity(&fp, "X25519")),
+        );
+        let vault = empty_vault();
+        let vault_path = PathBuf::from("/tmp/nonexistent-vault-agent-test");
+        let mp = empty_passphrase();
+        let resp = dispatch_request(AgentRequest::Lock, &ids, &vault, &vault_path, &mp).await;
+        assert!(matches!(resp, AgentResponse::Ok));
+        assert!(ids.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_unlock_no_vault() {
+        let ids = new_identity_map();
+        let vault = empty_vault();
+        let vault_path = PathBuf::from("/tmp/nonexistent-vault-for-unlock-agent-test");
+        let mp = empty_passphrase();
+        let resp = dispatch_request(
+            AgentRequest::Unlock(String::new()),
+            &ids,
+            &vault,
+            &vault_path,
+            &mp,
+        )
+        .await;
+        assert!(matches!(resp, AgentResponse::Ok));
+        assert!(ids.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn handle_connection_single_request() {
+        let ids = new_identity_map();
+        let vault = empty_vault();
+        let vault_path = PathBuf::from("/tmp/nonexistent-vault-agent-test");
+        let mp = empty_passphrase();
+
+        let (mut client, server) = UnixStream::pair().unwrap();
+
+        drop(tokio::spawn(handle_connection(
+            server,
+            Arc::clone(&ids),
+            Arc::clone(&vault),
+            vault_path,
+            Arc::clone(&mp),
+        )));
+
+        let req = AgentRequest::ListIdentities;
+        let encoded = encode_to_vec(&req, standard()).unwrap();
+        let len = u32::try_from(encoded.len()).unwrap();
+        client.write_all(&len.to_be_bytes()).await.unwrap();
+        client.write_all(&encoded).await.unwrap();
+        client.flush().await.unwrap();
+
+        let resp_len = client.read_u32().await.unwrap() as usize;
+        let mut buf = vec![0u8; resp_len];
+        let _ = client.read_exact(&mut buf).await.unwrap();
+        let (resp, _): (AgentResponse, _) = decode_from_slice(&buf, standard()).unwrap();
+
+        assert!(matches!(resp, AgentResponse::Identities(v) if v.is_empty()));
+        drop(client);
+    }
+
+    #[tokio::test]
+    async fn handle_connection_zero_length_breaks() {
+        let ids = new_identity_map();
+        let vault = empty_vault();
+        let vault_path = PathBuf::from("/tmp/nonexistent-vault-agent-test");
+        let mp = empty_passphrase();
+
+        let (mut client, server) = UnixStream::pair().unwrap();
+
+        let task = tokio::spawn(handle_connection(server, ids, vault, vault_path, mp));
+
+        client.write_all(&0u32.to_be_bytes()).await.unwrap();
+        client.flush().await.unwrap();
+        drop(client);
+
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_connection_bad_decode_breaks() {
+        let ids = new_identity_map();
+        let vault = empty_vault();
+        let vault_path = PathBuf::from("/tmp/nonexistent-vault-agent-test");
+        let mp = empty_passphrase();
+
+        let (mut client, server) = UnixStream::pair().unwrap();
+
+        let task = tokio::spawn(handle_connection(server, ids, vault, vault_path, mp));
+
+        let garbage = vec![0xFF_u8, 0xFE, 0xFD, 0xFC];
+        let len = u32::try_from(garbage.len()).unwrap();
+        client.write_all(&len.to_be_bytes()).await.unwrap();
+        client.write_all(&garbage).await.unwrap();
+        client.flush().await.unwrap();
+        drop(client);
+
+        task.await.unwrap();
+    }
+
+    #[test]
+    fn best_identity_prefers_p384_over_x25519() {
+        let ids = vec![
+            AgentIdentityInfo {
+                algorithm: "X25519".into(),
+                fingerprint: "SHA256:x25519".into(),
+                comment: String::new(),
+            },
+            AgentIdentityInfo {
+                algorithm: "P384".into(),
+                fingerprint: "SHA256:p384".into(),
+                comment: String::new(),
+            },
+        ];
+        let best = best_identity(&ids);
+        assert_eq!(best.algorithm, "P384");
+    }
+
+    #[test]
+    fn best_identity_single_unknown_returns_first() {
+        let ids = vec![AgentIdentityInfo {
+            algorithm: "Unknown".into(),
+            fingerprint: "SHA256:unk".into(),
+            comment: String::new(),
+        }];
+        let best = best_identity(&ids);
+        assert_eq!(best.algorithm, "Unknown");
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn socket_from_env_set() {
+        // Safety: nextest runs each test in its own process; no concurrent set_var calls.
+        unsafe { std::env::set_var("MOSHPIT_AGENT_SOCK", "/tmp/mpa-test-socket.sock") };
+        let result = socket_from_env();
+        unsafe { std::env::remove_var("MOSHPIT_AGENT_SOCK") };
+        assert_eq!(result.unwrap(), PathBuf::from("/tmp/mpa-test-socket.sock"));
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn socket_from_env_not_set() {
+        // Safety: nextest runs each test in its own process; no concurrent env access.
+        unsafe { std::env::remove_var("MOSHPIT_AGENT_SOCK") };
+        assert!(socket_from_env().is_err());
+    }
+
+    #[test]
+    fn unlock_backend_passphrase_default() {
+        let config = AgentConfig::resolve(
+            Some("/tmp/dummy.sock"),
+            Some("/tmp/dummy.vault"),
+            false,
+            "unknown-backend".to_string(),
+        );
+        let backend = unlock_backend(&config);
+        assert_eq!(backend.name(), "passphrase");
     }
 }

@@ -349,4 +349,79 @@ mod tests {
         let loaded = Vault::load_encrypted(&path, "ignored").expect("load plaintext");
         assert_eq!(loaded.entries()[0].key_path, "/tmp/k");
     }
+
+    #[test]
+    fn vault_default_path_is_some() {
+        assert!(default_vault_path().is_some());
+    }
+
+    #[test]
+    fn vault_load_invalid_header() {
+        use base64::Engine as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vault");
+        // Write base64-encoded garbage that decodes to something with wrong header
+        let garbage = STANDARD.encode(b"not-a-valid-vault");
+        std::fs::write(&path, garbage.as_bytes()).unwrap();
+        let result = Vault::load_encrypted(&path, "any");
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("invalid vault header")
+        );
+    }
+
+    #[test]
+    fn vault_load_unsupported_cipher() {
+        use base64::Engine as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vault");
+        // Build a valid header but with an unknown cipher name
+        let mut out = VAULT_HEADER.to_vec();
+        write_lv(&mut out, b"unknown-cipher");
+        write_lv(&mut out, b"none");
+        let encoded = STANDARD.encode(&out);
+        std::fs::write(&path, encoded.as_bytes()).unwrap();
+        let result = Vault::load_encrypted(&path, "any");
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported vault cipher")
+        );
+    }
+
+    #[test]
+    fn read_lv_truncated_length_field() {
+        // Buffer with only 2 bytes — too short to read a u32 length
+        let mut buf = BytesMut::from(&[0x00u8, 0x01][..]);
+        let result = read_lv(&mut buf);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("truncated reading length")
+        );
+    }
+
+    #[test]
+    fn read_lv_truncated_value_field() {
+        // Buffer says value is 100 bytes but only has 2 bytes after the length
+        let mut out = Vec::new();
+        out.extend_from_slice(&100u32.to_be_bytes());
+        out.extend_from_slice(&[0xAAu8, 0xBB]);
+        let mut buf = BytesMut::from(&out[..]);
+        let result = read_lv(&mut buf);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("truncated reading value")
+        );
+    }
 }

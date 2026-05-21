@@ -17,12 +17,14 @@ use super::UnlockBackend;
 pub(crate) struct PassphraseBackend;
 
 impl UnlockBackend for PassphraseBackend {
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn retrieve_passphrase(&self) -> Result<String> {
         Ok(Password::new()
             .with_prompt("Enter moshpit-agent master passphrase")
             .interact()?)
     }
 
+    #[cfg_attr(coverage_nightly, coverage(off))]
     fn set_passphrase(&self) -> Result<String> {
         Ok(Password::new()
             .with_prompt("Set moshpit-agent master passphrase")

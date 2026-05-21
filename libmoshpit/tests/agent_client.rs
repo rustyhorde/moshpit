@@ -149,3 +149,75 @@ async fn agent_client_error_response() {
     server.await.unwrap();
     let _ = std::fs::remove_file(&path);
 }
+
+#[tokio::test]
+async fn agent_client_list_identities_unexpected_response() {
+    let path = temp_socket_path("list-unexpected");
+    let server_path = path.clone();
+    // Return PublicKey instead of Identities — client should error
+    let server_response = AgentResponse::PublicKey(b"unexpected".to_vec());
+
+    let server = tokio::spawn(run_one_shot_server(server_path, server_response));
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let client = libmoshpit::AgentClient::new(path.clone());
+    let result = client.list_identities().await;
+    assert!(result.is_err());
+
+    server.await.unwrap();
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn agent_client_list_supported_identities_unexpected_response() {
+    let path = temp_socket_path("list-sup-unexpected");
+    let server_path = path.clone();
+    // Return Signature instead of Identities — client should error
+    let server_response = AgentResponse::Signature(vec![0xAA, 0xBB]);
+
+    let server = tokio::spawn(run_one_shot_server(server_path, server_response));
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let client = libmoshpit::AgentClient::new(path.clone());
+    let result = client.list_supported_identities(&["P384", "X25519"]).await;
+    assert!(result.is_err());
+
+    server.await.unwrap();
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn agent_client_get_public_key_unexpected_response() {
+    let path = temp_socket_path("pubkey-unexpected");
+    let server_path = path.clone();
+    // Return Identities instead of PublicKey — client should error
+    let server_response = AgentResponse::Identities(vec![]);
+
+    let server = tokio::spawn(run_one_shot_server(server_path, server_response));
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let client = libmoshpit::AgentClient::new(path.clone());
+    let result = client.get_public_key("SHA256:test").await;
+    assert!(result.is_err());
+
+    server.await.unwrap();
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn agent_client_sign_unexpected_response() {
+    let path = temp_socket_path("sign-unexpected");
+    let server_path = path.clone();
+    // Return Ok instead of Signature — client should error
+    let server_response = AgentResponse::Ok;
+
+    let server = tokio::spawn(run_one_shot_server(server_path, server_response));
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let client = libmoshpit::AgentClient::new(path.clone());
+    let result = client.sign("SHA256:test", b"data").await;
+    assert!(result.is_err());
+
+    server.await.unwrap();
+    let _ = std::fs::remove_file(&path);
+}

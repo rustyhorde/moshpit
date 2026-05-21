@@ -88,3 +88,52 @@ pub enum AgentResponse {
     /// An error message.
     Error(String),
 }
+
+#[cfg(test)]
+mod tests {
+    use bincode_next::{config::standard, decode_from_slice, encode_to_vec};
+
+    use super::*;
+
+    #[test]
+    fn roundtrip_request_lock() {
+        let encoded = encode_to_vec(&AgentRequest::Lock, standard()).unwrap();
+        let (rt, _): (AgentRequest, _) = decode_from_slice(&encoded, standard()).unwrap();
+        assert!(matches!(rt, AgentRequest::Lock));
+    }
+
+    #[test]
+    fn roundtrip_request_unlock() {
+        let encoded =
+            encode_to_vec(AgentRequest::Unlock("secret".to_string()), standard()).unwrap();
+        let (rt, _): (AgentRequest, _) = decode_from_slice(&encoded, standard()).unwrap();
+        assert!(matches!(rt, AgentRequest::Unlock(ref s) if s == "secret"));
+    }
+
+    #[test]
+    fn roundtrip_request_remove_all() {
+        let encoded = encode_to_vec(&AgentRequest::RemoveAllIdentities, standard()).unwrap();
+        let (rt, _): (AgentRequest, _) = decode_from_slice(&encoded, standard()).unwrap();
+        assert!(matches!(rt, AgentRequest::RemoveAllIdentities));
+    }
+
+    #[test]
+    fn roundtrip_response_ok() {
+        let encoded = encode_to_vec(&AgentResponse::Ok, standard()).unwrap();
+        let (rt, _): (AgentResponse, _) = decode_from_slice(&encoded, standard()).unwrap();
+        assert!(matches!(rt, AgentResponse::Ok));
+    }
+
+    #[test]
+    fn agent_identity_info_clone_and_debug() {
+        let info = AgentIdentityInfo {
+            algorithm: "P384".to_string(),
+            fingerprint: "SHA256:abcd".to_string(),
+            comment: "user@host".to_string(),
+        };
+        let cloned = info.clone();
+        assert_eq!(cloned.algorithm, "P384");
+        let debug_str = format!("{info:?}");
+        assert!(debug_str.contains("P384"));
+    }
+}
