@@ -235,6 +235,7 @@
 #![cfg_attr(all(docsrs), feature(doc_cfg))]
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
+pub mod agent;
 mod config;
 mod error;
 mod frames;
@@ -248,6 +249,11 @@ mod udp;
 mod utils;
 mod uuid;
 
+#[cfg(unix)]
+pub use self::agent::AgentClient;
+pub use self::agent::AgentIdentityInfo;
+pub use self::agent::AgentRequest;
+pub use self::agent::AgentResponse;
 pub use self::config::KexConfig;
 pub use self::config::PathDefaults;
 pub use self::config::load;

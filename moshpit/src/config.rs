@@ -203,6 +203,10 @@ impl KexConfig for Config {
     fn send_path(&self) -> Vec<String> {
         self.send_path.clone()
     }
+
+    fn agent_socket(&self) -> Option<PathBuf> {
+        std::env::var("MOSHPIT_AGENT_SOCK").ok().map(PathBuf::from)
+    }
 }
 
 #[cfg(test)]

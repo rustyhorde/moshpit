@@ -1,0 +1,19 @@
+[Unit]
+Description=Moshpit Agent — identity key daemon
+Documentation=man:mpa(1)
+ConditionEnvironment=!SSH_AGENT_PID
+ConditionUser=!root
+# Start after the session's graphical target so secret-service backends are
+# available, but also work in headless / SSH sessions.
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/mpa start --foreground --socket %t/moshpit-agent-%i.sock
+Restart=on-failure
+RestartSec=5s
+# Expose the socket path to child processes launched by systemd.
+Environment=MOSHPIT_AGENT_SOCK=%t/moshpit-agent-%i.sock
+
+[Install]
+WantedBy=default.target

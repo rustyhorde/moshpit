@@ -1,0 +1,39 @@
+FROM ghcr.io/cross-rs/x86_64-unknown-linux-musl:main
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends cmake git libpcsclite-dev pkg-config && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Build static libcbor
+RUN git clone --depth 1 --branch v0.11.0 https://github.com/PJK/libcbor.git /tmp/libcbor && \
+    cmake -S /tmp/libcbor -B /tmp/libcbor/build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DCMAKE_INSTALL_PREFIX=/usr/local && \
+    cmake --build /tmp/libcbor/build --parallel && \
+    cmake --install /tmp/libcbor/build && \
+    rm -rf /tmp/libcbor
+
+# Build static hidapi
+RUN git clone --depth 1 --branch hidapi-0.14.0 https://github.com/libusb/hidapi.git /tmp/hidapi && \
+    cmake -S /tmp/hidapi -B /tmp/hidapi/build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DCMAKE_INSTALL_PREFIX=/usr/local && \
+    cmake --build /tmp/hidapi/build --parallel && \
+    cmake --install /tmp/hidapi/build && \
+    rm -rf /tmp/hidapi
+
+# Build static libfido2 (with hidapi transport)
+RUN git clone --depth 1 --branch 1.16.0 https://github.com/Yubico/libfido2.git /tmp/libfido2 && \
+    cmake -S /tmp/libfido2 -B /tmp/libfido2/build \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DUSE_HIDAPI=ON \
+        -DCMAKE_INSTALL_PREFIX=/usr/local && \
+    cmake --build /tmp/libfido2/build --parallel && \
+    cmake --install /tmp/libfido2/build && \
+    rm -rf /tmp/libfido2

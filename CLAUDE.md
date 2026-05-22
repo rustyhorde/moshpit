@@ -116,7 +116,7 @@ Tagging `v<semver>` triggers `release.yml`, which:
 ## Key Configuration Details
 
 - **Rust edition**: 2024 (all crates)
-- **MSRV**: 1.91.1
+- **MSRV**: 1.91.1 — when updating `rust-version` in any `Cargo.toml`, also update the required status check names on the `master` branch (GitHub → Settings → Branches → master protection rule). The MSRV check names embed the version string, e.g. `🧪 Test (Linux) 🧪 (ubuntu-latest, 1.91.1, x86_64-unknown-linux-gnu)` — replace the old version with the new one for all three platform variants (Linux × 1, MacOS × 1, Windows × 2 targets).
 - **`unstable` feature flag**: Exists in libmoshpit/moshpit/moshpits/keygen but is currently a no-op placeholder
 - **Config precedence** (both client and server): env vars > CLI flags > TOML config file
 - **Client env prefix**: `MOSHPIT_`; **Server env prefix**: `MOSHPITS_`

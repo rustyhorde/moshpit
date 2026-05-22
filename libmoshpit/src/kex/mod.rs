@@ -32,9 +32,15 @@ use tokio::{
     sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
     task::JoinHandle,
 };
+#[cfg(unix)]
+use tracing::warn;
 use tracing::{debug, error, info, trace};
 use uuid::Uuid;
 
+#[cfg(unix)]
+use crate::AgentClient;
+#[cfg(unix)]
+use crate::keygen::{SUPPORTED_IDENTITY_ALGORITHMS, algorithm_strength_rank};
 use crate::{
     ConnectionReader, ConnectionWriter, Frame, KexConfig, KexReader, KexSender, MoshpitError,
     UuidWrapper, kex::negotiate::NegotiatedAlgorithms, load_identity_key, load_public_key,
@@ -427,54 +433,139 @@ async fn run_client_kex<T: KexConfig>(
     passphrase_fn: impl Fn() -> Result<Option<String>>,
     callbacks: HostKeyCallbacks,
 ) -> Result<(Kex, Arc<UdpSocket>, Option<ServerKex>)> {
-    let (private_key_path, public_key_path) = config.key_pair_paths()?;
-    info!("Loading private key from {}", private_key_path.display());
-    info!("Loading public key from {}", public_key_path.display());
+    let agent_socket = config.agent_socket();
 
-    let (full_public_key_bytes, public_key_bytes) = load_public_key(&public_key_path)
-        .inspect_err(|e| {
-            error!(
-                "Failed to load public key from {}: {e}",
-                public_key_path.display()
-            );
-        })
-        .map_err(|_| MoshpitError::KeyFileMissing)?;
-    if !private_key_path.try_exists().unwrap_or(false) {
-        error!(
-            "Failed to load private key from {}: file does not exist",
+    // Resolve identity: try agent first, fall back to key files if agent is
+    // unavailable or has no compatible identities.
+    #[cfg(unix)]
+    let agent_result: Option<(Vec<u8>, String)> = if let Some(ref socket) = agent_socket {
+        info!("Agent socket configured — loading identity from moshpit-agent");
+        let client = AgentClient::new(socket.clone());
+        match client
+            .list_supported_identities(SUPPORTED_IDENTITY_ALGORITHMS)
+            .await
+        {
+            Ok(mut ids) if !ids.is_empty() => {
+                ids.sort_by_key(|id| std::cmp::Reverse(algorithm_strength_rank(&id.algorithm)));
+                let id = &ids[0];
+                info!(
+                    "Using agent identity: {} ({})",
+                    id.fingerprint, id.algorithm
+                );
+                match client.get_public_key(&id.fingerprint).await {
+                    Ok(pk_bytes) => Some((pk_bytes, id.fingerprint.clone())),
+                    Err(e) => {
+                        warn!(
+                            "Failed to get public key from agent ({e}) — falling back to key file"
+                        );
+                        None
+                    }
+                }
+            }
+            Ok(_) => {
+                warn!(
+                    "Agent has no identities with algorithms supported by this client \
+                     (supported: {}) — falling back to key file",
+                    SUPPORTED_IDENTITY_ALGORITHMS.join(", ")
+                );
+                None
+            }
+            Err(e) => {
+                warn!("Failed to contact agent ({e}) — falling back to key file");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    #[cfg(not(unix))]
+    let agent_result: Option<(Vec<u8>, String)> = None;
+
+    let (full_public_key_bytes, agent_fingerprint) = if let Some((pk_bytes, fp)) = agent_result {
+        (pk_bytes, Some(fp))
+    } else {
+        let (private_key_path, public_key_path) = config.key_pair_paths()?;
+        info!(
+            "Agent not configured (or fell back) — loading identity from key file: {}",
             private_key_path.display()
         );
-        return Err(MoshpitError::KeyFileMissing.into());
-    }
 
-    let identity_key = if let Ok(identity_key) = load_identity_key(&private_key_path, None) {
-        info!("Private key is unencrypted — no passphrase needed");
-        identity_key
-    } else {
-        info!("Private key may be encrypted — invoking passphrase prompt");
-        let passphrase = passphrase_fn().map_err(|e| {
-            error!("Passphrase prompt failed: {e}");
-            e
-        })?;
-        let Some(passphrase) = passphrase else {
-            error!("Passphrase prompt returned no input — cannot decrypt key");
-            return Err(MoshpitError::KeyCorrupt.into());
+        let (full_pub_bytes, public_key_bytes) = load_public_key(&public_key_path)
+            .inspect_err(|e| {
+                error!(
+                    "Failed to load public key from {}: {e}",
+                    public_key_path.display()
+                );
+            })
+            .map_err(|_| MoshpitError::KeyFileMissing)?;
+        if !private_key_path.try_exists().unwrap_or(false) {
+            error!(
+                "Failed to load private key from {}: file does not exist",
+                private_key_path.display()
+            );
+            return Err(MoshpitError::KeyFileMissing.into());
+        }
+
+        let identity_key = if let Ok(identity_key) = load_identity_key(&private_key_path, None) {
+            info!("Private key is unencrypted — no passphrase needed");
+            identity_key
+        } else {
+            info!("Private key may be encrypted — invoking passphrase prompt");
+            let passphrase = passphrase_fn().map_err(|e| {
+                error!("Passphrase prompt failed: {e}");
+                e
+            })?;
+            let Some(passphrase) = passphrase else {
+                error!("Passphrase prompt returned no input — cannot decrypt key");
+                return Err(MoshpitError::KeyCorrupt.into());
+            };
+            load_identity_key(&private_key_path, Some(&passphrase))
+                .inspect_err(|e| error!("Private key validation failed: {e}"))
+                .map_err(|_| MoshpitError::KeyCorrupt)?
         };
-        load_identity_key(&private_key_path, Some(&passphrase))
-            .inspect_err(|e| error!("Private key validation failed: {e}"))
-            .map_err(|_| MoshpitError::KeyCorrupt)?
-    };
-    if identity_key.public_key().as_slice() != public_key_bytes.as_slice() {
-        error!(
-            "Computed public key does not match stored public key at {}",
-            public_key_path.display()
+        if identity_key.public_key().as_slice() != public_key_bytes.as_slice() {
+            error!(
+                "Computed public key does not match stored public key at {}",
+                public_key_path.display()
+            );
+            return Err(MoshpitError::KeyPairMismatch.into());
+        }
+        info!(
+            "Using file identity: {} ({})",
+            public_key_path.display(),
+            identity_key.key_algorithm()
         );
-        return Err(MoshpitError::KeyPairMismatch.into());
-    }
-    info!(
-        "Private identity key ({}) verified successfully",
-        identity_key.key_algorithm()
-    );
+
+        #[cfg(feature = "unstable")]
+        {
+            // Store algorithm and private key for later use below.
+            (full_pub_bytes, None)
+        }
+        #[cfg(not(feature = "unstable"))]
+        (full_pub_bytes, None)
+    };
+
+    // For file-based path, we need the identity_key for unstable signing.
+    // Re-load it here (only in the non-agent branch that reaches this point).
+    #[cfg(feature = "unstable")]
+    let (client_identity_key_algorithm, client_identity_private_key) =
+        if agent_fingerprint.is_some() {
+            // Agent holds the private key; algorithm is looked up from fingerprint.
+            // The `agent_fingerprint` carries the algorithm at signing time.
+            (String::new(), vec![])
+        } else {
+            let (private_key_path, _) = config.key_pair_paths()?;
+            let identity_key = load_identity_key(&private_key_path, None).or_else(|_| {
+                let passphrase = passphrase_fn()?;
+                let p = passphrase.ok_or(MoshpitError::KeyCorrupt)?;
+                load_identity_key(&private_key_path, Some(&p))
+                    .map_err(|_| anyhow::anyhow!(MoshpitError::KeyCorrupt))
+            })?;
+            (
+                identity_key.key_algorithm().clone(),
+                identity_key.private_key().clone(),
+            )
+        };
 
     // Setup the TCP frame reader
     let tx_c = tx.clone();
@@ -494,10 +585,6 @@ async fn run_client_kex<T: KexConfig>(
         .filter(|(k, _)| env_var_matches(k, &send_env_patterns))
         .collect();
     let send_path = config.send_path();
-    #[cfg(feature = "unstable")]
-    let client_identity_key_algorithm = identity_key.key_algorithm().clone();
-    #[cfg(feature = "unstable")]
-    let client_identity_private_key = identity_key.private_key().clone();
     let _read_handle = spawn(async move {
         #[cfg(feature = "unstable")]
         let mut frame_reader = KexReader::builder()
@@ -514,6 +601,8 @@ async fn run_client_kex<T: KexConfig>(
             .full_public_key_bytes(full_public_key_bytes)
             .client_identity_key_algorithm(client_identity_key_algorithm)
             .client_identity_private_key(client_identity_private_key)
+            .maybe_agent_socket(agent_socket)
+            .maybe_agent_fingerprint(agent_fingerprint)
             .send_env(send_env)
             .send_path(send_path)
             .build();
@@ -530,6 +619,8 @@ async fn run_client_kex<T: KexConfig>(
             .client_algos(client_algos)
             .user(user)
             .full_public_key_bytes(full_public_key_bytes)
+            .maybe_agent_socket(agent_socket)
+            .maybe_agent_fingerprint(agent_fingerprint)
             .send_env(send_env)
             .send_path(send_path)
             .build();
@@ -711,6 +802,222 @@ mod tests {
         assert_eq!(
             format!("{}", KexMode::Server(addr)),
             "Server(127.0.0.1:12345)"
+        );
+    }
+
+    #[test]
+    fn env_var_matches_exact() {
+        assert!(env_var_matches("LANG", &["LANG".to_string()]));
+    }
+
+    #[test]
+    fn env_var_matches_wildcard() {
+        assert!(env_var_matches("LC_ALL", &["LC_*".to_string()]));
+    }
+
+    #[test]
+    fn env_var_matches_no_match() {
+        assert!(!env_var_matches(
+            "PATH",
+            &["LANG".to_string(), "LC_*".to_string()]
+        ));
+    }
+
+    #[test]
+    fn env_var_matches_empty_patterns() {
+        assert!(!env_var_matches("LANG", &[]));
+    }
+
+    #[test]
+    fn kex_default_has_empty_keys_and_nil_uuid() {
+        use crate::kex::negotiate::NegotiatedAlgorithms;
+        let kex = Kex::default();
+        assert!(kex.key().is_empty());
+        assert!(kex.hmac_key().is_empty());
+        assert_eq!(kex.uuid(), Uuid::nil());
+        assert!(kex.moshpits_addr().is_none());
+        assert!(kex.session_uuid().is_none());
+        assert!(!kex.is_resume());
+        drop(NegotiatedAlgorithms::default());
+    }
+
+    #[test]
+    fn build_aead_key_aes256_gcm_siv() {
+        use crate::kex::negotiate::{AEAD_AES256_GCM_SIV, NegotiatedAlgorithms};
+        let kex = Kex {
+            key: vec![0u8; 32],
+            hmac_key: Vec::new(),
+            uuid: Uuid::nil(),
+            moshpits_addr: None,
+            session_uuid: None,
+            is_resume: false,
+            negotiated_algorithms: NegotiatedAlgorithms {
+                aead: AEAD_AES256_GCM_SIV.to_string(),
+                ..NegotiatedAlgorithms::default()
+            },
+        };
+        assert!(kex.build_aead_key().is_ok());
+    }
+
+    #[test]
+    fn build_aead_key_aes256_gcm() {
+        use crate::kex::negotiate::{AEAD_AES256_GCM, NegotiatedAlgorithms};
+        let kex = Kex {
+            key: vec![0u8; 32],
+            hmac_key: Vec::new(),
+            uuid: Uuid::nil(),
+            moshpits_addr: None,
+            session_uuid: None,
+            is_resume: false,
+            negotiated_algorithms: NegotiatedAlgorithms {
+                aead: AEAD_AES256_GCM.to_string(),
+                ..NegotiatedAlgorithms::default()
+            },
+        };
+        assert!(kex.build_aead_key().is_ok());
+    }
+
+    #[test]
+    fn build_aead_key_chacha20_poly1305() {
+        use crate::kex::negotiate::{AEAD_CHACHA20_POLY1305, NegotiatedAlgorithms};
+        let kex = Kex {
+            key: vec![0u8; 32],
+            hmac_key: Vec::new(),
+            uuid: Uuid::nil(),
+            moshpits_addr: None,
+            session_uuid: None,
+            is_resume: false,
+            negotiated_algorithms: NegotiatedAlgorithms {
+                aead: AEAD_CHACHA20_POLY1305.to_string(),
+                ..NegotiatedAlgorithms::default()
+            },
+        };
+        assert!(kex.build_aead_key().is_ok());
+    }
+
+    #[test]
+    fn build_aead_key_aes128_gcm_siv() {
+        use crate::kex::negotiate::{AEAD_AES128_GCM_SIV, NegotiatedAlgorithms};
+        let kex = Kex {
+            key: vec![0u8; 16],
+            hmac_key: Vec::new(),
+            uuid: Uuid::nil(),
+            moshpits_addr: None,
+            session_uuid: None,
+            is_resume: false,
+            negotiated_algorithms: NegotiatedAlgorithms {
+                aead: AEAD_AES128_GCM_SIV.to_string(),
+                ..NegotiatedAlgorithms::default()
+            },
+        };
+        assert!(kex.build_aead_key().is_ok());
+    }
+
+    #[test]
+    fn build_aead_key_unknown_returns_err() {
+        use crate::kex::negotiate::NegotiatedAlgorithms;
+        let kex = Kex {
+            key: vec![0u8; 32],
+            hmac_key: Vec::new(),
+            uuid: Uuid::nil(),
+            moshpits_addr: None,
+            session_uuid: None,
+            is_resume: false,
+            negotiated_algorithms: NegotiatedAlgorithms {
+                aead: "unknown-cipher".to_string(),
+                ..NegotiatedAlgorithms::default()
+            },
+        };
+        assert!(kex.build_aead_key().is_err());
+    }
+
+    #[test]
+    fn mac_tag_len_sha256_is_32() {
+        use crate::kex::negotiate::{MAC_HMAC_SHA256, NegotiatedAlgorithms};
+        let kex = Kex {
+            key: Vec::new(),
+            hmac_key: vec![0u8; 32],
+            uuid: Uuid::nil(),
+            moshpits_addr: None,
+            session_uuid: None,
+            is_resume: false,
+            negotiated_algorithms: NegotiatedAlgorithms {
+                mac: MAC_HMAC_SHA256.to_string(),
+                ..NegotiatedAlgorithms::default()
+            },
+        };
+        assert_eq!(kex.mac_tag_len(), 32);
+    }
+
+    #[test]
+    fn mac_tag_len_sha512_is_64() {
+        use crate::kex::negotiate::{MAC_HMAC_SHA512, NegotiatedAlgorithms};
+        let kex = Kex {
+            key: Vec::new(),
+            hmac_key: vec![0u8; 64],
+            uuid: Uuid::nil(),
+            moshpits_addr: None,
+            session_uuid: None,
+            is_resume: false,
+            negotiated_algorithms: NegotiatedAlgorithms {
+                mac: MAC_HMAC_SHA512.to_string(),
+                ..NegotiatedAlgorithms::default()
+            },
+        };
+        assert_eq!(kex.mac_tag_len(), 64);
+    }
+
+    #[test]
+    fn build_hmac_sha256_produces_key() {
+        use crate::kex::negotiate::{MAC_HMAC_SHA256, NegotiatedAlgorithms};
+        let kex = Kex {
+            key: Vec::new(),
+            hmac_key: vec![0u8; 32],
+            uuid: Uuid::nil(),
+            moshpits_addr: None,
+            session_uuid: None,
+            is_resume: false,
+            negotiated_algorithms: NegotiatedAlgorithms {
+                mac: MAC_HMAC_SHA256.to_string(),
+                ..NegotiatedAlgorithms::default()
+            },
+        };
+        let _key = kex.build_hmac(); // verify it doesn't panic
+        assert_eq!(kex.mac_tag_len(), 32);
+    }
+
+    #[test]
+    fn build_hmac_sha512_produces_key() {
+        use crate::kex::negotiate::{MAC_HMAC_SHA512, NegotiatedAlgorithms};
+        let kex = Kex {
+            key: Vec::new(),
+            hmac_key: vec![0u8; 64],
+            uuid: Uuid::nil(),
+            moshpits_addr: None,
+            session_uuid: None,
+            is_resume: false,
+            negotiated_algorithms: NegotiatedAlgorithms {
+                mac: MAC_HMAC_SHA512.to_string(),
+                ..NegotiatedAlgorithms::default()
+            },
+        };
+        let _key = kex.build_hmac(); // verify it doesn't panic
+        assert_eq!(kex.mac_tag_len(), 64);
+    }
+
+    #[tokio::test]
+    async fn kex_state_machine_no_common_algorithm_returns_error() {
+        let (tx, rx) = unbounded_channel();
+        let mut sm = KexStateMachine::builder().rx_event(rx).build();
+        tx.send(KexEvent::NoCommonAlgorithm).unwrap();
+        drop(tx);
+        let result = sm.handle_events(true).await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .downcast_ref::<MoshpitError>()
+                .is_some_and(|e| *e == MoshpitError::NoCommonAlgorithm),
         );
     }
 }

@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 
-members = ["keygen","libmoshpit", "moshpit", "moshpits", "xtask"]
+members = ["agent", "keygen","libmoshpit", "moshpit", "moshpits", "xtask"]
 
 [workspace.dependencies]
 anyhow = "1.0.102"

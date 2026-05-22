@@ -1,0 +1,107 @@
+[package]
+authors = ["Jason Ozias <jason.g.ozias@gmail.com>"]
+categories = ["command-line-interface", "network-programming", "cryptography"]
+description = "moshpit agent — holds identity keys in memory and serves them over a Unix socket"
+documentation = "https://docs.rs/libmoshpit"
+edition = "2024"
+homepage = "https://github.com/rustyhorde/moshpit"
+keywords = ["ssh", "mosh"]
+license = "MIT OR Apache-2.0"
+name = "moshpit-agent"
+readme = "../README.md"
+repository = "https://github.com/rustyhorde/moshpit"
+version = "0.8.6"
+rust-version = "1.91.1"
+
+[[bin]]
+name = "mpa"
+path = "src/main.rs"
+
+[features]
+unstable = ["libmoshpit/unstable"]
+# OS keyring integration via libsecret (GNOME Keyring / KWallet)
+secret-service = ["dep:secret-service"]
+# macOS Keychain
+macos-keychain = ["dep:security-framework"]
+# FIDO2 / passkey / YubiKey (no extra dep — uses system libfido2 via FFI stub)
+fido2 = []
+# TPM 2.0 sealing
+tpm = ["dep:tss-esapi"]
+# systemd credentials ($CREDENTIALS_DIRECTORY) — no extra dep needed
+systemd-creds = []
+# Fingerprint via fprintd D-Bus
+fprintd = ["dep:zbus"]
+# Derive vault key from SSH agent challenge-response — no extra dep needed
+ssh-agent-piggyback = []
+
+[dependencies]
+anyhow = { workspace = true }
+argon2 = { version = "0.6.0-rc.8", features = ["getrandom"] }
+aws-lc-rs = { workspace = true }
+base64 = "0.22.1"
+bincode-next = "3.0.0-rc.14"
+bytes = { workspace = true }
+clap = { workspace = true }
+dialoguer = "0.12.0"
+dirs2 = "3.0.1"
+getset = { workspace = true }
+libmoshpit = { version = "0.8.6", path = "../libmoshpit" }
+nix = { version = "0.31.3", features = ["socket", "user"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal"] }
+tracing = { workspace = true }
+vergen-pretty = { workspace = true }
+zeroize = { workspace = true }
+
+# Feature-gated optional deps
+secret-service = { version = "5.1.0", features = ["rt-tokio-crypto-rust"], optional = true }
+security-framework = { version = "3.7.0", optional = true }
+tss-esapi = { version = "7.7.0", optional = true }
+zbus = { version = "5.15.0", optional = true }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[build-dependencies]
+anyhow = { workspace = true }
+pkg-config = "0.3"
+rustversion = { workspace = true }
+vergen-gix = { workspace = true }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[[package.metadata.cargo-matrix.channel]]
+name = "linux"
+# secret-service matches the dep name so cargo-matrix treats it as an implicit dep-feature;
+# include_optional re-adds it explicitly to the powerset seed.
+include_optional = ["secret-service"]
+# security-framework is guarded #![cfg(target_vendor = "apple")] — hard compile error on Linux.
+always_deny = ["macos-keychain"]
+mutually_exclusive = [
+  [
+    "fido2",
+    "fprintd",
+    "secret-service",
+    "ssh-agent-piggyback",
+    "systemd-creds",
+    "tpm",
+  ],
+]
+
+[[package.metadata.cargo-matrix.channel]]
+name = "macos"
+# tpm2-tss not in standard Homebrew; fprintd/secret-service/systemd-creds are Linux-specific.
+always_deny = ["fprintd", "secret-service", "systemd-creds", "tpm"]
+mutually_exclusive = [
+  [
+    "fido2",
+    "macos-keychain",
+    "ssh-agent-piggyback",
+  ],
+]
+
+[[package.metadata.cargo-matrix.channel]]
+name = "windows"
+# No system libraries available; macos-keychain/fido2/tpm require non-Windows SDKs.
+always_deny = ["fido2", "fprintd", "macos-keychain", "secret-service", "systemd-creds", "tpm"]

@@ -33,56 +33,13 @@ jobs:
         # v6.0.2
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
 
-      - name: 📦 Install cargo-audit 📦
-        run: cargo install cargo-audit --locked
-
-      - name: 💣 cargo audit 💣
-        id: audit
-        run: cargo audit -D warnings
-
-      - name: 📝 Open issue for advisories 📝
-        if: failure() && steps.audit.conclusion == 'failure' && github.event_name != 'pull_request'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          cargo audit --json > audit.json 2>/dev/null || true
-
-          TITLE=$(jq -r '
-            [
-              (.vulnerabilities.list[]? | .advisory.id),
-              (.warnings | to_entries[]? | .value[]? | .advisory.id // empty)
-            ] | unique | sort | join(", ")
-          ' audit.json)
-          [ -z "$TITLE" ] && TITLE="cargo-audit: security advisories found"
-
-          BODY=$(jq -r '
-            (if (.vulnerabilities.list | length) > 0 then
-              "## Vulnerabilities\n\n" +
-              ([ .vulnerabilities.list[] |
-                "### ‼️ \(.advisory.id) ‼️\n" +
-                "<\(.advisory.url)>\n\n" +
-                "| Field | Value |\n|---|---|\n" +
-                "| Crate | `\(.package.name)` |\n" +
-                "| Version | `\(.package.version)` |\n" +
-                "| Title | \(.advisory.title) |\n" +
-                "| Date | \(.advisory.date) |\n" +
-                (if (.versions.patched | length) > 0
-                 then "| Fix | upgrade to `\(.versions.patched | join("`, `"))` |"
-                 else "| Fix | no fix available |"
-                 end)
-              ] | join("\n\n"))
-            else "" end) +
-            (if (.warnings | to_entries | map(.value | length) | add // 0) > 0 then
-              "\n\n## Warnings\n\n" +
-              ([ .warnings | to_entries[]? | .value[]? |
-                "### ⚠️ \(.advisory.id // "Warning") — \(.kind // "unknown") ⚠️\n" +
-                "- **Crate:** `\(.package.name)` \(.package.version)\n" +
-                (if .advisory != null then "- **URL:** <\(.advisory.url)>" else "" end)
-              ] | join("\n\n"))
-            else "" end)
-          ' audit.json)
-
-          gh issue create --title "$TITLE" --body "$BODY"
+      - name: 💣 Audit 💣
+        # v0
+        uses: rustyhorde/audit-check@f7875ca3428c17cce4d5a141ea1128568db8b6c2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          deny: warnings
+          create_issue: ${{ github.event_name != 'pull_request' }}
 
   fuzz-smoke:
     name: 🧪 Fuzz Smoke Test 🧪

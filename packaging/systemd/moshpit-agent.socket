@@ -1,0 +1,15 @@
+[Unit]
+Description=Moshpit Agent Socket
+Documentation=man:mpa(1)
+
+[Socket]
+# Socket activation: systemd creates the socket and passes it to mpa via
+# LISTEN_FDS / sd_listen_fds().  Requires mpa to implement sd_notify or
+# ListenStream-based activation (future work).
+ListenStream=%t/moshpit-agent.sock
+SocketMode=0600
+# Clean up the socket file on stop.
+RemoveOnStop=true
+
+[Install]
+WantedBy=sockets.target

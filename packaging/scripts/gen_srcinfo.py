@@ -101,7 +101,12 @@ def main() -> int:
     repo_root = Path(__file__).resolve().parent.parent.parent
     arch_dir = repo_root / "packaging" / "arch"
 
-    packages = ["moshpit-keygen", "moshpit", "moshpits"]
+    packages = [
+        "moshpit-keygen", "moshpit", "moshpits",
+        "moshpit-agent", "moshpit-agent-fido2", "moshpit-agent-systemd-creds",
+        "moshpit-agent-ssh-agent-piggyback", "moshpit-agent-secret-service",
+        "moshpit-agent-tpm", "moshpit-agent-fprintd", "moshpit-agent-full",
+    ]
     for pkg in packages:
         pkgbuild = arch_dir / pkg / "PKGBUILD"
         if not pkgbuild.exists():
