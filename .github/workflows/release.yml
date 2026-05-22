@@ -658,6 +658,6 @@ jobs:
             assets: ${{ steps.assets.outputs.assets }}
             commit_username: Jason Ozias
             commit_email: jason.g.ozias@gmail.com
-            ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+            ssh_private_key: ${{ toJSON(secrets.AUR_SSH_PRIVATE_KEY) }}
             commit_message: Update to v${{ needs.build.outputs.pkgver }}
             allow_empty_commits: false
