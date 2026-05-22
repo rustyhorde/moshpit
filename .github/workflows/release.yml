@@ -565,6 +565,17 @@ jobs:
             packaging/arch/moshpit-agent-full-bin/PKGBUILD \
             "$DIST_MPA" "$X86_64_MPA_FULL" "$AARCH64_MPA_FULL"
 
+      - name: Generate .SRCINFO files
+        run: |
+          for pkg_dir in packaging/arch/*/; do
+            docker run --rm \
+              -v "$(pwd)/${pkg_dir%/}:/pkg" \
+              -w /pkg \
+              archlinux:latest \
+              bash -c "useradd -m builder && chown -R builder /pkg && su -s /bin/bash builder -c 'makepkg --printsrcinfo'" \
+              > "${pkg_dir}.SRCINFO"
+          done
+
       - name: Upload updated PKGBUILDs as artifact
         # v7
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -630,34 +641,47 @@ jobs:
           name: pkgbuilds
           path: packaging/arch/
 
-      - name: Collect flat package assets
-        id: assets
-        run: |
-          pkg_dir="packaging/arch/${{ matrix.package }}"
-          {
-            # Include only regular files in package root (no subdirectories).
-            find "$pkg_dir" -maxdepth 1 -type f ! -name 'PKGBUILD' | sort
-          } > assets.txt
-          {
-            echo "assets<<EOF"
-            cat assets.txt
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-
       - name: Publish ${{ matrix.package }} to AUR
-        # wretry.action v3.8.0
-        uses: Wandalen/wretry.action@e68c23e6309f2871ca8ae4763e7629b9c258e1ea
-        with:
-          # v4.1.3
-          action: KSXGitHub/github-actions-deploy-aur@da03e160361ce01bf087e790b6ffd196d7dccff7
-          attempt_limit: 3
-          attempt_delay: 10000
-          with: |
-            pkgname: ${{ matrix.package }}
-            pkgbuild: packaging/arch/${{ matrix.package }}/PKGBUILD
-            assets: ${{ steps.assets.outputs.assets }}
-            commit_username: Jason Ozias
-            commit_email: jason.g.ozias@gmail.com
-            ssh_private_key: ${{ toJSON(secrets.AUR_SSH_PRIVATE_KEY) }}
-            commit_message: Update to v${{ needs.build.outputs.pkgver }}
-            allow_empty_commits: false
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          PKGNAME: ${{ matrix.package }}
+          PKGVER: ${{ needs.build.outputs.pkgver }}
+        run: |
+          set -euo pipefail
+
+          # SSH setup — env var preserves newlines natively; no YAML parsing involved
+          mkdir -p ~/.ssh
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" | tr -d '\r' > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          ssh-keyscan -t rsa,ecdsa,ed25519 aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
+          printf 'Host aur.archlinux.org\n  IdentityFile ~/.ssh/aur\n  User aur\n' >> ~/.ssh/config
+          chmod 600 ~/.ssh/config
+
+          # Clone AUR repo
+          git clone "ssh://aur@aur.archlinux.org/${PKGNAME}.git" /tmp/aur-repo
+          cd /tmp/aur-repo
+
+          # Copy PKGBUILD and all sidecar files (including .SRCINFO generated upstream)
+          PKG_DIR="${GITHUB_WORKSPACE}/packaging/arch/${PKGNAME}"
+          cp "${PKG_DIR}/PKGBUILD" .
+          find "${PKG_DIR}" -maxdepth 1 -type f ! -name PKGBUILD -exec cp -v {} . \;
+
+          # Commit if there are changes
+          git config user.name  "Jason Ozias"
+          git config user.email "jason.g.ozias@gmail.com"
+          git add .
+          git diff-index --quiet HEAD || git commit -m "Update to v${PKGVER}"
+
+          # Push with retry
+          for attempt in 1 2 3; do
+            if git push; then
+              break
+            fi
+            if [[ $attempt -lt 3 ]]; then
+              echo "Push attempt ${attempt} failed, retrying in 10s..."
+              sleep 10
+            else
+              echo "All push attempts failed."
+              exit 1
+            fi
+          done
