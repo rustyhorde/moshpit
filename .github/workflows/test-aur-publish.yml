@@ -1,0 +1,116 @@
+name: Test AUR Publish
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version string (e.g. 0.8.6)'
+        required: true
+        type: string
+      package:
+        description: 'AUR package to test'
+        required: true
+        type: choice
+        options:
+          - moshpit-keygen
+          - moshpit
+          - moshpits
+          - moshpit-keygen-bin
+          - moshpit-bin
+          - moshpits-bin
+          - moshpit-keygen-unstable-bin
+          - moshpit-unstable-bin
+          - moshpits-unstable-bin
+          - moshpit-agent
+          - moshpit-agent-fido2
+          - moshpit-agent-systemd-creds
+          - moshpit-agent-ssh-agent-piggyback
+          - moshpit-agent-secret-service
+          - moshpit-agent-tpm
+          - moshpit-agent-fprintd
+          - moshpit-agent-full
+          - moshpit-agent-bin
+          - moshpit-agent-full-bin
+      dry_run:
+        description: 'Dry run — validate SSH + commit logic but skip push'
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  test-aur-publish:
+    name: Test AUR Publish (${{ inputs.package }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        # v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Generate .SRCINFO
+        run: |
+          docker run --rm \
+            -v "$(pwd)/packaging/arch/${{ inputs.package }}:/pkg" \
+            -w /pkg \
+            archlinux:latest \
+            bash -c "makepkg --printsrcinfo > .SRCINFO"
+
+      - name: Validate SSH connectivity
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s' "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          ssh-keyscan -t rsa,ecdsa,ed25519 aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
+          printf 'Host aur.archlinux.org\n  IdentityFile ~/.ssh/aur\n  User aur\n' >> ~/.ssh/config
+          chmod 600 ~/.ssh/config
+          # AUR prints "Interactive shell disabled" on successful auth (exit code non-zero is expected)
+          ssh -o BatchMode=yes aur@aur.archlinux.org 2>&1 || true
+
+      - name: Publish ${{ inputs.package }} to AUR
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          PKGNAME: ${{ inputs.package }}
+          PKGVER: ${{ inputs.version }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p ~/.ssh
+          printf '%s' "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          ssh-keyscan -t rsa,ecdsa,ed25519 aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
+          printf 'Host aur.archlinux.org\n  IdentityFile ~/.ssh/aur\n  User aur\n' >> ~/.ssh/config
+          chmod 600 ~/.ssh/config
+
+          git clone "ssh://aur@aur.archlinux.org/${PKGNAME}.git" /tmp/aur-repo
+          cd /tmp/aur-repo
+
+          PKG_DIR="${GITHUB_WORKSPACE}/packaging/arch/${PKGNAME}"
+          cp "${PKG_DIR}/PKGBUILD" .
+          find "${PKG_DIR}" -maxdepth 1 -type f ! -name PKGBUILD -exec cp -v {} . \;
+
+          git config user.name  "Jason Ozias"
+          git config user.email "jason.g.ozias@gmail.com"
+          git add .
+          git diff-index --quiet HEAD || git commit -m "Update to v${PKGVER}"
+
+          if [[ "$DRY_RUN" == "true" ]]; then
+            echo "DRY RUN: skipping push. Commit log:"
+            git log --oneline -3
+            exit 0
+          fi
+
+          for attempt in 1 2 3; do
+            if git push; then
+              break
+            fi
+            if [[ $attempt -lt 3 ]]; then
+              echo "Push attempt ${attempt} failed, retrying in 10s..."
+              sleep 10
+            else
+              echo "All push attempts failed."
+              exit 1
+            fi
+          done
