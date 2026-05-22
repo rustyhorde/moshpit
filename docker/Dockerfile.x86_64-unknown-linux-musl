@@ -86,23 +86,13 @@ RUN git clone --depth 1 --branch hidapi-0.14.0 https://github.com/libusb/hidapi.
 # Build static libudev-zero (MUSL cross-compiled; satisfies libfido2's libudev requirement for
 # Linux device enumeration; daemon-free implementation that reads directly from sysfs/netlink)
 RUN git clone --depth 1 https://github.com/illiliti/libudev-zero.git /tmp/libudev-zero && \
-    cd /tmp/libudev-zero && \
-    ${MUSL_CC} -std=c99 -O2 -c libudev.c -o libudev.o && \
-    ${MUSL_AR} rcs /usr/local/lib/libudev.a libudev.o && \
-    cp libudev.h /usr/local/include/ && \
-    printf '%s\n' \
-        'prefix=/usr/local' \
-        'exec_prefix=${prefix}' \
-        'libdir=${exec_prefix}/lib' \
-        'includedir=${prefix}/include' \
-        '' \
-        'Name: libudev' \
-        'Description: libudev (zero implementation)' \
-        'Version: 999' \
-        'Libs: -L${libdir} -ludev' \
-        'Cflags: -I${includedir}' \
-        > /usr/local/lib/pkgconfig/libudev.pc && \
-    cd / && rm -rf /tmp/libudev-zero
+    make -C /tmp/libudev-zero \
+        CC="${MUSL_CC}" \
+        AR="${MUSL_AR}" \
+        PREFIX=/usr/local \
+        USB_IDS_PATH=/usr/share/hwdata/usb.ids \
+        install-static && \
+    rm -rf /tmp/libudev-zero
 
 # Build static libfido2 (MUSL cross-compiled, with hidapi transport; library target only)
 RUN git clone --depth 1 --branch 1.16.0 https://github.com/Yubico/libfido2.git /tmp/libfido2 && \
