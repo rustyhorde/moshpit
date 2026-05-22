@@ -1,0 +1,21 @@
+pkgbase = moshpit-keygen-unstable-bin
+	pkgdesc = Asymmetric key generation and inspection tool for moshpit — X25519, P-384, P-256, and ML-DSA post-quantum identity keys (pre-compiled binary)
+	pkgver = 0.8.6
+	pkgrel = 1
+	url = https://github.com/rustyhorde/moshpit
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	license = Apache-2.0
+	provides = moshpit-keygen
+	conflicts = moshpit-keygen
+	conflicts = moshpit-keygen-bin
+	replaces = moshpit-keygen-bin
+	source = https://github.com/rustyhorde/moshpit/releases/download/v0.8.6/dist-mp-keygen.tar.gz
+	sha256sums = 4de2a63136e04c4cdb5fccadf64aa0aae83cd796eb00381bfd020fc1894a7aae
+	source_x86_64 = mp-keygen-unstable-x86_64::https://github.com/rustyhorde/moshpit/releases/download/v0.8.6/mp-keygen-unstable-x86_64-unknown-linux-musl
+	sha256sums_x86_64 = 6898674f0be318bd3c91a460f0b13ba3b92b13f28a4d8971bd1aa03168dc846d
+	source_aarch64 = mp-keygen-unstable-aarch64::https://github.com/rustyhorde/moshpit/releases/download/v0.8.6/mp-keygen-unstable-aarch64-unknown-linux-musl
+	sha256sums_aarch64 = c374b5c59b996e3043fd974bf9a9b1117051099e6a5088fdd135649aeef08a0d
+
+pkgname = moshpit-keygen-unstable-bin
