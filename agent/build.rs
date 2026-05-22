@@ -35,6 +35,7 @@ fn link_fido2() {
         println!("cargo:rustc-link-lib=static=cbor");
         println!("cargo:rustc-link-lib=static=hidapi-hidraw");
         println!("cargo:rustc-link-lib=static=usb-1.0");
+        println!("cargo:rustc-link-lib=static=udev");
         println!("cargo:rustc-link-lib=static=crypto");
         println!("cargo:rustc-link-lib=static=z");
     } else {
