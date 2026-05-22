@@ -1,0 +1,20 @@
+pkgbase = moshpit-bin
+	pkgdesc = moshpit client — SSH and Mosh inspired remote terminal client (pre-compiled binary)
+	pkgver = 0.8.6
+	pkgrel = 1
+	url = https://github.com/rustyhorde/moshpit
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	license = Apache-2.0
+	depends = moshpit-keygen
+	provides = moshpit
+	conflicts = moshpit
+	source = https://github.com/rustyhorde/moshpit/releases/download/v0.8.6/dist-mp.tar.gz
+	sha256sums = 01fe2c64dd041bb23abdd1eb4d44a4946011d98c3ec7423c85cf3aa875e69365
+	source_x86_64 = mp-x86_64::https://github.com/rustyhorde/moshpit/releases/download/v0.8.6/mp-x86_64-unknown-linux-musl
+	sha256sums_x86_64 = e026ef32ccd12db05a8e6ea88d6121fed3de0c28dae2f719470e6bc04b5f58f7
+	source_aarch64 = mp-aarch64::https://github.com/rustyhorde/moshpit/releases/download/v0.8.6/mp-aarch64-unknown-linux-musl
+	sha256sums_aarch64 = b35762c5576a1245ca8872acd66a742e5b05a6e8413b8ac85ac1a92e95bc92c9
+
+pkgname = moshpit-bin

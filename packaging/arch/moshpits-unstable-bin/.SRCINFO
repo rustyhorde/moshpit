@@ -1,0 +1,25 @@
+pkgbase = moshpits-unstable-bin
+	pkgdesc = moshpits server with post-quantum support — SSH and Mosh inspired remote terminal server (pre-compiled binary)
+	pkgver = 0.8.6
+	pkgrel = 1
+	url = https://github.com/rustyhorde/moshpit
+	install = moshpits.install
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	license = Apache-2.0
+	depends = moshpit-keygen
+	provides = moshpits
+	conflicts = moshpits
+	conflicts = moshpits-bin
+	replaces = moshpits-bin
+	source = https://github.com/rustyhorde/moshpit/releases/download/v0.8.6/dist-mps.tar.gz
+	source = mps.service
+	sha256sums = 31038dd5acc81e8ced394aeab8078a62d65aeb0b3f8697cecb44f6c5239a27b4
+	sha256sums = SKIP
+	source_x86_64 = mps-unstable-x86_64::https://github.com/rustyhorde/moshpit/releases/download/v0.8.6/mps-unstable-x86_64-unknown-linux-musl
+	sha256sums_x86_64 = 5ca02826e2b0a702ff729132aa882c1207d1b6dabf34e90e8a2e71d9ccd6c0ae
+	source_aarch64 = mps-unstable-aarch64::https://github.com/rustyhorde/moshpit/releases/download/v0.8.6/mps-unstable-aarch64-unknown-linux-musl
+	sha256sums_aarch64 = 0adaa9b59d22cfb83a9b794761d73c9bf1710d16abbd2a9cfbb6e1f78e465496
+
+pkgname = moshpits-unstable-bin
