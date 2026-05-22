@@ -651,7 +651,7 @@ jobs:
 
           # SSH setup — env var preserves newlines natively; no YAML parsing involved
           mkdir -p ~/.ssh
-          printf '%s' "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/aur
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" | tr -d '\r' > ~/.ssh/aur
           chmod 600 ~/.ssh/aur
           ssh-keyscan -t rsa,ecdsa,ed25519 aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
           printf 'Host aur.archlinux.org\n  IdentityFile ~/.ssh/aur\n  User aur\n' >> ~/.ssh/config
