@@ -166,9 +166,9 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "bincode-next"
-version = "3.0.0-rc.14"
+version = "3.0.0-rc.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e4979ec1902cb712ca61a681f05e8a54f1fd42b82234c732dce7cfd1f4fac62a"
+checksum = "a88baf40ae3f860eeec5746d569f7aacff71aa26dd9585263e22158019382ae4"
 dependencies = [
  "bincode_derive-next",
  "pastey",
@@ -179,9 +179,9 @@ dependencies = [
 
 [[package]]
 name = "bincode_derive-next"
-version = "3.0.0-rc.14"
+version = "3.0.0-rc.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2af0c928ada99005e6bb883059345daa044b1fa92495c681ad52a4b30c65789b"
+checksum = "dcb002c0d9815b6eecea9fd321c6031159fd497f8ee2d95bcc81a267495e36a4"
 dependencies = [
  "virtue-next",
 ]
