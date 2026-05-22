@@ -572,7 +572,8 @@ jobs:
               -v "$(pwd)/${pkg_dir%/}:/pkg" \
               -w /pkg \
               archlinux:latest \
-              bash -c "makepkg --printsrcinfo > .SRCINFO"
+              bash -c "useradd -m builder && chown -R builder /pkg && su -s /bin/bash builder -c 'makepkg --printsrcinfo'" \
+              > "${pkg_dir}.SRCINFO"
           done
 
       - name: Upload updated PKGBUILDs as artifact

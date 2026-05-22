@@ -53,7 +53,8 @@ jobs:
             -v "$(pwd)/packaging/arch/${{ inputs.package }}:/pkg" \
             -w /pkg \
             archlinux:latest \
-            bash -c "makepkg --printsrcinfo > .SRCINFO"
+            bash -c "useradd -m builder && chown -R builder /pkg && su -s /bin/bash builder -c 'makepkg --printsrcinfo'" \
+            > "packaging/arch/${{ inputs.package }}/.SRCINFO"
 
       - name: Validate SSH connectivity
         env:
