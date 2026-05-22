@@ -93,6 +93,7 @@ jobs:
 
           git clone "ssh://aur@aur.archlinux.org/${PKGNAME}.git" /tmp/aur-repo
           cd /tmp/aur-repo
+          git checkout -B master
 
           PKG_DIR="${GITHUB_WORKSPACE}/packaging/arch/${PKGNAME}"
           cp "${PKG_DIR}/PKGBUILD" .
