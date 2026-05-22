@@ -33,7 +33,11 @@ fn link_fido2() {
         println!("cargo:rustc-link-search=/usr/local/lib");
         println!("cargo:rustc-link-lib=static=fido2");
         println!("cargo:rustc-link-lib=static=cbor");
-        println!("cargo:rustc-link-lib=static=hidapi");
+        println!("cargo:rustc-link-lib=static=hidapi-hidraw");
+        println!("cargo:rustc-link-lib=static=usb-1.0");
+        println!("cargo:rustc-link-lib=static=udev");
+        println!("cargo:rustc-link-lib=static=crypto");
+        println!("cargo:rustc-link-lib=static=z");
     } else {
         pkg_config::probe_library("libfido2").expect(
             "libfido2 not found; install the libfido2 package (e.g. `sudo pacman -S libfido2`)",

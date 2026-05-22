@@ -3,37 +3,116 @@ FROM ghcr.io/cross-rs/aarch64-unknown-linux-musl:main
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends cmake git libpcsclite-dev pkg-config && \
+    apt-get install -y --no-install-recommends \
+        autoconf automake cmake git libtool perl pkg-config && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-# Build static libcbor
+# All C dependencies are cross-compiled with aarch64-linux-musl-gcc so they produce
+# aarch64 MUSL-ABI object files.
+ENV MUSL_CC=aarch64-linux-musl-gcc \
+    MUSL_AR=aarch64-linux-musl-gcc-ar \
+    MUSL_RANLIB=aarch64-linux-musl-ranlib \
+    MUSL_HOST=aarch64-linux-musl \
+    PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
+
+# Build static OpenSSL for aarch64-MUSL (required by libfido2)
+# --libdir=lib forces the install path to lib/ (not lib64/) so pkg-config finds it
+RUN git clone --depth 1 --branch openssl-3.0.15 https://github.com/openssl/openssl.git /tmp/openssl && \
+    cd /tmp/openssl && \
+    CC=${MUSL_CC} \
+    ./Configure \
+        linux-aarch64 \
+        --prefix=/usr/local \
+        --libdir=lib \
+        no-shared \
+        no-tests \
+        no-ui-console && \
+    make -j"$(nproc)" build_libs && \
+    make install_dev && \
+    cd / && rm -rf /tmp/openssl
+
+# Build static zlib for aarch64-MUSL (required by libfido2)
+RUN git clone --depth 1 --branch v1.3.1 https://github.com/madler/zlib.git /tmp/zlib && \
+    cd /tmp/zlib && \
+    CC=${MUSL_CC} \
+    ./configure --prefix=/usr/local --static && \
+    make -j"$(nproc)" && make install && \
+    cd / && rm -rf /tmp/zlib
+
+# Build static libcbor (cross-compiled for aarch64-MUSL)
 RUN git clone --depth 1 --branch v0.11.0 https://github.com/PJK/libcbor.git /tmp/libcbor && \
     cmake -S /tmp/libcbor -B /tmp/libcbor/build \
         -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_SHARED_LIBS=OFF \
+        -DCMAKE_C_COMPILER=${MUSL_CC} \
+        -DCMAKE_SYSTEM_NAME=Linux \
+        -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
         -DCMAKE_INSTALL_PREFIX=/usr/local && \
     cmake --build /tmp/libcbor/build --parallel && \
     cmake --install /tmp/libcbor/build && \
     rm -rf /tmp/libcbor
 
-# Build static hidapi
+# Build static libusb (cross-compiled for aarch64-MUSL, udev-free)
+RUN git clone --depth 1 --branch v1.0.27 https://github.com/libusb/libusb.git /tmp/libusb && \
+    cd /tmp/libusb && autoreconf -i && \
+    CC=${MUSL_CC} AR=${MUSL_AR} RANLIB=${MUSL_RANLIB} \
+    ./configure \
+        --prefix=/usr/local \
+        --host=${MUSL_HOST} \
+        --enable-static \
+        --disable-shared \
+        --disable-udev && \
+    make -j"$(nproc)" && make install && \
+    cd / && rm -rf /tmp/libusb
+
+# Build static hidapi (cross-compiled for aarch64-MUSL, libusb backend only — no udev dependency)
 RUN git clone --depth 1 --branch hidapi-0.14.0 https://github.com/libusb/hidapi.git /tmp/hidapi && \
     cmake -S /tmp/hidapi -B /tmp/hidapi/build \
         -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_SHARED_LIBS=OFF \
+        -DHIDAPI_WITH_HIDRAW=OFF \
+        -DHIDAPI_WITH_LIBUSB=ON \
+        -DCMAKE_C_COMPILER=${MUSL_CC} \
+        -DCMAKE_SYSTEM_NAME=Linux \
+        -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
         -DCMAKE_INSTALL_PREFIX=/usr/local && \
     cmake --build /tmp/hidapi/build --parallel && \
     cmake --install /tmp/hidapi/build && \
+    ln -sf /usr/local/lib/libhidapi-libusb.a /usr/local/lib/libhidapi-hidraw.a && \
+    ln -sf /usr/local/lib/pkgconfig/hidapi-libusb.pc /usr/local/lib/pkgconfig/hidapi-hidraw.pc && \
     rm -rf /tmp/hidapi
 
-# Build static libfido2 (with hidapi transport)
+# Build static libudev-zero (cross-compiled for aarch64-MUSL; satisfies libfido2's libudev requirement
+# for Linux device enumeration; daemon-free implementation that reads directly from sysfs/netlink)
+RUN git clone --depth 1 https://github.com/illiliti/libudev-zero.git /tmp/libudev-zero && \
+    make -C /tmp/libudev-zero \
+        CC="${MUSL_CC}" \
+        AR="${MUSL_AR}" \
+        PREFIX=/usr/local \
+        USB_IDS_PATH=/usr/share/hwdata/usb.ids \
+        install-static && \
+    rm -rf /tmp/libudev-zero
+
+# Build static libfido2 (cross-compiled for aarch64-MUSL, with hidapi transport; library target only)
 RUN git clone --depth 1 --branch 1.16.0 https://github.com/Yubico/libfido2.git /tmp/libfido2 && \
+    PKG_CONFIG_PATH=/usr/local/lib/pkgconfig \
+    PKG_CONFIG_LIBDIR=/usr/local/lib/pkgconfig \
     cmake -S /tmp/libfido2 -B /tmp/libfido2/build \
         -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_SHARED_LIBS=OFF \
         -DUSE_HIDAPI=ON \
+        -DNFC_LINUX=OFF \
+        -DCMAKE_C_COMPILER=${MUSL_CC} \
+        -DCMAKE_SYSTEM_NAME=Linux \
+        -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+        -DCMAKE_PREFIX_PATH=/usr/local \
+        -DCMAKE_FIND_ROOT_PATH=/usr/local \
+        -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=BOTH \
+        -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=BOTH \
         -DCMAKE_INSTALL_PREFIX=/usr/local && \
-    cmake --build /tmp/libfido2/build --parallel && \
-    cmake --install /tmp/libfido2/build && \
+    cmake --build /tmp/libfido2/build --parallel --target fido2 && \
+    cp /tmp/libfido2/build/src/libfido2.a /usr/local/lib/ && \
+    cp /tmp/libfido2/src/fido.h /usr/local/include/ && \
+    cp -r /tmp/libfido2/src/fido /usr/local/include/ && \
     rm -rf /tmp/libfido2

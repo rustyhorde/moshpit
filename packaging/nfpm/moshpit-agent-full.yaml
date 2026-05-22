@@ -14,13 +14,14 @@ description: |
 homepage: https://github.com/rustyhorde/moshpit
 license: MIT OR Apache-2.0
 
+conflicts:
+  - moshpit-agent
+  - moshpit-agent-fido2
+  - moshpit-agent-systemd-creds
+  - moshpit-agent-ssh-agent-piggyback
+
 deb:
   compression: xz
-  conflicts:
-    - moshpit-agent
-    - moshpit-agent-fido2
-    - moshpit-agent-systemd-creds
-    - moshpit-agent-ssh-agent-piggyback
 
 rpm:
   compression: xz
