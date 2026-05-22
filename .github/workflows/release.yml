@@ -600,6 +600,7 @@ jobs:
     permissions:
       contents: read
     strategy:
+      max-parallel: 3
       matrix:
         package:
           - moshpit-keygen
