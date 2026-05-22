@@ -14,7 +14,7 @@ conflicts=('moshpit-agent' 'moshpit-agent-fido2' 'moshpit-agent-ssh-agent-piggyb
 depends=('systemd')
 makedepends=('cargo' 'cmake' 'gcc')
 source=("$pkgname-$pkgver.tar.gz::https://github.com/rustyhorde/moshpit/archive/v$pkgver.tar.gz")
-sha256sums=('PLACEHOLDER')
+sha256sums=('49d0e6531f6c6e6d124b6e04663993197e3ce92147befb977b7af464569699db')
 
 prepare() {
     cd "moshpit-$pkgver"
