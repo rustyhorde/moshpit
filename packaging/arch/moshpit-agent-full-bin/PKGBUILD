@@ -18,9 +18,9 @@ _base="https://github.com/rustyhorde/moshpit/releases/download/v${pkgver}"
 source=("${_base}/dist-mpa.tar.gz")
 source_x86_64=("mpa-full-x86_64::${_base}/mpa-full-x86_64-unknown-linux-musl")
 source_aarch64=("mpa-full-aarch64::${_base}/mpa-full-aarch64-unknown-linux-musl")
-sha256sums=('PLACEHOLDER')
-sha256sums_x86_64=('PLACEHOLDER')
-sha256sums_aarch64=('PLACEHOLDER')
+sha256sums=('d510803332edd58001937b36a3e790cfccb3320ad2718c80243b497edfa615b2')
+sha256sums_x86_64=('99654385a4ff60d8723c61c79a382a585fc8c598d6326fbde5e91ee5d41cb51e')
+sha256sums_aarch64=('85cc951dd75235ae0bbb8ff57b111ff548af0e68c14efb41f517dc47c63b30ef')
 
 package() {
     install -Dm755 "mpa-full-${CARCH}" "$pkgdir/usr/bin/mpa"
