@@ -1630,6 +1630,20 @@ mod tests {
     }
 
     #[test]
+    #[allow(unsafe_code)]
+    fn env_guard_restores_original_value() {
+        // Safety: nextest runs each test in its own process; no concurrent env access.
+        const KEY: &str = "MOSHPIT_TEST_ENV_GUARD_RESTORE";
+        unsafe { std::env::set_var(KEY, "original") };
+        {
+            let _guard = EnvGuard::new(KEY, Some("overridden"));
+            assert_eq!(std::env::var(KEY).ok().as_deref(), Some("overridden"));
+        }
+        assert_eq!(std::env::var(KEY).ok().as_deref(), Some("original"));
+        unsafe { std::env::remove_var(KEY) };
+    }
+
+    #[test]
     fn test_pass_cache() {
         let mut cache = PassCache::Uncached;
         assert!(!cache.is_cached());

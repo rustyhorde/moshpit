@@ -649,18 +649,24 @@ fn unlock_backend(config: &AgentConfig) -> Box<dyn UnlockBackend> {
     Box::new(PassphraseBackend)
 }
 
-fn print_socket_env(path: &Path, shell: ShellKind) {
+fn format_socket_env(path: &Path, shell: ShellKind) -> String {
     match shell {
-        ShellKind::Fish => println!("set -Ux MOSHPIT_AGENT_SOCK {}", path.display()),
-        ShellKind::Bash => println!(
+        ShellKind::Fish => format!("set -Ux MOSHPIT_AGENT_SOCK {}", path.display()),
+        ShellKind::Bash => format!(
             "MOSHPIT_AGENT_SOCK={}; export MOSHPIT_AGENT_SOCK",
             path.display()
         ),
     }
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn print_socket_env(path: &Path, shell: ShellKind) {
+    println!("{}", format_socket_env(path, shell));
+}
+
 /// Re-exec this binary as `mpa start --foreground` with the passphrase piped
 /// to its stdin so the parent can return control to the shell immediately.
+#[cfg_attr(coverage_nightly, coverage(off))]
 fn spawn_daemon_child(
     socket_override: Option<&str>,
     vault_override: Option<&str>,
@@ -1307,5 +1313,25 @@ mod tests {
         );
         let backend = unlock_backend(&config);
         assert_eq!(backend.name(), "passphrase");
+    }
+
+    #[test]
+    fn format_socket_env_fish() {
+        let path = Path::new("/run/user/1000/moshpit-agent.sock");
+        let s = format_socket_env(path, ShellKind::Fish);
+        assert_eq!(
+            s,
+            "set -Ux MOSHPIT_AGENT_SOCK /run/user/1000/moshpit-agent.sock"
+        );
+    }
+
+    #[test]
+    fn format_socket_env_bash() {
+        let path = Path::new("/run/user/1000/moshpit-agent.sock");
+        let s = format_socket_env(path, ShellKind::Bash);
+        assert_eq!(
+            s,
+            "MOSHPIT_AGENT_SOCK=/run/user/1000/moshpit-agent.sock; export MOSHPIT_AGENT_SOCK"
+        );
     }
 }
