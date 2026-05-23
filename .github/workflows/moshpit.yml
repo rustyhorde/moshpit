@@ -32,7 +32,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: ✅ Checkout ✅
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: Wandalen/wretry.action@71a909ebf09f3ffdc6f42a17bd54ecb43481da49 # v3.8.0
+        with:
+          action: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+          attempt_limit: 3
+          attempt_delay: 30000
       - name: 🧹 Cleanup 🧹
         run: |
           rm -rf /home/runner/.cargo/bin/rustfmt
@@ -68,7 +72,11 @@ jobs:
     runs-on: macos-latest
     steps:
       - name: ✅ Checkout ✅
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: Wandalen/wretry.action@71a909ebf09f3ffdc6f42a17bd54ecb43481da49 # v3.8.0
+        with:
+          action: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+          attempt_limit: 3
+          attempt_delay: 30000
       - name: 🧰 Toolchain 🧰
         run: |
           rustup toolchain remove nightly
@@ -101,7 +109,11 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: ✅ Checkout ✅
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: Wandalen/wretry.action@71a909ebf09f3ffdc6f42a17bd54ecb43481da49 # v3.8.0
+        with:
+          action: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+          attempt_limit: 3
+          attempt_delay: 30000
       - name: 🧹 Cleanup 🧹
         run: |
           If (Test-Path C:\Users\runneradmin\.cargo\bin\rustfmt.exe) { Remove-Item C:\Users\runneradmin\.cargo\bin\rustfmt.exe }
@@ -140,7 +152,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: ✅ Checkout ✅
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: Wandalen/wretry.action@71a909ebf09f3ffdc6f42a17bd54ecb43481da49 # v3.8.0
+        with:
+          action: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+          attempt_limit: 3
+          attempt_delay: 30000
       - name: 🧹 Cleanup 🧹
         run: |
           rm -rf /home/runner/.cargo/bin/rustfmt
@@ -181,7 +197,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: ✅ Checkout ✅
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: Wandalen/wretry.action@71a909ebf09f3ffdc6f42a17bd54ecb43481da49 # v3.8.0
+        with:
+          action: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+          attempt_limit: 3
+          attempt_delay: 30000
       - name: 🧰 Toolchain 🧰
         run: |
           rustup toolchain remove ${{ matrix.channel }}-${{ matrix.target }}
@@ -219,7 +239,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - name: ✅ Checkout ✅
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: Wandalen/wretry.action@71a909ebf09f3ffdc6f42a17bd54ecb43481da49 # v3.8.0
+        with:
+          action: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+          attempt_limit: 3
+          attempt_delay: 30000
       - name: 🧹 Cleanup 🧹
         run: |
           If (Test-Path C:\Users\runneradmin\.cargo\bin\rustfmt.exe) { Remove-Item C:\Users\runneradmin\.cargo\bin\rustfmt.exe }
