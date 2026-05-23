@@ -119,6 +119,37 @@ jobs:
             --bin mpa
           cp target/x86_64-unknown-linux-musl/release/mpa mpa-full-x86_64-unknown-linux-musl
 
+          # mpa — unstable builds (post-quantum ML-DSA identity key support)
+          cross build --release --locked \
+            --target x86_64-unknown-linux-musl \
+            -p moshpit-agent --features unstable \
+            --bin mpa
+          cp target/x86_64-unknown-linux-musl/release/mpa mpa-unstable-x86_64-unknown-linux-musl
+
+          cross build --release --locked \
+            --target x86_64-unknown-linux-musl \
+            -p moshpit-agent --features fido2,unstable \
+            --bin mpa
+          cp target/x86_64-unknown-linux-musl/release/mpa mpa-fido2-unstable-x86_64-unknown-linux-musl
+
+          cross build --release --locked \
+            --target x86_64-unknown-linux-musl \
+            -p moshpit-agent --features systemd-creds,unstable \
+            --bin mpa
+          cp target/x86_64-unknown-linux-musl/release/mpa mpa-systemd-creds-unstable-x86_64-unknown-linux-musl
+
+          cross build --release --locked \
+            --target x86_64-unknown-linux-musl \
+            -p moshpit-agent --features ssh-agent-piggyback,unstable \
+            --bin mpa
+          cp target/x86_64-unknown-linux-musl/release/mpa mpa-ssh-agent-piggyback-unstable-x86_64-unknown-linux-musl
+
+          cross build --release --locked \
+            --target x86_64-unknown-linux-musl \
+            -p moshpit-agent --features fido2,systemd-creds,ssh-agent-piggyback,unstable \
+            --bin mpa
+          cp target/x86_64-unknown-linux-musl/release/mpa mpa-full-unstable-x86_64-unknown-linux-musl
+
       - name: Build aarch64 cross Docker image
         run: |
           docker build \
@@ -183,6 +214,37 @@ jobs:
             --bin mpa
           cp target/aarch64-unknown-linux-musl/release/mpa mpa-full-aarch64-unknown-linux-musl
 
+          # mpa — unstable builds (post-quantum ML-DSA identity key support)
+          cross build --release --locked \
+            --target aarch64-unknown-linux-musl \
+            -p moshpit-agent --features unstable \
+            --bin mpa
+          cp target/aarch64-unknown-linux-musl/release/mpa mpa-unstable-aarch64-unknown-linux-musl
+
+          cross build --release --locked \
+            --target aarch64-unknown-linux-musl \
+            -p moshpit-agent --features fido2,unstable \
+            --bin mpa
+          cp target/aarch64-unknown-linux-musl/release/mpa mpa-fido2-unstable-aarch64-unknown-linux-musl
+
+          cross build --release --locked \
+            --target aarch64-unknown-linux-musl \
+            -p moshpit-agent --features systemd-creds,unstable \
+            --bin mpa
+          cp target/aarch64-unknown-linux-musl/release/mpa mpa-systemd-creds-unstable-aarch64-unknown-linux-musl
+
+          cross build --release --locked \
+            --target aarch64-unknown-linux-musl \
+            -p moshpit-agent --features ssh-agent-piggyback,unstable \
+            --bin mpa
+          cp target/aarch64-unknown-linux-musl/release/mpa mpa-ssh-agent-piggyback-unstable-aarch64-unknown-linux-musl
+
+          cross build --release --locked \
+            --target aarch64-unknown-linux-musl \
+            -p moshpit-agent --features fido2,systemd-creds,ssh-agent-piggyback,unstable \
+            --bin mpa
+          cp target/aarch64-unknown-linux-musl/release/mpa mpa-full-unstable-aarch64-unknown-linux-musl
+
       - name: Generate xtask dist artifacts
         run: |
           cargo xtask dist mp
@@ -234,6 +296,20 @@ jobs:
           cp mpa-systemd-creds-aarch64-unknown-linux-musl      release-assets/
           cp mpa-ssh-agent-piggyback-aarch64-unknown-linux-musl release-assets/
           cp mpa-full-aarch64-unknown-linux-musl               release-assets/
+
+          # mpa x86_64 static MUSL binaries — unstable (post-quantum ML-DSA support)
+          cp mpa-unstable-x86_64-unknown-linux-musl                    release-assets/
+          cp mpa-fido2-unstable-x86_64-unknown-linux-musl              release-assets/
+          cp mpa-systemd-creds-unstable-x86_64-unknown-linux-musl      release-assets/
+          cp mpa-ssh-agent-piggyback-unstable-x86_64-unknown-linux-musl release-assets/
+          cp mpa-full-unstable-x86_64-unknown-linux-musl               release-assets/
+
+          # mpa aarch64 static MUSL binaries — unstable (post-quantum ML-DSA support)
+          cp mpa-unstable-aarch64-unknown-linux-musl                    release-assets/
+          cp mpa-fido2-unstable-aarch64-unknown-linux-musl              release-assets/
+          cp mpa-systemd-creds-unstable-aarch64-unknown-linux-musl      release-assets/
+          cp mpa-ssh-agent-piggyback-unstable-aarch64-unknown-linux-musl release-assets/
+          cp mpa-full-unstable-aarch64-unknown-linux-musl               release-assets/
 
           # dist tarballs (man pages + shell completions + licenses + example configs)
           cp dist-mp.tar.gz        release-assets/
@@ -342,6 +418,48 @@ jobs:
               --target release-assets/
             nfpm package \
               --config packaging/nfpm/moshpit-agent-full-aarch64.yaml \
+              --packager "$packager" \
+              --target release-assets/
+            # mpa — unstable per-feature x86_64
+            nfpm package \
+              --config packaging/nfpm/moshpit-agent-unstable.yaml \
+              --packager "$packager" \
+              --target release-assets/
+            nfpm package \
+              --config packaging/nfpm/moshpit-agent-fido2-unstable.yaml \
+              --packager "$packager" \
+              --target release-assets/
+            nfpm package \
+              --config packaging/nfpm/moshpit-agent-systemd-creds-unstable.yaml \
+              --packager "$packager" \
+              --target release-assets/
+            nfpm package \
+              --config packaging/nfpm/moshpit-agent-ssh-agent-piggyback-unstable.yaml \
+              --packager "$packager" \
+              --target release-assets/
+            nfpm package \
+              --config packaging/nfpm/moshpit-agent-full-unstable.yaml \
+              --packager "$packager" \
+              --target release-assets/
+            # mpa — unstable per-feature aarch64
+            nfpm package \
+              --config packaging/nfpm/moshpit-agent-unstable-aarch64.yaml \
+              --packager "$packager" \
+              --target release-assets/
+            nfpm package \
+              --config packaging/nfpm/moshpit-agent-fido2-unstable-aarch64.yaml \
+              --packager "$packager" \
+              --target release-assets/
+            nfpm package \
+              --config packaging/nfpm/moshpit-agent-systemd-creds-unstable-aarch64.yaml \
+              --packager "$packager" \
+              --target release-assets/
+            nfpm package \
+              --config packaging/nfpm/moshpit-agent-ssh-agent-piggyback-unstable-aarch64.yaml \
+              --packager "$packager" \
+              --target release-assets/
+            nfpm package \
+              --config packaging/nfpm/moshpit-agent-full-unstable-aarch64.yaml \
               --packager "$packager" \
               --target release-assets/
           done
@@ -473,6 +591,26 @@ jobs:
             >> "$GITHUB_OUTPUT"
           echo "aarch64_mpa_full=$(sha256sum release-assets/mpa-full-aarch64-unknown-linux-musl | awk '{print $1}')" \
             >> "$GITHUB_OUTPUT"
+          echo "x86_64_mpa_unstable=$(sha256sum release-assets/mpa-unstable-x86_64-unknown-linux-musl | awk '{print $1}')" \
+            >> "$GITHUB_OUTPUT"
+          echo "x86_64_mpa_fido2_unstable=$(sha256sum release-assets/mpa-fido2-unstable-x86_64-unknown-linux-musl | awk '{print $1}')" \
+            >> "$GITHUB_OUTPUT"
+          echo "x86_64_mpa_systemd_creds_unstable=$(sha256sum release-assets/mpa-systemd-creds-unstable-x86_64-unknown-linux-musl | awk '{print $1}')" \
+            >> "$GITHUB_OUTPUT"
+          echo "x86_64_mpa_ssh_agent_unstable=$(sha256sum release-assets/mpa-ssh-agent-piggyback-unstable-x86_64-unknown-linux-musl | awk '{print $1}')" \
+            >> "$GITHUB_OUTPUT"
+          echo "x86_64_mpa_full_unstable=$(sha256sum release-assets/mpa-full-unstable-x86_64-unknown-linux-musl | awk '{print $1}')" \
+            >> "$GITHUB_OUTPUT"
+          echo "aarch64_mpa_unstable=$(sha256sum release-assets/mpa-unstable-aarch64-unknown-linux-musl | awk '{print $1}')" \
+            >> "$GITHUB_OUTPUT"
+          echo "aarch64_mpa_fido2_unstable=$(sha256sum release-assets/mpa-fido2-unstable-aarch64-unknown-linux-musl | awk '{print $1}')" \
+            >> "$GITHUB_OUTPUT"
+          echo "aarch64_mpa_systemd_creds_unstable=$(sha256sum release-assets/mpa-systemd-creds-unstable-aarch64-unknown-linux-musl | awk '{print $1}')" \
+            >> "$GITHUB_OUTPUT"
+          echo "aarch64_mpa_ssh_agent_unstable=$(sha256sum release-assets/mpa-ssh-agent-piggyback-unstable-aarch64-unknown-linux-musl | awk '{print $1}')" \
+            >> "$GITHUB_OUTPUT"
+          echo "aarch64_mpa_full_unstable=$(sha256sum release-assets/mpa-full-unstable-aarch64-unknown-linux-musl | awk '{print $1}')" \
+            >> "$GITHUB_OUTPUT"
 
       - name: Update source PKGBUILDs
         env:
@@ -520,6 +658,16 @@ jobs:
           AARCH64_MPA_SYSTEMD_CREDS:    ${{ steps.binsums.outputs.aarch64_mpa_systemd_creds }}
           AARCH64_MPA_SSH_AGENT:        ${{ steps.binsums.outputs.aarch64_mpa_ssh_agent }}
           AARCH64_MPA_FULL:             ${{ steps.binsums.outputs.aarch64_mpa_full }}
+          X86_64_MPA_UNSTABLE:              ${{ steps.binsums.outputs.x86_64_mpa_unstable }}
+          X86_64_MPA_FIDO2_UNSTABLE:        ${{ steps.binsums.outputs.x86_64_mpa_fido2_unstable }}
+          X86_64_MPA_SYSTEMD_CREDS_UNSTABLE: ${{ steps.binsums.outputs.x86_64_mpa_systemd_creds_unstable }}
+          X86_64_MPA_SSH_AGENT_UNSTABLE:    ${{ steps.binsums.outputs.x86_64_mpa_ssh_agent_unstable }}
+          X86_64_MPA_FULL_UNSTABLE:         ${{ steps.binsums.outputs.x86_64_mpa_full_unstable }}
+          AARCH64_MPA_UNSTABLE:             ${{ steps.binsums.outputs.aarch64_mpa_unstable }}
+          AARCH64_MPA_FIDO2_UNSTABLE:       ${{ steps.binsums.outputs.aarch64_mpa_fido2_unstable }}
+          AARCH64_MPA_SYSTEMD_CREDS_UNSTABLE: ${{ steps.binsums.outputs.aarch64_mpa_systemd_creds_unstable }}
+          AARCH64_MPA_SSH_AGENT_UNSTABLE:   ${{ steps.binsums.outputs.aarch64_mpa_ssh_agent_unstable }}
+          AARCH64_MPA_FULL_UNSTABLE:        ${{ steps.binsums.outputs.aarch64_mpa_full_unstable }}
         run: |
           # Replaces pkgver, pkgrel, and release-asset sha256 arrays in binary PKGBUILDs.
           # For sha256sums, only the first value (dist tarball) is replaced.
@@ -564,6 +712,26 @@ jobs:
           update_bin_pkgbuild \
             packaging/arch/moshpit-agent-full-bin/PKGBUILD \
             "$DIST_MPA" "$X86_64_MPA_FULL" "$AARCH64_MPA_FULL"
+
+          update_bin_pkgbuild \
+            packaging/arch/moshpit-agent-unstable-bin/PKGBUILD \
+            "$DIST_MPA" "$X86_64_MPA_UNSTABLE" "$AARCH64_MPA_UNSTABLE"
+
+          update_bin_pkgbuild \
+            packaging/arch/moshpit-agent-fido2-unstable-bin/PKGBUILD \
+            "$DIST_MPA" "$X86_64_MPA_FIDO2_UNSTABLE" "$AARCH64_MPA_FIDO2_UNSTABLE"
+
+          update_bin_pkgbuild \
+            packaging/arch/moshpit-agent-systemd-creds-unstable-bin/PKGBUILD \
+            "$DIST_MPA" "$X86_64_MPA_SYSTEMD_CREDS_UNSTABLE" "$AARCH64_MPA_SYSTEMD_CREDS_UNSTABLE"
+
+          update_bin_pkgbuild \
+            packaging/arch/moshpit-agent-ssh-agent-piggyback-unstable-bin/PKGBUILD \
+            "$DIST_MPA" "$X86_64_MPA_SSH_AGENT_UNSTABLE" "$AARCH64_MPA_SSH_AGENT_UNSTABLE"
+
+          update_bin_pkgbuild \
+            packaging/arch/moshpit-agent-full-unstable-bin/PKGBUILD \
+            "$DIST_MPA" "$X86_64_MPA_FULL_UNSTABLE" "$AARCH64_MPA_FULL_UNSTABLE"
 
       - name: Generate .SRCINFO files
         run: |
@@ -635,6 +803,11 @@ jobs:
           - moshpit-agent-full
           - moshpit-agent-bin
           - moshpit-agent-full-bin
+          - moshpit-agent-unstable-bin
+          - moshpit-agent-fido2-unstable-bin
+          - moshpit-agent-systemd-creds-unstable-bin
+          - moshpit-agent-ssh-agent-piggyback-unstable-bin
+          - moshpit-agent-full-unstable-bin
     steps:
       - name: Download updated PKGBUILDs
         # v8

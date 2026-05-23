@@ -30,6 +30,11 @@ on:
           - moshpit-agent-full
           - moshpit-agent-bin
           - moshpit-agent-full-bin
+          - moshpit-agent-unstable-bin
+          - moshpit-agent-fido2-unstable-bin
+          - moshpit-agent-systemd-creds-unstable-bin
+          - moshpit-agent-ssh-agent-piggyback-unstable-bin
+          - moshpit-agent-full-unstable-bin
       dry_run:
         description: 'Dry run — validate SSH + commit logic but skip push'
         required: false
