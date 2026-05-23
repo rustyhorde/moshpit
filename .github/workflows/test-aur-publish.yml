@@ -1,4 +1,4 @@
-name: Test AUR Publish
+name: 🧪 Test AUR Publish 🧪
 on:
   workflow_dispatch:
     inputs:
@@ -38,7 +38,7 @@ on:
 
 jobs:
   test-aur-publish:
-    name: Test AUR Publish (${{ inputs.package }})
+    name: 🧪 Test AUR Publish (${{ inputs.package }}) 🧪
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -93,7 +93,15 @@ jobs:
 
           git clone "ssh://aur@aur.archlinux.org/${PKGNAME}.git" /tmp/aur-repo
           cd /tmp/aur-repo
-          git checkout -B master
+          # Handle all AUR repo states: normal (origin/master tracked), detached HEAD
+          # (prior failed push), or empty repo (brand-new package, first-ever push)
+          if git show-ref --quiet refs/remotes/origin/master; then
+            git checkout master
+          elif git rev-parse HEAD 2>/dev/null; then
+            git checkout -B master
+          else
+            git checkout --orphan master
+          fi
 
           PKG_DIR="${GITHUB_WORKSPACE}/packaging/arch/${PKGNAME}"
           cp "${PKG_DIR}/PKGBUILD" .
@@ -111,7 +119,7 @@ jobs:
           fi
 
           for attempt in 1 2 3; do
-            if git push; then
+            if git push origin master; then
               break
             fi
             if [[ $attempt -lt 3 ]]; then
