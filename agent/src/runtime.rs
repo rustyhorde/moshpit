@@ -724,18 +724,22 @@ async fn run_daemon(
         config.socket_path.display()
     );
 
-    // Graceful shutdown on SIGTERM/SIGINT
+    // Graceful shutdown on SIGTERM/SIGINT; ignore SIGHUP so the daemon survives terminal hangup.
     let socket_path_cleanup = config.socket_path.clone();
     #[cfg(target_family = "unix")]
     {
         use tokio::signal::unix::{SignalKind, signal};
         let mut sigterm = signal(SignalKind::terminate())?;
         let mut sigint = signal(SignalKind::interrupt())?;
+        let mut sighup = signal(SignalKind::hangup())?;
         let cleanup_path = socket_path_cleanup.clone();
         drop(tokio::spawn(async move {
-            tokio::select! {
-                _ = sigterm.recv() => {}
-                _ = sigint.recv() => {}
+            loop {
+                tokio::select! {
+                    _ = sigterm.recv() => break,
+                    _ = sigint.recv() => break,
+                    _ = sighup.recv() => {} // ignore — daemon survives terminal hangup
+                }
             }
             drop(fs::remove_file(&cleanup_path));
             std::process::exit(0);
