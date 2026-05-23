@@ -138,6 +138,7 @@ async fn handle_connection(
     vault_path: PathBuf,
     master_passphrase: Arc<Mutex<String>>,
     socket_path: PathBuf,
+    lock_path: PathBuf,
 ) {
     while let Ok(raw_len) = stream.read_u32().await {
         let req_len = raw_len as usize;
@@ -184,6 +185,7 @@ async fn handle_connection(
         }
         if is_shutdown {
             drop(fs::remove_file(&socket_path));
+            drop(fs::remove_file(&lock_path));
             std::process::exit(0);
         }
     }
@@ -697,6 +699,46 @@ fn print_unset_socket_env(shell: ShellKind) {
 /// Re-exec this binary as `mpa start --foreground` with the passphrase piped
 /// to its stdin so the parent can return control to the shell immediately.
 #[cfg_attr(coverage_nightly, coverage(off))]
+fn is_process_alive(pid: u32) -> bool {
+    #[cfg(target_family = "unix")]
+    {
+        use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
+        matches!(
+            kill(Pid::from_raw(pid as i32), None),
+            Ok(()) | Err(Errno::EPERM)
+        )
+    }
+    #[cfg(not(target_family = "unix"))]
+    {
+        let _ = pid;
+        true // can't check without platform API; let socket check decide
+    }
+}
+
+async fn check_not_already_running(lock_path: &Path, socket_path: &Path) -> Result<()> {
+    if lock_path.exists() {
+        let pid_str = fs::read_to_string(lock_path).unwrap_or_default();
+        let pid: u32 = pid_str.trim().parse().unwrap_or(0);
+        if pid > 0 && is_process_alive(pid) {
+            if socket_path.exists() && UnixStream::connect(socket_path).await.is_ok() {
+                return Err(anyhow!(
+                    "agent is already running (pid {pid}, socket: {})\n  To stop it: mpa stop",
+                    socket_path.display()
+                ));
+            }
+        }
+        // Stale lock file — remove it and proceed.
+        drop(fs::remove_file(lock_path));
+    } else if socket_path.exists() && UnixStream::connect(socket_path).await.is_ok() {
+        // No lock file but socket is live (e.g. upgrade from older binary).
+        return Err(anyhow!(
+            "agent is already running (socket: {})\n  To stop it: mpa stop",
+            socket_path.display()
+        ));
+    }
+    Ok(())
+}
+
 fn spawn_daemon_child(
     socket_override: Option<&str>,
     vault_override: Option<&str>,
@@ -799,6 +841,11 @@ async fn run_daemon(
         }
     }
 
+    // Refuse to start if a live instance is already running.
+    if !config.foreground {
+        check_not_already_running(&config.lock_path, &config.socket_path).await?;
+    }
+
     // Remove stale socket
     if config.socket_path.exists() {
         fs::remove_file(&config.socket_path)?;
@@ -824,8 +871,18 @@ async fn run_daemon(
         config.socket_path.display()
     );
 
+    // Record our PID so concurrent `mpa start` invocations can detect us.
+    let pid = std::process::id();
+    if let Err(e) = fs::write(&config.lock_path, format!("{pid}\n")) {
+        warn!(
+            "failed to write lock file {}: {e}",
+            config.lock_path.display()
+        );
+    }
+
     // Graceful shutdown on SIGTERM/SIGINT; ignore SIGHUP so the daemon survives terminal hangup.
     let socket_path_cleanup = config.socket_path.clone();
+    let lock_path_cleanup = config.lock_path.clone();
     #[cfg(target_family = "unix")]
     {
         use tokio::signal::unix::{SignalKind, signal};
@@ -833,6 +890,7 @@ async fn run_daemon(
         let mut sigint = signal(SignalKind::interrupt())?;
         let mut sighup = signal(SignalKind::hangup())?;
         let cleanup_path = socket_path_cleanup.clone();
+        let cleanup_lock = lock_path_cleanup.clone();
         drop(tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -842,6 +900,7 @@ async fn run_daemon(
                 }
             }
             drop(fs::remove_file(&cleanup_path));
+            drop(fs::remove_file(&cleanup_lock));
             std::process::exit(0);
         }));
     }
@@ -854,8 +913,9 @@ async fn run_daemon(
                 let vp = config.vault_path.clone();
                 let mp = Arc::clone(&master_passphrase_arc);
                 let sp = config.socket_path.clone();
+                let lp = config.lock_path.clone();
                 drop(tokio::spawn(async move {
-                    handle_connection(stream, ids, v, vp, mp, sp).await;
+                    handle_connection(stream, ids, v, vp, mp, sp, lp).await;
                 }));
             }
             Err(e) => error!("accept error: {e}"),
@@ -1230,6 +1290,7 @@ mod tests {
             vault_path,
             Arc::clone(&mp),
             PathBuf::from("/tmp/nonexistent-socket-agent-test"),
+            PathBuf::from("/tmp/nonexistent-lock-agent-test"),
         )));
 
         let req = AgentRequest::ListIdentities;
@@ -1264,6 +1325,7 @@ mod tests {
             vault_path,
             mp,
             PathBuf::from("/tmp/nonexistent-socket-agent-test"),
+            PathBuf::from("/tmp/nonexistent-lock-agent-test"),
         ));
 
         client.write_all(&0u32.to_be_bytes()).await.unwrap();
@@ -1289,6 +1351,7 @@ mod tests {
             vault_path,
             mp,
             PathBuf::from("/tmp/nonexistent-socket-agent-test"),
+            PathBuf::from("/tmp/nonexistent-lock-agent-test"),
         ));
 
         let garbage = vec![0xFF_u8, 0xFE, 0xFD, 0xFC];
@@ -1395,5 +1458,71 @@ mod tests {
             format_unset_socket_env(ShellKind::Bash),
             "unset MOSHPIT_AGENT_SOCK"
         );
+    }
+
+    // --- is_process_alive ---
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn is_process_alive_self() {
+        assert!(is_process_alive(std::process::id()));
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn is_process_alive_dead_pid() {
+        // Spawn a trivial child, wait for it to exit, then check its PID is dead.
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        let _ = child.wait().unwrap();
+        assert!(!is_process_alive(pid));
+    }
+
+    // --- check_not_already_running ---
+
+    #[tokio::test]
+    async fn check_no_files_ok() {
+        let dir = tempdir().unwrap();
+        let lock = dir.path().join("test.lock");
+        let sock = dir.path().join("test.sock");
+        assert!(check_not_already_running(&lock, &sock).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn check_stale_lock_no_socket_cleans_up() {
+        let dir = tempdir().unwrap();
+        let lock = dir.path().join("test.lock");
+        let sock = dir.path().join("test.sock");
+        // Write a guaranteed-dead PID to the lock file.
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        let _ = child.wait().unwrap();
+        fs::write(&lock, format!("{pid}\n")).unwrap();
+        assert!(check_not_already_running(&lock, &sock).await.is_ok());
+        assert!(!lock.exists(), "stale lock file must be removed");
+    }
+
+    #[tokio::test]
+    async fn check_live_lock_and_socket_errors() {
+        let dir = tempdir().unwrap();
+        let lock = dir.path().join("test.lock");
+        let sock = dir.path().join("test.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        drop(tokio::spawn(async move { drop(listener.accept().await) }));
+        fs::write(&lock, format!("{}\n", std::process::id())).unwrap();
+        let err = check_not_already_running(&lock, &sock).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("already running"), "msg: {msg}");
+        assert!(msg.contains("mpa stop"), "msg: {msg}");
+    }
+
+    #[tokio::test]
+    async fn check_socket_live_no_lock_errors() {
+        let dir = tempdir().unwrap();
+        let lock = dir.path().join("test.lock");
+        let sock = dir.path().join("test.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        drop(tokio::spawn(async move { drop(listener.accept().await) }));
+        assert!(check_not_already_running(&lock, &sock).await.is_err());
     }
 }

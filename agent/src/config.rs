@@ -15,6 +15,8 @@ use crate::cli::ShellKind;
 pub(crate) struct AgentConfig {
     /// Path to the Unix domain socket.
     pub socket_path: PathBuf,
+    /// Path to the PID lock file (socket path with `.lock` extension).
+    pub lock_path: PathBuf,
     /// Path to the encrypted vault file.
     pub vault_path: PathBuf,
     /// Whether to stay in the foreground instead of daemonising.
@@ -38,6 +40,7 @@ impl AgentConfig {
         shell: ShellKind,
     ) -> Self {
         let socket_path = socket_override.map_or_else(default_socket_path, PathBuf::from);
+        let lock_path = socket_path.with_extension("lock");
 
         let vault_path = vault_override.map_or_else(
             || {
@@ -52,6 +55,7 @@ impl AgentConfig {
 
         Self {
             socket_path,
+            lock_path,
             vault_path,
             foreground,
             backend,
@@ -92,6 +96,7 @@ mod tests {
             ShellKind::Bash,
         );
         assert_eq!(cfg.socket_path, PathBuf::from("/tmp/test.sock"));
+        assert_eq!(cfg.lock_path, PathBuf::from("/tmp/test.lock"));
         assert_eq!(cfg.vault_path, PathBuf::from("/tmp/test-vault"));
         assert!(cfg.foreground);
         assert_eq!(cfg.backend, "passphrase");
@@ -103,6 +108,7 @@ mod tests {
             AgentConfig::resolve(None, None, false, "passphrase".to_string(), ShellKind::Fish);
         // Just verify we get non-empty paths — the exact values depend on env.
         assert!(!cfg.socket_path.as_os_str().is_empty());
+        assert!(!cfg.lock_path.as_os_str().is_empty());
         assert!(!cfg.vault_path.as_os_str().is_empty());
     }
 }
