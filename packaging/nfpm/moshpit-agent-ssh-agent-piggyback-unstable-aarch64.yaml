@@ -1,0 +1,63 @@
+# nfpm package configuration for moshpit-agent-ssh-agent-piggyback-unstable (SSH agent unlock + post-quantum, aarch64)
+# Build with: VERSION=<ver> nfpm package --config packaging/nfpm/moshpit-agent-ssh-agent-piggyback-unstable-aarch64.yaml --packager deb|rpm --target release-assets/
+name: moshpit-agent-ssh-agent-piggyback-unstable
+arch: arm64
+version: ${VERSION}
+version_schema: semver
+section: net
+maintainer: Jason Ozias <jason.g.ozias@gmail.com>
+description: |
+  Moshpit agent daemon — SSH agent piggyback unlock with post-quantum ML-DSA support.
+  Holds decrypted identity keys in memory and serves signing and public-key
+  requests to mp over a Unix socket. Vault unlock derived from SSH agent
+  challenge-response; seamless when ssh-agent is already running.
+  Includes ML-DSA-65 post-quantum identity key support.
+homepage: https://github.com/rustyhorde/moshpit
+license: MIT OR Apache-2.0
+
+conflicts:
+  - moshpit-agent
+  - moshpit-agent-fido2
+  - moshpit-agent-systemd-creds
+  - moshpit-agent-ssh-agent-piggyback
+  - moshpit-agent-full
+  - moshpit-agent-unstable
+  - moshpit-agent-fido2-unstable
+  - moshpit-agent-systemd-creds-unstable
+  - moshpit-agent-full-unstable
+
+deb:
+  compression: xz
+
+rpm:
+  compression: xz
+
+contents:
+  - src: mpa-ssh-agent-piggyback-unstable-aarch64-unknown-linux-musl
+    dst: /usr/bin/mpa
+    file_info:
+      mode: 0755
+
+  - src: dist/mpa/mpa.1
+    dst: /usr/share/man/man1/mpa.1
+
+  - src: dist/mpa/mpa.bash
+    dst: /usr/share/bash-completion/completions/mpa
+
+  - src: dist/mpa/_mpa
+    dst: /usr/share/zsh/vendor-completions/_mpa
+
+  - src: dist/mpa/mpa.fish
+    dst: /usr/share/fish/vendor_completions.d/mpa.fish
+
+  - src: dist/mpa/moshpit-agent.service
+    dst: /usr/lib/systemd/user/moshpit-agent.service
+
+  - src: dist/mpa/moshpit-agent.socket
+    dst: /usr/lib/systemd/user/moshpit-agent.socket
+
+  - src: dist/mpa/LICENSE-MIT
+    dst: /usr/share/doc/moshpit-agent-ssh-agent-piggyback-unstable/LICENSE-MIT
+
+  - src: dist/mpa/LICENSE-APACHE
+    dst: /usr/share/doc/moshpit-agent-ssh-agent-piggyback-unstable/LICENSE-APACHE
