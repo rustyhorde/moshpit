@@ -46,7 +46,7 @@ dialoguer = "0.12.0"
 dirs2 = "3.0.1"
 getset = { workspace = true }
 libmoshpit = { version = "0.8.8", path = "../libmoshpit" }
-nix = { version = "0.31.3", features = ["socket", "user"] }
+nix = { version = "0.31.3", features = ["process", "socket", "user"] }
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal"] }
 tracing = { workspace = true }
 vergen-pretty = { workspace = true }

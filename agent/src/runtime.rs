@@ -34,7 +34,7 @@ use tracing::{error, info, warn};
 use zeroize::Zeroize as _;
 
 use crate::{
-    cli::{Cli, Commands},
+    cli::{Cli, Commands, ShellKind},
     config::AgentConfig,
     unlock::{UnlockBackend, passphrase::PassphraseBackend},
     vault::Vault,
@@ -498,6 +498,8 @@ where
             foreground,
             backend,
             passphrase_stdin,
+            shell,
+            passphrase_pipe,
         } => {
             run_daemon(
                 socket.as_deref(),
@@ -505,6 +507,8 @@ where
                 *foreground,
                 backend.clone(),
                 *passphrase_stdin,
+                *shell,
+                *passphrase_pipe,
             )
             .await
         }
@@ -645,6 +649,64 @@ fn unlock_backend(config: &AgentConfig) -> Box<dyn UnlockBackend> {
     Box::new(PassphraseBackend)
 }
 
+fn print_socket_env(path: &Path, shell: ShellKind) {
+    match shell {
+        ShellKind::Fish => println!("set -Ux MOSHPIT_AGENT_SOCK {}", path.display()),
+        ShellKind::Bash => println!(
+            "MOSHPIT_AGENT_SOCK={}; export MOSHPIT_AGENT_SOCK",
+            path.display()
+        ),
+    }
+}
+
+/// Re-exec this binary as `mpa start --foreground` with the passphrase piped
+/// to its stdin so the parent can return control to the shell immediately.
+fn spawn_daemon_child(
+    socket_override: Option<&str>,
+    vault_override: Option<&str>,
+    backend: &str,
+    shell: ShellKind,
+    master_passphrase: &str,
+) -> Result<()> {
+    let exe = std::env::current_exe()?;
+    let shell_str = match shell {
+        ShellKind::Fish => "fish",
+        ShellKind::Bash => "bash",
+    };
+    let mut cmd = std::process::Command::new(exe);
+    let _ = cmd
+        .arg("start")
+        .arg("--foreground")
+        .arg("--shell")
+        .arg(shell_str)
+        .arg("--backend")
+        .arg(backend)
+        .arg("--passphrase-pipe");
+    if let Some(s) = socket_override {
+        let _ = cmd.arg("--socket").arg(s);
+    }
+    if let Some(v) = vault_override {
+        let _ = cmd.arg("--vault").arg(v);
+    }
+    let _ = cmd
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(target_family = "unix")]
+    {
+        use std::os::unix::process::CommandExt as _;
+        // Put the child in its own process group so it is detached from the
+        // terminal's process group and won't receive keyboard signals.
+        let _ = cmd.process_group(0);
+    }
+    let mut child = cmd.spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write as _;
+        drop(writeln!(stdin, "{master_passphrase}"));
+    }
+    Ok(())
+}
+
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn run_daemon(
     socket_override: Option<&str>,
@@ -652,8 +714,10 @@ async fn run_daemon(
     foreground: bool,
     backend: String,
     passphrase_stdin: bool,
+    shell: ShellKind,
+    passphrase_pipe: bool,
 ) -> Result<()> {
-    let config = AgentConfig::resolve(socket_override, vault_override, foreground, backend);
+    let config = AgentConfig::resolve(socket_override, vault_override, foreground, backend, shell);
 
     // Create parent directories for socket and vault
     if let Some(parent) = config.socket_path.parent() {
@@ -677,7 +741,7 @@ async fn run_daemon(
 
     let backend = unlock_backend(&config);
     let vault_exists = config.vault_path.exists();
-    let master_passphrase = if passphrase_stdin && config.backend == "passphrase" {
+    let master_passphrase = if passphrase_stdin || passphrase_pipe {
         read_passphrase_stdin()?
     } else if vault_exists {
         backend.retrieve_passphrase()?
@@ -706,17 +770,17 @@ async fn run_daemon(
 
     let listener = UnixListener::bind(&config.socket_path)?;
 
-    // Announce socket path so the caller can eval the output
-    println!(
-        "MOSHPIT_AGENT_SOCK={}; export MOSHPIT_AGENT_SOCK",
-        config.socket_path.display()
-    );
+    // Announce socket path so the caller can source the output.
+    print_socket_env(&config.socket_path, config.shell);
 
     if !config.foreground {
-        // Simple daemonisation: we've already bound the socket and printed the
-        // export line; in a real deployment the systemd unit handles this, but
-        // for manual use we just continue running (background via shell `&`
-        // or eval). On Linux we could double-fork here in the future.
+        return spawn_daemon_child(
+            socket_override,
+            vault_override,
+            &config.backend,
+            config.shell,
+            &master_passphrase,
+        );
     }
 
     info!(
@@ -1239,6 +1303,7 @@ mod tests {
             Some("/tmp/dummy.vault"),
             false,
             "unknown-backend".to_string(),
+            ShellKind::Fish,
         );
         let backend = unlock_backend(&config);
         assert_eq!(backend.name(), "passphrase");
