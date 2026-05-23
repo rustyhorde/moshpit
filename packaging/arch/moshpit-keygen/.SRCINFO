@@ -1,0 +1,15 @@
+pkgbase = moshpit-keygen
+	pkgdesc = Asymmetric key generation and inspection tool for moshpit
+	pkgver = 0.8.6
+	pkgrel = 1
+	url = https://github.com/rustyhorde/moshpit
+	arch = x86_64
+	license = MIT
+	license = Apache-2.0
+	makedepends = cargo
+	makedepends = cmake
+	makedepends = gcc
+	source = moshpit-keygen-0.8.6.tar.gz::https://github.com/rustyhorde/moshpit/archive/v0.8.6.tar.gz
+	sha256sums = 73fc457fd1c4a5e37e0181fef6cf987cd3237d237fe67cee5ebfc81b027822b8
+
+pkgname = moshpit-keygen

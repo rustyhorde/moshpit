@@ -1,0 +1,19 @@
+pkgbase = moshpit-keygen-bin
+	pkgdesc = Asymmetric key generation and inspection tool for moshpit (pre-compiled binary)
+	pkgver = 0.8.6
+	pkgrel = 1
+	url = https://github.com/rustyhorde/moshpit
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	license = Apache-2.0
+	provides = moshpit-keygen
+	conflicts = moshpit-keygen
+	source = https://github.com/rustyhorde/moshpit/releases/download/v0.8.6/dist-mp-keygen.tar.gz
+	sha256sums = a4ec5e5aef15170f5394260442284ce4e0ecb79ca4e3fdd28ff409f91d83c6c9
+	source_x86_64 = mp-keygen-x86_64::https://github.com/rustyhorde/moshpit/releases/download/v0.8.6/mp-keygen-x86_64-unknown-linux-musl
+	sha256sums_x86_64 = 9f78fa7c627c6718ffeff9c1cf82e64497ad54686c28d3fdf135e544f001bcb8
+	source_aarch64 = mp-keygen-aarch64::https://github.com/rustyhorde/moshpit/releases/download/v0.8.6/mp-keygen-aarch64-unknown-linux-musl
+	sha256sums_aarch64 = 3d9afc9829988e0bd3a4868e8e0034979a7c538f5806c5ed018366114b2b5ab4
+
+pkgname = moshpit-keygen-bin

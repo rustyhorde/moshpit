@@ -1,0 +1,23 @@
+pkgbase = moshpit-agent-full-bin
+	pkgdesc = Moshpit agent daemon — all MUSL-portable unlock backends: FIDO2, systemd-creds, SSH agent (pre-compiled static binary)
+	pkgver = 0.8.6
+	pkgrel = 1
+	url = https://github.com/rustyhorde/moshpit
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	license = Apache-2.0
+	provides = moshpit-agent
+	conflicts = moshpit-agent
+	conflicts = moshpit-agent-bin
+	conflicts = moshpit-agent-fido2-bin
+	conflicts = moshpit-agent-systemd-creds-bin
+	conflicts = moshpit-agent-ssh-agent-piggyback-bin
+	source = https://github.com/rustyhorde/moshpit/releases/download/v0.8.6/dist-mpa.tar.gz
+	sha256sums = b126b55fec5f5cd4ccafb22f64cbbd3bd9ff701c0e188f8a0d71d343a03c5c40
+	source_x86_64 = mpa-full-x86_64::https://github.com/rustyhorde/moshpit/releases/download/v0.8.6/mpa-full-x86_64-unknown-linux-musl
+	sha256sums_x86_64 = d4930c6ed1af46a67a7961c63084af28be668f5bf799aa9ddf8564334105f509
+	source_aarch64 = mpa-full-aarch64::https://github.com/rustyhorde/moshpit/releases/download/v0.8.6/mpa-full-aarch64-unknown-linux-musl
+	sha256sums_aarch64 = 707a5472df99eb59c9d77e6a8cf33f5daa0afaf1c828f683093ece472b8381df
+
+pkgname = moshpit-agent-full-bin

@@ -1,0 +1,22 @@
+pkgbase = moshpit-unstable-bin
+	pkgdesc = moshpit client with post-quantum support — SSH and Mosh inspired remote terminal client (pre-compiled binary)
+	pkgver = 0.8.6
+	pkgrel = 1
+	url = https://github.com/rustyhorde/moshpit
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	license = Apache-2.0
+	depends = moshpit-keygen
+	provides = moshpit
+	conflicts = moshpit
+	conflicts = moshpit-bin
+	replaces = moshpit-bin
+	source = https://github.com/rustyhorde/moshpit/releases/download/v0.8.6/dist-mp.tar.gz
+	sha256sums = f97138c33bbf06fba83296b7edd08571f8dc2f6b254780372356733ee095f5a1
+	source_x86_64 = mp-unstable-x86_64::https://github.com/rustyhorde/moshpit/releases/download/v0.8.6/mp-unstable-x86_64-unknown-linux-musl
+	sha256sums_x86_64 = 3a1ce9e848520fe27000586a20c22941427550afe5d9e29cdfc9d472528f0b9d
+	source_aarch64 = mp-unstable-aarch64::https://github.com/rustyhorde/moshpit/releases/download/v0.8.6/mp-unstable-aarch64-unknown-linux-musl
+	sha256sums_aarch64 = 64a161cca69fc83c9fb909688f27c2add87b91050c741efd74cf13f436d313e4
+
+pkgname = moshpit-unstable-bin
