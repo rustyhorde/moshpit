@@ -1,0 +1,23 @@
+pkgbase = moshpit-agent-bin
+	pkgdesc = Moshpit agent daemon — passphrase unlock (pre-compiled MUSL static binary)
+	pkgver = 0.8.6
+	pkgrel = 1
+	url = https://github.com/rustyhorde/moshpit
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	license = Apache-2.0
+	provides = moshpit-agent
+	conflicts = moshpit-agent
+	conflicts = moshpit-agent-fido2-bin
+	conflicts = moshpit-agent-systemd-creds-bin
+	conflicts = moshpit-agent-ssh-agent-piggyback-bin
+	conflicts = moshpit-agent-full-bin
+	source = https://github.com/rustyhorde/moshpit/releases/download/v0.8.6/dist-mpa.tar.gz
+	sha256sums = b126b55fec5f5cd4ccafb22f64cbbd3bd9ff701c0e188f8a0d71d343a03c5c40
+	source_x86_64 = mpa-x86_64::https://github.com/rustyhorde/moshpit/releases/download/v0.8.6/mpa-x86_64-unknown-linux-musl
+	sha256sums_x86_64 = db66d23fe267a61a3a3661b8b26bcec8f1f8a09eeb31597bf93098e35a52582c
+	source_aarch64 = mpa-aarch64::https://github.com/rustyhorde/moshpit/releases/download/v0.8.6/mpa-aarch64-unknown-linux-musl
+	sha256sums_aarch64 = 3a17dedcc63bb4900cce2db693920a341feb8f56adecb4c90d35cdb22dacbd34
+
+pkgname = moshpit-agent-bin
