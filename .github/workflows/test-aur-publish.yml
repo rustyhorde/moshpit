@@ -1,4 +1,4 @@
-name: Test AUR Publish
+name: 🧪 Test AUR Publish 🧪
 on:
   workflow_dispatch:
     inputs:
@@ -38,7 +38,7 @@ on:
 
 jobs:
   test-aur-publish:
-    name: Test AUR Publish (${{ inputs.package }})
+    name: 🧪 Test AUR Publish (${{ inputs.package }}) 🧪
     runs-on: ubuntu-latest
     permissions:
       contents: read
