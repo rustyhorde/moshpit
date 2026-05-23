@@ -42,10 +42,8 @@ else
 end
 
 echo ""
-echo "==> Fixing binary ownership"
-for bin in $bins
-    run_step sudo chown jozias:jozias $release_dir/$bin
-end
+echo "==> Fixing target directory ownership"
+run_step sudo chown -R jozias:jozias target/
 
 echo ""
 echo "==> Copying binaries to ~"
