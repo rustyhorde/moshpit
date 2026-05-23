@@ -8,7 +8,7 @@
 
 use std::{io::Cursor, sync::LazyLock};
 
-use clap::{ArgAction, Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use getset::{CopyGetters, Getters};
 use vergen_pretty::{Pretty, vergen_pretty_env};
 
@@ -50,14 +50,25 @@ pub(crate) struct Cli {
     command: Commands,
 }
 
+/// Output format for the socket environment variable printed by `mpa start`.
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+pub(crate) enum ShellKind {
+    /// fish: `set -Ux MOSHPIT_AGENT_SOCK <path>`
+    #[default]
+    Fish,
+    /// bash/zsh: `MOSHPIT_AGENT_SOCK=<path>; export MOSHPIT_AGENT_SOCK`
+    Bash,
+}
+
 #[derive(Clone, Debug, Subcommand)]
 pub(crate) enum Commands {
-    /// Start the agent daemon in the background.
+    /// Start the agent daemon (background by default).
     ///
-    /// Prints `MOSHPIT_AGENT_SOCK=<path>; export MOSHPIT_AGENT_SOCK` to stdout
-    /// so the caller can eval it:
-    ///   eval $(mpa start)          # bash/zsh
-    ///   mpa start | source          # fish
+    /// Prints the socket path as a shell assignment to stdout so the caller
+    /// can source it:
+    ///   mpa start | source              # fish (default)
+    ///   eval $(mpa start --shell bash)  # bash/zsh
+    ///   mpa start --foreground          # foreground; same output, keeps running
     #[clap(about = "Start the agent daemon")]
     Start {
         /// Override the socket path (default: $XDG_RUNTIME_DIR/moshpit-agent-<uid>.sock
@@ -67,9 +78,15 @@ pub(crate) enum Commands {
         /// Path to the vault file (default: ~/.mp/agent-vault).
         #[clap(long, value_name = "PATH")]
         vault: Option<String>,
-        /// Do not fork to background; run in the foreground.
+        /// Run in the foreground instead of daemonising (daemon is the default).
         #[clap(long, default_value_t = false)]
         foreground: bool,
+        /// Shell syntax for the exported environment variable.
+        #[clap(long, value_enum, default_value_t = ShellKind::Fish)]
+        shell: ShellKind,
+        /// Internal: read master passphrase from stdin pipe (used by daemon self-spawn).
+        #[clap(long, default_value_t = false, hide = true)]
+        passphrase_pipe: bool,
         /// Unlock backend to use (passphrase, fido2, systemd-creds,
         /// ssh-agent-piggyback).  Defaults to the backend compiled into this
         /// binary.
@@ -113,6 +130,21 @@ pub(crate) enum Commands {
     /// Unlock the agent: re-load keys from the vault.
     #[clap(about = "Unlock the agent (reload keys from vault)")]
     Unlock,
+    /// Stop the running agent daemon.
+    ///
+    /// Sends a shutdown request over the socket, then prints the unset command
+    /// for the shell so the caller can source it:
+    ///   mpa stop | source              # fish (default)
+    ///   eval $(mpa stop --shell bash)  # bash/zsh
+    #[clap(about = "Stop the agent daemon")]
+    Stop {
+        /// Override the socket path (default: `$MOSHPIT_AGENT_SOCK` or XDG default).
+        #[clap(long, value_name = "PATH")]
+        socket: Option<String>,
+        /// Shell syntax for the unset command.
+        #[clap(long, value_enum, default_value_t = ShellKind::Fish)]
+        shell: ShellKind,
+    },
 }
 
 /// Returns the backend name that matches the compile-time feature set.
@@ -157,6 +189,8 @@ mod tests {
                 socket: None,
                 vault: None,
                 foreground: false,
+                shell: ShellKind::Fish,
+                passphrase_pipe: false,
                 ..
             }
         ));
@@ -189,6 +223,32 @@ mod tests {
         assert!(matches!(
             Cli::try_parse_from(["mpa", "unlock"])?.command(),
             Commands::Unlock
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn stop_command_defaults() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from(["mpa", "stop"])?;
+        assert!(matches!(
+            cli.command(),
+            Commands::Stop {
+                socket: None,
+                shell: ShellKind::Fish,
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn stop_command_bash_shell() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from(["mpa", "stop", "--shell", "bash"])?;
+        assert!(matches!(
+            cli.command(),
+            Commands::Stop {
+                shell: ShellKind::Bash,
+                ..
+            }
         ));
         Ok(())
     }

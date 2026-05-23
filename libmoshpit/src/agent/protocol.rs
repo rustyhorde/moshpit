@@ -72,6 +72,12 @@ pub enum AgentRequest {
     Lock,
     /// Unlock the agent with a master credential (currently a passphrase string).
     Unlock(String),
+    /// Ask the agent to shut down gracefully.
+    ///
+    /// The agent responds with [`AgentResponse::Ok`], removes its socket file,
+    /// then exits.  Clients should source the output of `mpa stop` to unset
+    /// `MOSHPIT_AGENT_SOCK` after calling this.
+    Shutdown,
 }
 
 /// Responses from the agent.
@@ -115,6 +121,13 @@ mod tests {
         let encoded = encode_to_vec(&AgentRequest::RemoveAllIdentities, standard()).unwrap();
         let (rt, _): (AgentRequest, _) = decode_from_slice(&encoded, standard()).unwrap();
         assert!(matches!(rt, AgentRequest::RemoveAllIdentities));
+    }
+
+    #[test]
+    fn roundtrip_request_shutdown() {
+        let encoded = encode_to_vec(&AgentRequest::Shutdown, standard()).unwrap();
+        let (rt, _): (AgentRequest, _) = decode_from_slice(&encoded, standard()).unwrap();
+        assert!(matches!(rt, AgentRequest::Shutdown));
     }
 
     #[test]

@@ -34,7 +34,7 @@ use tracing::{error, info, warn};
 use zeroize::Zeroize as _;
 
 use crate::{
-    cli::{Cli, Commands},
+    cli::{Cli, Commands, ShellKind},
     config::AgentConfig,
     unlock::{UnlockBackend, passphrase::PassphraseBackend},
     vault::Vault,
@@ -137,6 +137,7 @@ async fn handle_connection(
     vault: Arc<Mutex<Option<Vault>>>,
     vault_path: PathBuf,
     master_passphrase: Arc<Mutex<String>>,
+    socket_path: PathBuf,
 ) {
     while let Ok(raw_len) = stream.read_u32().await {
         let req_len = raw_len as usize;
@@ -155,6 +156,7 @@ async fn handle_connection(
             }
         };
 
+        let is_shutdown = matches!(request, AgentRequest::Shutdown);
         let response = dispatch_request(
             request,
             &identities,
@@ -179,6 +181,10 @@ async fn handle_connection(
             || stream.flush().await.is_err()
         {
             break;
+        }
+        if is_shutdown {
+            drop(fs::remove_file(&socket_path));
+            std::process::exit(0);
         }
     }
 }
@@ -348,6 +354,8 @@ async fn dispatch_request(
                 Err(e) => AgentResponse::Error(e.to_string()),
             }
         }
+
+        AgentRequest::Shutdown => AgentResponse::Ok,
     }
 }
 
@@ -498,6 +506,8 @@ where
             foreground,
             backend,
             passphrase_stdin,
+            shell,
+            passphrase_pipe,
         } => {
             run_daemon(
                 socket.as_deref(),
@@ -505,6 +515,8 @@ where
                 *foreground,
                 backend.clone(),
                 *passphrase_stdin,
+                *shell,
+                *passphrase_pipe,
             )
             .await
         }
@@ -599,6 +611,16 @@ where
             }
             Ok(())
         }
+        Commands::Stop { socket, shell } => {
+            let socket_path = socket
+                .as_deref()
+                .map(PathBuf::from)
+                .map_or_else(socket_from_env, Ok)?;
+            // Best-effort: ignore errors — daemon may already be dead (e.g. after SIGKILL).
+            drop(send_to_agent(&socket_path, AgentRequest::Shutdown).await);
+            print_unset_socket_env(*shell);
+            Ok(())
+        }
     }
 }
 
@@ -645,6 +667,82 @@ fn unlock_backend(config: &AgentConfig) -> Box<dyn UnlockBackend> {
     Box::new(PassphraseBackend)
 }
 
+fn format_socket_env(path: &Path, shell: ShellKind) -> String {
+    match shell {
+        ShellKind::Fish => format!("set -Ux MOSHPIT_AGENT_SOCK {}", path.display()),
+        ShellKind::Bash => format!(
+            "MOSHPIT_AGENT_SOCK={}; export MOSHPIT_AGENT_SOCK",
+            path.display()
+        ),
+    }
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn print_socket_env(path: &Path, shell: ShellKind) {
+    println!("{}", format_socket_env(path, shell));
+}
+
+fn format_unset_socket_env(shell: ShellKind) -> String {
+    match shell {
+        ShellKind::Fish => "set -e MOSHPIT_AGENT_SOCK".to_string(),
+        ShellKind::Bash => "unset MOSHPIT_AGENT_SOCK".to_string(),
+    }
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn print_unset_socket_env(shell: ShellKind) {
+    println!("{}", format_unset_socket_env(shell));
+}
+
+/// Re-exec this binary as `mpa start --foreground` with the passphrase piped
+/// to its stdin so the parent can return control to the shell immediately.
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn spawn_daemon_child(
+    socket_override: Option<&str>,
+    vault_override: Option<&str>,
+    backend: &str,
+    shell: ShellKind,
+    master_passphrase: &str,
+) -> Result<()> {
+    let exe = std::env::current_exe()?;
+    let shell_str = match shell {
+        ShellKind::Fish => "fish",
+        ShellKind::Bash => "bash",
+    };
+    let mut cmd = std::process::Command::new(exe);
+    let _ = cmd
+        .arg("start")
+        .arg("--foreground")
+        .arg("--shell")
+        .arg(shell_str)
+        .arg("--backend")
+        .arg(backend)
+        .arg("--passphrase-pipe");
+    if let Some(s) = socket_override {
+        let _ = cmd.arg("--socket").arg(s);
+    }
+    if let Some(v) = vault_override {
+        let _ = cmd.arg("--vault").arg(v);
+    }
+    let _ = cmd
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(target_family = "unix")]
+    {
+        use std::os::unix::process::CommandExt as _;
+        // Put the child in its own process group so it is detached from the
+        // terminal's process group and won't receive keyboard signals.
+        let _ = cmd.process_group(0);
+    }
+    let mut child = cmd.spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write as _;
+        drop(writeln!(stdin, "{master_passphrase}"));
+    }
+    Ok(())
+}
+
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn run_daemon(
     socket_override: Option<&str>,
@@ -652,8 +750,10 @@ async fn run_daemon(
     foreground: bool,
     backend: String,
     passphrase_stdin: bool,
+    shell: ShellKind,
+    passphrase_pipe: bool,
 ) -> Result<()> {
-    let config = AgentConfig::resolve(socket_override, vault_override, foreground, backend);
+    let config = AgentConfig::resolve(socket_override, vault_override, foreground, backend, shell);
 
     // Create parent directories for socket and vault
     if let Some(parent) = config.socket_path.parent() {
@@ -677,7 +777,7 @@ async fn run_daemon(
 
     let backend = unlock_backend(&config);
     let vault_exists = config.vault_path.exists();
-    let master_passphrase = if passphrase_stdin && config.backend == "passphrase" {
+    let master_passphrase = if passphrase_stdin || passphrase_pipe {
         read_passphrase_stdin()?
     } else if vault_exists {
         backend.retrieve_passphrase()?
@@ -706,17 +806,17 @@ async fn run_daemon(
 
     let listener = UnixListener::bind(&config.socket_path)?;
 
-    // Announce socket path so the caller can eval the output
-    println!(
-        "MOSHPIT_AGENT_SOCK={}; export MOSHPIT_AGENT_SOCK",
-        config.socket_path.display()
-    );
+    // Announce socket path so the caller can source the output.
+    print_socket_env(&config.socket_path, config.shell);
 
     if !config.foreground {
-        // Simple daemonisation: we've already bound the socket and printed the
-        // export line; in a real deployment the systemd unit handles this, but
-        // for manual use we just continue running (background via shell `&`
-        // or eval). On Linux we could double-fork here in the future.
+        return spawn_daemon_child(
+            socket_override,
+            vault_override,
+            &config.backend,
+            config.shell,
+            &master_passphrase,
+        );
     }
 
     info!(
@@ -724,18 +824,22 @@ async fn run_daemon(
         config.socket_path.display()
     );
 
-    // Graceful shutdown on SIGTERM/SIGINT
+    // Graceful shutdown on SIGTERM/SIGINT; ignore SIGHUP so the daemon survives terminal hangup.
     let socket_path_cleanup = config.socket_path.clone();
     #[cfg(target_family = "unix")]
     {
         use tokio::signal::unix::{SignalKind, signal};
         let mut sigterm = signal(SignalKind::terminate())?;
         let mut sigint = signal(SignalKind::interrupt())?;
+        let mut sighup = signal(SignalKind::hangup())?;
         let cleanup_path = socket_path_cleanup.clone();
         drop(tokio::spawn(async move {
-            tokio::select! {
-                _ = sigterm.recv() => {}
-                _ = sigint.recv() => {}
+            loop {
+                tokio::select! {
+                    _ = sigterm.recv() => break,
+                    _ = sigint.recv() => break,
+                    _ = sighup.recv() => {} // ignore — daemon survives terminal hangup
+                }
             }
             drop(fs::remove_file(&cleanup_path));
             std::process::exit(0);
@@ -749,8 +853,9 @@ async fn run_daemon(
                 let v = Arc::clone(&vault);
                 let vp = config.vault_path.clone();
                 let mp = Arc::clone(&master_passphrase_arc);
+                let sp = config.socket_path.clone();
                 drop(tokio::spawn(async move {
-                    handle_connection(stream, ids, v, vp, mp).await;
+                    handle_connection(stream, ids, v, vp, mp, sp).await;
                 }));
             }
             Err(e) => error!("accept error: {e}"),
@@ -1124,6 +1229,7 @@ mod tests {
             Arc::clone(&vault),
             vault_path,
             Arc::clone(&mp),
+            PathBuf::from("/tmp/nonexistent-socket-agent-test"),
         )));
 
         let req = AgentRequest::ListIdentities;
@@ -1151,7 +1257,14 @@ mod tests {
 
         let (mut client, server) = UnixStream::pair().unwrap();
 
-        let task = tokio::spawn(handle_connection(server, ids, vault, vault_path, mp));
+        let task = tokio::spawn(handle_connection(
+            server,
+            ids,
+            vault,
+            vault_path,
+            mp,
+            PathBuf::from("/tmp/nonexistent-socket-agent-test"),
+        ));
 
         client.write_all(&0u32.to_be_bytes()).await.unwrap();
         client.flush().await.unwrap();
@@ -1169,7 +1282,14 @@ mod tests {
 
         let (mut client, server) = UnixStream::pair().unwrap();
 
-        let task = tokio::spawn(handle_connection(server, ids, vault, vault_path, mp));
+        let task = tokio::spawn(handle_connection(
+            server,
+            ids,
+            vault,
+            vault_path,
+            mp,
+            PathBuf::from("/tmp/nonexistent-socket-agent-test"),
+        ));
 
         let garbage = vec![0xFF_u8, 0xFE, 0xFD, 0xFC];
         let len = u32::try_from(garbage.len()).unwrap();
@@ -1235,8 +1355,45 @@ mod tests {
             Some("/tmp/dummy.vault"),
             false,
             "unknown-backend".to_string(),
+            ShellKind::Fish,
         );
         let backend = unlock_backend(&config);
         assert_eq!(backend.name(), "passphrase");
+    }
+
+    #[test]
+    fn format_socket_env_fish() {
+        let path = Path::new("/run/user/1000/moshpit-agent.sock");
+        let s = format_socket_env(path, ShellKind::Fish);
+        assert_eq!(
+            s,
+            "set -Ux MOSHPIT_AGENT_SOCK /run/user/1000/moshpit-agent.sock"
+        );
+    }
+
+    #[test]
+    fn format_socket_env_bash() {
+        let path = Path::new("/run/user/1000/moshpit-agent.sock");
+        let s = format_socket_env(path, ShellKind::Bash);
+        assert_eq!(
+            s,
+            "MOSHPIT_AGENT_SOCK=/run/user/1000/moshpit-agent.sock; export MOSHPIT_AGENT_SOCK"
+        );
+    }
+
+    #[test]
+    fn format_unset_socket_env_fish() {
+        assert_eq!(
+            format_unset_socket_env(ShellKind::Fish),
+            "set -e MOSHPIT_AGENT_SOCK"
+        );
+    }
+
+    #[test]
+    fn format_unset_socket_env_bash() {
+        assert_eq!(
+            format_unset_socket_env(ShellKind::Bash),
+            "unset MOSHPIT_AGENT_SOCK"
+        );
     }
 }

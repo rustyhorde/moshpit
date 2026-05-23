@@ -8,6 +8,8 @@
 
 use std::path::PathBuf;
 
+use crate::cli::ShellKind;
+
 /// Resolved runtime configuration for the agent daemon.
 #[derive(Debug)]
 pub(crate) struct AgentConfig {
@@ -19,6 +21,8 @@ pub(crate) struct AgentConfig {
     pub foreground: bool,
     /// Name of the unlock backend to use (e.g. `"passphrase"`, `"fido2"`).
     pub backend: String,
+    /// Shell syntax for the socket env var output.
+    pub shell: ShellKind,
     /// Path to the FIDO2 state file (`{vault_path}.fido2`).
     #[cfg(feature = "fido2")]
     pub fido2_state_path: PathBuf,
@@ -31,6 +35,7 @@ impl AgentConfig {
         vault_override: Option<&str>,
         foreground: bool,
         backend: String,
+        shell: ShellKind,
     ) -> Self {
         let socket_path = socket_override.map_or_else(default_socket_path, PathBuf::from);
 
@@ -50,6 +55,7 @@ impl AgentConfig {
             vault_path,
             foreground,
             backend,
+            shell,
             #[cfg(feature = "fido2")]
             fido2_state_path,
         }
@@ -83,6 +89,7 @@ mod tests {
             Some("/tmp/test-vault"),
             true,
             "passphrase".to_string(),
+            ShellKind::Bash,
         );
         assert_eq!(cfg.socket_path, PathBuf::from("/tmp/test.sock"));
         assert_eq!(cfg.vault_path, PathBuf::from("/tmp/test-vault"));
@@ -92,7 +99,8 @@ mod tests {
 
     #[test]
     fn resolve_defaults() {
-        let cfg = AgentConfig::resolve(None, None, false, "passphrase".to_string());
+        let cfg =
+            AgentConfig::resolve(None, None, false, "passphrase".to_string(), ShellKind::Fish);
         // Just verify we get non-empty paths — the exact values depend on env.
         assert!(!cfg.socket_path.as_os_str().is_empty());
         assert!(!cfg.vault_path.as_os_str().is_empty());

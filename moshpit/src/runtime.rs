@@ -1597,6 +1597,52 @@ mod tests {
         }
     }
 
+    /// RAII guard that temporarily overrides (or removes) an env var.
+    /// Restores the original value on drop.
+    struct EnvGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvGuard {
+        #[allow(unsafe_code)]
+        fn new(key: &'static str, value: Option<&str>) -> Self {
+            let original = std::env::var(key).ok();
+            // SAFETY: test-only; nextest runs each test in its own process so
+            // there is no concurrent env access from other threads.
+            match value {
+                Some(v) => unsafe { std::env::set_var(key, v) },
+                None => unsafe { std::env::remove_var(key) },
+            }
+            Self { key, original }
+        }
+    }
+
+    #[allow(unsafe_code)]
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: same as EnvGuard::new.
+            match &self.original {
+                Some(v) => unsafe { std::env::set_var(self.key, v) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn env_guard_restores_original_value() {
+        // Safety: nextest runs each test in its own process; no concurrent env access.
+        const KEY: &str = "MOSHPIT_TEST_ENV_GUARD_RESTORE";
+        unsafe { std::env::set_var(KEY, "original") };
+        {
+            let _guard = EnvGuard::new(KEY, Some("overridden"));
+            assert_eq!(std::env::var(KEY).ok().as_deref(), Some("overridden"));
+        }
+        assert_eq!(std::env::var(KEY).ok().as_deref(), Some("original"));
+        unsafe { std::env::remove_var(KEY) };
+    }
+
     #[test]
     fn test_pass_cache() {
         let mut cache = PassCache::Uncached;
@@ -1839,6 +1885,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_connect_and_kex_kex_failure() -> Result<()> {
+        // A live agent would supply an identity and bypass the empty-key-file path.
+        let _agent_guard = EnvGuard::new("MOSHPIT_AGENT_SOCK", None);
         let dir = std::env::temp_dir().join(Uuid::new_v4().to_string());
         std::fs::create_dir_all(&dir)?;
         let config_path = dir.join("config.toml");
@@ -1942,6 +1990,8 @@ mod tests {
     #[tokio::test]
     async fn connect_and_kex_missing_key_file_wrapped_as_fatal_error() -> Result<()> {
         use clap::Parser as _;
+        // A live agent would supply an identity and bypass the missing-key-file path.
+        let _agent_guard = EnvGuard::new("MOSHPIT_AGENT_SOCK", None);
         let home = TestHome::new();
         let config_path = home.path().join("config.toml");
         // Non-existent key paths

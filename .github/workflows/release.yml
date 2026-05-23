@@ -26,8 +26,11 @@ jobs:
       pkgver: ${{ steps.version.outputs.pkgver }}
     steps:
       - name: Checkout
-        # v6
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        uses: Wandalen/wretry.action@71a909ebf09f3ffdc6f42a17bd54ecb43481da49 # v3.8.0
+        with:
+          action: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+          attempt_limit: 3
+          attempt_delay: 30000
 
       - name: Extract version from tag
         id: version
@@ -522,10 +525,13 @@ jobs:
       pull-requests: write
     steps:
       - name: Checkout
-        # v6
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        uses: Wandalen/wretry.action@71a909ebf09f3ffdc6f42a17bd54ecb43481da49 # v3.8.0
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          action: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+          with: |
+            token: ${{ secrets.GITHUB_TOKEN }}
+          attempt_limit: 3
+          attempt_delay: 30000
 
       - name: Download release assets
         # v8

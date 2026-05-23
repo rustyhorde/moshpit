@@ -10,7 +10,7 @@ license = "MIT OR Apache-2.0"
 name = "moshpit"
 readme = "../README.md"
 repository = "https://github.com/rustyhorde/moshpit"
-version = "0.8.8"
+version = "0.8.9"
 rust-version = "1.91.1"
 
 [[bin]]
@@ -27,7 +27,7 @@ config = { workspace = true }
 crossterm = "0.29.0"
 dialoguer = "0.12.0"
 getset = { workspace = true }
-libmoshpit = { version = "0.8.8", path = "../libmoshpit" }
+libmoshpit = { version = "0.8.9", path = "../libmoshpit" }
 dirs2 = "3.0.1"
 serde = { workspace = true }
 terminal_size = "0.4.4"
