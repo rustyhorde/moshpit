@@ -110,7 +110,7 @@ jobs:
           git config user.name  "Jason Ozias"
           git config user.email "jason.g.ozias@gmail.com"
           git add .
-          git diff-index --quiet HEAD || git commit -m "Update to v${PKGVER}"
+          git diff-index --quiet HEAD 2>/dev/null || git commit -m "Update to v${PKGVER}"
 
           if [[ "$DRY_RUN" == "true" ]]; then
             echo "DRY RUN: skipping push. Commit log:"
