@@ -567,6 +567,7 @@ jobs:
 
       - name: Generate .SRCINFO files
         run: |
+          set -euo pipefail
           for pkg_dir in packaging/arch/*/; do
             docker run --rm \
               -v "$(pwd)/${pkg_dir%/}:/pkg" \
@@ -582,6 +583,7 @@ jobs:
         with:
           name: pkgbuilds
           path: packaging/arch/
+          include-hidden-files: true
 
       - name: Open PR to update PKGBUILDs
         env:
@@ -679,7 +681,7 @@ jobs:
           git config user.name  "Jason Ozias"
           git config user.email "jason.g.ozias@gmail.com"
           git add .
-          git diff-index --quiet HEAD || git commit -m "Update to v${PKGVER}"
+          git diff-index --quiet HEAD 2>/dev/null || git commit -m "Update to v${PKGVER}"
 
           # Push with retry
           for attempt in 1 2 3; do
