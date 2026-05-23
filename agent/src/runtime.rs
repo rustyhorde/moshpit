@@ -137,6 +137,7 @@ async fn handle_connection(
     vault: Arc<Mutex<Option<Vault>>>,
     vault_path: PathBuf,
     master_passphrase: Arc<Mutex<String>>,
+    socket_path: PathBuf,
 ) {
     while let Ok(raw_len) = stream.read_u32().await {
         let req_len = raw_len as usize;
@@ -155,6 +156,7 @@ async fn handle_connection(
             }
         };
 
+        let is_shutdown = matches!(request, AgentRequest::Shutdown);
         let response = dispatch_request(
             request,
             &identities,
@@ -179,6 +181,10 @@ async fn handle_connection(
             || stream.flush().await.is_err()
         {
             break;
+        }
+        if is_shutdown {
+            drop(fs::remove_file(&socket_path));
+            std::process::exit(0);
         }
     }
 }
@@ -348,6 +354,8 @@ async fn dispatch_request(
                 Err(e) => AgentResponse::Error(e.to_string()),
             }
         }
+
+        AgentRequest::Shutdown => AgentResponse::Ok,
     }
 }
 
@@ -603,6 +611,16 @@ where
             }
             Ok(())
         }
+        Commands::Stop { socket, shell } => {
+            let socket_path = socket
+                .as_deref()
+                .map(PathBuf::from)
+                .map_or_else(socket_from_env, Ok)?;
+            // Best-effort: ignore errors — daemon may already be dead (e.g. after SIGKILL).
+            drop(send_to_agent(&socket_path, AgentRequest::Shutdown).await);
+            print_unset_socket_env(*shell);
+            Ok(())
+        }
     }
 }
 
@@ -662,6 +680,18 @@ fn format_socket_env(path: &Path, shell: ShellKind) -> String {
 #[cfg_attr(coverage_nightly, coverage(off))]
 fn print_socket_env(path: &Path, shell: ShellKind) {
     println!("{}", format_socket_env(path, shell));
+}
+
+fn format_unset_socket_env(shell: ShellKind) -> String {
+    match shell {
+        ShellKind::Fish => "set -e MOSHPIT_AGENT_SOCK".to_string(),
+        ShellKind::Bash => "unset MOSHPIT_AGENT_SOCK".to_string(),
+    }
+}
+
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn print_unset_socket_env(shell: ShellKind) {
+    println!("{}", format_unset_socket_env(shell));
 }
 
 /// Re-exec this binary as `mpa start --foreground` with the passphrase piped
@@ -823,8 +853,9 @@ async fn run_daemon(
                 let v = Arc::clone(&vault);
                 let vp = config.vault_path.clone();
                 let mp = Arc::clone(&master_passphrase_arc);
+                let sp = config.socket_path.clone();
                 drop(tokio::spawn(async move {
-                    handle_connection(stream, ids, v, vp, mp).await;
+                    handle_connection(stream, ids, v, vp, mp, sp).await;
                 }));
             }
             Err(e) => error!("accept error: {e}"),
@@ -1198,6 +1229,7 @@ mod tests {
             Arc::clone(&vault),
             vault_path,
             Arc::clone(&mp),
+            PathBuf::from("/tmp/nonexistent-socket-agent-test"),
         )));
 
         let req = AgentRequest::ListIdentities;
@@ -1225,7 +1257,14 @@ mod tests {
 
         let (mut client, server) = UnixStream::pair().unwrap();
 
-        let task = tokio::spawn(handle_connection(server, ids, vault, vault_path, mp));
+        let task = tokio::spawn(handle_connection(
+            server,
+            ids,
+            vault,
+            vault_path,
+            mp,
+            PathBuf::from("/tmp/nonexistent-socket-agent-test"),
+        ));
 
         client.write_all(&0u32.to_be_bytes()).await.unwrap();
         client.flush().await.unwrap();
@@ -1243,7 +1282,14 @@ mod tests {
 
         let (mut client, server) = UnixStream::pair().unwrap();
 
-        let task = tokio::spawn(handle_connection(server, ids, vault, vault_path, mp));
+        let task = tokio::spawn(handle_connection(
+            server,
+            ids,
+            vault,
+            vault_path,
+            mp,
+            PathBuf::from("/tmp/nonexistent-socket-agent-test"),
+        ));
 
         let garbage = vec![0xFF_u8, 0xFE, 0xFD, 0xFC];
         let len = u32::try_from(garbage.len()).unwrap();
@@ -1332,6 +1378,22 @@ mod tests {
         assert_eq!(
             s,
             "MOSHPIT_AGENT_SOCK=/run/user/1000/moshpit-agent.sock; export MOSHPIT_AGENT_SOCK"
+        );
+    }
+
+    #[test]
+    fn format_unset_socket_env_fish() {
+        assert_eq!(
+            format_unset_socket_env(ShellKind::Fish),
+            "set -e MOSHPIT_AGENT_SOCK"
+        );
+    }
+
+    #[test]
+    fn format_unset_socket_env_bash() {
+        assert_eq!(
+            format_unset_socket_env(ShellKind::Bash),
+            "unset MOSHPIT_AGENT_SOCK"
         );
     }
 }

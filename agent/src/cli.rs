@@ -130,6 +130,21 @@ pub(crate) enum Commands {
     /// Unlock the agent: re-load keys from the vault.
     #[clap(about = "Unlock the agent (reload keys from vault)")]
     Unlock,
+    /// Stop the running agent daemon.
+    ///
+    /// Sends a shutdown request over the socket, then prints the unset command
+    /// for the shell so the caller can source it:
+    ///   mpa stop | source              # fish (default)
+    ///   eval $(mpa stop --shell bash)  # bash/zsh
+    #[clap(about = "Stop the agent daemon")]
+    Stop {
+        /// Override the socket path (default: `$MOSHPIT_AGENT_SOCK` or XDG default).
+        #[clap(long, value_name = "PATH")]
+        socket: Option<String>,
+        /// Shell syntax for the unset command.
+        #[clap(long, value_enum, default_value_t = ShellKind::Fish)]
+        shell: ShellKind,
+    },
 }
 
 /// Returns the backend name that matches the compile-time feature set.
@@ -208,6 +223,32 @@ mod tests {
         assert!(matches!(
             Cli::try_parse_from(["mpa", "unlock"])?.command(),
             Commands::Unlock
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn stop_command_defaults() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from(["mpa", "stop"])?;
+        assert!(matches!(
+            cli.command(),
+            Commands::Stop {
+                socket: None,
+                shell: ShellKind::Fish,
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn stop_command_bash_shell() -> anyhow::Result<()> {
+        let cli = Cli::try_parse_from(["mpa", "stop", "--shell", "bash"])?;
+        assert!(matches!(
+            cli.command(),
+            Commands::Stop {
+                shell: ShellKind::Bash,
+                ..
+            }
         ));
         Ok(())
     }
