@@ -144,3 +144,101 @@ impl AgentClient {
         }
     }
 }
+
+#[cfg(test)]
+#[cfg(unix)]
+mod tests {
+    use tempfile::TempDir;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::net::UnixListener;
+
+    use super::*;
+
+    fn spawn_mock_agent(
+        socket_path: &PathBuf,
+        response: AgentResponse,
+    ) -> tokio::task::JoinHandle<()> {
+        let listener = UnixListener::bind(socket_path).expect("bind test agent socket");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept test connection");
+            let req_len = stream.read_u32().await.expect("read request length") as usize;
+            let mut buf = vec![0u8; req_len];
+            let _ = stream
+                .read_exact(&mut buf)
+                .await
+                .expect("read request body");
+            let encoded = encode_to_vec(&response, standard()).expect("encode mock response");
+            let len = u32::try_from(encoded.len()).expect("response length fits u32");
+            stream
+                .write_all(&len.to_be_bytes())
+                .await
+                .expect("write response length");
+            stream.write_all(&encoded).await.expect("write response");
+            stream.flush().await.expect("flush response");
+        })
+    }
+
+    #[tokio::test]
+    async fn status_unlocked_with_identities() {
+        let dir = TempDir::new().expect("temp dir");
+        let socket_path = dir.path().join("test-agent.sock");
+        drop(spawn_mock_agent(
+            &socket_path,
+            AgentResponse::AgentStatus {
+                locked: false,
+                identities: vec![AgentIdentityInfo {
+                    algorithm: "X25519".to_string(),
+                    fingerprint: "SHA256:aabbcc".to_string(),
+                    comment: String::new(),
+                }],
+            },
+        ));
+        let client = AgentClient::new(socket_path);
+        let (locked, ids) = client.status().await.expect("status should succeed");
+        assert!(!locked);
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0].fingerprint, "SHA256:aabbcc");
+    }
+
+    #[tokio::test]
+    async fn status_locked_no_identities() {
+        let dir = TempDir::new().expect("temp dir");
+        let socket_path = dir.path().join("test-agent-locked.sock");
+        drop(spawn_mock_agent(
+            &socket_path,
+            AgentResponse::AgentStatus {
+                locked: true,
+                identities: vec![],
+            },
+        ));
+        let client = AgentClient::new(socket_path);
+        let (locked, ids) = client.status().await.expect("status should succeed");
+        assert!(locked);
+        assert!(ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn status_propagates_agent_error() {
+        let dir = TempDir::new().expect("temp dir");
+        let socket_path = dir.path().join("test-agent-err.sock");
+        drop(spawn_mock_agent(
+            &socket_path,
+            AgentResponse::Error("daemon error".to_string()),
+        ));
+        let client = AgentClient::new(socket_path);
+        let err = client
+            .status()
+            .await
+            .expect_err("expected error from agent");
+        assert!(err.to_string().contains("daemon error"), "err: {err}");
+    }
+
+    #[tokio::test]
+    async fn status_unexpected_response_errors() {
+        let dir = TempDir::new().expect("temp dir");
+        let socket_path = dir.path().join("test-agent-unexpected.sock");
+        drop(spawn_mock_agent(&socket_path, AgentResponse::Ok));
+        let client = AgentClient::new(socket_path);
+        assert!(client.status().await.is_err());
+    }
+}

@@ -1358,6 +1358,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_status_unlocked_empty() {
+        let ids = new_identity_map();
+        let vault = empty_vault();
+        let vault_path = PathBuf::from("/tmp/nonexistent-vault-agent-test");
+        let mp = empty_passphrase();
+        let resp = dispatch_request(
+            AgentRequest::Status,
+            &ids,
+            &vault,
+            &vault_path,
+            &mp,
+            &unlocked_state(),
+        )
+        .await;
+        match resp {
+            AgentResponse::AgentStatus { locked, identities } => {
+                assert!(!locked);
+                assert!(identities.is_empty());
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_status_unlocked_with_identity() {
+        let ids = new_identity_map();
+        let fp = "SHA256:status-key".to_string();
+        drop(
+            ids.lock()
+                .await
+                .insert(fp.clone(), dummy_identity(&fp, "X25519")),
+        );
+        let vault = empty_vault();
+        let vault_path = PathBuf::from("/tmp/nonexistent-vault-agent-test");
+        let mp = empty_passphrase();
+        let resp = dispatch_request(
+            AgentRequest::Status,
+            &ids,
+            &vault,
+            &vault_path,
+            &mp,
+            &unlocked_state(),
+        )
+        .await;
+        match resp {
+            AgentResponse::AgentStatus { locked, identities } => {
+                assert!(!locked);
+                assert_eq!(identities.len(), 1);
+                assert_eq!(identities[0].fingerprint, fp);
+                assert_eq!(identities[0].algorithm, "X25519");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_status_locked_state() {
+        let ids = new_identity_map();
+        let vault = empty_vault();
+        let vault_path = PathBuf::from("/tmp/nonexistent-vault-agent-test");
+        let mp = empty_passphrase();
+        let locked = Arc::new(Mutex::new(true));
+        let resp = dispatch_request(
+            AgentRequest::Status,
+            &ids,
+            &vault,
+            &vault_path,
+            &mp,
+            &locked,
+        )
+        .await;
+        match resp {
+            AgentResponse::AgentStatus { locked, identities } => {
+                assert!(locked, "agent should report locked state");
+                assert!(identities.is_empty());
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_lock_sets_locked_flag() {
+        let ids = new_identity_map();
+        let fp = "SHA256:flagme".to_string();
+        drop(
+            ids.lock()
+                .await
+                .insert(fp.clone(), dummy_identity(&fp, "P384")),
+        );
+        let vault = empty_vault();
+        let vault_path = PathBuf::from("/tmp/nonexistent-vault-agent-test");
+        let mp = empty_passphrase();
+        let locked = unlocked_state();
+        let resp =
+            dispatch_request(AgentRequest::Lock, &ids, &vault, &vault_path, &mp, &locked).await;
+        assert!(matches!(resp, AgentResponse::Ok));
+        assert!(*locked.lock().await, "locked flag must be true after Lock");
+    }
+
+    #[tokio::test]
     async fn handle_connection_single_request() {
         let ids = new_identity_map();
         let vault = empty_vault();
