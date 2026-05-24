@@ -191,18 +191,16 @@ mod tests {
 
     const TEST_USIZE: usize = 12;
 
-    fn validate_get_u8(cursor: &mut Cursor<&[u8]>) {
-        let flag = get_u8(cursor);
-        assert!(flag.is_some());
-        let flag = flag.unwrap();
+    fn validate_get_u8(cursor: &mut Cursor<&[u8]>) -> Result<()> {
+        let flag = get_u8(cursor).ok_or_else(|| anyhow::anyhow!("expected Some flag byte"))?;
         assert_eq!(flag, 0);
         assert_eq!(cursor.position(), 1);
+        Ok(())
     }
 
     fn validate_get_usize(cursor: &mut Cursor<&[u8]>, expected: usize) -> Result<()> {
-        let line = get_usize(cursor)?;
-        assert!(line.is_some());
-        let line = line.unwrap();
+        let line =
+            get_usize(cursor)?.ok_or_else(|| anyhow::anyhow!("expected Some usize bytes"))?;
         let value = usize::from_be_bytes(line.try_into()?);
         assert_eq!(value, expected);
         assert_eq!(cursor.position(), u64::try_from(USIZE_LENGTH + 1)?);
@@ -210,9 +208,8 @@ mod tests {
     }
 
     fn validate_get_bytes(cursor: &mut Cursor<&[u8]>, expected: &[u8]) -> Result<()> {
-        let bytes = get_bytes(cursor, expected.len())?;
-        assert!(bytes.is_some());
-        let bytes = bytes.unwrap();
+        let bytes = get_bytes(cursor, expected.len())?
+            .ok_or_else(|| anyhow::anyhow!("expected Some bytes"))?;
         assert_eq!(bytes, expected);
         assert_eq!(
             cursor.position(),
@@ -270,10 +267,11 @@ mod tests {
     }
 
     #[test]
-    fn test_get_u8() {
+    fn test_get_u8() -> Result<()> {
         let (all_data, _, _) = test_data(DataKind::U8, Completness::Complete);
         let mut cursor = Cursor::new(&all_data[..]);
-        validate_get_u8(&mut cursor);
+        validate_get_u8(&mut cursor)?;
+        Ok(())
     }
 
     #[test]
@@ -287,20 +285,19 @@ mod tests {
     fn test_get_usize() -> Result<()> {
         let (all_data, expected_usize, _) = test_data(DataKind::Usize, Completness::Complete);
         let mut cursor = Cursor::new(&all_data[..]);
-        validate_get_u8(&mut cursor);
+        validate_get_u8(&mut cursor)?;
         validate_get_usize(&mut cursor, expected_usize)?;
         Ok(())
     }
 
     #[test]
-    fn test_get_usize_incomplete() {
+    fn test_get_usize_incomplete() -> Result<()> {
         let (all_data, _, _) = test_data(DataKind::Usize, Completness::Incomplete);
         let mut cursor = Cursor::new(&all_data[..]);
-        validate_get_u8(&mut cursor);
-        let res = get_usize(&mut cursor);
-        assert!(res.is_ok());
-        let maybe_usize = res.unwrap();
+        validate_get_u8(&mut cursor)?;
+        let maybe_usize = get_usize(&mut cursor)?;
         assert!(maybe_usize.is_none());
+        Ok(())
     }
 
     #[test]
@@ -308,7 +305,7 @@ mod tests {
         let (all_data, expected_usize, expected_bytes) =
             test_data(DataKind::Bytes, Completness::Complete);
         let mut cursor = Cursor::new(&all_data[..]);
-        validate_get_u8(&mut cursor);
+        validate_get_u8(&mut cursor)?;
         validate_get_usize(&mut cursor, expected_usize)?;
         validate_get_bytes(&mut cursor, &expected_bytes)?;
         Ok(())
@@ -318,11 +315,9 @@ mod tests {
     fn test_get_bytes_incomplete() -> Result<()> {
         let (all_data, expected_usize, _) = test_data(DataKind::Bytes, Completness::Incomplete);
         let mut cursor = Cursor::new(&all_data[..]);
-        validate_get_u8(&mut cursor);
+        validate_get_u8(&mut cursor)?;
         validate_get_usize(&mut cursor, expected_usize)?;
-        let res = get_bytes(&mut cursor, expected_usize);
-        assert!(res.is_ok());
-        let maybe_bytes = res.unwrap();
+        let maybe_bytes = get_bytes(&mut cursor, expected_usize)?;
         assert!(maybe_bytes.is_none());
         Ok(())
     }
@@ -344,29 +339,27 @@ mod tests {
         let mut cursor = Cursor::new(&all_data[..]);
         let parsed_frame = Frame::parse(&mut cursor)?;
         assert!(parsed_frame.is_some());
-        let parsed_frame = parsed_frame.unwrap();
+        let parsed_frame = parsed_frame.ok_or_else(|| anyhow::anyhow!("expected parsed frame"))?;
         assert_eq!(parsed_frame, frame);
         Ok(())
     }
 
     #[test]
-    fn test_parse_incomplete() {
+    fn test_parse_incomplete() -> Result<()> {
         let all_data = [200u8];
         let mut cursor = Cursor::new(&all_data[..]);
-        let result = Frame::parse(&mut cursor);
-        assert!(result.is_ok());
-        let maybe_frame = result.unwrap();
+        let maybe_frame = Frame::parse(&mut cursor)?;
         assert!(maybe_frame.is_none());
+        Ok(())
     }
 
     #[test]
-    fn test_parse_error() {
+    fn test_parse_error() -> Result<()> {
         let all_data = [];
         let mut cursor = Cursor::new(&all_data[..]);
-        let result = Frame::parse(&mut cursor);
-        assert!(result.is_ok());
-        let maybe_frame = result.unwrap();
+        let maybe_frame = Frame::parse(&mut cursor)?;
         assert!(maybe_frame.is_none());
+        Ok(())
     }
 
     #[test]
@@ -376,28 +369,25 @@ mod tests {
         let length_bytes = oversized_len.to_be_bytes();
         let mut all_data = vec![0u8];
         all_data.extend_from_slice(&length_bytes);
-        all_data.extend_from_slice(&[0u8; 10]); // Mock data
+        all_data.extend_from_slice(&[0u8; 10]);
 
         let mut cursor = Cursor::new(&all_data[..]);
-        let result = Frame::parse(&mut cursor);
-        assert!(result.is_err());
         assert_eq!(
-            result.unwrap_err().to_string(),
+            Frame::parse(&mut cursor)
+                .expect_err("expected FrameTooLarge error")
+                .to_string(),
             crate::error::Error::FrameTooLarge.to_string()
         );
     }
 
     #[test]
-    fn test_parse_unknown_frame_id_returns_none() {
+    fn test_parse_unknown_frame_id_returns_none() -> Result<()> {
         // Frame IDs 0-11 are known; anything above 11 must be silently ignored (Ok(None)).
         let all_data = [12u8, 0, 0, 0, 0, 0, 0, 0, 0]; // id=12, length=0, no payload
         let mut cursor = Cursor::new(&all_data[..]);
-        let result = Frame::parse(&mut cursor);
-        assert!(result.is_ok(), "unknown frame id must not be an error");
-        assert!(
-            result.unwrap().is_none(),
-            "unknown frame id must return Ok(None)"
-        );
+        let result = Frame::parse(&mut cursor)?;
+        assert!(result.is_none(), "unknown frame id must return Ok(None)");
+        Ok(())
     }
 
     #[test]
@@ -415,9 +405,9 @@ mod tests {
         all_data.extend_from_slice(&encoded_frame);
 
         let mut cursor = Cursor::new(&all_data[..]);
-        let parsed = Frame::parse(&mut cursor)?;
-        assert!(parsed.is_some());
-        let Frame::KexInit(parsed_list) = parsed.unwrap() else {
+        let Frame::KexInit(parsed_list) =
+            Frame::parse(&mut cursor)?.ok_or_else(|| anyhow::anyhow!("expected KexInit frame"))?
+        else {
             panic!("expected KexInit");
         };
         assert_eq!(parsed_list, list);
@@ -437,9 +427,9 @@ mod tests {
         all_data.extend_from_slice(&encoded_frame);
 
         let mut cursor = Cursor::new(&all_data[..]);
-        let parsed = Frame::parse(&mut cursor)?;
-        assert!(parsed.is_some());
-        let Frame::IdentityProof(parsed_sig) = parsed.unwrap() else {
+        let Frame::IdentityProof(parsed_sig) = Frame::parse(&mut cursor)?
+            .ok_or_else(|| anyhow::anyhow!("expected IdentityProof frame"))?
+        else {
             panic!("expected IdentityProof");
         };
         assert_eq!(parsed_sig, sig);

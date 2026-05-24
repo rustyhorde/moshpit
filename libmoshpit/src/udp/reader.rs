@@ -1746,15 +1746,16 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_handle_arrival_seq_jump() {
+    async fn test_handle_arrival_seq_jump() -> Result<()> {
         // Build a minimal UdpReader
-        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
 
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
             .rnk(LessSafeKey::new(
-                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32])
+                    .expect("test AES-256-GCM-SIV key setup"),
             ))
             .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .build();
@@ -1786,6 +1787,7 @@ mod tests {
         assert_eq!(reader.gap_first_seen.len(), 2);
         assert!(reader.gap_first_seen.contains_key(&1));
         assert!(reader.gap_first_seen.contains_key(&2));
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -1797,13 +1799,18 @@ mod tests {
     fn make_reader_sync() -> UdpReader {
         // Build a UdpReader synchronously using a blocking socket creation.
         // proptest strategy closures cannot be async, so we use a blocking handle.
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let socket = rt.block_on(async { UdpSocket::bind("127.0.0.1:0").await.unwrap() });
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let socket = rt.block_on(async {
+            UdpSocket::bind("127.0.0.1:0")
+                .await
+                .expect("bind test socket")
+        });
         UdpReader::builder()
             .socket(Arc::new(socket))
             .id(Uuid::new_v4())
             .rnk(LessSafeKey::new(
-                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32])
+                    .expect("test AES-256-GCM-SIV key setup"),
             ))
             .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .build()
@@ -1905,13 +1912,18 @@ mod tests {
     /// can be observed in tests.
     async fn make_reader_with_response_rx()
     -> (UdpReader, tokio::sync::mpsc::Receiver<EncryptedFrame>) {
-        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let socket = Arc::new(
+            UdpSocket::bind("127.0.0.1:0")
+                .await
+                .expect("bind test socket"),
+        );
         let (tx, rx) = tokio::sync::mpsc::channel::<EncryptedFrame>(16);
         let reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
             .rnk(LessSafeKey::new(
-                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32])
+                    .expect("test AES-256-GCM-SIV key setup"),
             ))
             .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .query_response_tx(tx)
@@ -1998,7 +2010,7 @@ mod tests {
             panic!("expected Bytes frame, got {frame:?}");
         };
         // Response format: ESC [ row ; col R
-        let s = String::from_utf8(resp).unwrap();
+        let s = String::from_utf8(resp).expect("valid UTF-8 response");
         assert!(s.starts_with("\x1b["), "response must start with ESC [");
         assert!(s.ends_with('R'), "response must end with R");
     }
@@ -2110,7 +2122,7 @@ mod tests {
         let EncryptedFrame::Bytes((_id, resp)) = frame else {
             panic!("expected Bytes frame");
         };
-        let s = String::from_utf8(resp).unwrap();
+        let s = String::from_utf8(resp).expect("valid UTF-8 response");
         assert!(
             s.starts_with("\x1b[8;"),
             "response must start with ESC[8; — got {s:?}"
@@ -2168,7 +2180,7 @@ mod tests {
         let EncryptedFrame::Bytes((_id, resp)) = frame else {
             panic!("expected Bytes frame");
         };
-        let s = String::from_utf8(resp).unwrap();
+        let s = String::from_utf8(resp).expect("valid UTF-8 response");
         assert!(s.starts_with("\x1b]10;"), "response must be OSC 10");
         assert!(s.ends_with('\x07'), "response must be BEL-terminated");
     }
@@ -2185,7 +2197,7 @@ mod tests {
         let EncryptedFrame::Bytes((_id, resp)) = frame else {
             panic!("expected Bytes frame");
         };
-        let s = String::from_utf8(resp).unwrap();
+        let s = String::from_utf8(resp).expect("valid UTF-8 response");
         assert!(s.starts_with("\x1b]11;"), "response must be OSC 11");
     }
 
@@ -2201,7 +2213,7 @@ mod tests {
         let EncryptedFrame::Bytes((_id, resp)) = frame else {
             panic!("expected Bytes frame");
         };
-        let s = String::from_utf8(resp).unwrap();
+        let s = String::from_utf8(resp).expect("valid UTF-8 response");
         assert!(s.starts_with("\x1b]12;"));
     }
 
@@ -2237,14 +2249,15 @@ mod tests {
     // --- NAK routing via handle_arrival ---
 
     #[tokio::test]
-    async fn handle_arrival_nak_routed_to_retransmit_tx() {
-        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    async fn handle_arrival_nak_routed_to_retransmit_tx() -> Result<()> {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
         let (retransmit_tx, mut retransmit_rx) = tokio::sync::mpsc::channel::<Vec<u64>>(4);
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
             .rnk(LessSafeKey::new(
-                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32])
+                    .expect("test AES-256-GCM-SIV key setup"),
             ))
             .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .retransmit_tx(retransmit_tx)
@@ -2262,18 +2275,20 @@ mod tests {
             .try_recv()
             .expect("expected retransmit request");
         assert_eq!(seqs, vec![5, 6, 7]);
+        Ok(())
     }
 
     // --- window give-up path in check_nak_timeouts ---
 
     #[tokio::test]
-    async fn check_nak_timeouts_window_give_up_advances_next_seq() {
-        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    async fn check_nak_timeouts_window_give_up_advances_next_seq() -> Result<()> {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
             .rnk(LessSafeKey::new(
-                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32])
+                    .expect("test AES-256-GCM-SIV key setup"),
             ))
             .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .build();
@@ -2293,6 +2308,7 @@ mod tests {
         );
         assert!(reader.gap_first_seen.is_empty(), "gap must be cleared");
         assert!(delivered.is_empty(), "no buffered frames to deliver");
+        Ok(())
     }
 
     // ── Option A + Option D ────────────────────────────────────────────────────
@@ -2309,7 +2325,9 @@ mod tests {
         reader.update_rtt_estimate(Duration::from_millis(100));
         assert_eq!(reader.srtt, Some(Duration::from_millis(100)));
         assert_eq!(reader.rttvar, Some(Duration::from_millis(50)));
-        let rto = reader.nak_timeout.unwrap();
+        let rto = reader
+            .nak_timeout
+            .expect("nak_timeout set after first sample");
         assert_eq!(
             rto,
             Duration::from_millis(300),
@@ -2328,9 +2346,11 @@ mod tests {
         // SRTT   = 100ms - 100ms/8 + 200ms/8 = 100 - 12.5 + 25 = 112.5ms.
         // RTO    = 112.5 + 4*62.5 = 112.5 + 250 = 362.5ms.
         reader.update_rtt_estimate(Duration::from_millis(200));
-        let srtt = reader.srtt.unwrap();
-        let rttvar = reader.rttvar.unwrap();
-        let rto = reader.nak_timeout.unwrap();
+        let srtt = reader.srtt.expect("srtt set after second sample");
+        let rttvar = reader.rttvar.expect("rttvar set after second sample");
+        let rto = reader
+            .nak_timeout
+            .expect("nak_timeout set after second sample");
         assert_eq!(
             srtt,
             Duration::from_micros(112_500),
@@ -2353,7 +2373,9 @@ mod tests {
         for _ in 0..64 {
             reader.update_rtt_estimate(Duration::from_millis(20));
         }
-        let rto = reader.nak_timeout.unwrap();
+        let rto = reader
+            .nak_timeout
+            .expect("nak_timeout set after 64 samples");
         assert!(
             rto <= Duration::from_millis(60),
             "low-jitter LAN path RTO must converge toward MIN: got {rto:?}"
@@ -2368,7 +2390,7 @@ mod tests {
             let sample = if i % 2 == 0 { 10 } else { 200 };
             reader.update_rtt_estimate(Duration::from_millis(sample));
         }
-        let rto = reader.nak_timeout.unwrap();
+        let rto = reader.nak_timeout.expect("nak_timeout set after 8 samples");
         // With high jitter, RTTVAR grows large, pushing RTO up.
         assert!(
             rto > Duration::from_millis(100),
@@ -2381,7 +2403,7 @@ mod tests {
         let mut reader = make_reader_sync();
         reader.nak_timeout = Some(Duration::from_millis(25));
         reader.update_rtt_estimate(Duration::from_millis(1));
-        assert!(reader.nak_timeout.unwrap() >= MIN_NAK_TIMEOUT);
+        assert!(reader.nak_timeout.expect("nak_timeout set") >= MIN_NAK_TIMEOUT);
     }
 
     #[test]
@@ -2389,7 +2411,7 @@ mod tests {
         let mut reader = make_reader_sync();
         reader.nak_timeout = Some(Duration::from_millis(490));
         reader.update_rtt_estimate(Duration::from_secs(2));
-        assert!(reader.nak_timeout.unwrap() <= MAX_NAK_TIMEOUT);
+        assert!(reader.nak_timeout.expect("nak_timeout set") <= MAX_NAK_TIMEOUT);
     }
 
     #[test]
@@ -2398,7 +2420,7 @@ mod tests {
         // Inject a NAK timestamp as if we NAKed for seq=0 ~50 ms ago.
         let sent = Instant::now()
             .checked_sub(Duration::from_millis(50))
-            .unwrap();
+            .expect("time far enough in the past");
         let _prev = reader.gap_nak_sent_at.insert(0, sent);
         // Deliver seq=0 in order — gap closes, RTT sample taken.
         drop(reader.handle_arrival(EncryptedFrame::Keepalive(0), 0));
@@ -2407,14 +2429,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_arrival_sends_immediate_nak_for_new_gaps() {
-        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    async fn handle_arrival_sends_immediate_nak_for_new_gaps() -> Result<()> {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
         let (nak_tx, mut nak_rx) = tokio::sync::mpsc::channel::<EncryptedFrame>(16);
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
             .rnk(LessSafeKey::new(
-                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32])
+                    .expect("test AES-256-GCM-SIV key setup"),
             ))
             .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .nak_out_tx(nak_tx)
@@ -2452,17 +2475,19 @@ mod tests {
             vec![3],
             "only the newly-discovered gap must be NAKed"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn handle_arrival_no_duplicate_immediate_nak_for_known_gaps() {
-        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    async fn handle_arrival_no_duplicate_immediate_nak_for_known_gaps() -> Result<()> {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
         let (nak_tx, mut nak_rx) = tokio::sync::mpsc::channel::<EncryptedFrame>(16);
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
             .rnk(LessSafeKey::new(
-                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32])
+                    .expect("test AES-256-GCM-SIV key setup"),
             ))
             .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .nak_out_tx(nak_tx)
@@ -2479,6 +2504,7 @@ mod tests {
             nak_rx.try_recv().is_err(),
             "no immediate NAK when all gaps are already tracked"
         );
+        Ok(())
     }
 
     #[test]
@@ -2500,8 +2526,12 @@ mod tests {
         // Simulate client mode: silence_timeout was set.
         reader.silence_timeout = Some(Duration::from_secs(15));
         reader.update_rtt_estimate(Duration::from_millis(100));
-        let nak = reader.nak_timeout.unwrap();
-        let silence = reader.silence_timeout.unwrap();
+        let nak = reader
+            .nak_timeout
+            .expect("nak_timeout set after rtt update");
+        let silence = reader
+            .silence_timeout
+            .expect("silence_timeout set after rtt update");
         assert_eq!(silence, (nak * 30).max(Duration::from_secs(9)));
     }
 
@@ -2534,14 +2564,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn route_or_deliver_nak_increments_received_count() {
-        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    async fn route_or_deliver_nak_increments_received_count() -> Result<()> {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
         let counter = Arc::new(AtomicU64::new(0));
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
             .rnk(LessSafeKey::new(
-                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32])
+                    .expect("test AES-256-GCM-SIV key setup"),
             ))
             .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .nak_received_count(counter.clone())
@@ -2565,6 +2596,7 @@ mod tests {
             1,
             "non-NAK frames must not increment the counter"
         );
+        Ok(())
     }
 
     #[test]
@@ -2590,7 +2622,12 @@ mod tests {
         );
         // The effective sample was 400 ms (ceiling), not 7 s.
         // First measurement: SRTT=400ms, RTTVAR=200ms, RTO=400+800=1200ms → MAX=500ms.
-        assert_eq!(reader.nak_timeout.unwrap(), MAX_NAK_TIMEOUT);
+        assert_eq!(
+            reader
+                .nak_timeout
+                .expect("nak_timeout set after rtt update"),
+            MAX_NAK_TIMEOUT
+        );
     }
 
     #[test]
@@ -2615,7 +2652,10 @@ mod tests {
         // nak_timeout must grow upward (out of the MIN neighbourhood).
         reader.update_rtt_estimate(Duration::from_millis(300));
         assert!(
-            reader.nak_timeout.unwrap() > Duration::from_millis(25),
+            reader
+                .nak_timeout
+                .expect("nak_timeout set after rtt update")
+                > Duration::from_millis(25),
             "clamped sample must grow nak_timeout above the prior value"
         );
     }
@@ -2632,7 +2672,9 @@ mod tests {
             reader.update_rtt_estimate(Duration::from_millis(5));
         }
         assert_eq!(
-            reader.nak_timeout.unwrap(),
+            reader
+                .nak_timeout
+                .expect("nak_timeout set after many rtt updates"),
             MIN_NAK_TIMEOUT,
             "setup: nak_timeout must be at MIN before the spike"
         );
@@ -2640,7 +2682,7 @@ mod tests {
         // nak_timeout stuck at 20 ms. With clamping it must grow.
         reader.update_rtt_estimate(Duration::from_secs(7));
         assert!(
-            reader.nak_timeout.unwrap() > MIN_NAK_TIMEOUT,
+            reader.nak_timeout.expect("nak_timeout set after spike") > MIN_NAK_TIMEOUT,
             "clamped spike must grow nak_timeout above MIN — death spiral broken"
         );
     }
@@ -2648,13 +2690,14 @@ mod tests {
     // ── handle_arrival: ScreenState obsoletes prior gaps ─────────────────────
 
     #[tokio::test]
-    async fn handle_arrival_screen_state_obsoletes_gaps() {
-        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    async fn handle_arrival_screen_state_obsoletes_gaps() -> Result<()> {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
             .rnk(LessSafeKey::new(
-                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32])
+                    .expect("test AES-256-GCM-SIV key setup"),
             ))
             .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .build();
@@ -2678,16 +2721,18 @@ mod tests {
             "all gaps must be discarded after ScreenState"
         );
         assert_eq!(reader.next_seq, 6);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn handle_arrival_screen_state_drains_following_buffered_frames() {
-        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    async fn handle_arrival_screen_state_drains_following_buffered_frames() -> Result<()> {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
             .rnk(LessSafeKey::new(
-                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32])
+                    .expect("test AES-256-GCM-SIV key setup"),
             ))
             .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .build();
@@ -2706,6 +2751,7 @@ mod tests {
         );
         assert_eq!(reader.next_seq, 7);
         assert!(reader.recv_buffer.is_empty());
+        Ok(())
     }
 
     // ── process_bytes_with_prediction: alternate screen tracking ─────────────
@@ -2837,13 +2883,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_arrival_screen_state_compressed_also_obsoletes_gaps() {
-        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    async fn handle_arrival_screen_state_compressed_also_obsoletes_gaps() -> Result<()> {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
             .rnk(LessSafeKey::new(
-                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32])
+                    .expect("test AES-256-GCM-SIV key setup"),
             ))
             .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .build();
@@ -2859,19 +2906,21 @@ mod tests {
                 .any(|f| matches!(f, EncryptedFrame::ScreenStateCompressed(_))),
         );
         assert!(reader.gap_first_seen.is_empty());
+        Ok(())
     }
 
     // ── handle_arrival: burst gap threshold + immediate NAK ──────────────────
 
     #[tokio::test]
-    async fn handle_arrival_burst_triggers_repaint_request_at_threshold() {
-        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    async fn handle_arrival_burst_triggers_repaint_request_at_threshold() -> Result<()> {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
         let (nak_tx, mut nak_rx) = tokio::sync::mpsc::channel::<EncryptedFrame>(32);
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
             .rnk(LessSafeKey::new(
-                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32])
+                    .expect("test AES-256-GCM-SIV key setup"),
             ))
             .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .nak_out_tx(nak_tx)
@@ -2882,7 +2931,7 @@ mod tests {
         // RECV_BUFFER_REPAINT_THRESHOLD * 2 so there are that many frames in the buffer.
         let threshold = RECV_BUFFER_REPAINT_THRESHOLD;
         for i in 0..=threshold {
-            let seq = u64::try_from(threshold + 1 + i).unwrap();
+            let seq = u64::try_from(threshold + 1 + i).expect("seq fits in u64");
             drop(reader.handle_arrival(EncryptedFrame::Keepalive(0), seq));
         }
 
@@ -2897,17 +2946,19 @@ mod tests {
             saw_repaint,
             "expected RepaintRequest when recv_buffer reaches threshold"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn handle_arrival_new_gap_triggers_immediate_nak() {
-        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    async fn handle_arrival_new_gap_triggers_immediate_nak() -> Result<()> {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
         let (nak_tx, mut nak_rx) = tokio::sync::mpsc::channel::<EncryptedFrame>(32);
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
             .rnk(LessSafeKey::new(
-                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32])
+                    .expect("test AES-256-GCM-SIV key setup"),
             ))
             .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .nak_out_tx(nak_tx)
@@ -2924,6 +2975,7 @@ mod tests {
         for i in 0u64..5 {
             assert!(seqs.contains(&i), "gap {i} missing from NAK");
         }
+        Ok(())
     }
 
     // ── drain_given_up_seqs: consecutive give-ups with buffered frames ────────
@@ -2933,7 +2985,9 @@ mod tests {
         let mut reader = make_reader_sync();
 
         // Set up: seq 0 and seq 2 are given up (retry count at MAX), seq 1 is buffered.
-        let past = Instant::now().checked_sub(Duration::from_mins(1)).unwrap();
+        let past = Instant::now()
+            .checked_sub(Duration::from_mins(1))
+            .expect("time far enough in the past");
         let _r = reader.gap_first_seen.insert(0, past);
         let _r = reader.gap_nak_count.insert(0, MAX_NAK_RETRIES);
         let _r = reader.recv_buffer.insert(1, EncryptedFrame::Keepalive(0));
@@ -2957,21 +3011,24 @@ mod tests {
     // ── check_nak_timeouts: multiple timed-out gaps send a single Nak ─────────
 
     #[tokio::test]
-    async fn check_nak_timeouts_multiple_gaps_sends_single_nak() {
-        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    async fn check_nak_timeouts_multiple_gaps_sends_single_nak() -> Result<()> {
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
         let (nak_tx, mut nak_rx) = tokio::sync::mpsc::channel::<EncryptedFrame>(16);
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
             .rnk(LessSafeKey::new(
-                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32])
+                    .expect("test AES-256-GCM-SIV key setup"),
             ))
             .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .nak_out_tx(nak_tx)
             .build();
 
         // Insert 3 gaps with an old timestamp so they all time out immediately.
-        let past = Instant::now().checked_sub(Duration::from_secs(10)).unwrap();
+        let past = Instant::now()
+            .checked_sub(Duration::from_secs(10))
+            .expect("time far enough in the past");
         for seq in [1u64, 3, 5] {
             let _r = reader.gap_first_seen.insert(seq, past);
             let _r = reader.gap_nak_count.insert(seq, 0);
@@ -2995,6 +3052,7 @@ mod tests {
         for s in [1u64, 3, 5] {
             assert!(seqs.contains(&s), "gap {s} missing from NAK");
         }
+        Ok(())
     }
 
     // ── RTT: ceiling exact boundary ───────────────────────────────────────────
@@ -3008,7 +3066,9 @@ mod tests {
         // The estimator should have used 400ms directly (not clamped), producing
         // SRTT=400ms → nak_timeout = MAX (500ms).
         assert_eq!(
-            reader.nak_timeout.unwrap(),
+            reader
+                .nak_timeout
+                .expect("nak_timeout set after rtt update"),
             MAX_NAK_TIMEOUT,
             "sample equal to ceiling should not be clamped and should raise nak_timeout"
         );
@@ -3017,16 +3077,17 @@ mod tests {
     // ── handle_state_chunk ────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn handle_state_chunk_single_chunk_completes_assembly() {
+    async fn handle_state_chunk_single_chunk_completes_assembly() -> Result<()> {
         use std::sync::Mutex as StdMutex;
         use zstd::encode_all;
 
-        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
             .rnk(LessSafeKey::new(
-                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32])
+                    .expect("test AES-256-GCM-SIV key setup"),
             ))
             .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .build();
@@ -3036,7 +3097,7 @@ mod tests {
         let (stdout_tx, _stdout_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
 
         let raw = b"hello";
-        let compressed = encode_all(raw.as_slice(), 0).unwrap();
+        let compressed = encode_all(raw.as_slice(), 0).expect("zstd compression");
 
         // Single-chunk assembly: seq=0, total=1
         reader
@@ -3047,19 +3108,21 @@ mod tests {
         assert_eq!(reader.pending_chunk_seq, 0);
         assert_eq!(reader.pending_chunk_total, 0);
         assert!(reader.pending_chunk_data.is_empty());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn handle_state_chunk_out_of_order_clears_and_requests_repaint() {
+    async fn handle_state_chunk_out_of_order_clears_and_requests_repaint() -> Result<()> {
         use std::sync::Mutex as StdMutex;
 
-        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
         let (nak_tx, mut nak_rx) = tokio::sync::mpsc::channel::<EncryptedFrame>(8);
         let mut reader = UdpReader::builder()
             .socket(socket)
             .id(Uuid::new_v4())
             .rnk(LessSafeKey::new(
-                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32])
+                    .expect("test AES-256-GCM-SIV key setup"),
             ))
             .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .nak_out_tx(nak_tx)
@@ -3088,6 +3151,7 @@ mod tests {
             matches!(frame, EncryptedFrame::RepaintRequest),
             "expected RepaintRequest after out-of-order chunk"
         );
+        Ok(())
     }
 
     // ── server_frame_loop / client_frame_loop integration tests ──────────────
@@ -3095,7 +3159,7 @@ mod tests {
     /// `server_frame_loop` parks the NAK deadline when no gaps exist after the timer fires
     /// and rearms it when a subsequent frame arrives.
     #[tokio::test]
-    async fn server_frame_loop_parks_nak_when_no_gaps() {
+    async fn server_frame_loop_parks_nak_when_no_gaps() -> Result<()> {
         use crate::UdpSender;
         use tokio::sync::mpsc::channel as mpsc_channel;
 
@@ -3104,12 +3168,12 @@ mod tests {
         let session_id = Uuid::new_v4();
 
         // Server socket: unconnected so recv_from can capture the client's address.
-        let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let server_addr = server_sock.local_addr().unwrap();
+        let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+        let server_addr = server_sock.local_addr()?;
 
         // Client socket: connected to server — sender uses send() without an explicit peer.
-        let client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        client_sock.connect(server_addr).await.unwrap();
+        let client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+        client_sock.connect(server_addr).await?;
 
         let (term_tx, _term_rx) = mpsc_channel::<TerminalMessage>(16);
         let token = CancellationToken::new();
@@ -3118,7 +3182,8 @@ mod tests {
             .socket(server_sock)
             .id(session_id)
             .rnk(LessSafeKey::new(
-                UnboundKey::new(&AES_256_GCM_SIV, &key_bytes).unwrap(),
+                UnboundKey::new(&AES_256_GCM_SIV, &key_bytes)
+                    .expect("test AES-256-GCM-SIV key setup"),
             ))
             .hmac(Key::new(HMAC_SHA512, &hmac_bytes))
             .build();
@@ -3130,7 +3195,8 @@ mod tests {
         let mut sender = UdpSender::builder()
             .id(session_id)
             .rnk(LessSafeKey::new(
-                UnboundKey::new(&AES_256_GCM_SIV, &key_bytes).unwrap(),
+                UnboundKey::new(&AES_256_GCM_SIV, &key_bytes)
+                    .expect("test AES-256-GCM-SIV key setup"),
             ))
             .hmac(Key::new(HMAC_SHA512, &hmac_bytes))
             .socket(client_sock)
@@ -3147,32 +3213,39 @@ mod tests {
             tokio::spawn(async move { reader.server_frame_loop(t_reader, term_tx).await });
 
         // First Keepalive triggers initial peer-discovery recv_from and enters the loop.
-        frame_tx.send(EncryptedFrame::Keepalive(0)).await.unwrap();
+        frame_tx
+            .send(EncryptedFrame::Keepalive(0))
+            .await
+            .expect("test channel send");
 
         // Allow time for the NAK timer to fire (≥1 tick at nak_check_interval ≈ 5–12ms)
         // and park the deadline because gap_first_seen is empty.
         tokio::time::sleep(Duration::from_millis(40)).await;
 
         // Second Keepalive exercises the rearm-on-recv path inside the main loop.
-        frame_tx.send(EncryptedFrame::Keepalive(0)).await.unwrap();
+        frame_tx
+            .send(EncryptedFrame::Keepalive(0))
+            .await
+            .expect("test channel send");
         tokio::time::sleep(Duration::from_millis(10)).await;
 
         token.cancel();
         drop(sender_handle.await);
-        let result = reader_handle.await.unwrap();
+        let result = reader_handle.await?;
         assert!(result.is_ok());
+        Ok(())
     }
 
     /// In `DiffMode::Datagram` the NAK deadline is parked immediately (24-hour horizon)
     /// so the timer branch never fires.  This exercises the `else { nak_park }` branch
     /// in `client_frame_loop` initialization.
     #[tokio::test]
-    async fn client_frame_loop_nak_deadline_parked_in_datagram_mode() {
+    async fn client_frame_loop_nak_deadline_parked_in_datagram_mode() -> Result<()> {
         use crate::DisplayPreference;
         use std::sync::atomic::AtomicBool;
         use tokio::sync::mpsc::channel as mpsc_channel;
 
-        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
         let token = CancellationToken::new();
         let exit_token = CancellationToken::new();
 
@@ -3180,7 +3253,8 @@ mod tests {
             .socket(socket)
             .id(Uuid::new_v4())
             .rnk(LessSafeKey::new(
-                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32])
+                    .expect("test AES-256-GCM-SIV key setup"),
             ))
             .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .diff_mode(DiffMode::Datagram)
@@ -3201,17 +3275,18 @@ mod tests {
                 token, exit_token, stdout_tx, emulator, prediction, renderer, in_alt,
             )
             .await;
+        Ok(())
     }
 
     /// In `DiffMode::Reliable` the NAK check timer fires and parks the deadline when
     /// `gap_first_seen` is empty, exercising the parking logic inside `client_frame_loop`.
     #[tokio::test]
-    async fn client_frame_loop_parks_nak_deadline_when_no_gaps() {
+    async fn client_frame_loop_parks_nak_deadline_when_no_gaps() -> Result<()> {
         use crate::DisplayPreference;
         use std::sync::atomic::AtomicBool;
         use tokio::sync::mpsc::channel as mpsc_channel;
 
-        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
         let token = CancellationToken::new();
         let exit_token = CancellationToken::new();
 
@@ -3219,7 +3294,8 @@ mod tests {
             .socket(socket)
             .id(Uuid::new_v4())
             .rnk(LessSafeKey::new(
-                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32])
+                    .expect("test AES-256-GCM-SIV key setup"),
             ))
             .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .build();
@@ -3246,6 +3322,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(40)).await;
 
         token.cancel();
-        handle.await.unwrap();
+        handle.await.expect("client_frame_loop task");
+        Ok(())
     }
 }

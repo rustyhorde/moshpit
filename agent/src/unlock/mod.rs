@@ -82,8 +82,9 @@ mod tests {
     }
 
     #[test]
-    fn default_set_passphrase_delegates_to_retrieve() {
-        assert_eq!(AlwaysOkBackend.set_passphrase().unwrap(), "the-passphrase");
+    fn default_set_passphrase_delegates_to_retrieve() -> anyhow::Result<()> {
+        assert_eq!(AlwaysOkBackend.set_passphrase()?, "the-passphrase");
+        Ok(())
     }
 
     #[test]

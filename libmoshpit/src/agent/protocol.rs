@@ -102,39 +102,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn roundtrip_request_lock() {
-        let encoded = encode_to_vec(&AgentRequest::Lock, standard()).unwrap();
-        let (rt, _): (AgentRequest, _) = decode_from_slice(&encoded, standard()).unwrap();
+    fn roundtrip_request_lock() -> anyhow::Result<()> {
+        let encoded = encode_to_vec(&AgentRequest::Lock, standard())?;
+        let (rt, _): (AgentRequest, _) = decode_from_slice(&encoded, standard())?;
         assert!(matches!(rt, AgentRequest::Lock));
+        Ok(())
     }
 
     #[test]
-    fn roundtrip_request_unlock() {
-        let encoded =
-            encode_to_vec(AgentRequest::Unlock("secret".to_string()), standard()).unwrap();
-        let (rt, _): (AgentRequest, _) = decode_from_slice(&encoded, standard()).unwrap();
+    fn roundtrip_request_unlock() -> anyhow::Result<()> {
+        let encoded = encode_to_vec(AgentRequest::Unlock("secret".to_string()), standard())?;
+        let (rt, _): (AgentRequest, _) = decode_from_slice(&encoded, standard())?;
         assert!(matches!(rt, AgentRequest::Unlock(ref s) if s == "secret"));
+        Ok(())
     }
 
     #[test]
-    fn roundtrip_request_remove_all() {
-        let encoded = encode_to_vec(&AgentRequest::RemoveAllIdentities, standard()).unwrap();
-        let (rt, _): (AgentRequest, _) = decode_from_slice(&encoded, standard()).unwrap();
+    fn roundtrip_request_remove_all() -> anyhow::Result<()> {
+        let encoded = encode_to_vec(&AgentRequest::RemoveAllIdentities, standard())?;
+        let (rt, _): (AgentRequest, _) = decode_from_slice(&encoded, standard())?;
         assert!(matches!(rt, AgentRequest::RemoveAllIdentities));
+        Ok(())
     }
 
     #[test]
-    fn roundtrip_request_shutdown() {
-        let encoded = encode_to_vec(&AgentRequest::Shutdown, standard()).unwrap();
-        let (rt, _): (AgentRequest, _) = decode_from_slice(&encoded, standard()).unwrap();
+    fn roundtrip_request_shutdown() -> anyhow::Result<()> {
+        let encoded = encode_to_vec(&AgentRequest::Shutdown, standard())?;
+        let (rt, _): (AgentRequest, _) = decode_from_slice(&encoded, standard())?;
         assert!(matches!(rt, AgentRequest::Shutdown));
+        Ok(())
     }
 
     #[test]
-    fn roundtrip_response_ok() {
-        let encoded = encode_to_vec(&AgentResponse::Ok, standard()).unwrap();
-        let (rt, _): (AgentResponse, _) = decode_from_slice(&encoded, standard()).unwrap();
+    fn roundtrip_response_ok() -> anyhow::Result<()> {
+        let encoded = encode_to_vec(&AgentResponse::Ok, standard())?;
+        let (rt, _): (AgentResponse, _) = decode_from_slice(&encoded, standard())?;
         assert!(matches!(rt, AgentResponse::Ok));
+        Ok(())
     }
 
     #[test]

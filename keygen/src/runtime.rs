@@ -446,7 +446,10 @@ mod tests {
         let pub_path_str = pub_path.to_str().expect("valid UTF-8");
 
         verify_key(&fp, pub_path_str, false)?;
-        let fp_no_host = fp.split_whitespace().next().unwrap();
+        let fp_no_host = fp
+            .split_whitespace()
+            .next()
+            .expect("fingerprint string has content");
         verify_key(fp_no_host, pub_path_str, false)?;
         verify_key(&fp, pub_path_str, true)?;
         Ok(())
@@ -465,7 +468,7 @@ mod tests {
 
         let res = verify_key(
             "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
-            pub_path.to_str().unwrap(),
+            pub_path.to_str().expect("test path is valid UTF-8"),
             false,
         );
         assert!(res.is_err());

@@ -1681,25 +1681,28 @@ mod tests {
     /// Write a `.mp/known_hosts` file inside `dir` with `host <pk_b64>` line.
     fn write_known_hosts(dir: &TempDir, host: &str, pk: &[u8]) {
         let mp = dir.path().join(".mp");
-        std::fs::create_dir_all(&mp).unwrap();
+        std::fs::create_dir_all(&mp).expect("create .mp dir");
         let kh = mp.join("known_hosts");
-        let mut f = std::fs::File::create(kh).unwrap();
-        writeln!(f, "{host} {}", STANDARD.encode(pk)).unwrap();
+        let mut f = std::fs::File::create(kh).expect("create known_hosts file");
+        writeln!(f, "{host} {}", STANDARD.encode(pk)).expect("write known_hosts entry");
     }
 
     /// Write a `.mp/authorized_keys` file with the given bytes as content and
     /// apply the supplied `mode` bits.
     fn write_authorized_keys(dir: &TempDir, content: &[u8], mode: u32) {
         let mp = dir.path().join(".mp");
-        std::fs::DirBuilder::new().mode(0o700).create(&mp).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&mp)
+            .expect("create .mp dir with 0o700");
         let ak = mp.join("authorized_keys");
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .mode(mode)
             .open(ak)
-            .unwrap();
-        f.write_all(content).unwrap();
+            .expect("create authorized_keys file");
+        f.write_all(content).expect("write authorized_keys content");
     }
 
     #[test]
@@ -1709,18 +1712,19 @@ mod tests {
             (&ML_KEM_768, KEX_ML_KEM_768_SHA256),
             (&ML_KEM_1024, KEX_ML_KEM_1024_SHA256),
         ] {
-            let decapsulation_key = DecapsulationKey::generate(alg).unwrap();
+            let decapsulation_key =
+                DecapsulationKey::generate(alg).expect("test ML-KEM key generation");
             let encapsulation_key_bytes = decapsulation_key
                 .encapsulation_key()
-                .unwrap()
+                .expect("encapsulation key from decapsulation key")
                 .key_bytes()
-                .unwrap();
-            let encapsulation_key =
-                EncapsulationKey::new(alg, encapsulation_key_bytes.as_ref()).unwrap();
-            let (ciphertext, server_secret) = encapsulation_key.encapsulate().unwrap();
+                .expect("encapsulation key bytes");
+            let encapsulation_key = EncapsulationKey::new(alg, encapsulation_key_bytes.as_ref())
+                .expect("encapsulation key from bytes");
+            let (ciphertext, server_secret) = encapsulation_key.encapsulate().expect("encapsulate");
             let client_secret = decapsulation_key
                 .decapsulate(Ciphertext::from(ciphertext.as_ref()))
-                .unwrap();
+                .expect("decapsulate");
             assert_eq!(server_secret.as_ref(), client_secret.as_ref());
 
             let negotiated = NegotiatedAlgorithms {
@@ -1730,10 +1734,10 @@ mod tests {
                 kdf: KDF_HKDF_SHA256.to_string(),
             };
             let salt = [7u8; 32];
-            let server_keys =
-                derive_session_keys(server_secret.as_ref(), &salt, &negotiated).unwrap();
-            let client_keys =
-                derive_session_keys(client_secret.as_ref(), &salt, &negotiated).unwrap();
+            let server_keys = derive_session_keys(server_secret.as_ref(), &salt, &negotiated)
+                .expect("derive server session keys");
+            let client_keys = derive_session_keys(client_secret.as_ref(), &salt, &negotiated)
+                .expect("derive client session keys");
             assert_eq!(server_keys, client_keys);
             assert_eq!(server_keys.0.len(), 32);
             assert_eq!(server_keys.1.len(), 64);
@@ -1742,17 +1746,19 @@ mod tests {
 
     #[test]
     fn ml_kem_rejects_mismatched_or_malformed_inputs() {
-        let decapsulation_key = DecapsulationKey::generate(&ML_KEM_512).unwrap();
+        let decapsulation_key =
+            DecapsulationKey::generate(&ML_KEM_512).expect("test ML-KEM-512 key generation");
         let encapsulation_key_bytes = decapsulation_key
             .encapsulation_key()
-            .unwrap()
+            .expect("encapsulation key from decapsulation key")
             .key_bytes()
-            .unwrap();
+            .expect("encapsulation key bytes");
         assert!(EncapsulationKey::new(&ML_KEM_768, encapsulation_key_bytes.as_ref()).is_err());
 
         let encapsulation_key =
-            EncapsulationKey::new(&ML_KEM_512, encapsulation_key_bytes.as_ref()).unwrap();
-        let (ciphertext, _) = encapsulation_key.encapsulate().unwrap();
+            EncapsulationKey::new(&ML_KEM_512, encapsulation_key_bytes.as_ref())
+                .expect("encapsulation key from bytes");
+        let (ciphertext, _) = encapsulation_key.encapsulate().expect("encapsulate");
         let truncated = &ciphertext.as_ref()[..ciphertext.as_ref().len() - 1];
         assert!(
             decapsulation_key
@@ -1768,9 +1774,12 @@ mod tests {
             encoding::AsRawBytes as _, signature::KeyPair as _, unstable::signature::PqdsaKeyPair,
         };
 
-        let key_pair =
-            PqdsaKeyPair::generate(&aws_lc_rs::unstable::signature::ML_DSA_44_SIGNING).unwrap();
-        let private_key = key_pair.private_key().as_raw_bytes().unwrap();
+        let key_pair = PqdsaKeyPair::generate(&aws_lc_rs::unstable::signature::ML_DSA_44_SIGNING)
+            .expect("test ML-DSA-44 key generation");
+        let private_key = key_pair
+            .private_key()
+            .as_raw_bytes()
+            .expect("private key bytes");
         let public_key = key_pair.public_key().as_ref();
         let negotiated = NegotiatedAlgorithms {
             kex: KEX_ML_KEM_768_SHA256.to_string(),
@@ -1788,20 +1797,20 @@ mod tests {
             server_exchange: b"server-exchange",
             salt: b"salt",
         })
-        .unwrap();
+        .expect("build identity transcript");
         let signature = super::sign_identity_transcript(
             crate::KEY_ALGORITHM_ML_DSA_44,
             private_key.as_ref(),
             &transcript,
         )
-        .unwrap();
+        .expect("sign identity transcript");
         super::verify_identity_transcript(
             crate::KEY_ALGORITHM_ML_DSA_44,
             public_key,
             &transcript,
             &signature,
         )
-        .unwrap();
+        .expect("verify identity transcript");
     }
 
     // -----------------------------------------------------------------------
@@ -1811,38 +1820,38 @@ mod tests {
     /// A key that exactly matches the pinned entry is accepted.
     #[test]
     fn check_known_hosts_match() {
-        let _guard = home_lock().lock().unwrap();
-        let dir = TempDir::new().unwrap();
+        let _guard = home_lock().lock().expect("home mutex not poisoned");
+        let dir = TempDir::new().expect("temp dir creation");
         let pk = b"server-public-key-bytes";
         let host = "192.0.2.1";
         write_known_hosts(&dir, host, pk);
         // Point HOME at the temp dir so check_known_hosts finds our file.
         // SAFETY: test-only; serialized via home_lock.
         unsafe { std::env::set_var("HOME", dir.path()) };
-        let result = check_known_hosts(host, pk, None, None).unwrap();
+        let result = check_known_hosts(host, pk, None, None).expect("check_known_hosts");
         assert!(result, "matching key should be accepted");
     }
 
     /// A different key for a known host is a MITM — must be rejected.
     #[test]
     fn check_known_hosts_mismatch() {
-        let _guard = home_lock().lock().unwrap();
-        let dir = TempDir::new().unwrap();
+        let _guard = home_lock().lock().expect("home mutex not poisoned");
+        let dir = TempDir::new().expect("temp dir creation");
         let pinned_pk = b"real-server-key";
         let attacker_pk = b"mitm-attacker-key";
         let host = "192.0.2.2";
         write_known_hosts(&dir, host, pinned_pk);
         // SAFETY: test-only; serialized via home_lock.
         unsafe { std::env::set_var("HOME", dir.path()) };
-        let result = check_known_hosts(host, attacker_pk, None, None).unwrap();
+        let result = check_known_hosts(host, attacker_pk, None, None).expect("check_known_hosts");
         assert!(!result, "mismatched host key must be rejected");
     }
 
     /// A mismatched key can be explicitly accepted and replaced by callback.
     #[test]
     fn check_known_hosts_mismatch_replace_accept() {
-        let _guard = home_lock().lock().unwrap();
-        let dir = TempDir::new().unwrap();
+        let _guard = home_lock().lock().expect("home mutex not poisoned");
+        let dir = TempDir::new().expect("temp dir creation");
         let old_pk = b"old-server-key";
         let new_pk = b"new-server-key";
         let host = "192.0.2.20";
@@ -1851,10 +1860,12 @@ mod tests {
         unsafe { std::env::set_var("HOME", dir.path()) };
 
         let mismatch_fn: HostKeyMismatchFn = Arc::new(|_h, _old_fp, _new_fp| Ok(true));
-        let result = check_known_hosts(host, new_pk, None, Some(&mismatch_fn)).unwrap();
+        let result =
+            check_known_hosts(host, new_pk, None, Some(&mismatch_fn)).expect("check_known_hosts");
         assert!(result, "accepted replacement should return true");
 
-        let content = std::fs::read_to_string(dir.path().join(".mp").join("known_hosts")).unwrap();
+        let content = std::fs::read_to_string(dir.path().join(".mp").join("known_hosts"))
+            .expect("read known_hosts file");
         assert!(content.contains(host));
         assert!(content.contains(&STANDARD.encode(new_pk)));
         assert!(!content.contains(&STANDARD.encode(old_pk)));
@@ -1863,8 +1874,8 @@ mod tests {
     /// A mismatched key rejected by callback must keep existing `known_hosts` entry.
     #[test]
     fn check_known_hosts_mismatch_replace_reject_keeps_old_key() {
-        let _guard = home_lock().lock().unwrap();
-        let dir = TempDir::new().unwrap();
+        let _guard = home_lock().lock().expect("home mutex not poisoned");
+        let dir = TempDir::new().expect("temp dir creation");
         let old_pk = b"old-server-key";
         let new_pk = b"new-server-key";
         let host = "192.0.2.21";
@@ -1873,10 +1884,12 @@ mod tests {
         unsafe { std::env::set_var("HOME", dir.path()) };
 
         let mismatch_fn: HostKeyMismatchFn = Arc::new(|_h, _old_fp, _new_fp| Ok(false));
-        let result = check_known_hosts(host, new_pk, None, Some(&mismatch_fn)).unwrap();
+        let result =
+            check_known_hosts(host, new_pk, None, Some(&mismatch_fn)).expect("check_known_hosts");
         assert!(!result, "rejected replacement should return false");
 
-        let content = std::fs::read_to_string(dir.path().join(".mp").join("known_hosts")).unwrap();
+        let content = std::fs::read_to_string(dir.path().join(".mp").join("known_hosts"))
+            .expect("read known_hosts file");
         assert!(content.contains(host));
         assert!(content.contains(&STANDARD.encode(old_pk)));
         assert!(!content.contains(&STANDARD.encode(new_pk)));
@@ -1892,20 +1905,20 @@ mod tests {
     /// Unknown host + TOFU callback that returns `true` → accepted and saved.
     #[test]
     fn check_known_hosts_tofu_accept() {
-        let _guard = home_lock().lock().unwrap();
-        let dir = TempDir::new().unwrap();
+        let _guard = home_lock().lock().expect("home mutex not poisoned");
+        let dir = TempDir::new().expect("temp dir creation");
         let pk = b"brand-new-server-key";
         let host = "192.0.2.3";
         // No existing known_hosts file; just ensure the .mp dir exists.
-        std::fs::create_dir_all(dir.path().join(".mp")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".mp")).expect("create .mp dir");
         // SAFETY: test-only; serialized via home_lock.
         unsafe { std::env::set_var("HOME", dir.path()) };
         let tofu_fn: TofuFn = Arc::new(|_host, _fp| Ok(true));
-        let result = check_known_hosts(host, pk, Some(&tofu_fn), None).unwrap();
+        let result = check_known_hosts(host, pk, Some(&tofu_fn), None).expect("check_known_hosts");
         assert!(result, "TOFU accept should return true");
         // Key should now be persisted.
-        let kh_content =
-            std::fs::read_to_string(dir.path().join(".mp").join("known_hosts")).unwrap();
+        let kh_content = std::fs::read_to_string(dir.path().join(".mp").join("known_hosts"))
+            .expect("read known_hosts file");
         assert!(
             kh_content.contains(host),
             "host should be saved to known_hosts"
@@ -1915,29 +1928,29 @@ mod tests {
     /// Unknown host + TOFU callback that returns `false` → rejected.
     #[test]
     fn check_known_hosts_tofu_reject() {
-        let _guard = home_lock().lock().unwrap();
-        let dir = TempDir::new().unwrap();
+        let _guard = home_lock().lock().expect("home mutex not poisoned");
+        let dir = TempDir::new().expect("temp dir creation");
         let pk = b"unknown-server-key";
         let host = "192.0.2.4";
-        std::fs::create_dir_all(dir.path().join(".mp")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".mp")).expect("create .mp dir");
         // SAFETY: test-only; serialized via home_lock.
         unsafe { std::env::set_var("HOME", dir.path()) };
         let tofu_fn: TofuFn = Arc::new(|_host, _fp| Ok(false));
-        let result = check_known_hosts(host, pk, Some(&tofu_fn), None).unwrap();
+        let result = check_known_hosts(host, pk, Some(&tofu_fn), None).expect("check_known_hosts");
         assert!(!result, "TOFU reject should return false");
     }
 
     /// Unknown host with no TOFU callback → rejected (fail closed).
     #[test]
     fn check_known_hosts_no_tofu() {
-        let _guard = home_lock().lock().unwrap();
-        let dir = TempDir::new().unwrap();
+        let _guard = home_lock().lock().expect("home mutex not poisoned");
+        let dir = TempDir::new().expect("temp dir creation");
         let pk = b"some-server-key";
         let host = "192.0.2.5";
-        std::fs::create_dir_all(dir.path().join(".mp")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".mp")).expect("create .mp dir");
         // SAFETY: test-only; serialized via home_lock.
         unsafe { std::env::set_var("HOME", dir.path()) };
-        let result = check_known_hosts(host, pk, None, None).unwrap();
+        let result = check_known_hosts(host, pk, None, None).expect("check_known_hosts");
         assert!(!result, "no TOFU callback must fail closed");
     }
 
@@ -1948,34 +1961,34 @@ mod tests {
     /// Key present in `authorized_keys` with correct permissions → accepted.
     #[test]
     fn check_authorized_keys_match() {
-        let dir = TempDir::new().unwrap();
+        let dir = TempDir::new().expect("temp dir creation");
         let key_bytes = b"my-full-public-key-bytes";
         write_authorized_keys(&dir, key_bytes, 0o600);
-        let home_str = dir.path().to_str().unwrap();
-        let result = check_authorized_keys(home_str, key_bytes).unwrap();
+        let home_str = dir.path().to_str().expect("test path is valid UTF-8");
+        let result = check_authorized_keys(home_str, key_bytes).expect("check_authorized_keys");
         assert!(result, "matching key in authorized_keys should be accepted");
     }
 
     /// Key NOT present in `authorized_keys` → rejected.
     #[test]
     fn check_authorized_keys_mismatch() {
-        let dir = TempDir::new().unwrap();
+        let dir = TempDir::new().expect("temp dir creation");
         let stored_key = b"stored-key";
         let presented_key = b"different-key";
         write_authorized_keys(&dir, stored_key, 0o600);
-        let home_str = dir.path().to_str().unwrap();
-        let result = check_authorized_keys(home_str, presented_key).unwrap();
+        let home_str = dir.path().to_str().expect("test path is valid UTF-8");
+        let result = check_authorized_keys(home_str, presented_key).expect("check_authorized_keys");
         assert!(!result, "key not in authorized_keys should be rejected");
     }
 
     /// `authorized_keys` with 0o644 permissions (group/world-readable) → rejected.
     #[test]
     fn check_authorized_keys_bad_perms() {
-        let dir = TempDir::new().unwrap();
+        let dir = TempDir::new().expect("temp dir creation");
         let key_bytes = b"my-full-public-key-bytes";
         write_authorized_keys(&dir, key_bytes, 0o644);
-        let home_str = dir.path().to_str().unwrap();
-        let result = check_authorized_keys(home_str, key_bytes).unwrap();
+        let home_str = dir.path().to_str().expect("test path is valid UTF-8");
+        let result = check_authorized_keys(home_str, key_bytes).expect("check_authorized_keys");
         assert!(
             !result,
             "world-readable authorized_keys must be rejected (permission check)"
@@ -1993,7 +2006,10 @@ mod tests {
             let result = super::resolve_kex_alg(kex);
             assert!(result.is_ok(), "{kex} should resolve OK");
             assert!(
-                matches!(result.unwrap(), super::ResolvedKexAlgorithm::Dh(_)),
+                matches!(
+                    result.expect("resolve kex alg"),
+                    super::ResolvedKexAlgorithm::Dh(_)
+                ),
                 "{kex} should map to a DH algorithm"
             );
         }
@@ -2009,7 +2025,10 @@ mod tests {
             let result = super::resolve_kex_alg(kex);
             assert!(result.is_ok(), "{kex} should resolve OK");
             assert!(
-                matches!(result.unwrap(), super::ResolvedKexAlgorithm::Kem(_)),
+                matches!(
+                    result.expect("resolve kex alg"),
+                    super::ResolvedKexAlgorithm::Kem(_)
+                ),
                 "{kex} should map to a KEM algorithm"
             );
         }
@@ -2095,13 +2114,21 @@ mod tests {
         ConnectionReader,
         ConnectionWriter,
     ) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test TCP listener");
+        let addr = listener.local_addr().expect("listener local addr");
         let (server_stream, client_stream) = tokio::join!(
-            async { listener.accept().await.map(|(s, _)| s).unwrap() },
+            async {
+                listener
+                    .accept()
+                    .await
+                    .map(|(s, _)| s)
+                    .expect("accept connection")
+            },
             TcpStream::connect(addr),
         );
-        let client_stream = client_stream.unwrap();
+        let client_stream = client_stream.expect("connect to test listener");
         let (server_r, server_w) = server_stream.into_split();
         let (client_r, client_w) = client_stream.into_split();
         (
@@ -2136,7 +2163,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn handle_udp_setup_uses_first_available_port() {
+    async fn handle_udp_setup_uses_first_available_port() -> anyhow::Result<()> {
         let (client_reader, _client_writer, _server_reader, _server_writer) =
             make_bidirectional_loopback().await;
         let (mut kex_reader, mut rx_frames, _rx_events) = make_test_kex_reader(client_reader);
@@ -2144,28 +2171,27 @@ mod tests {
         // Ask the OS for a free port so the test doesn't conflict with a running
         // moshpit server that may already hold a port in the 50000–59999 range.
         let free_port = {
-            let probe = UdpSocket::bind("0.0.0.0:0").await.unwrap();
-            probe.local_addr().unwrap().port()
+            let probe = UdpSocket::bind("0.0.0.0:0").await?;
+            probe.local_addr()?.port()
             // probe drops here, releasing the port before handle_udp_setup re-binds it
         };
 
         let mut pool = BTreeSet::new();
         let _ = pool.insert(free_port);
         let port_pool = StdArc::new(TokioMutex::new(pool));
-        let socket_addr: std::net::SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let socket_addr: std::net::SocketAddr =
+            "127.0.0.1:9000".parse().expect("hardcoded test address");
 
-        let udp_arc = kex_reader
-            .handle_udp_setup(socket_addr, port_pool)
-            .await
-            .unwrap();
+        let udp_arc = kex_reader.handle_udp_setup(socket_addr, port_pool).await?;
 
-        let frame = rx_frames.recv().await.unwrap();
+        let frame = rx_frames.recv().await.expect("receive MoshpitsAddr frame");
         let advertised_port = match frame {
             Frame::MoshpitsAddr(a) => a.port(),
             other => panic!("expected MoshpitsAddr, got {other:?}"),
         };
         assert_eq!(advertised_port, free_port);
         assert!(udp_arc.local_addr().is_ok());
+        Ok(())
     }
 
     #[tokio::test]
@@ -2176,7 +2202,8 @@ mod tests {
 
         let pool: BTreeSet<u16> = BTreeSet::new();
         let port_pool = StdArc::new(TokioMutex::new(pool));
-        let socket_addr: std::net::SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let socket_addr: std::net::SocketAddr =
+            "127.0.0.1:9000".parse().expect("hardcoded test address");
 
         let result = kex_reader.handle_udp_setup(socket_addr, port_pool).await;
         assert!(result.is_err(), "expected error when pool is empty");
@@ -2189,10 +2216,14 @@ mod tests {
         let (mut kex_reader, mut rx_frames, _rx_events) = make_test_kex_reader(client_reader);
 
         // Get two OS-assigned free ports.
-        let sock_a = UdpSocket::bind("0.0.0.0:0").await.unwrap();
-        let sock_b = UdpSocket::bind("0.0.0.0:0").await.unwrap();
-        let port_a = sock_a.local_addr().unwrap().port();
-        let port_b = sock_b.local_addr().unwrap().port();
+        let sock_a = UdpSocket::bind("0.0.0.0:0")
+            .await
+            .expect("bind test UDP socket a");
+        let sock_b = UdpSocket::bind("0.0.0.0:0")
+            .await
+            .expect("bind test UDP socket b");
+        let port_a = sock_a.local_addr().expect("socket a local addr").port();
+        let port_b = sock_b.local_addr().expect("socket b local addr").port();
 
         // Ensure the lower-numbered port (tried first by BTreeSet iteration) stays
         // occupied; drop the higher-numbered socket so handle_udp_setup can bind it.
@@ -2208,16 +2239,17 @@ mod tests {
         let _ = pool.insert(occupied_port);
         let _ = pool.insert(free_port);
         let port_pool = StdArc::new(TokioMutex::new(pool));
-        let socket_addr: std::net::SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        let socket_addr: std::net::SocketAddr =
+            "127.0.0.1:9000".parse().expect("hardcoded test address");
 
         // occupied_sock is still alive — occupied_port is held at the OS level.
         let udp_arc = kex_reader
             .handle_udp_setup(socket_addr, port_pool.clone())
             .await
-            .unwrap();
+            .expect("handle_udp_setup with one free port");
         drop(occupied_sock); // explicit: ensure it outlives handle_udp_setup
 
-        let frame = rx_frames.recv().await.unwrap();
+        let frame = rx_frames.recv().await.expect("receive MoshpitsAddr frame");
         let advertised_port = match frame {
             Frame::MoshpitsAddr(a) => a.port(),
             other => panic!("expected MoshpitsAddr, got {other:?}"),
@@ -2244,23 +2276,26 @@ mod tests {
         let (mut kex_reader, mut rx_frames, _rx_events) = make_test_kex_reader(client_reader);
 
         let key_bytes = [1u8; 32];
-        let rnk = LessSafeKey::new(UnboundKey::new(&AES_256_GCM_SIV, &key_bytes).unwrap());
+        let rnk = LessSafeKey::new(
+            UnboundKey::new(&AES_256_GCM_SIV, &key_bytes).expect("test AES-256-GCM-SIV key setup"),
+        );
 
         // Encrypt "Yoda" the same way client_kex does
         let mut plaintext = b"Yoda".to_vec();
         let mut nonce_bytes = [0u8; NONCE_LEN];
-        fill(&mut nonce_bytes).unwrap();
-        let nonce = aws_lc_rs::aead::Nonce::try_assume_unique_for_key(&nonce_bytes).unwrap();
+        fill(&mut nonce_bytes).expect("fill nonce bytes");
+        let nonce =
+            aws_lc_rs::aead::Nonce::try_assume_unique_for_key(&nonce_bytes).expect("create nonce");
         rnk.seal_in_place_append_tag(nonce, Aad::empty(), &mut plaintext)
-            .unwrap();
+            .expect("seal in place");
 
         let (tx_event_clone, _rx_event_clone) = unbounded_channel::<KexEvent>();
         kex_reader
             .handle_check(&rnk, nonce_bytes, plaintext, &tx_event_clone)
-            .unwrap();
+            .expect("handle_check with valid Yoda payload");
 
         // Should have sent KeyAgreement frame via kex_reader's own tx
-        let frame = rx_frames.recv().await.unwrap();
+        let frame = rx_frames.recv().await.expect("receive KeyAgreement frame");
         assert!(
             matches!(frame, Frame::KeyAgreement(_)),
             "expected KeyAgreement, got {frame:?}"
@@ -2275,7 +2310,9 @@ mod tests {
         let (mut kex_reader, _rx_frames, _rx_events) = make_test_kex_reader(client_reader);
 
         let key_bytes = [1u8; 32];
-        let rnk = LessSafeKey::new(UnboundKey::new(&AES_256_GCM_SIV, &key_bytes).unwrap());
+        let rnk = LessSafeKey::new(
+            UnboundKey::new(&AES_256_GCM_SIV, &key_bytes).expect("test AES-256-GCM-SIV key setup"),
+        );
 
         let nonce_bytes = [0u8; NONCE_LEN];
         let garbage = vec![0u8; 32]; // not a valid ciphertext
@@ -2285,7 +2322,7 @@ mod tests {
         assert!(result.is_err());
         assert!(
             result
-                .unwrap_err()
+                .expect_err("expected decryption error")
                 .downcast_ref::<MoshpitError>()
                 .is_some_and(|e| *e == MoshpitError::DecryptionFailed),
         );
@@ -2320,14 +2357,17 @@ mod tests {
         let (mut kex_reader, _rx_frames, _rx_events) = make_test_kex_reader(client_reader);
 
         // Server rejects immediately with KexFailure (e.g. no common algorithm)
-        server_writer.write_frame(&Frame::KexFailure).await.unwrap();
+        server_writer
+            .write_frame(&Frame::KexFailure)
+            .await
+            .expect("write KexFailure frame");
         drop(server_writer);
 
         let result = kex_reader.client_kex().await;
         assert!(result.is_err());
         assert!(
             result
-                .unwrap_err()
+                .expect_err("expected NoCommonAlgorithm error")
                 .downcast_ref::<MoshpitError>()
                 .is_some_and(|e| *e == MoshpitError::NoCommonAlgorithm),
         );
@@ -2345,14 +2385,14 @@ mod tests {
         server_writer
             .write_frame(&Frame::KeyAgreement(UuidWrapper::new(uuid::Uuid::nil())))
             .await
-            .unwrap();
+            .expect("write unexpected KeyAgreement frame");
         drop(server_writer);
 
         let result = kex_reader.client_kex().await;
         assert!(result.is_err());
         assert!(
             result
-                .unwrap_err()
+                .expect_err("expected KeyNotEstablished error")
                 .downcast_ref::<MoshpitError>()
                 .is_some_and(|e| *e == MoshpitError::KeyNotEstablished),
         );
@@ -2365,14 +2405,14 @@ mod tests {
         let (mut kex_reader, _rx_frames, _rx_events) = make_test_kex_reader(client_reader);
 
         // Server sends KexInit then PeerInitialize with a valid X25519 public key, then closes
-        let server_epk = PrivateKey::generate(&X25519).unwrap();
-        let server_epk_pub = server_epk.compute_public_key().unwrap();
+        let server_epk = PrivateKey::generate(&X25519).expect("generate test X25519 key");
+        let server_epk_pub = server_epk.compute_public_key().expect("compute public key");
         let identity_key = vec![0u8; 32]; // fixed identity bytes (not used for ECDH)
         let salt = vec![0u8; 32];
         server_writer
             .write_frame(&Frame::KexInit(supported_algorithms()))
             .await
-            .unwrap();
+            .expect("write KexInit frame");
         server_writer
             .write_frame(&Frame::PeerInitialize(
                 identity_key,
@@ -2380,7 +2420,7 @@ mod tests {
                 salt,
             ))
             .await
-            .unwrap();
+            .expect("write PeerInitialize frame");
         drop(server_writer);
 
         let result = kex_reader.client_kex().await;
@@ -2398,14 +2438,14 @@ mod tests {
             make_bidirectional_loopback().await;
         let (mut kex_reader, _rx_frames, _rx_events) = make_test_kex_reader(client_reader);
 
-        let server_epk = PrivateKey::generate(&X25519).unwrap();
-        let server_epk_pub = server_epk.compute_public_key().unwrap();
+        let server_epk = PrivateKey::generate(&X25519).expect("generate test X25519 key");
+        let server_epk_pub = server_epk.compute_public_key().expect("compute public key");
         let identity_key = vec![0u8; 32];
         let salt = vec![0u8; 32];
         server_writer
             .write_frame(&Frame::KexInit(supported_algorithms()))
             .await
-            .unwrap();
+            .expect("write KexInit frame");
         server_writer
             .write_frame(&Frame::PeerInitialize(
                 identity_key,
@@ -2413,16 +2453,19 @@ mod tests {
                 salt,
             ))
             .await
-            .unwrap();
+            .expect("write PeerInitialize frame");
         // Send wrong frame instead of KeyAgreement
-        server_writer.write_frame(&Frame::KexFailure).await.unwrap();
+        server_writer
+            .write_frame(&Frame::KexFailure)
+            .await
+            .expect("write KexFailure frame");
         drop(server_writer);
 
         let result = kex_reader.client_kex().await;
         assert!(result.is_err());
         assert!(
             result
-                .unwrap_err()
+                .expect_err("expected KeyNotEstablished error")
                 .downcast_ref::<MoshpitError>()
                 .is_some_and(|e| *e == MoshpitError::KeyNotEstablished),
         );
@@ -2443,15 +2486,16 @@ mod tests {
             .tx_event(tx_event_out)
             .build();
 
-        let server_epk = PrivateKey::generate(&X25519).unwrap();
-        let server_epk_pub = server_epk.compute_public_key().unwrap();
+        let server_epk = PrivateKey::generate(&X25519).expect("generate test X25519 key");
+        let server_epk_pub = server_epk.compute_public_key().expect("compute public key");
         let identity_key = vec![0u8; 32]; // fixed identity bytes (not used for ECDH)
         let mut salt_bytes = [0u8; 32];
-        fill(&mut salt_bytes).unwrap();
+        fill(&mut salt_bytes).expect("fill salt bytes");
 
         let conn_uuid = Uuid::new_v4();
         let session_uuid = Uuid::new_v4();
-        let moshpits_addr: std::net::SocketAddr = "127.0.0.1:50002".parse().unwrap();
+        let moshpits_addr: std::net::SocketAddr =
+            "127.0.0.1:50002".parse().expect("hardcoded test address");
 
         // Spawn mock server task
         let server_handle = tokio::spawn(async move {
@@ -2459,7 +2503,7 @@ mod tests {
             server_writer
                 .write_frame(&Frame::KexInit(supported_algorithms()))
                 .await
-                .unwrap();
+                .expect("write KexInit frame");
             // 2. Drain the Initialize frame that client_kex sends after negotiation.
             drop(rx_out.recv().await);
             // 3. Send PeerInitialize with the server's identity key, ephemeral key, and salt.
@@ -2470,27 +2514,30 @@ mod tests {
                     salt_bytes.to_vec(),
                 ))
                 .await
-                .unwrap();
+                .expect("write PeerInitialize frame");
             // 4. Drain the Check frame that client_kex sends after ECDH.
             drop(rx_out.recv().await);
             // 5. Send KeyAgreement, SessionToken, MoshpitsAddr.
             server_writer
                 .write_frame(&Frame::KeyAgreement(UuidWrapper::new(conn_uuid)))
                 .await
-                .unwrap();
+                .expect("write KeyAgreement frame");
             server_writer
                 .write_frame(&Frame::SessionToken(UuidWrapper::new(session_uuid)))
                 .await
-                .unwrap();
+                .expect("write SessionToken frame");
             server_writer
                 .write_frame(&Frame::MoshpitsAddr(moshpits_addr))
                 .await
-                .unwrap();
+                .expect("write MoshpitsAddr frame");
         });
 
         let mut kex_reader = kex_reader;
-        kex_reader.client_kex().await.unwrap();
-        server_handle.await.unwrap();
+        kex_reader
+            .client_kex()
+            .await
+            .expect("client_kex happy path");
+        server_handle.await.expect("server task panicked");
 
         // Collect all events
         let mut events = Vec::new();
@@ -2514,14 +2561,14 @@ mod tests {
             make_bidirectional_loopback().await;
         let (mut kex_reader, _rx_frames, _rx_events) = make_test_kex_reader(client_reader);
 
-        let server_epk = PrivateKey::generate(&X25519).unwrap();
-        let server_epk_pub = server_epk.compute_public_key().unwrap();
+        let server_epk = PrivateKey::generate(&X25519).expect("generate test X25519 key");
+        let server_epk_pub = server_epk.compute_public_key().expect("compute public key");
         let identity_key = vec![0u8; 32];
         let salt = vec![0u8; 32];
         server_writer
             .write_frame(&Frame::KexInit(supported_algorithms()))
             .await
-            .unwrap();
+            .expect("write KexInit frame");
         server_writer
             .write_frame(&Frame::PeerInitialize(
                 identity_key,
@@ -2529,11 +2576,11 @@ mod tests {
                 salt,
             ))
             .await
-            .unwrap();
+            .expect("write PeerInitialize frame");
         server_writer
             .write_frame(&Frame::KeyAgreement(UuidWrapper::new(uuid::Uuid::new_v4())))
             .await
-            .unwrap();
+            .expect("write KeyAgreement frame");
         // Close without sending SessionToken
         drop(server_writer);
 
@@ -2550,14 +2597,14 @@ mod tests {
             make_bidirectional_loopback().await;
         let (mut kex_reader, _rx_frames, _rx_events) = make_test_kex_reader(client_reader);
 
-        let server_epk = PrivateKey::generate(&X25519).unwrap();
-        let server_epk_pub = server_epk.compute_public_key().unwrap();
+        let server_epk = PrivateKey::generate(&X25519).expect("generate test X25519 key");
+        let server_epk_pub = server_epk.compute_public_key().expect("compute public key");
         let identity_key = vec![0u8; 32];
         let salt = vec![0u8; 32];
         server_writer
             .write_frame(&Frame::KexInit(supported_algorithms()))
             .await
-            .unwrap();
+            .expect("write KexInit frame");
         server_writer
             .write_frame(&Frame::PeerInitialize(
                 identity_key,
@@ -2565,15 +2612,15 @@ mod tests {
                 salt,
             ))
             .await
-            .unwrap();
+            .expect("write PeerInitialize frame");
         server_writer
             .write_frame(&Frame::KeyAgreement(UuidWrapper::new(uuid::Uuid::new_v4())))
             .await
-            .unwrap();
+            .expect("write KeyAgreement frame");
         server_writer
             .write_frame(&Frame::SessionToken(UuidWrapper::new(uuid::Uuid::new_v4())))
             .await
-            .unwrap();
+            .expect("write SessionToken frame");
         // Close without sending MoshpitsAddr
         drop(server_writer);
 
@@ -2592,14 +2639,14 @@ mod tests {
             make_bidirectional_loopback().await;
         let (mut kex_reader, _rx_frames, _rx_events) = make_test_kex_reader(client_reader);
 
-        let server_epk = PrivateKey::generate(&X25519).unwrap();
-        let server_epk_pub = server_epk.compute_public_key().unwrap();
+        let server_epk = PrivateKey::generate(&X25519).expect("generate test X25519 key");
+        let server_epk_pub = server_epk.compute_public_key().expect("compute public key");
         let identity_key = vec![0u8; 32];
         let salt = vec![0u8; 32];
         server_writer
             .write_frame(&Frame::KexInit(supported_algorithms()))
             .await
-            .unwrap();
+            .expect("write KexInit frame");
         server_writer
             .write_frame(&Frame::PeerInitialize(
                 identity_key,
@@ -2607,20 +2654,23 @@ mod tests {
                 salt,
             ))
             .await
-            .unwrap();
+            .expect("write PeerInitialize frame");
         server_writer
             .write_frame(&Frame::KeyAgreement(UuidWrapper::new(uuid::Uuid::new_v4())))
             .await
-            .unwrap();
+            .expect("write KeyAgreement frame");
         // Send wrong frame instead of SessionToken
-        server_writer.write_frame(&Frame::KexFailure).await.unwrap();
+        server_writer
+            .write_frame(&Frame::KexFailure)
+            .await
+            .expect("write KexFailure frame");
         drop(server_writer);
 
         let result = kex_reader.client_kex().await;
         assert!(result.is_err());
         assert!(
             result
-                .unwrap_err()
+                .expect_err("expected KeyNotEstablished error")
                 .downcast_ref::<MoshpitError>()
                 .is_some_and(|e| *e == MoshpitError::KeyNotEstablished),
             "expected KeyNotEstablished error"
@@ -2675,8 +2725,11 @@ mod tests {
             (&ML_DSA_65_SIGNING, crate::KEY_ALGORITHM_ML_DSA_65),
             (&ML_DSA_87_SIGNING, crate::KEY_ALGORITHM_ML_DSA_87),
         ] {
-            let key_pair = PqdsaKeyPair::generate(signing_alg).unwrap();
-            let private_key = key_pair.private_key().as_raw_bytes().unwrap();
+            let key_pair = PqdsaKeyPair::generate(signing_alg).expect("generate test ML-DSA key");
+            let private_key = key_pair
+                .private_key()
+                .as_raw_bytes()
+                .expect("private key bytes");
             let public_key = key_pair.public_key().as_ref().to_vec();
             let transcript = super::identity_transcript(&super::IdentityTranscriptParts {
                 role: b"client",
@@ -2688,12 +2741,12 @@ mod tests {
                 server_exchange: b"server-exchange",
                 salt: b"salt",
             })
-            .unwrap();
+            .expect("build identity transcript");
             let signature =
                 super::sign_identity_transcript(alg_str, private_key.as_ref(), &transcript)
-                    .unwrap();
+                    .expect("sign identity transcript");
             super::verify_identity_transcript(alg_str, &public_key, &transcript, &signature)
-                .unwrap();
+                .expect("verify identity transcript");
         }
     }
 
@@ -2719,13 +2772,22 @@ mod tests {
         let alg = b"X25519";
         let pubkey = [0xABu8; 32];
         let mut payload = Vec::new();
-        payload.extend_from_slice(&u32::try_from(alg.len()).unwrap().to_be_bytes());
+        payload.extend_from_slice(
+            &u32::try_from(alg.len())
+                .expect("alg length fits in u32")
+                .to_be_bytes(),
+        );
         payload.extend_from_slice(alg);
-        payload.extend_from_slice(&u32::try_from(pubkey.len()).unwrap().to_be_bytes());
+        payload.extend_from_slice(
+            &u32::try_from(pubkey.len())
+                .expect("pubkey length fits in u32")
+                .to_be_bytes(),
+        );
         payload.extend_from_slice(&pubkey);
         let b64 = STANDARD.encode(&payload);
         let full_key = format!("moshpit {b64} user@host").into_bytes();
-        let (key_alg, key_bytes) = super::parse_full_public_key(&full_key).unwrap();
+        let (key_alg, key_bytes) =
+            super::parse_full_public_key(&full_key).expect("parse full public key");
         assert_eq!(key_alg, "X25519");
         assert_eq!(key_bytes, pubkey);
     }

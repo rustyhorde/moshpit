@@ -227,7 +227,7 @@ mod tests {
     }
 
     #[test]
-    fn test_kex_config_impl() {
+    fn test_kex_config_impl() -> Result<()> {
         let mut config = Config::default();
         let _ = config.set_user("testuser".to_string());
 
@@ -236,8 +236,12 @@ mod tests {
 
         assert_eq!(KexConfig::mode(&config), KexMode::Client);
         assert!(KexConfig::port_pool(&config).is_none());
-        assert_eq!(KexConfig::user(&config).unwrap(), "testuser");
+        assert_eq!(
+            KexConfig::user(&config).ok_or_else(|| anyhow::anyhow!("expected user to be set"))?,
+            "testuser"
+        );
         assert_eq!(KexConfig::resume_session_uuid(&config), Some(uuid));
+        Ok(())
     }
 
     #[test]

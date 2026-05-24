@@ -129,34 +129,36 @@ mod tests {
     use super::*;
     use crate::ConnectionWriter;
 
-    async fn make_loopback() -> (ConnectionReader, ConnectionWriter) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+    async fn make_loopback() -> Result<(ConnectionReader, ConnectionWriter)> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
         let (server, client) = tokio::join!(
-            async { listener.accept().await.map(|(s, _)| s).unwrap() },
+            async { listener.accept().await.map(|(s, _)| s) },
             TcpStream::connect(addr),
         );
-        let (server_r, _) = server.into_split();
-        let (_, client_w) = client.unwrap().into_split();
+        let (server_r, _) = server?.into_split();
+        let (_, client_w) = client?.into_split();
         let reader = ConnectionReader::builder().reader(server_r).build();
         let writer = ConnectionWriter::builder().writer(client_w).build();
-        (reader, writer)
+        Ok((reader, writer))
     }
 
     #[tokio::test]
-    async fn read_frame_round_trip() {
-        let (mut reader, mut writer) = make_loopback().await;
-        writer.write_frame(&Frame::KexFailure).await.unwrap();
+    async fn read_frame_round_trip() -> Result<()> {
+        let (mut reader, mut writer) = make_loopback().await?;
+        writer.write_frame(&Frame::KexFailure).await?;
         drop(writer);
-        let frame = reader.read_frame().await.unwrap();
+        let frame = reader.read_frame().await?;
         assert_eq!(frame, Some(Frame::KexFailure));
+        Ok(())
     }
 
     #[tokio::test]
-    async fn read_frame_eof_returns_none() {
-        let (mut reader, writer) = make_loopback().await;
+    async fn read_frame_eof_returns_none() -> Result<()> {
+        let (mut reader, writer) = make_loopback().await?;
         drop(writer);
-        let frame = reader.read_frame().await.unwrap();
+        let frame = reader.read_frame().await?;
         assert_eq!(frame, None);
+        Ok(())
     }
 }

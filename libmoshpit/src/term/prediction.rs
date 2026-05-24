@@ -661,7 +661,7 @@ mod tests {
     /// Printable ASCII branch: `Cell::contents()` result (`.to_owned()`) is stored in
     /// `cell.original` and must be a valid `String`.
     #[test]
-    fn new_user_byte_printable_stores_original_as_string() {
+    fn new_user_byte_printable_stores_original_as_string() -> anyhow::Result<()> {
         let mut engine = PredictionEngine::new(DisplayPreference::Always);
         // Write 'X' at (0,0), then home the cursor back to (0,0) so the
         // prediction lands on the cell that contains 'X'.
@@ -672,16 +672,25 @@ mod tests {
         // Type 'a' — should predict 'a' at (0,0) and store original = "X".
         engine.new_user_byte(b'a', screen);
 
-        let row = engine.overlay_rows.iter().find(|r| r.row == 0).unwrap();
-        let cell = row.cells.iter().find(|c| c.col == 0).unwrap();
+        let row = engine
+            .overlay_rows
+            .iter()
+            .find(|r| r.row == 0)
+            .ok_or_else(|| anyhow::anyhow!("no overlay row for row 0"))?;
+        let cell = row
+            .cells
+            .iter()
+            .find(|c| c.col == 0)
+            .ok_or_else(|| anyhow::anyhow!("no overlay cell for col 0"))?;
         assert_eq!(cell.replacement, 'a');
         assert_eq!(cell.original, "X");
+        Ok(())
     }
 
     /// Backspace branch: `Cell::contents()` result (`.to_owned()`) is stored in
     /// `cell.original` for the cell being blanked.
     #[test]
-    fn new_user_byte_backspace_stores_original_as_string() {
+    fn new_user_byte_backspace_stores_original_as_string() -> anyhow::Result<()> {
         let mut engine = PredictionEngine::new(DisplayPreference::Always);
         // Write 'X' at (0,0) and home the cursor to (0,0).
         let parser = make_screen(24, 80, b"X\x1b[H");
@@ -695,13 +704,18 @@ mod tests {
         // original = screen.cell(0, 0) = "X".
         engine.new_user_byte(0x7f, screen);
 
-        let row = engine.overlay_rows.iter().find(|r| r.row == 0).unwrap();
+        let row = engine
+            .overlay_rows
+            .iter()
+            .find(|r| r.row == 0)
+            .ok_or_else(|| anyhow::anyhow!("no overlay row for row 0"))?;
         let cell = row
             .cells
             .iter()
             .find(|c| c.col == 0 && c.replacement == ' ')
-            .unwrap();
+            .ok_or_else(|| anyhow::anyhow!("no overlay cell for backspace at col 0"))?;
         assert_eq!(cell.original, "X");
+        Ok(())
     }
 
     #[test]

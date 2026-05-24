@@ -63,9 +63,9 @@ fn start_agent(socket: &Path, vault: &Path) -> Child {
             "--foreground",
             "--passphrase-stdin",
             "--socket",
-            socket.to_str().unwrap(),
+            socket.to_str().expect("test socket path is valid UTF-8"),
             "--vault",
-            vault.to_str().unwrap(),
+            vault.to_str().expect("test vault path is valid UTF-8"),
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -218,9 +218,9 @@ async fn duplicate_start_is_rejected() {
             "start",
             "--passphrase-stdin",
             "--socket",
-            socket.to_str().unwrap(),
+            socket.to_str().expect("test socket path is valid UTF-8"),
             "--vault",
-            vault.to_str().unwrap(),
+            vault.to_str().expect("test vault path is valid UTF-8"),
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
