@@ -129,4 +129,18 @@ impl AgentClient {
             other => Err(anyhow!("unexpected agent response: {other:?}")),
         }
     }
+
+    /// Query the agent's current state: whether it is locked and which identities are loaded.
+    ///
+    /// Returns `(locked, identities)`. A connection error means the agent is not running.
+    ///
+    /// # Errors
+    /// Returns an error if the agent returns an unexpected response.
+    pub async fn status(&self) -> Result<(bool, Vec<AgentIdentityInfo>)> {
+        match self.send(&AgentRequest::Status).await? {
+            AgentResponse::AgentStatus { locked, identities } => Ok((locked, identities)),
+            AgentResponse::Error(e) => Err(anyhow!("agent error: {e}")),
+            other => Err(anyhow!("unexpected agent response: {other:?}")),
+        }
+    }
 }

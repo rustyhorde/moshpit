@@ -78,6 +78,8 @@ pub enum AgentRequest {
     /// then exits.  Clients should source the output of `mpa stop` to unset
     /// `MOSHPIT_AGENT_SOCK` after calling this.
     Shutdown,
+    /// Query the agent's current state (locked flag + loaded identities).
+    Status,
 }
 
 /// Responses from the agent.
@@ -93,6 +95,13 @@ pub enum AgentResponse {
     Ok,
     /// An error message.
     Error(String),
+    /// Returned in response to [`AgentRequest::Status`].
+    AgentStatus {
+        /// Whether the agent is currently locked (keys cleared from memory).
+        locked: bool,
+        /// Identities currently held in memory (empty when locked).
+        identities: Vec<AgentIdentityInfo>,
+    },
 }
 
 #[cfg(test)]

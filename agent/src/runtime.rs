@@ -139,6 +139,7 @@ async fn handle_connection(
     master_passphrase: Arc<Mutex<String>>,
     socket_path: PathBuf,
     lock_path: PathBuf,
+    locked: Arc<Mutex<bool>>,
 ) {
     while let Ok(raw_len) = stream.read_u32().await {
         let req_len = raw_len as usize;
@@ -164,6 +165,7 @@ async fn handle_connection(
             &vault,
             &vault_path,
             &master_passphrase,
+            &locked,
         )
         .await;
 
@@ -242,6 +244,7 @@ async fn dispatch_request(
     vault: &Arc<Mutex<Option<Vault>>>,
     vault_path: &Path,
     master_passphrase: &Arc<Mutex<String>>,
+    locked: &Arc<Mutex<bool>>,
 ) -> AgentResponse {
     match request {
         AgentRequest::ListIdentities => {
@@ -335,6 +338,7 @@ async fn dispatch_request(
         }
 
         AgentRequest::Lock => {
+            *locked.lock().await = true;
             let mut map = identities.lock().await;
             for id in map.values_mut() {
                 id.private_key.zeroize();
@@ -350,10 +354,28 @@ async fn dispatch_request(
             drop(mp);
             match reload_from_vault(identities, vault, vault_path, &passphrase).await {
                 Ok(n) => {
+                    *locked.lock().await = false;
                     info!("agent unlocked, {n} identities loaded");
                     AgentResponse::Ok
                 }
                 Err(e) => AgentResponse::Error(e.to_string()),
+            }
+        }
+
+        AgentRequest::Status => {
+            let is_locked = *locked.lock().await;
+            let map = identities.lock().await;
+            let identities = map
+                .values()
+                .map(|id| AgentIdentityInfo {
+                    algorithm: id.algorithm.clone(),
+                    fingerprint: id.fingerprint.clone(),
+                    comment: String::new(),
+                })
+                .collect();
+            AgentResponse::AgentStatus {
+                locked: is_locked,
+                identities,
             }
         }
 
@@ -613,6 +635,28 @@ where
             }
             Ok(())
         }
+        Commands::Status => {
+            let socket_path = std::env::var("MOSHPIT_AGENT_SOCK")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| crate::config::default_socket_path());
+            let client = libmoshpit::AgentClient::new(socket_path);
+            match client.status().await {
+                Err(_) => println!("stopped"),
+                Ok((is_locked, ids)) => {
+                    if is_locked {
+                        println!("running (locked)");
+                    } else if ids.is_empty() {
+                        println!("running (no keys)");
+                    } else {
+                        println!("running");
+                        for id in &ids {
+                            println!("  {} {} {}", id.fingerprint, id.algorithm, id.comment);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
         Commands::Stop { socket, shell } => {
             let socket_path = socket
                 .as_deref()
@@ -832,6 +876,7 @@ async fn run_daemon(
     let identities = new_identity_map();
     let vault: Arc<Mutex<Option<Vault>>> = Arc::new(Mutex::new(None));
     let master_passphrase_arc = Arc::new(Mutex::new(master_passphrase.clone()));
+    let locked: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
 
     // Load from vault if it exists
     if config.vault_path.exists() {
@@ -914,8 +959,9 @@ async fn run_daemon(
                 let mp = Arc::clone(&master_passphrase_arc);
                 let sp = config.socket_path.clone();
                 let lp = config.lock_path.clone();
+                let lk = Arc::clone(&locked);
                 drop(tokio::spawn(async move {
-                    handle_connection(stream, ids, v, vp, mp, sp, lp).await;
+                    handle_connection(stream, ids, v, vp, mp, sp, lp, lk).await;
                 }));
             }
             Err(e) => error!("accept error: {e}"),
@@ -952,6 +998,10 @@ mod tests {
         Arc::new(Mutex::new(String::new()))
     }
 
+    fn unlocked_state() -> Arc<Mutex<bool>> {
+        Arc::new(Mutex::new(false))
+    }
+
     #[test]
     fn new_identity_map_is_empty() {
         let map = new_identity_map();
@@ -964,8 +1014,15 @@ mod tests {
         let vault = empty_vault();
         let vault_path = PathBuf::from("/tmp/nonexistent-vault-agent-test");
         let mp = empty_passphrase();
-        let resp =
-            dispatch_request(AgentRequest::ListIdentities, &ids, &vault, &vault_path, &mp).await;
+        let resp = dispatch_request(
+            AgentRequest::ListIdentities,
+            &ids,
+            &vault,
+            &vault_path,
+            &mp,
+            &unlocked_state(),
+        )
+        .await;
         assert!(matches!(resp, AgentResponse::Identities(v) if v.is_empty()));
     }
 
@@ -981,8 +1038,15 @@ mod tests {
         let vault = empty_vault();
         let vault_path = PathBuf::from("/tmp/nonexistent-vault-agent-test");
         let mp = empty_passphrase();
-        let resp =
-            dispatch_request(AgentRequest::ListIdentities, &ids, &vault, &vault_path, &mp).await;
+        let resp = dispatch_request(
+            AgentRequest::ListIdentities,
+            &ids,
+            &vault,
+            &vault_path,
+            &mp,
+            &unlocked_state(),
+        )
+        .await;
         match resp {
             AgentResponse::Identities(list) => {
                 assert_eq!(list.len(), 1);
@@ -1019,6 +1083,7 @@ mod tests {
             &vault,
             &vault_path,
             &mp,
+            &unlocked_state(),
         )
         .await;
         match resp {
@@ -1048,6 +1113,7 @@ mod tests {
             &vault,
             &vault_path,
             &mp,
+            &unlocked_state(),
         )
         .await;
         assert!(matches!(resp, AgentResponse::PublicKey(b) if b == b"dummy pub key bytes"));
@@ -1065,6 +1131,7 @@ mod tests {
             &vault,
             &vault_path,
             &mp,
+            &unlocked_state(),
         )
         .await;
         assert!(matches!(resp, AgentResponse::Error(_)));
@@ -1085,6 +1152,7 @@ mod tests {
             &vault,
             &vault_path,
             &mp,
+            &unlocked_state(),
         )
         .await;
         assert!(matches!(resp, AgentResponse::Error(_)));
@@ -1111,6 +1179,7 @@ mod tests {
             &vault,
             &vault_path,
             &mp,
+            &unlocked_state(),
         )
         .await;
         // In non-unstable builds sign_data always returns an error
@@ -1142,6 +1211,7 @@ mod tests {
             &vault,
             &vault_path,
             &mp,
+            &unlocked_state(),
         )
         .await;
         assert!(matches!(resp, AgentResponse::Ok));
@@ -1163,6 +1233,7 @@ mod tests {
             &vault,
             &vault_path,
             &mp,
+            &unlocked_state(),
         )
         .await;
         assert!(matches!(resp, AgentResponse::Error(_)));
@@ -1186,6 +1257,7 @@ mod tests {
             &vault,
             &vault_path,
             &mp,
+            &unlocked_state(),
         )
         .await;
         assert!(matches!(resp, AgentResponse::Ok));
@@ -1204,6 +1276,7 @@ mod tests {
             &vault,
             &vault_path,
             &mp,
+            &unlocked_state(),
         )
         .await;
         assert!(matches!(resp, AgentResponse::Error(_)));
@@ -1233,6 +1306,7 @@ mod tests {
             &vault,
             &vault_path,
             &mp,
+            &unlocked_state(),
         )
         .await;
         assert!(matches!(resp, AgentResponse::Ok));
@@ -1251,7 +1325,15 @@ mod tests {
         let vault = empty_vault();
         let vault_path = PathBuf::from("/tmp/nonexistent-vault-agent-test");
         let mp = empty_passphrase();
-        let resp = dispatch_request(AgentRequest::Lock, &ids, &vault, &vault_path, &mp).await;
+        let resp = dispatch_request(
+            AgentRequest::Lock,
+            &ids,
+            &vault,
+            &vault_path,
+            &mp,
+            &unlocked_state(),
+        )
+        .await;
         assert!(matches!(resp, AgentResponse::Ok));
         assert!(ids.lock().await.is_empty());
     }
@@ -1268,6 +1350,7 @@ mod tests {
             &vault,
             &vault_path,
             &mp,
+            &unlocked_state(),
         )
         .await;
         assert!(matches!(resp, AgentResponse::Ok));
@@ -1291,6 +1374,7 @@ mod tests {
             Arc::clone(&mp),
             PathBuf::from("/tmp/nonexistent-socket-agent-test"),
             PathBuf::from("/tmp/nonexistent-lock-agent-test"),
+            Arc::new(Mutex::new(false)),
         )));
 
         let req = AgentRequest::ListIdentities;
@@ -1326,6 +1410,7 @@ mod tests {
             mp,
             PathBuf::from("/tmp/nonexistent-socket-agent-test"),
             PathBuf::from("/tmp/nonexistent-lock-agent-test"),
+            Arc::new(Mutex::new(false)),
         ));
 
         client.write_all(&0u32.to_be_bytes()).await.unwrap();
@@ -1352,6 +1437,7 @@ mod tests {
             mp,
             PathBuf::from("/tmp/nonexistent-socket-agent-test"),
             PathBuf::from("/tmp/nonexistent-lock-agent-test"),
+            Arc::new(Mutex::new(false)),
         ));
 
         let garbage = vec![0xFF_u8, 0xFE, 0xFD, 0xFC];
