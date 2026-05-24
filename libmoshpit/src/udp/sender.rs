@@ -289,7 +289,8 @@ mod tests {
         UdpSender::builder()
             .id(Uuid::new_v4())
             .rnk(LessSafeKey::new(
-                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32])
+                    .expect("test AES-256-GCM-SIV key setup"),
             ))
             .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .socket(socket)
@@ -304,9 +305,9 @@ mod tests {
     /// constructed to be definitionally older than `t_before_send` by ≥4 s, while
     /// the re-stamped ts must be ≥ `t_before_send`.
     #[tokio::test]
-    async fn keepalive_is_restamped_at_send_time() {
-        let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let server_addr = server.local_addr().unwrap();
+    async fn keepalive_is_restamped_at_send_time() -> Result<()> {
+        let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+        let server_addr = server.local_addr()?;
 
         let (_ctrl_tx, ctrl_rx) = channel::<EncryptedFrame>(4);
         let (frame_tx, frame_rx) = channel::<EncryptedFrame>(4);
@@ -318,16 +319,13 @@ mod tests {
         frame_tx
             .send(EncryptedFrame::Keepalive(stale_ts))
             .await
-            .unwrap();
+            .expect("test channel send");
 
         let t_before_send = now_micros();
 
-        let send_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        send_socket.connect(server_addr).await.unwrap();
-        server
-            .connect(send_socket.local_addr().unwrap())
-            .await
-            .unwrap();
+        let send_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+        send_socket.connect(server_addr).await?;
+        server.connect(send_socket.local_addr()?).await?;
 
         let mut sender = make_sender(send_socket, ctrl_rx, frame_rx, retransmit_rx);
         let token2 = token.clone();
@@ -353,34 +351,38 @@ mod tests {
             t_after_send >= t_before_send,
             "monotonic clock must advance"
         );
+        Ok(())
     }
 
     /// When the control channel closes but the data channel is still open,
     /// `frame_loop` must continue running — `control_active` guards the branch.
     #[tokio::test]
-    async fn control_channel_close_does_not_break_loop() {
-        let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let server_addr = server.local_addr().unwrap();
+    async fn control_channel_close_does_not_break_loop() -> Result<()> {
+        let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+        let server_addr = server.local_addr()?;
 
         let (ctrl_tx, ctrl_rx) = channel::<EncryptedFrame>(4);
         let (frame_tx, frame_rx) = channel::<EncryptedFrame>(4);
         let (_retransmit_tx, retransmit_rx) = channel::<Vec<u64>>(4);
         let token = CancellationToken::new();
 
-        let send_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        send_socket.connect(server_addr).await.unwrap();
-        server
-            .connect(send_socket.local_addr().unwrap())
-            .await
-            .unwrap();
+        let send_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+        send_socket.connect(server_addr).await?;
+        server.connect(send_socket.local_addr()?).await?;
 
         // Send a Keepalive via control, then close the control channel.
         let ts = now_micros();
-        ctrl_tx.send(EncryptedFrame::Keepalive(ts)).await.unwrap();
+        ctrl_tx
+            .send(EncryptedFrame::Keepalive(ts))
+            .await
+            .expect("test channel send");
         drop(ctrl_tx);
 
         // Send a data frame after the control channel is closed.
-        frame_tx.send(EncryptedFrame::Shutdown).await.unwrap();
+        frame_tx
+            .send(EncryptedFrame::Shutdown)
+            .await
+            .expect("test channel send");
         drop(frame_tx);
 
         let mut sender = make_sender(send_socket, ctrl_rx, frame_rx, retransmit_rx);
@@ -402,17 +404,18 @@ mod tests {
 
         // Two wire packets: one Keepalive (control) + one Shutdown (data).
         assert_eq!(count, 2, "expected exactly 2 wire packets");
+        Ok(())
     }
 
     /// After a NAT roam signal arrives on `peer_addr_rx`, subsequent sends must
     /// go to the new address — verified by checking which of two receiver sockets
     /// actually receives the encrypted wire packet.
     #[tokio::test]
-    async fn sender_adopts_roamed_peer_addr() {
-        let old_peer = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let new_peer = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let old_addr = old_peer.local_addr().unwrap();
-        let new_addr = new_peer.local_addr().unwrap();
+    async fn sender_adopts_roamed_peer_addr() -> Result<()> {
+        let old_peer = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+        let new_peer = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+        let old_addr = old_peer.local_addr()?;
+        let new_addr = new_peer.local_addr()?;
 
         let (_ctrl_tx, ctrl_rx) = channel::<EncryptedFrame>(4);
         let (frame_tx, frame_rx) = channel::<EncryptedFrame>(4);
@@ -421,11 +424,12 @@ mod tests {
         let (peer_addr_tx, peer_addr_rx) = channel::<SocketAddr>(4);
         let token = CancellationToken::new();
 
-        let send_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let send_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
         let mut sender = UdpSender::builder()
             .id(Uuid::new_v4())
             .rnk(LessSafeKey::new(
-                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).unwrap(),
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32])
+                    .expect("test AES-256-GCM-SIV key setup"),
             ))
             .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
             .socket(send_socket)
@@ -437,7 +441,7 @@ mod tests {
             .build();
 
         // Give the sender its initial destination: old_peer.
-        peer_disc_tx.send(old_addr).unwrap();
+        peer_disc_tx.send(old_addr).expect("test oneshot send");
 
         let token2 = token.clone();
         let handle = tokio::spawn(async move {
@@ -445,20 +449,29 @@ mod tests {
         });
 
         // First frame must reach old_peer.
-        frame_tx.send(EncryptedFrame::Keepalive(0)).await.unwrap();
+        frame_tx
+            .send(EncryptedFrame::Keepalive(0))
+            .await
+            .expect("test channel send");
         let mut buf = vec![0u8; 65535];
         let got_old = tokio::time::timeout(Duration::from_millis(500), old_peer.recv(&mut buf))
             .await
             .is_ok();
 
         // Signal a NAT roam to new_peer.
-        peer_addr_tx.send(new_addr).await.unwrap();
+        peer_addr_tx
+            .send(new_addr)
+            .await
+            .expect("test channel send");
 
         // Give frame_loop one pass through the select! so it drains peer_addr_rx.
         sleep(Duration::from_millis(10)).await;
 
         // Second frame must reach new_peer.
-        frame_tx.send(EncryptedFrame::Keepalive(0)).await.unwrap();
+        frame_tx
+            .send(EncryptedFrame::Keepalive(0))
+            .await
+            .expect("test channel send");
         let got_new = tokio::time::timeout(Duration::from_millis(500), new_peer.recv(&mut buf))
             .await
             .is_ok();
@@ -468,20 +481,18 @@ mod tests {
 
         assert!(got_old, "first frame did not reach original peer");
         assert!(got_new, "second frame did not reach roamed peer");
+        Ok(())
     }
 
     /// A retransmit request received via `retransmit_rx` in Reliable mode arms the 20ms
     /// deadline; when it fires the frame is re-sent to the wire and the deadline is parked.
     #[tokio::test]
-    async fn retransmit_deadline_fires_after_nak_request() {
-        let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        let server_addr = server.local_addr().unwrap();
-        let send_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-        send_socket.connect(server_addr).await.unwrap();
-        server
-            .connect(send_socket.local_addr().unwrap())
-            .await
-            .unwrap();
+    async fn retransmit_deadline_fires_after_nak_request() -> Result<()> {
+        let server = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+        let server_addr = server.local_addr()?;
+        let send_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+        send_socket.connect(server_addr).await?;
+        server.connect(send_socket.local_addr()?).await?;
 
         let (_ctrl_tx, ctrl_rx) = channel::<EncryptedFrame>(4);
         let (frame_tx, frame_rx) = channel::<EncryptedFrame>(4);
@@ -493,14 +504,20 @@ mod tests {
         let handle = tokio::spawn(async move { drop(sender.frame_loop(token2).await) });
 
         // Send a data frame: populates retransmit_buffer[seq=0] and sends a wire packet.
-        frame_tx.send(EncryptedFrame::Keepalive(0)).await.unwrap();
+        frame_tx
+            .send(EncryptedFrame::Keepalive(0))
+            .await
+            .expect("test channel send");
         let mut buf = vec![0u8; 65535];
         let got_original = tokio::time::timeout(Duration::from_millis(200), server.recv(&mut buf))
             .await
             .is_ok();
 
         // Send a NAK for seq=0: arms the 20ms retransmit deadline.
-        retransmit_tx.send(vec![0]).await.unwrap();
+        retransmit_tx
+            .send(vec![0])
+            .await
+            .expect("test channel send");
 
         // Deadline fires after ~20ms and re-sends the stored wire bytes.
         let got_retransmit =
@@ -516,5 +533,6 @@ mod tests {
             got_retransmit,
             "retransmit must fire within 100ms of NAK request"
         );
+        Ok(())
     }
 }

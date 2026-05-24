@@ -66,30 +66,32 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn write_frame_succeeds() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+    async fn write_frame_succeeds() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
         let (server, client) = tokio::join!(
-            async { listener.accept().await.map(|(s, _)| s).unwrap() },
+            async { listener.accept().await.map(|(s, _)| s) },
             TcpStream::connect(addr),
         );
-        let (_server_r, _server_w) = server.into_split();
-        let (_, client_w) = client.unwrap().into_split();
+        let _server = server?;
+        let (_, client_w) = client?.into_split();
         let mut writer = ConnectionWriter::builder().writer(client_w).build();
-        writer.write_frame(&Frame::KexFailure).await.unwrap();
+        writer.write_frame(&Frame::KexFailure).await?;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn write_bytes_succeeds() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+    async fn write_bytes_succeeds() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
         let (server, client) = tokio::join!(
-            async { listener.accept().await.map(|(s, _)| s).unwrap() },
+            async { listener.accept().await.map(|(s, _)| s) },
             TcpStream::connect(addr),
         );
-        let (_server_r, _server_w) = server.into_split();
-        let (_, client_w) = client.unwrap().into_split();
+        let _server = server?;
+        let (_, client_w) = client?.into_split();
         let mut writer = ConnectionWriter::builder().writer(client_w).build();
-        writer.write_bytes(b"hello").await.unwrap();
+        writer.write_bytes(b"hello").await?;
+        Ok(())
     }
 }

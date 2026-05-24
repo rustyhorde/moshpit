@@ -160,7 +160,7 @@ mod test {
 
     impl PathDefaults for TestConfig {
         fn default_tracing_path(&self) -> String {
-            let blah = NamedTempFile::new().unwrap();
+            let blah = NamedTempFile::new().expect("create temp file for test tracing path");
             blah.path().display().to_string()
         }
 

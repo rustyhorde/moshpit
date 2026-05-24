@@ -124,6 +124,9 @@ pub(crate) enum Commands {
         #[clap(value_name = "FINGERPRINT")]
         fingerprint: String,
     },
+    /// Show the running status of the agent daemon.
+    #[clap(about = "Show the agent's current status")]
+    Status,
     /// Lock the agent: clear all keys from memory.
     #[clap(about = "Lock the agent (clear keys from memory)")]
     Lock,

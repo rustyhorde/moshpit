@@ -195,11 +195,11 @@ mod tests {
 
     use super::EncryptedFrame;
 
-    fn make_keys() -> (Uuid, LessSafeKey, Key) {
+    fn make_keys() -> anyhow::Result<(Uuid, LessSafeKey, Key)> {
         let id = Uuid::new_v4();
-        let rnk = LessSafeKey::new(UnboundKey::new(&AES_256_GCM_SIV, &[1u8; 32]).unwrap());
+        let rnk = LessSafeKey::new(UnboundKey::new(&AES_256_GCM_SIV, &[1u8; 32])?);
         let hmac = Key::new(HMAC_SHA512, &[2u8; 64]);
-        (id, rnk, hmac)
+        Ok((id, rnk, hmac))
     }
 
     fn encrypt_frame(
@@ -208,28 +208,30 @@ mod tests {
         id: Uuid,
         rnk: &LessSafeKey,
         hmac: &Key,
-    ) -> Vec<u8> {
-        let data = encode_to_vec(frame, standard()).unwrap();
+    ) -> anyhow::Result<Vec<u8>> {
+        let data = encode_to_vec(frame, standard())?;
         let aad = Aad::from(seq.to_be_bytes());
         let mut encrypted_part = id.as_bytes().to_vec();
         encrypted_part.extend_from_slice(&data);
         let mut nonce_bytes = [0u8; NONCE_LEN];
-        rand::fill(&mut nonce_bytes).unwrap();
-        let nonce = aws_lc_rs::aead::Nonce::try_assume_unique_for_key(&nonce_bytes).unwrap();
-        rnk.seal_in_place_append_tag(nonce, aad, &mut encrypted_part)
-            .unwrap();
+        rand::fill(&mut nonce_bytes)?;
+        let nonce = aws_lc_rs::aead::Nonce::try_assume_unique_for_key(&nonce_bytes)?;
+        rnk.seal_in_place_append_tag(nonce, aad, &mut encrypted_part)?;
         let seq_bytes = seq.to_be_bytes();
         let mut to_sign = seq_bytes.to_vec();
         to_sign.extend_from_slice(&encrypted_part);
         let tag = sign(hmac, &to_sign);
-        let tag_bytes: [u8; 64] = tag.as_ref().try_into().unwrap();
+        let tag_bytes: [u8; 64] = tag
+            .as_ref()
+            .try_into()
+            .expect("HMAC-SHA512 tag is always 64 bytes");
         let len = encrypted_part.len().to_be_bytes();
         let mut packet = nonce_bytes.to_vec();
         packet.extend_from_slice(&seq_bytes);
         packet.extend_from_slice(&tag_bytes);
         packet.extend_from_slice(&len);
         packet.extend_from_slice(&encrypted_part);
-        packet
+        Ok(packet)
     }
 
     #[test]
@@ -262,16 +264,16 @@ mod tests {
     }
 
     #[test]
-    fn parse_round_trip_keepalive() {
-        let (id, rnk, hmac) = make_keys();
+    fn parse_round_trip_keepalive() -> anyhow::Result<()> {
+        let (id, rnk, hmac) = make_keys()?;
         let ts = 1_234_567_890_u64;
-        let packet = encrypt_frame(&EncryptedFrame::Keepalive(ts), 0, id, &rnk, &hmac);
+        let packet = encrypt_frame(&EncryptedFrame::Keepalive(ts), 0, id, &rnk, &hmac)?;
         let mut cursor = Cursor::new(packet.as_slice());
-        let (parsed_frame, seq) = EncryptedFrame::parse(&mut cursor, id, &hmac, &rnk, 64)
-            .unwrap()
-            .unwrap();
+        let (parsed_frame, seq) = EncryptedFrame::parse(&mut cursor, id, &hmac, &rnk, 64)?
+            .ok_or_else(|| anyhow::anyhow!("expected parsed frame"))?;
         assert_eq!(parsed_frame, EncryptedFrame::Keepalive(ts));
         assert_eq!(seq, 0);
+        Ok(())
     }
 
     /// Verify that two independent `RandomizedNonceKey` instances constructed from the
@@ -308,7 +310,8 @@ mod tests {
             );
 
             let ts = 42_u64;
-            let packet = encrypt_frame(&EncryptedFrame::Keepalive(ts), 7, id, &enc_key, &hmac);
+            let packet = encrypt_frame(&EncryptedFrame::Keepalive(ts), 7, id, &enc_key, &hmac)
+                .unwrap_or_else(|e| panic!("encrypt_frame failed for {alg:?}: {e}"));
             let mut cursor = Cursor::new(packet.as_slice());
             let result = EncryptedFrame::parse(&mut cursor, id, &hmac, &dec_key, 64);
             let (parsed_frame, seq) = match result {
@@ -326,62 +329,62 @@ mod tests {
     }
 
     #[test]
-    fn parse_round_trip_shutdown() {
-        let (id, rnk, hmac) = make_keys();
-        let packet = encrypt_frame(&EncryptedFrame::Shutdown, 42, id, &rnk, &hmac);
+    fn parse_round_trip_shutdown() -> anyhow::Result<()> {
+        let (id, rnk, hmac) = make_keys()?;
+        let packet = encrypt_frame(&EncryptedFrame::Shutdown, 42, id, &rnk, &hmac)?;
         let mut cursor = Cursor::new(packet.as_slice());
-        let (parsed_frame, seq) = EncryptedFrame::parse(&mut cursor, id, &hmac, &rnk, 64)
-            .unwrap()
-            .unwrap();
+        let (parsed_frame, seq) = EncryptedFrame::parse(&mut cursor, id, &hmac, &rnk, 64)?
+            .ok_or_else(|| anyhow::anyhow!("expected parsed frame"))?;
         assert_eq!(parsed_frame, EncryptedFrame::Shutdown);
         assert_eq!(seq, 42);
+        Ok(())
     }
 
     #[test]
-    fn parse_truncated_returns_none() {
-        let (id, rnk, hmac) = make_keys();
+    fn parse_truncated_returns_none() -> anyhow::Result<()> {
+        let (id, rnk, hmac) = make_keys()?;
         let packet = [0u8; 4];
         let mut cursor = Cursor::new(packet.as_slice());
-        let result = EncryptedFrame::parse(&mut cursor, id, &hmac, &rnk, 64).unwrap();
+        let result = EncryptedFrame::parse(&mut cursor, id, &hmac, &rnk, 64)?;
         assert!(result.is_none());
+        Ok(())
     }
 
     #[test]
-    fn parse_wrong_uuid_returns_error() {
-        let (id, rnk, hmac) = make_keys();
-        let packet = encrypt_frame(&EncryptedFrame::Keepalive(0), 0, id, &rnk, &hmac);
+    fn parse_wrong_uuid_returns_error() -> anyhow::Result<()> {
+        let (id, rnk, hmac) = make_keys()?;
+        let packet = encrypt_frame(&EncryptedFrame::Keepalive(0), 0, id, &rnk, &hmac)?;
         let wrong_id = Uuid::new_v4();
         let mut cursor = Cursor::new(packet.as_slice());
-        let result = EncryptedFrame::parse(&mut cursor, wrong_id, &hmac, &rnk, 64);
-        assert!(result.is_err());
+        assert!(EncryptedFrame::parse(&mut cursor, wrong_id, &hmac, &rnk, 64).is_err());
+        Ok(())
     }
 
     #[test]
-    fn test_parse_oversized_encframe() {
+    fn test_parse_oversized_encframe() -> anyhow::Result<()> {
         use crate::frames::encframe::MAX_ENCFRAME_LENGTH;
-        let (id, rnk, hmac) = make_keys();
-        // Construct a packet with oversized length
+        let (id, rnk, hmac) = make_keys()?;
         let oversized_len = MAX_ENCFRAME_LENGTH + 1;
 
         let seq = 0u64;
         let aad = Aad::from(seq.to_be_bytes());
         let mut encrypted_part = id.as_bytes().to_vec();
-        // Add fake payload to match length
         encrypted_part.extend_from_slice(&[0u8; 10]);
         let mut nonce_bytes = [0u8; NONCE_LEN];
-        rand::fill(&mut nonce_bytes).unwrap();
-        let nonce = aws_lc_rs::aead::Nonce::try_assume_unique_for_key(&nonce_bytes).unwrap();
-        rnk.seal_in_place_append_tag(nonce, aad, &mut encrypted_part)
-            .unwrap();
+        rand::fill(&mut nonce_bytes)?;
+        let nonce = aws_lc_rs::aead::Nonce::try_assume_unique_for_key(&nonce_bytes)?;
+        rnk.seal_in_place_append_tag(nonce, aad, &mut encrypted_part)?;
 
         let seq_bytes = seq.to_be_bytes();
         let mut to_sign = seq_bytes.to_vec();
         to_sign.extend_from_slice(&encrypted_part);
         let tag = sign(&hmac, &to_sign);
-        let tag_bytes: [u8; 64] = tag.as_ref().try_into().unwrap();
+        let tag_bytes: [u8; 64] = tag
+            .as_ref()
+            .try_into()
+            .expect("HMAC-SHA512 tag is always 64 bytes");
 
-        let len = oversized_len.to_be_bytes(); // Oversized!
-
+        let len = oversized_len.to_be_bytes();
         let mut packet = nonce_bytes.to_vec();
         packet.extend_from_slice(&seq_bytes);
         packet.extend_from_slice(&tag_bytes);
@@ -390,10 +393,12 @@ mod tests {
 
         let mut cursor = Cursor::new(packet.as_slice());
         let result = EncryptedFrame::parse(&mut cursor, id, &hmac, &rnk, 64);
-        assert!(result.is_err());
         assert_eq!(
-            result.unwrap_err().to_string(),
+            result
+                .expect_err("expected FrameTooLarge error")
+                .to_string(),
             crate::error::Error::FrameTooLarge.to_string()
         );
+        Ok(())
     }
 }

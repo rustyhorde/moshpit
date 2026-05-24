@@ -78,6 +78,8 @@ pub enum AgentRequest {
     /// then exits.  Clients should source the output of `mpa stop` to unset
     /// `MOSHPIT_AGENT_SOCK` after calling this.
     Shutdown,
+    /// Query the agent's current state (locked flag + loaded identities).
+    Status,
 }
 
 /// Responses from the agent.
@@ -93,6 +95,13 @@ pub enum AgentResponse {
     Ok,
     /// An error message.
     Error(String),
+    /// Returned in response to [`AgentRequest::Status`].
+    AgentStatus {
+        /// Whether the agent is currently locked (keys cleared from memory).
+        locked: bool,
+        /// Identities currently held in memory (empty when locked).
+        identities: Vec<AgentIdentityInfo>,
+    },
 }
 
 #[cfg(test)]
@@ -102,39 +111,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn roundtrip_request_lock() {
-        let encoded = encode_to_vec(&AgentRequest::Lock, standard()).unwrap();
-        let (rt, _): (AgentRequest, _) = decode_from_slice(&encoded, standard()).unwrap();
+    fn roundtrip_request_lock() -> anyhow::Result<()> {
+        let encoded = encode_to_vec(&AgentRequest::Lock, standard())?;
+        let (rt, _): (AgentRequest, _) = decode_from_slice(&encoded, standard())?;
         assert!(matches!(rt, AgentRequest::Lock));
+        Ok(())
     }
 
     #[test]
-    fn roundtrip_request_unlock() {
-        let encoded =
-            encode_to_vec(AgentRequest::Unlock("secret".to_string()), standard()).unwrap();
-        let (rt, _): (AgentRequest, _) = decode_from_slice(&encoded, standard()).unwrap();
+    fn roundtrip_request_unlock() -> anyhow::Result<()> {
+        let encoded = encode_to_vec(AgentRequest::Unlock("secret".to_string()), standard())?;
+        let (rt, _): (AgentRequest, _) = decode_from_slice(&encoded, standard())?;
         assert!(matches!(rt, AgentRequest::Unlock(ref s) if s == "secret"));
+        Ok(())
     }
 
     #[test]
-    fn roundtrip_request_remove_all() {
-        let encoded = encode_to_vec(&AgentRequest::RemoveAllIdentities, standard()).unwrap();
-        let (rt, _): (AgentRequest, _) = decode_from_slice(&encoded, standard()).unwrap();
+    fn roundtrip_request_remove_all() -> anyhow::Result<()> {
+        let encoded = encode_to_vec(&AgentRequest::RemoveAllIdentities, standard())?;
+        let (rt, _): (AgentRequest, _) = decode_from_slice(&encoded, standard())?;
         assert!(matches!(rt, AgentRequest::RemoveAllIdentities));
+        Ok(())
     }
 
     #[test]
-    fn roundtrip_request_shutdown() {
-        let encoded = encode_to_vec(&AgentRequest::Shutdown, standard()).unwrap();
-        let (rt, _): (AgentRequest, _) = decode_from_slice(&encoded, standard()).unwrap();
+    fn roundtrip_request_shutdown() -> anyhow::Result<()> {
+        let encoded = encode_to_vec(&AgentRequest::Shutdown, standard())?;
+        let (rt, _): (AgentRequest, _) = decode_from_slice(&encoded, standard())?;
         assert!(matches!(rt, AgentRequest::Shutdown));
+        Ok(())
     }
 
     #[test]
-    fn roundtrip_response_ok() {
-        let encoded = encode_to_vec(&AgentResponse::Ok, standard()).unwrap();
-        let (rt, _): (AgentResponse, _) = decode_from_slice(&encoded, standard()).unwrap();
+    fn roundtrip_response_ok() -> anyhow::Result<()> {
+        let encoded = encode_to_vec(&AgentResponse::Ok, standard())?;
+        let (rt, _): (AgentResponse, _) = decode_from_slice(&encoded, standard())?;
         assert!(matches!(rt, AgentResponse::Ok));
+        Ok(())
     }
 
     #[test]

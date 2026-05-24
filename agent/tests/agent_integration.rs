@@ -63,9 +63,9 @@ fn start_agent(socket: &Path, vault: &Path) -> Child {
             "--foreground",
             "--passphrase-stdin",
             "--socket",
-            socket.to_str().unwrap(),
+            socket.to_str().expect("test socket path is valid UTF-8"),
             "--vault",
-            vault.to_str().unwrap(),
+            vault.to_str().expect("test vault path is valid UTF-8"),
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -83,6 +83,17 @@ async fn wait_for_socket(socket: &Path, timeout: Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
         if socket.exists() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
+async fn wait_for_lock(lock: &Path, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if lock.exists() {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -179,6 +190,66 @@ async fn agent_lifecycle_add_list_lock_unlock() {
     child.kill().ok();
     child.wait().ok();
     let _ = std::fs::remove_file(&socket);
+    let _ = std::fs::remove_file(&vault);
+}
+
+#[tokio::test]
+async fn duplicate_start_is_rejected() {
+    use std::io::Write as _;
+
+    let socket = temp_socket("dup");
+    let vault = temp_vault("dup");
+    let lock = socket.with_extension("lock");
+
+    let mut daemon = start_agent(&socket, &vault);
+
+    // Wait for both socket and lock file — the worker writes the lock after binding.
+    let ready = wait_for_socket(&socket, Duration::from_secs(5)).await
+        && wait_for_lock(&lock, Duration::from_secs(5)).await;
+    if !ready {
+        daemon.kill().ok();
+        daemon.wait().ok();
+        panic!("agent socket/lock did not appear within 5s");
+    }
+
+    // Attempt a second start in non-foreground (parent) mode — triggers the guard.
+    let mut second = Command::new(agent_binary())
+        .args([
+            "start",
+            "--passphrase-stdin",
+            "--socket",
+            socket.to_str().expect("test socket path is valid UTF-8"),
+            "--vault",
+            vault.to_str().expect("test vault path is valid UTF-8"),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn second mpa start");
+    if let Some(mut stdin) = second.stdin.take() {
+        let _ = stdin.write_all(b"\n");
+    }
+    let output = second.wait_with_output().expect("wait second mpa");
+
+    assert!(
+        !output.status.success(),
+        "second start should exit non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("already running"),
+        "expected 'already running' in stderr; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("mpa stop"),
+        "expected 'mpa stop' hint in stderr; got: {stderr}"
+    );
+
+    daemon.kill().ok();
+    daemon.wait().ok();
+    let _ = std::fs::remove_file(&socket);
+    let _ = std::fs::remove_file(&lock);
     let _ = std::fs::remove_file(&vault);
 }
 

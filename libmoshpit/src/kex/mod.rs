@@ -707,7 +707,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn kex_state_machine_server_mode_completes_after_uuid() {
+    async fn kex_state_machine_server_mode_completes_after_uuid() -> Result<()> {
         use crate::kex::negotiate::NegotiatedAlgorithms;
 
         let (tx, rx) = unbounded_channel();
@@ -718,22 +718,24 @@ mod tests {
         tx.send(KexEvent::NegotiatedAlgorithms(
             NegotiatedAlgorithms::default(),
         ))
-        .unwrap();
-        tx.send(KexEvent::KeyMaterial(key.clone())).unwrap();
+        .expect("test channel send");
+        tx.send(KexEvent::KeyMaterial(key.clone()))
+            .expect("test channel send");
         tx.send(KexEvent::HMACKeyMaterial(hmac_key.clone()))
-            .unwrap();
-        tx.send(KexEvent::Uuid(uuid)).unwrap();
+            .expect("test channel send");
+        tx.send(KexEvent::Uuid(uuid)).expect("test channel send");
         drop(tx);
-        let kex = sm.handle_events(false).await.unwrap();
+        let kex = sm.handle_events(false).await?;
         assert_eq!(kex.key().as_slice(), key.as_slice());
         assert_eq!(kex.hmac_key().as_slice(), hmac_key.as_slice());
         assert_eq!(kex.uuid(), uuid);
         assert!(kex.moshpits_addr().is_none());
         assert!(kex.session_uuid().is_none());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn kex_state_machine_client_mode_full_sequence() {
+    async fn kex_state_machine_client_mode_full_sequence() -> Result<()> {
         use crate::kex::negotiate::NegotiatedAlgorithms;
 
         let (tx, rx) = unbounded_channel();
@@ -742,38 +744,42 @@ mod tests {
         let hmac_key = vec![4u8; 64];
         let uuid = Uuid::new_v4();
         let session_uuid = Uuid::new_v4();
-        let addr: SocketAddr = "127.0.0.1:50001".parse().unwrap();
+        let addr: SocketAddr = "127.0.0.1:50001".parse().expect("hardcoded test address");
         tx.send(KexEvent::NegotiatedAlgorithms(
             NegotiatedAlgorithms::default(),
         ))
-        .unwrap();
-        tx.send(KexEvent::KeyMaterial(key.clone())).unwrap();
+        .expect("test channel send");
+        tx.send(KexEvent::KeyMaterial(key.clone()))
+            .expect("test channel send");
         tx.send(KexEvent::HMACKeyMaterial(hmac_key.clone()))
-            .unwrap();
-        tx.send(KexEvent::Uuid(uuid)).unwrap();
-        tx.send(KexEvent::SessionInfo(session_uuid, false)).unwrap();
-        tx.send(KexEvent::MoshpitsAddr(addr)).unwrap();
-        let kex = sm.handle_events(true).await.unwrap();
+            .expect("test channel send");
+        tx.send(KexEvent::Uuid(uuid)).expect("test channel send");
+        tx.send(KexEvent::SessionInfo(session_uuid, false))
+            .expect("test channel send");
+        tx.send(KexEvent::MoshpitsAddr(addr))
+            .expect("test channel send");
+        let kex = sm.handle_events(true).await?;
         assert_eq!(kex.key().as_slice(), key.as_slice());
         assert_eq!(kex.hmac_key().as_slice(), hmac_key.as_slice());
         assert_eq!(kex.uuid(), uuid);
         assert_eq!(kex.session_uuid(), Some(session_uuid));
         assert_eq!(kex.moshpits_addr(), Some(addr));
         assert!(!kex.is_resume());
+        Ok(())
     }
 
     #[tokio::test]
     async fn kex_state_machine_wrong_event_order_returns_invalid_state() {
         let (tx, rx) = unbounded_channel();
         let mut sm = KexStateMachine::builder().rx_event(rx).build();
-        // Send Uuid when state is AwaitingNegotiatedAlgorithms — wrong order
-        tx.send(KexEvent::Uuid(Uuid::new_v4())).unwrap();
+        tx.send(KexEvent::Uuid(Uuid::new_v4()))
+            .expect("test channel send");
         drop(tx);
         let result = sm.handle_events(true).await;
         assert!(result.is_err());
         assert!(
             result
-                .unwrap_err()
+                .expect_err("expected InvalidKexState error")
                 .downcast_ref::<MoshpitError>()
                 .is_some_and(|e| *e == MoshpitError::InvalidKexState),
         );
@@ -798,7 +804,7 @@ mod tests {
     #[test]
     fn kex_mode_display_formatting() {
         assert_eq!(format!("{}", KexMode::Client), "Client");
-        let addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let addr: SocketAddr = "127.0.0.1:12345".parse().expect("hardcoded test address");
         assert_eq!(
             format!("{}", KexMode::Server(addr)),
             "Server(127.0.0.1:12345)"
@@ -1009,13 +1015,13 @@ mod tests {
     async fn kex_state_machine_no_common_algorithm_returns_error() {
         let (tx, rx) = unbounded_channel();
         let mut sm = KexStateMachine::builder().rx_event(rx).build();
-        tx.send(KexEvent::NoCommonAlgorithm).unwrap();
+        tx.send(KexEvent::NoCommonAlgorithm)
+            .expect("test channel send");
         drop(tx);
         let result = sm.handle_events(true).await;
-        assert!(result.is_err());
         assert!(
             result
-                .unwrap_err()
+                .expect_err("expected NoCommonAlgorithm error")
                 .downcast_ref::<MoshpitError>()
                 .is_some_and(|e| *e == MoshpitError::NoCommonAlgorithm),
         );

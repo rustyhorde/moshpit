@@ -141,11 +141,11 @@ impl Vault {
         };
 
         let mut out = VAULT_HEADER.to_vec();
-        write_lv(&mut out, VAULT_CIPHER.as_bytes());
-        write_lv(&mut out, hash.as_bytes());
-        write_lv(&mut out, &salt_bytes);
-        write_lv(&mut out, &nonce_bytes);
-        write_lv(&mut out, &ciphertext);
+        write_lv(&mut out, VAULT_CIPHER.as_bytes())?;
+        write_lv(&mut out, hash.as_bytes())?;
+        write_lv(&mut out, &salt_bytes)?;
+        write_lv(&mut out, &nonce_bytes)?;
+        write_lv(&mut out, &ciphertext)?;
 
         let encoded = STANDARD.encode(&out);
 
@@ -233,9 +233,9 @@ impl Vault {
     pub(crate) fn save_plaintext(&self, path: &Path) -> Result<()> {
         let payload = encode_to_vec(&self.entries, standard())?;
         let mut out = VAULT_HEADER.to_vec();
-        write_lv(&mut out, VAULT_NONE_CIPHER.as_bytes());
-        write_lv(&mut out, VAULT_NONE_KDF.as_bytes());
-        write_lv(&mut out, &payload);
+        write_lv(&mut out, VAULT_NONE_CIPHER.as_bytes())?;
+        write_lv(&mut out, VAULT_NONE_KDF.as_bytes())?;
+        write_lv(&mut out, &payload)?;
         let encoded = STANDARD.encode(&out);
 
         let mut file = {
@@ -262,10 +262,11 @@ impl Vault {
     }
 }
 
-fn write_lv(out: &mut Vec<u8>, data: &[u8]) {
-    let len = u32::try_from(data.len()).expect("data too large for vault field");
+fn write_lv(out: &mut Vec<u8>, data: &[u8]) -> Result<()> {
+    let len = u32::try_from(data.len()).map_err(|_| anyhow!("vault field exceeds 4 GiB limit"))?;
     out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(data);
+    Ok(())
 }
 
 fn read_lv(buf: &mut BytesMut) -> Result<BytesMut> {
@@ -360,38 +361,35 @@ mod tests {
         use base64::Engine as _;
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("vault");
-        // Write base64-encoded garbage that decodes to something with wrong header
         let garbage = STANDARD.encode(b"not-a-valid-vault");
-        std::fs::write(&path, garbage.as_bytes()).unwrap();
+        std::fs::write(&path, garbage.as_bytes()).expect("write test file");
         let result = Vault::load_encrypted(&path, "any");
-        assert!(result.is_err());
         assert!(
             result
-                .unwrap_err()
+                .expect_err("expected load error on invalid header")
                 .to_string()
                 .contains("invalid vault header")
         );
     }
 
     #[test]
-    fn vault_load_unsupported_cipher() {
+    fn vault_load_unsupported_cipher() -> Result<()> {
         use base64::Engine as _;
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("vault");
-        // Build a valid header but with an unknown cipher name
         let mut out = VAULT_HEADER.to_vec();
-        write_lv(&mut out, b"unknown-cipher");
-        write_lv(&mut out, b"none");
+        write_lv(&mut out, b"unknown-cipher")?;
+        write_lv(&mut out, b"none")?;
         let encoded = STANDARD.encode(&out);
-        std::fs::write(&path, encoded.as_bytes()).unwrap();
+        std::fs::write(&path, encoded.as_bytes()).expect("write test file");
         let result = Vault::load_encrypted(&path, "any");
-        assert!(result.is_err());
         assert!(
             result
-                .unwrap_err()
+                .expect_err("expected load error on unknown cipher")
                 .to_string()
                 .contains("unsupported vault cipher")
         );
+        Ok(())
     }
 
     #[test]

@@ -99,18 +99,20 @@ impl Encode for UuidWrapper {
 
 #[cfg(test)]
 mod tests {
+    use anyhow::Result;
     use bincode_next::{config::standard, decode_from_slice, encode_to_vec};
     use uuid::Uuid;
 
     use super::UuidWrapper;
 
     #[test]
-    fn uuid_wrapper_bincode_round_trip() {
+    fn uuid_wrapper_bincode_round_trip() -> Result<()> {
         let uuid = Uuid::new_v4();
         let wrapper = UuidWrapper::new(uuid);
-        let encoded = encode_to_vec(wrapper, standard()).unwrap();
-        let (decoded, _): (UuidWrapper, _) = decode_from_slice(&encoded, standard()).unwrap();
+        let encoded = encode_to_vec(wrapper, standard())?;
+        let (decoded, _): (UuidWrapper, _) = decode_from_slice(&encoded, standard())?;
         assert_eq!(decoded.as_uuid(), uuid);
+        Ok(())
     }
 
     #[test]

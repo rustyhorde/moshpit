@@ -880,14 +880,13 @@ mod tests {
     // +----[SHA256]-----+
     //
     #[test]
-    fn test_load_private_key_unenc() {
+    fn test_load_private_key_unenc() -> Result<()> {
         let priv_key_path = PathBuf::from("tests/keys/id_x25519_test");
-        let result = load_private_key(&priv_key_path);
-        assert!(result.is_ok());
-        let (unencrypted_key_pair_opt, encrypted_key_pair_opt) = result.unwrap();
+        let (unencrypted_key_pair_opt, encrypted_key_pair_opt) = load_private_key(&priv_key_path)?;
         assert!(unencrypted_key_pair_opt.is_some());
         assert!(encrypted_key_pair_opt.is_none());
-        let unencrypted_key_pair = unencrypted_key_pair_opt.unwrap();
+        let unencrypted_key_pair = unencrypted_key_pair_opt
+            .ok_or_else(|| anyhow::anyhow!("expected unencrypted key pair"))?;
         let public_key_bytes = unencrypted_key_pair.public_key.as_ref();
         let expected_public_key_bytes = vec![
             0x38, 0x43, 0x92, 0xD7, 0x3E, 0xEA, 0x2F, 0x77, 0x6B, 0x45, 0x7B, 0x99, 0xFD, 0xD6,
@@ -895,17 +894,17 @@ mod tests {
             0x93, 0xD4, 0xF5, 0x5B,
         ];
         assert_eq!(public_key_bytes, expected_public_key_bytes.as_slice());
+        Ok(())
     }
 
     #[test]
     fn test_load_private_key_enc() -> Result<()> {
         let priv_key_path = PathBuf::from("tests/keys/id_x25519_test_enc");
-        let result = load_private_key(&priv_key_path);
-        assert!(result.is_ok());
-        let (unencrypted_key_pair_opt, encrypted_key_pair_opt) = result.unwrap();
+        let (unencrypted_key_pair_opt, encrypted_key_pair_opt) = load_private_key(&priv_key_path)?;
         assert!(unencrypted_key_pair_opt.is_none());
         assert!(encrypted_key_pair_opt.is_some());
-        let encrypted_key_pair = encrypted_key_pair_opt.unwrap();
+        let encrypted_key_pair =
+            encrypted_key_pair_opt.ok_or_else(|| anyhow::anyhow!("expected encrypted key pair"))?;
         assert!(encrypted_key_pair.kdf.starts_with("$argon2id$"));
         let public_key_bytes = encrypted_key_pair.public_key.as_slice();
         let expected_public_key_bytes = vec![
@@ -934,7 +933,7 @@ mod tests {
     fn test_generate_key_pair_unencrypted() -> Result<()> {
         let key_pair = super::KeyPair::generate_key_pair(
             None,
-            super::KexMode::Server("0.0.0.0:0".parse().unwrap()),
+            super::KexMode::Server("0.0.0.0:0".parse().expect("hardcoded address")),
             super::KEY_ALGORITHM_X25519,
         )?;
         let mut priv_key_bytes = vec![];
@@ -964,7 +963,7 @@ mod tests {
         ] {
             let key_pair = super::KeyPair::generate_key_pair(
                 None,
-                super::KexMode::Server("0.0.0.0:0".parse().unwrap()),
+                super::KexMode::Server("0.0.0.0:0".parse().expect("hardcoded address")),
                 key_alg,
             )?;
             let dir = tempfile::TempDir::new()?;
@@ -1051,7 +1050,7 @@ mod tests {
     fn test_generate_key_pair_p384() -> Result<()> {
         let key_pair = super::KeyPair::generate_key_pair(
             None,
-            super::KexMode::Server("0.0.0.0:0".parse().unwrap()),
+            super::KexMode::Server("0.0.0.0:0".parse().expect("hardcoded address")),
             super::KEY_ALGORITHM_P384,
         )?;
         let dir = tempfile::TempDir::new()?;
@@ -1073,7 +1072,7 @@ mod tests {
     fn test_generate_key_pair_p256() -> Result<()> {
         let key_pair = super::KeyPair::generate_key_pair(
             None,
-            super::KexMode::Server("0.0.0.0:0".parse().unwrap()),
+            super::KexMode::Server("0.0.0.0:0".parse().expect("hardcoded address")),
             super::KEY_ALGORITHM_P256,
         )?;
         let dir = tempfile::TempDir::new()?;
@@ -1108,7 +1107,7 @@ mod tests {
         assert!(
             super::KeyPair::generate_key_pair(
                 None,
-                super::KexMode::Server("0.0.0.0:0".parse().unwrap()),
+                super::KexMode::Server("0.0.0.0:0".parse().expect("hardcoded address")),
                 "unknown-alg",
             )
             .is_err()
@@ -1120,7 +1119,7 @@ mod tests {
         let passphrase = "my-test-passphrase".to_string();
         let key_pair = super::KeyPair::generate_key_pair(
             Some(&passphrase),
-            super::KexMode::Server("0.0.0.0:0".parse().unwrap()),
+            super::KexMode::Server("0.0.0.0:0".parse().expect("hardcoded address")),
             super::KEY_ALGORITHM_X25519,
         )?;
         let dir = tempfile::TempDir::new()?;
@@ -1145,7 +1144,7 @@ mod tests {
         let passphrase = "ml-dsa-passphrase".to_string();
         let key_pair = super::KeyPair::generate_key_pair(
             Some(&passphrase),
-            super::KexMode::Server("0.0.0.0:0".parse().unwrap()),
+            super::KexMode::Server("0.0.0.0:0".parse().expect("hardcoded address")),
             super::KEY_ALGORITHM_ML_DSA_44,
         )?;
         let dir = tempfile::TempDir::new()?;

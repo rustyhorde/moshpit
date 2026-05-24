@@ -15,6 +15,7 @@
 
 use std::path::PathBuf;
 
+use anyhow::Result;
 use bincode_next::{config::standard, encode_to_vec};
 use libmoshpit::{AgentIdentityInfo, AgentResponse};
 use tokio::{
@@ -24,19 +25,20 @@ use tokio::{
 
 /// Minimal in-process server: accepts one connection, handles one request,
 /// responds, then exits.
-async fn run_one_shot_server(socket_path: PathBuf, response: AgentResponse) {
-    let listener = UnixListener::bind(&socket_path).unwrap();
-    let (mut stream, _) = listener.accept().await.unwrap();
+async fn run_one_shot_server(socket_path: PathBuf, response: AgentResponse) -> Result<()> {
+    let listener = UnixListener::bind(&socket_path)?;
+    let (mut stream, _) = listener.accept().await?;
 
-    let req_len = stream.read_u32().await.unwrap() as usize;
+    let req_len = stream.read_u32().await? as usize;
     let mut buf = vec![0u8; req_len];
-    stream.read_exact(&mut buf).await.unwrap();
+    stream.read_exact(&mut buf).await?;
 
-    let encoded = encode_to_vec(&response, standard()).unwrap();
-    let len = u32::try_from(encoded.len()).unwrap();
-    stream.write_all(&len.to_be_bytes()).await.unwrap();
-    stream.write_all(&encoded).await.unwrap();
-    stream.flush().await.unwrap();
+    let encoded = encode_to_vec(&response, standard())?;
+    let len = u32::try_from(encoded.len())?;
+    stream.write_all(&len.to_be_bytes()).await?;
+    stream.write_all(&encoded).await?;
+    stream.flush().await?;
+    Ok(())
 }
 
 fn temp_socket_path(name: &str) -> PathBuf {
@@ -44,7 +46,7 @@ fn temp_socket_path(name: &str) -> PathBuf {
 }
 
 #[tokio::test]
-async fn agent_client_list_identities() {
+async fn agent_client_list_identities() -> Result<()> {
     let path = temp_socket_path("list");
     let server_path = path.clone();
     let expected = vec![AgentIdentityInfo {
@@ -60,17 +62,18 @@ async fn agent_client_list_identities() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let client = libmoshpit::AgentClient::new(path.clone());
-    let ids = client.list_identities().await.unwrap();
+    let ids = client.list_identities().await?;
     assert_eq!(ids.len(), 1);
     assert_eq!(ids[0].fingerprint, "SHA256:test");
     assert_eq!(ids[0].algorithm, "X25519");
 
-    server.await.unwrap();
+    server.await??;
     let _ = std::fs::remove_file(&path);
+    Ok(())
 }
 
 #[tokio::test]
-async fn agent_client_list_supported_identities() {
+async fn agent_client_list_supported_identities() -> Result<()> {
     let path = temp_socket_path("list-supported");
     let server_path = path.clone();
     let expected = vec![AgentIdentityInfo {
@@ -86,18 +89,18 @@ async fn agent_client_list_supported_identities() {
     let client = libmoshpit::AgentClient::new(path.clone());
     let ids = client
         .list_supported_identities(&["P384", "P256", "X25519"])
-        .await
-        .unwrap();
+        .await?;
     assert_eq!(ids.len(), 1);
     assert_eq!(ids[0].algorithm, "P384");
     assert_eq!(ids[0].fingerprint, "SHA256:filtered");
 
-    server.await.unwrap();
+    server.await??;
     let _ = std::fs::remove_file(&path);
+    Ok(())
 }
 
 #[tokio::test]
-async fn agent_client_get_public_key() {
+async fn agent_client_get_public_key() -> Result<()> {
     let path = temp_socket_path("pubkey");
     let server_path = path.clone();
     let pk_bytes = b"moshpit AAAA== user@host".to_vec();
@@ -107,15 +110,16 @@ async fn agent_client_get_public_key() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let client = libmoshpit::AgentClient::new(path.clone());
-    let pk = client.get_public_key("SHA256:test").await.unwrap();
+    let pk = client.get_public_key("SHA256:test").await?;
     assert_eq!(pk, pk_bytes);
 
-    server.await.unwrap();
+    server.await??;
     let _ = std::fs::remove_file(&path);
+    Ok(())
 }
 
 #[tokio::test]
-async fn agent_client_sign() {
+async fn agent_client_sign() -> Result<()> {
     let path = temp_socket_path("sign");
     let server_path = path.clone();
     let sig_bytes = vec![0xDE, 0xAD, 0xBE, 0xEF];
@@ -125,15 +129,16 @@ async fn agent_client_sign() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let client = libmoshpit::AgentClient::new(path.clone());
-    let sig = client.sign("SHA256:test", b"data").await.unwrap();
+    let sig = client.sign("SHA256:test", b"data").await?;
     assert_eq!(sig, sig_bytes);
 
-    server.await.unwrap();
+    server.await??;
     let _ = std::fs::remove_file(&path);
+    Ok(())
 }
 
 #[tokio::test]
-async fn agent_client_error_response() {
+async fn agent_client_error_response() -> Result<()> {
     let path = temp_socket_path("error");
     let server_path = path.clone();
     let server_response = AgentResponse::Error("no such identity".into());
@@ -144,14 +149,16 @@ async fn agent_client_error_response() {
     let client = libmoshpit::AgentClient::new(path.clone());
     let result = client.get_public_key("SHA256:missing").await;
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("no such identity"));
+    let err_msg = result.expect_err("expected error response").to_string();
+    assert!(err_msg.contains("no such identity"));
 
-    server.await.unwrap();
+    server.await??;
     let _ = std::fs::remove_file(&path);
+    Ok(())
 }
 
 #[tokio::test]
-async fn agent_client_list_identities_unexpected_response() {
+async fn agent_client_list_identities_unexpected_response() -> Result<()> {
     let path = temp_socket_path("list-unexpected");
     let server_path = path.clone();
     // Return PublicKey instead of Identities — client should error
@@ -164,12 +171,13 @@ async fn agent_client_list_identities_unexpected_response() {
     let result = client.list_identities().await;
     assert!(result.is_err());
 
-    server.await.unwrap();
+    server.await??;
     let _ = std::fs::remove_file(&path);
+    Ok(())
 }
 
 #[tokio::test]
-async fn agent_client_list_supported_identities_unexpected_response() {
+async fn agent_client_list_supported_identities_unexpected_response() -> Result<()> {
     let path = temp_socket_path("list-sup-unexpected");
     let server_path = path.clone();
     // Return Signature instead of Identities — client should error
@@ -182,12 +190,13 @@ async fn agent_client_list_supported_identities_unexpected_response() {
     let result = client.list_supported_identities(&["P384", "X25519"]).await;
     assert!(result.is_err());
 
-    server.await.unwrap();
+    server.await??;
     let _ = std::fs::remove_file(&path);
+    Ok(())
 }
 
 #[tokio::test]
-async fn agent_client_get_public_key_unexpected_response() {
+async fn agent_client_get_public_key_unexpected_response() -> Result<()> {
     let path = temp_socket_path("pubkey-unexpected");
     let server_path = path.clone();
     // Return Identities instead of PublicKey — client should error
@@ -200,12 +209,13 @@ async fn agent_client_get_public_key_unexpected_response() {
     let result = client.get_public_key("SHA256:test").await;
     assert!(result.is_err());
 
-    server.await.unwrap();
+    server.await??;
     let _ = std::fs::remove_file(&path);
+    Ok(())
 }
 
 #[tokio::test]
-async fn agent_client_sign_unexpected_response() {
+async fn agent_client_sign_unexpected_response() -> Result<()> {
     let path = temp_socket_path("sign-unexpected");
     let server_path = path.clone();
     // Return Ok instead of Signature — client should error
@@ -218,6 +228,7 @@ async fn agent_client_sign_unexpected_response() {
     let result = client.sign("SHA256:test", b"data").await;
     assert!(result.is_err());
 
-    server.await.unwrap();
+    server.await??;
     let _ = std::fs::remove_file(&path);
+    Ok(())
 }
