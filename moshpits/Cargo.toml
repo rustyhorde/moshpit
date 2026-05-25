@@ -1,8 +1,8 @@
 [package]
 authors = ["Jason Ozias <jason.g.ozias@gmail.com>"]
 categories = ["command-line-interface", "network-programming", "cryptography"]
-description = "A Rust implementation of in the same vein as Mosh, the mobile shell."
-documentation = "https://docs.rs/libmoshpit"
+description = "moshpits server (mps) — server daemon for moshpit remote terminal sessions"
+documentation = "https://github.com/rustyhorde/moshpit#moshpits-server-mps"
 edition = "2024"
 homepage = "https://github.com/rustyhorde/moshpit"
 keywords = ["ssh", "mosh"]
@@ -48,7 +48,3 @@ tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test
 anyhow = { workspace = true }
 rustversion = { workspace = true }
 vergen-gix = { workspace = true }
-
-[package.metadata.docs.rs]
-all-features = true
-rustdoc-args = ["--cfg", "docsrs"]

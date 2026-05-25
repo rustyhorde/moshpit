@@ -62,6 +62,17 @@ server_path = ["/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/s
 # Default: false
 path_locked = false
 
+# ── Mount namespace escape ────────────────────────────────────────────────────
+# When the daemon runs inside a restricted mount namespace (e.g. a systemd
+# service unit that previously had ProtectSystem=full or PrivateTmp=true, or
+# inside a container), spawned user shells inherit those read-only/private
+# mounts.  With namespace_escape = true (the default), moshpits compares its
+# own mount namespace to PID 1's at spawn time and, if they differ, joins the
+# host namespace before exec — giving the shell the same filesystem view as an
+# SSH login session.  Requires the daemon to run as root (CAP_SYS_ADMIN).
+# Only active on Linux.  Set to false to disable this behaviour.
+# namespace_escape = true
+
 # ── Server listen address ─────────────────────────────────────────────────────
 [mps]
 ip   = "0.0.0.0"  # IP address to listen on for client connections

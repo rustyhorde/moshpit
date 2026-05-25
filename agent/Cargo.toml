@@ -2,7 +2,7 @@
 authors = ["Jason Ozias <jason.g.ozias@gmail.com>"]
 categories = ["command-line-interface", "network-programming", "cryptography"]
 description = "moshpit agent — holds identity keys in memory and serves them over a Unix socket"
-documentation = "https://docs.rs/libmoshpit"
+documentation = "https://github.com/rustyhorde/moshpit#moshpit-agent-mpa"
 edition = "2024"
 homepage = "https://github.com/rustyhorde/moshpit"
 keywords = ["ssh", "mosh"]
@@ -66,10 +66,6 @@ anyhow = { workspace = true }
 pkg-config = "0.3"
 rustversion = { workspace = true }
 vergen-gix = { workspace = true }
-
-[package.metadata.docs.rs]
-all-features = true
-rustdoc-args = ["--cfg", "docsrs"]
 
 [[package.metadata.cargo-matrix.channel]]
 name = "linux"

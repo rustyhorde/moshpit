@@ -6,6 +6,8 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
+//! Key generation, loading, encryption, and fingerprinting for identity key pairs.
+
 use std::{
     fs::File,
     io::{BufWriter, Read, Write},

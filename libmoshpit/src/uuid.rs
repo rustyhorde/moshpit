@@ -6,6 +6,8 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
+//! UUID wrapper for session identifiers.
+
 use std::fmt::{Display, Formatter};
 
 use bincode_next::{

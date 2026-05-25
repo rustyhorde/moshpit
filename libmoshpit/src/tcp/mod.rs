@@ -6,5 +6,7 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
+//! Async TCP connection reader/writer used during the key exchange phase.
+
 pub(crate) mod reader;
 pub(crate) mod writer;

@@ -6,7 +6,7 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-//! moshpit-agent — key agent for moshpit
+//! `mpa` — moshpit key agent: holds decrypted identity keys in memory and serves signing requests to mp over a Unix socket.
 
 // rustc lints
 #![cfg_attr(

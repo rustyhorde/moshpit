@@ -2,7 +2,7 @@
 authors = ["Jason Ozias <jason.g.ozias@gmail.com>"]
 categories = ["command-line-interface", "network-programming", "cryptography"]
 description = "Perform various key tasks for moshpit"
-documentation = "https://docs.rs/libmoshpit"
+documentation = "https://github.com/rustyhorde/moshpit#mp-keygen"
 edition = "2024"
 homepage = "https://github.com/rustyhorde/moshpit"
 keywords = ["ssh", "mosh"]
@@ -31,7 +31,3 @@ vergen-pretty = { workspace = true }
 anyhow = { workspace = true }
 rustversion = { workspace = true }
 vergen-gix = { workspace = true }
-
-[package.metadata.docs.rs]
-all-features = true
-rustdoc-args = ["--cfg", "docsrs"]

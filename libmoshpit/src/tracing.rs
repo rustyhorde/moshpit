@@ -6,6 +6,8 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
+//! Tracing and logging initialisation for the moshpit binary crates.
+
 use std::path::PathBuf;
 
 use anyhow::Result;
