@@ -5,3 +5,4 @@ test_key
 .github/prompts
 *.bin
 scripts/logs/
+TODO.md

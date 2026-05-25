@@ -146,7 +146,7 @@ async fn show_reconnect_banner(stdout_tx: &Sender<Vec<u8>>) {
     // ESC[K          – erase to end of line (fills line with blue)
     // ESC[0m         – reset attributes
     // ESC[u          – restore cursor position
-    let msg = b"\x1b[s\x1b[1;1H\x1b[44;97;1m [moshpit] server unreachable, reconnecting... (Ctrl-^ . to quit) \x1b[K\x1b[0m\x1b[u";
+    let msg = b"\x1b[s\x1b[1;1H\x1b[44;97;1m [moshpit] server unreachable, reconnecting... \x1b[K\x1b[0m\x1b[u";
     drop(stdout_tx.send(msg.to_vec()).await);
 }
 
@@ -189,9 +189,18 @@ async fn run_escape_listener(
     kb_rx: Arc<Mutex<Receiver<Vec<u8>>>>,
     exit_token: CancellationToken,
     done_token: CancellationToken,
+    ready_tx: tokio::sync::oneshot::Sender<()>,
 ) {
     let mut state = EscapeState::Normal;
-    let mut rx = kb_rx.lock().await;
+    // Acquire the lock interruptibly: if the countdown finishes before we can
+    // get the lock (e.g. the session forwarder is still holding it), return
+    // immediately so countdown_with_escape doesn't block on escape_handle.await.
+    let mut rx = select! {
+        guard = kb_rx.lock() => guard,
+        () = done_token.cancelled() => return,
+    };
+    // Lock acquired — notify the caller so it can display the Ctrl-^. hint.
+    let _ = ready_tx.send(());
     loop {
         select! {
             () = done_token.cancelled() => break,
@@ -612,11 +621,16 @@ async fn countdown_with_escape(
     kb_rx: Arc<Mutex<Receiver<Vec<u8>>>>,
 ) -> bool {
     let escape_done = CancellationToken::new();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let escape_handle = spawn(run_escape_listener(
         kb_rx,
         exit_token.clone(),
         escape_done.clone(),
+        ready_tx,
     ));
+    // Wait for the listener to acquire kb_rx before showing the Ctrl-^. hint.
+    // In practice nearly instant; 200ms guards against a slow forwarder cleanup.
+    drop(time::timeout(Duration::from_millis(200), ready_rx).await);
     let exiting = countdown_reconnect_banner(
         stdout_tx,
         backoff_secs,
@@ -716,7 +730,13 @@ async fn run_session_loop(
                     time::sleep(Duration::from_millis(100)).await;
                     std::process::exit(0);
                 }
-                // Session dropped — show the reconnecting banner while we retry.
+                // Session dropped — restore the terminal (the server-side app may
+                // have left us in alternate-screen mode) then show the reconnect banner.
+                drop(crossterm::execute!(
+                    stdout(),
+                    crossterm::terminal::LeaveAlternateScreen,
+                    crossterm::cursor::Show,
+                ));
                 show_reconnect_banner(&stdout_tx).await;
                 time::sleep(Duration::from_millis(500)).await;
             }
@@ -809,7 +829,9 @@ async fn connect_and_kex(
     // Refresh resume UUID from disk (may have been updated by previous connection).
     let _ = config.set_resume_session_uuid(read_session_uuid(server_ip, server_port));
 
-    let socket = TcpStream::connect(socket_addr).await?;
+    let socket = time::timeout(KEX_TIMEOUT, TcpStream::connect(socket_addr))
+        .await
+        .map_err(|_| anyhow::anyhow!("TCP connection timed out after {KEX_TIMEOUT:?}"))??;
     info!("Connected to {}", socket.peer_addr()?);
 
     let cache = pass_cache.clone();
@@ -1090,7 +1112,7 @@ async fn run_udp_session(
     let pred_fwd = prediction.clone();
     let stdout_tx_fwd = stdout_tx;
     let in_alt_screen_fwd = Arc::clone(&in_alt_screen);
-    let _forwarder = spawn(async move {
+    let forwarder = spawn(async move {
         let mut rx = kb_rx.lock().await;
         let mut escape_state = EscapeState::Normal;
         loop {
@@ -1170,6 +1192,7 @@ async fn run_udp_session(
             }
         }
     });
+    let forwarder_abort = forwarder.abort_handle();
 
     // Wait for a reconnect signal or a user-requested exit (Ctrl-^ .).
     select! {
@@ -1177,8 +1200,17 @@ async fn run_udp_session(
         () = exit_token.cancelled() => {}
     }
     token.cancel();
-    // Allow the stdin forwarder to release the kb_rx mutex before the next session.
-    time::sleep(Duration::from_millis(150)).await;
+    // Wait for the forwarder to release the kb_rx mutex. Give it 500 ms to exit
+    // gracefully (it should be nearly instant once the token fires), then abort
+    // it to guarantee the lock is released before we return.
+    if time::timeout(Duration::from_millis(500), forwarder)
+        .await
+        .is_err()
+    {
+        forwarder_abort.abort();
+        // Yield so the executor can drop the aborted task and release the lock.
+        tokio::task::yield_now().await;
+    }
     Ok(())
 }
 
@@ -2093,7 +2125,13 @@ mod tests {
             let exit_token = CancellationToken::new();
             let done_token = CancellationToken::new();
             done_token.cancel();
-            run_escape_listener(kb_rx, exit_token.clone(), done_token).await;
+            run_escape_listener(
+                kb_rx,
+                exit_token.clone(),
+                done_token,
+                tokio::sync::oneshot::channel().0,
+            )
+            .await;
             assert!(!exit_token.is_cancelled());
             drop(tx);
         }
@@ -2105,7 +2143,13 @@ mod tests {
             let exit_token = CancellationToken::new();
             let done_token = CancellationToken::new();
             drop(tx);
-            run_escape_listener(kb_rx, exit_token.clone(), done_token).await;
+            run_escape_listener(
+                kb_rx,
+                exit_token.clone(),
+                done_token,
+                tokio::sync::oneshot::channel().0,
+            )
+            .await;
             assert!(!exit_token.is_cancelled());
         }
 
@@ -2117,7 +2161,13 @@ mod tests {
             let done_token = CancellationToken::new();
             tx.send(b"hello".to_vec()).await?;
             drop(tx);
-            run_escape_listener(kb_rx, exit_token.clone(), done_token).await;
+            run_escape_listener(
+                kb_rx,
+                exit_token.clone(),
+                done_token,
+                tokio::sync::oneshot::channel().0,
+            )
+            .await;
             assert!(!exit_token.is_cancelled());
             Ok(())
         }
@@ -2131,7 +2181,13 @@ mod tests {
             // 0x1E followed by 'x' — state resets to Normal
             tx.send(vec![0x1E, b'x']).await?;
             drop(tx);
-            run_escape_listener(kb_rx, exit_token.clone(), done_token).await;
+            run_escape_listener(
+                kb_rx,
+                exit_token.clone(),
+                done_token,
+                tokio::sync::oneshot::channel().0,
+            )
+            .await;
             assert!(!exit_token.is_cancelled());
             Ok(())
         }
@@ -2146,7 +2202,13 @@ mod tests {
             // Multiple 0x1E bytes — stays in PendingDot but never completes
             tx.send(vec![0x1E, 0x1E, 0x1E]).await?;
             drop(tx);
-            run_escape_listener(kb_rx, exit_token.clone(), done_token).await;
+            run_escape_listener(
+                kb_rx,
+                exit_token.clone(),
+                done_token,
+                tokio::sync::oneshot::channel().0,
+            )
+            .await;
             assert!(!exit_token.is_cancelled());
             Ok(())
         }
@@ -2158,7 +2220,13 @@ mod tests {
             let exit_token = CancellationToken::new();
             let done_token = CancellationToken::new();
             tx.send(vec![0x1E, 0x2E]).await?;
-            run_escape_listener(kb_rx, exit_token.clone(), done_token).await;
+            run_escape_listener(
+                kb_rx,
+                exit_token.clone(),
+                done_token,
+                tokio::sync::oneshot::channel().0,
+            )
+            .await;
             assert!(exit_token.is_cancelled());
             Ok(())
         }
@@ -2171,7 +2239,13 @@ mod tests {
             let done_token = CancellationToken::new();
             tx.send(vec![0x1E]).await?;
             tx.send(vec![0x2E]).await?;
-            run_escape_listener(kb_rx, exit_token.clone(), done_token).await;
+            run_escape_listener(
+                kb_rx,
+                exit_token.clone(),
+                done_token,
+                tokio::sync::oneshot::channel().0,
+            )
+            .await;
             assert!(exit_token.is_cancelled());
             Ok(())
         }
