@@ -26,7 +26,7 @@ tracing = { version = "0.1.44", features = [
   "release_max_level_trace",
 ] }
 tracing-subscriber-init = { version = "0.2.6", features = ["tstime"] }
-uuid = { version = "1.23.1", features = ["v4"] }
+uuid = { version = "1.23.2", features = ["v4"] }
 vergen-gix = { version = "10.0.0-beta.8", features = [
   "build",
   "cargo",
