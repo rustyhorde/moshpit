@@ -16,21 +16,31 @@
 //!
 //! `vt100::Screen` exposes `contents_diff(prev: &vt100::Screen) -> Vec<u8>`
 //! which returns the bytes that transition a terminal showing `prev` to one
-//! showing `self`.  We use this as the baseline differential and then apply
-//! prediction overlays on top as a second pass:
+//! showing `self`, including the final cursor position, SGR attributes and
+//! cursor visibility.  Rather than diffing the server screen and then painting
+//! predictions on top as a separate pass, we build a single *target*
+//! framebuffer — the server screen with prediction overlays merged in as real
+//! cells and the cursor placed at its final position — and diff that:
 //!
-//! 1. `diff = current_screen.contents_diff(prev_screen)` – bring the physical
-//!    terminal up to date with the server-driven screen.
-//! 2. For each active overlay cell: `CSI row;col H` + SGR + character.
-//! 3. Restore the cursor to the predicted (or real) cursor position.
+//! 1. `frame = server_screen + predicted cells + final cursor` (a scratch
+//!    [`vt100::Parser`]).
+//! 2. `diff = frame.contents_diff(displayed)` – a fully self-contained update.
 //!
-//! We maintain a `vt100::Parser` that is advanced with every rendered output
-//! so that subsequent diffs are always computed against what is actually shown
-//! on the user's screen (real content + overlays).
+//! Because predictions are first-class cells in `frame`, a prediction that is
+//! later culled simply disappears from the next `frame`, and the diff repaints
+//! the real cell automatically — no stale glyph can be left behind.
+//!
+//! We maintain a `vt100::Parser` (`displayed`) that is advanced with exactly
+//! the bytes we emit, so subsequent diffs are always computed against what is
+//! actually shown on the user's screen.
 
-use std::fmt;
+use std::{
+    fmt,
+    sync::{Arc, Mutex},
+};
 
-use super::prediction::{OverlayCell, OverlayCursor};
+use super::emulator::Emulator;
+use super::prediction::{OverlayCell, OverlayCursor, PredictionEngine};
 
 /// A stateful differential renderer.
 pub struct Renderer {
@@ -82,74 +92,73 @@ impl Renderer {
         overlays: &[OverlayCell],
         cursor: Option<OverlayCursor>,
     ) -> Vec<u8> {
-        let mut out: Vec<u8> = Vec::with_capacity(4096);
-
-        // ── 1. diff the real screen against what we last displayed ───────
         let new_alt = screen.alternate_screen();
         let old_alt = self.displayed.screen().alternate_screen();
+        // An alt-screen buffer swap discards the previous buffer's contents, so
+        // a diff against `displayed` would be meaningless — force a full repaint.
+        let alt_changed = new_alt != old_alt;
 
-        // Emit the alt-screen transition before any content so the terminal is in the
-        // correct buffer before the diff / full-refresh bytes are applied.
+        // ── 1. build the target framebuffer (server screen + predictions) ──
+        let (rows, cols) = screen.size();
+        let mut frame = vt100::Parser::new(rows, cols, 0);
+        frame.process(&screen.contents_formatted());
+
+        // Merge predicted cells as real content so the diff treats them as
+        // first-class cells (and self-heals when they are later culled).
+        if !overlays.is_empty() {
+            let mut paint: Vec<u8> = Vec::with_capacity(overlays.len() * 12);
+            for cell in overlays {
+                write_to_vec(
+                    &mut paint,
+                    format_args!("\x1b[{};{}H", cell.row + 1, cell.col + 1),
+                );
+                if cell.flagged {
+                    paint.extend_from_slice(b"\x1b[4m");
+                }
+                let mut char_buf = [0u8; 4];
+                paint.extend_from_slice(cell.ch.encode_utf8(&mut char_buf).as_bytes());
+                if cell.flagged {
+                    paint.extend_from_slice(b"\x1b[24m");
+                }
+            }
+            frame.process(&paint);
+        }
+
+        // Place the cursor at its final resting position (predicted or real)
+        // inside the frame so the diff carries the correct cursor move.
+        let (cur_row, cur_col) = if let Some(oc) = cursor {
+            (oc.row, oc.col)
+        } else {
+            screen.cursor_position()
+        };
+        let mut mv: Vec<u8> = Vec::with_capacity(12);
+        write_to_vec(
+            &mut mv,
+            format_args!("\x1b[{};{}H", cur_row + 1, cur_col + 1),
+        );
+        frame.process(&mv);
+
+        // ── 2. emit the update ────────────────────────────────────────────
+        let mut out: Vec<u8> = Vec::with_capacity(4096);
+        // Emit the alt-screen transition first so the terminal is in the
+        // correct buffer before the content bytes are applied.
         if new_alt && !old_alt {
             out.extend_from_slice(b"\x1b[?1049h");
         } else if !new_alt && old_alt {
             out.extend_from_slice(b"\x1b[?1049l");
         }
 
-        if self.initialized {
-            let diff = screen.contents_diff(self.displayed.screen());
-            out.extend_from_slice(&diff);
+        if self.initialized && !alt_changed {
+            out.extend_from_slice(&frame.screen().contents_diff(self.displayed.screen()));
         } else {
-            // First render or after resize/invalidate: full refresh.
-            out.extend_from_slice(&screen.contents_formatted());
+            // First render, post-resize/invalidate, or an alt-screen swap.
+            out.extend_from_slice(&frame.screen().contents_formatted());
             self.initialized = true;
         }
 
-        // ── 2. paint overlay cells ───────────────────────────────────────
-        if !overlays.is_empty() {
-            // Save cursor position before painting overlays.
-            out.extend_from_slice(b"\x1b[s");
-
-            for cell in overlays {
-                // Move to cell position (1-based).
-                write_to_vec(
-                    &mut out,
-                    format_args!("\x1b[{};{}H", cell.row + 1, cell.col + 1),
-                );
-                if cell.flagged {
-                    // Underline on
-                    out.extend_from_slice(b"\x1b[4m");
-                }
-                // Write the predicted character.
-                let mut char_buf = [0u8; 4];
-                let s = cell.ch.encode_utf8(&mut char_buf);
-                out.extend_from_slice(s.as_bytes());
-                if cell.flagged {
-                    // Reset underline
-                    out.extend_from_slice(b"\x1b[24m");
-                }
-            }
-        }
-
-        // ── 3. position the cursor ───────────────────────────────────────
-        let (cur_row, cur_col) = if let Some(oc) = cursor {
-            (oc.row, oc.col)
-        } else {
-            screen.cursor_position()
-        };
-        write_to_vec(
-            &mut out,
-            format_args!("\x1b[{};{}H", cur_row + 1, cur_col + 1),
-        );
-
-        // Restore SGR to default in case overlays left state dirty.
-        if !overlays.is_empty() {
-            out.extend_from_slice(b"\x1b[m");
-            // We saved cursor before overlays; re-position explicitly above instead.
-        }
-
-        // ── 4. advance the "displayed" parser ────────────────────────────
-        // Process all bytes we just emitted so the next diff is correct.
+        // ── 3. advance the "displayed" parser ─────────────────────────────
+        // Process exactly the bytes we emit so the next diff is computed
+        // against what is physically on the user's screen.
         self.displayed.process(&out);
 
         out
@@ -202,6 +211,84 @@ pub fn paint_overlays_to_ansi(overlays: &[OverlayCell], cursor: Option<OverlayCu
     }
 
     out
+}
+
+/// Render a single clean update to the terminal after the server has changed
+/// the emulator's screen state.
+///
+/// Reconciles outstanding predictions against the new screen (`cull` +
+/// `apply`) and renders the result through the shared [`Renderer`], so the
+/// renderer remains the sole writer to the terminal and its `displayed`
+/// baseline stays exact.  Pass `with_predictions = false` to skip the
+/// prediction work entirely (e.g. in alternate-screen mode where a full-screen
+/// app owns the display).
+///
+/// Locks are always acquired in the order **emulator → prediction → renderer**
+/// to match [`render_prediction_update`] and avoid deadlocks.
+///
+/// # Panics
+/// Never panics; poisoned mutexes are recovered via [`std::sync::PoisonError`].
+#[must_use]
+pub fn render_server_update(
+    emulator: &Arc<Mutex<Emulator>>,
+    prediction: &Arc<Mutex<PredictionEngine>>,
+    renderer: &Arc<Mutex<Renderer>>,
+    with_predictions: bool,
+) -> Vec<u8> {
+    let emu = emulator
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let screen = emu.screen();
+    let (overlays, cursor) = if with_predictions {
+        let mut pred = prediction
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pred.cull(screen);
+        pred.apply(screen)
+    } else {
+        (Vec::new(), None)
+    };
+    let mut rend = renderer
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    rend.render(screen, &overlays, cursor)
+}
+
+/// Render a single clean update reflecting a locally-predicted keystroke.
+///
+/// Feeds each byte of `new_bytes` to the prediction engine, then renders the
+/// emulator's current screen with the resulting overlays through the shared
+/// [`Renderer`].  Unlike [`render_server_update`] this does **not** cull, since
+/// no new server data has arrived — it only adds the just-typed prediction.
+///
+/// Locks are always acquired in the order **emulator → prediction → renderer**.
+///
+/// # Panics
+/// Never panics; poisoned mutexes are recovered via [`std::sync::PoisonError`].
+#[must_use]
+pub fn render_prediction_update(
+    emulator: &Arc<Mutex<Emulator>>,
+    prediction: &Arc<Mutex<PredictionEngine>>,
+    renderer: &Arc<Mutex<Renderer>>,
+    new_bytes: &[u8],
+) -> Vec<u8> {
+    let emu = emulator
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let screen = emu.screen();
+    let (overlays, cursor) = {
+        let mut pred = prediction
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for &byte in new_bytes {
+            pred.new_user_byte(byte, screen);
+        }
+        pred.apply(screen)
+    };
+    let mut rend = renderer
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    rend.render(screen, &overlays, cursor)
 }
 
 // Helper: write a `fmt::Arguments` into a `Vec<u8>` without allocation.
@@ -306,10 +393,19 @@ mod tests {
         );
     }
 
+    // A stand-in for the user's physical terminal: feed it every byte the
+    // renderer emits and inspect the resulting screen state.  This mirrors the
+    // renderer's internal `displayed` parser and lets tests assert on *visual*
+    // outcomes instead of brittle escape-sequence substrings.
+    fn apply(term: &mut vt100::Parser, bytes: &[u8]) {
+        term.process(bytes);
+    }
+
     #[test]
-    fn render_with_overlay_cell_contains_overlay_character() {
+    fn render_with_overlay_cell_paints_overlay_character() {
         use super::super::prediction::OverlayCell;
         let mut r = Renderer::new(24, 80);
+        let mut term = vt100::Parser::new(24, 80, 0);
         let parser = vt100::Parser::new(24, 80, 0);
         let overlays = vec![OverlayCell {
             row: 0,
@@ -317,18 +413,19 @@ mod tests {
             ch: 'Z',
             flagged: false,
         }];
-        let out = r.render(parser.screen(), &overlays, None);
-        let s = String::from_utf8_lossy(&out);
-        assert!(
-            s.contains('Z'),
-            "overlay character 'Z' must appear in output"
+        apply(&mut term, &r.render(parser.screen(), &overlays, None));
+        assert_eq!(
+            term.screen().cell(0, 0).map(vt100::Cell::contents),
+            Some("Z"),
+            "overlay character 'Z' must be painted at (0,0)"
         );
     }
 
     #[test]
-    fn render_with_flagged_overlay_contains_underline_sequence() {
+    fn render_with_flagged_overlay_underlines_the_cell() {
         use super::super::prediction::OverlayCell;
         let mut r = Renderer::new(24, 80);
+        let mut term = vt100::Parser::new(24, 80, 0);
         let parser = vt100::Parser::new(24, 80, 0);
         let overlays = vec![OverlayCell {
             row: 2,
@@ -336,32 +433,87 @@ mod tests {
             ch: 'F',
             flagged: true,
         }];
-        let out = r.render(parser.screen(), &overlays, None);
-        let s = String::from_utf8_lossy(&out);
-        // Underline on: ESC[4m, underline off: ESC[24m
-        assert!(
-            s.contains("\x1b[4m"),
-            "flagged overlay must include underline-on sequence"
-        );
-        assert!(
-            s.contains("\x1b[24m"),
-            "flagged overlay must include underline-off sequence"
-        );
-        assert!(s.contains('F'));
+        apply(&mut term, &r.render(parser.screen(), &overlays, None));
+        let cell = term.screen().cell(2, 5).expect("cell exists");
+        assert_eq!(cell.contents(), "F");
+        assert!(cell.underline(), "flagged overlay cell must be underlined");
     }
 
     #[test]
     fn render_with_cursor_override_positions_cursor_at_override() {
         use super::super::prediction::OverlayCursor;
         let mut r = Renderer::new(24, 80);
+        let mut term = vt100::Parser::new(24, 80, 0);
         let parser = vt100::Parser::new(24, 80, 0);
         let cursor_override = Some(OverlayCursor { row: 5, col: 10 });
-        let out = r.render(parser.screen(), &[], cursor_override);
-        let s = String::from_utf8_lossy(&out);
-        // Cursor should be positioned at row+1=6, col+1=11 (1-based)
+        apply(&mut term, &r.render(parser.screen(), &[], cursor_override));
+        assert_eq!(
+            term.screen().cursor_position(),
+            (5, 10),
+            "cursor override must place the cursor at (5,10)"
+        );
+    }
+
+    #[test]
+    fn render_culled_prediction_self_heals() {
+        use super::super::prediction::OverlayCell;
+        // The server screen shows 'a' at (0,0).
+        let mut server = vt100::Parser::new(24, 80, 0);
+        server.process(b"a");
+
+        let mut r = Renderer::new(24, 80);
+        let mut term = vt100::Parser::new(24, 80, 0);
+
+        // Frame 1: a prediction overlays 'X' over the real 'a'.
+        let overlay = vec![OverlayCell {
+            row: 0,
+            col: 0,
+            ch: 'X',
+            flagged: false,
+        }];
+        apply(&mut term, &r.render(server.screen(), &overlay, None));
+        assert_eq!(
+            term.screen().cell(0, 0).map(vt100::Cell::contents),
+            Some("X"),
+            "prediction must be visible in frame 1"
+        );
+
+        // Frame 2: the prediction is culled (no overlays) — the real cell must
+        // be repainted with no leftover predicted glyph.
+        apply(&mut term, &r.render(server.screen(), &[], None));
+        assert_eq!(
+            term.screen().cell(0, 0).map(vt100::Cell::contents),
+            Some("a"),
+            "culled prediction must self-heal back to the real cell"
+        );
+    }
+
+    #[test]
+    fn render_no_sgr_bleed_after_flagged_overlay() {
+        use super::super::prediction::OverlayCell;
+        // Plain (non-underlined) server text "hi" at (0,0)-(0,1).
+        let mut server = vt100::Parser::new(24, 80, 0);
+        server.process(b"hi");
+
+        let mut r = Renderer::new(24, 80);
+        let mut term = vt100::Parser::new(24, 80, 0);
+
+        // A flagged (underlined) prediction at (0,5) must not leave underline
+        // state bleeding onto the plain server cells.
+        let overlay = vec![OverlayCell {
+            row: 0,
+            col: 5,
+            ch: 'P',
+            flagged: true,
+        }];
+        apply(&mut term, &r.render(server.screen(), &overlay, None));
         assert!(
-            s.contains("\x1b[6;11H"),
-            "cursor override must position cursor at (6,11): {s:?}"
+            !term.screen().cell(0, 0).expect("cell").underline(),
+            "plain server cell must not inherit the overlay's underline"
+        );
+        assert!(
+            term.screen().cell(0, 5).expect("cell").underline(),
+            "flagged overlay cell should be underlined"
         );
     }
 
@@ -431,5 +583,160 @@ mod tests {
         let after_resize = r.render(parser2.screen(), &[], None);
         assert!(r.initialized);
         assert!(!after_resize.is_empty());
+    }
+
+    use super::super::prediction::DisplayPreference;
+
+    /// The shared `(emulator, prediction, renderer)` trio the free-function
+    /// renderers operate on.
+    type RenderTrio = (
+        Arc<Mutex<Emulator>>,
+        Arc<Mutex<PredictionEngine>>,
+        Arc<Mutex<Renderer>>,
+    );
+
+    // Build the render trio with a blank 24×80 screen.
+    fn render_trio() -> RenderTrio {
+        (
+            Arc::new(Mutex::new(Emulator::new(24, 80))),
+            Arc::new(Mutex::new(PredictionEngine::new(DisplayPreference::Always))),
+            Arc::new(Mutex::new(Renderer::new(24, 80))),
+        )
+    }
+
+    #[test]
+    fn render_server_update_paints_emulator_screen() {
+        let (emulator, prediction, renderer) = render_trio();
+        emulator.lock().unwrap().process(b"server text");
+        let mut term = vt100::Parser::new(24, 80, 0);
+        apply(
+            &mut term,
+            &render_server_update(&emulator, &prediction, &renderer, true),
+        );
+        assert_eq!(
+            term.screen().cell(0, 0).map(vt100::Cell::contents),
+            Some("s"),
+            "server screen content must be rendered to the terminal"
+        );
+    }
+
+    #[test]
+    fn render_server_update_culls_stale_predictions() {
+        let (emulator, prediction, renderer) = render_trio();
+        // The emulator already shows 'a' at (0,0); register a prediction that
+        // the server screen contradicts so cull must discard it.
+        emulator.lock().unwrap().process(b"a");
+        {
+            let emu = emulator.lock().unwrap();
+            let mut pred = prediction.lock().unwrap();
+            pred.new_user_byte(b'Z', emu.screen());
+        }
+        let mut term = vt100::Parser::new(24, 80, 0);
+        apply(
+            &mut term,
+            &render_server_update(&emulator, &prediction, &renderer, true),
+        );
+        assert_eq!(
+            term.screen().cell(0, 0).map(vt100::Cell::contents),
+            Some("a"),
+            "a prediction the server screen contradicts must be culled, leaving the real cell"
+        );
+    }
+
+    #[test]
+    fn render_server_update_without_predictions_skips_overlays() {
+        let (emulator, prediction, renderer) = render_trio();
+        emulator.lock().unwrap().process(b"hello");
+        // Stash a prediction that would change the display if applied.
+        {
+            let emu = emulator.lock().unwrap();
+            let mut pred = prediction.lock().unwrap();
+            pred.new_user_byte(b'X', emu.screen());
+        }
+        let mut term = vt100::Parser::new(24, 80, 0);
+        // with_predictions = false must ignore the pending prediction entirely.
+        apply(
+            &mut term,
+            &render_server_update(&emulator, &prediction, &renderer, false),
+        );
+        assert_eq!(
+            term.screen().cell(0, 0).map(vt100::Cell::contents),
+            Some("h"),
+            "with_predictions=false must render only the raw server screen"
+        );
+    }
+
+    #[test]
+    fn render_prediction_update_paints_keystroke_once_confirmed() {
+        let (emulator, prediction, renderer) = render_trio();
+        // Prime the prediction engine with the terminal dimensions so the first
+        // confirming cull doesn't reset everything.
+        {
+            let emu = emulator.lock().unwrap();
+            prediction.lock().unwrap().cull(emu.screen());
+        }
+        let mut term = vt100::Parser::new(24, 80, 0);
+
+        // Type 'k' at (0,0): a fresh prediction is tentative and not yet shown.
+        apply(
+            &mut term,
+            &render_prediction_update(&emulator, &prediction, &renderer, b"k"),
+        );
+        assert_eq!(
+            term.screen().cell(0, 0).map(vt100::Cell::contents),
+            Some(""),
+            "a fresh (tentative) prediction must not be painted yet"
+        );
+
+        // A server update advances the real cursor to the predicted column
+        // (0,1) without echoing the keystroke yet — this confirms the epoch.
+        emulator.lock().unwrap().process(b"\x1b[1;2H");
+        apply(
+            &mut term,
+            &render_server_update(&emulator, &prediction, &renderer, true),
+        );
+        assert_eq!(
+            term.screen().cell(0, 0).map(vt100::Cell::contents),
+            Some("k"),
+            "once the epoch is confirmed the predicted keystroke must be painted"
+        );
+    }
+
+    #[test]
+    fn render_prediction_update_does_not_cull_between_keystrokes() {
+        let (emulator, prediction, renderer) = render_trio();
+        {
+            let emu = emulator.lock().unwrap();
+            prediction.lock().unwrap().cull(emu.screen());
+        }
+        let mut term = vt100::Parser::new(24, 80, 0);
+
+        // Two predicted bytes in sequence; neither call culls, so both
+        // predictions survive to be confirmed together.
+        apply(
+            &mut term,
+            &render_prediction_update(&emulator, &prediction, &renderer, b"a"),
+        );
+        apply(
+            &mut term,
+            &render_prediction_update(&emulator, &prediction, &renderer, b"b"),
+        );
+
+        // Confirm both predictions: real cursor advances to (0,2).
+        emulator.lock().unwrap().process(b"\x1b[1;3H");
+        apply(
+            &mut term,
+            &render_server_update(&emulator, &prediction, &renderer, true),
+        );
+        assert_eq!(
+            term.screen().cell(0, 0).map(vt100::Cell::contents),
+            Some("a"),
+            "first prediction must survive the second keystroke"
+        );
+        assert_eq!(
+            term.screen().cell(0, 1).map(vt100::Cell::contents),
+            Some("b"),
+            "second prediction must be appended alongside the first"
+        );
     }
 }

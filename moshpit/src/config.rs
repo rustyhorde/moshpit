@@ -97,6 +97,14 @@ pub(crate) struct Config {
     #[serde(default)]
     #[getset(get_copy = "pub(crate)")]
     diff_mode: DiffMode,
+    /// Legacy escape hatch: drive the terminal by forwarding raw server PTY
+    /// bytes straight to stdout instead of rendering exclusively through the
+    /// differential renderer.  Defaults to `false` (the artifact-free rendered
+    /// path).  Enable via `--legacy-passthrough` / `MOSHPIT_LEGACY_PASSTHROUGH=true`
+    /// only if the rendered path regresses.
+    #[serde(default)]
+    #[getset(get_copy = "pub(crate)")]
+    legacy_passthrough: bool,
     /// Per-category algorithm overrides from TOML `[preferred_algorithms]` or CLI flags.
     #[serde(default)]
     preferred_algorithms: AlgorithmPreferences,
@@ -156,6 +164,7 @@ impl Default for Config {
             nat_warmup: false,
             nat_warmup_count: Self::default_nat_warmup_count(),
             diff_mode: DiffMode::default(),
+            legacy_passthrough: false,
             preferred_algorithms: AlgorithmPreferences::default(),
             send_env: Self::default_send_env(),
             send_path: Vec::new(),

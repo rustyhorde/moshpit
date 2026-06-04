@@ -120,6 +120,15 @@ pub(crate) struct Cli {
     )]
     #[getset(get = "pub(crate)")]
     diff_mode: String,
+    /// Legacy escape hatch: forward raw server PTY bytes straight to the
+    /// terminal instead of rendering exclusively through the differential
+    /// renderer.  Off by default; enable only if the rendered path regresses.
+    #[clap(
+        long,
+        help = "Forward raw server bytes to the terminal (legacy; disables unified rendering)"
+    )]
+    #[getset(get_copy = "pub(crate)")]
+    legacy_passthrough: bool,
     /// Ordered KEX algorithms to offer (comma-separated).
     /// Example: `--kex-algos ml-kem-768-sha256,x25519-sha256`
     #[clap(
@@ -242,6 +251,10 @@ impl Source for Cli {
         let _old = map.insert(
             "diff_mode".to_string(),
             Value::new(Some(&origin), ValueKind::String(self.diff_mode.clone())),
+        );
+        let _old = map.insert(
+            "legacy_passthrough".to_string(),
+            Value::new(Some(&origin), ValueKind::Boolean(self.legacy_passthrough)),
         );
         if let Some(table) = build_algo_table(
             self.kex_algos.as_deref(),

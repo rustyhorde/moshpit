@@ -12,7 +12,9 @@ pub(crate) mod renderer;
 
 pub use self::emulator::Emulator;
 pub use self::prediction::{DisplayPreference, OverlayCell, OverlayCursor, PredictionEngine};
-pub use self::renderer::{Renderer, paint_overlays_to_ansi};
+pub use self::renderer::{
+    Renderer, paint_overlays_to_ansi, render_prediction_update, render_server_update,
+};
 
 /// A message for the moshpits psuedo-terminal
 #[derive(Clone, Debug, Eq, PartialEq)]

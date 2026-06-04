@@ -31,7 +31,7 @@ use libmoshpit::{
     DiffMode, DisplayPreference, Emulator, EncryptedFrame, FileLayer, KEY_ALGORITHM_X25519, Kex,
     KexConfig as _, KexMode, KeyPair, MoshpitError, PredictionEngine, Renderer, UdpReader,
     UdpSender, UuidWrapper, init_tracing, load, paint_overlays_to_ansi, parse_server_destination,
-    run_key_exchange,
+    render_prediction_update, run_key_exchange,
 };
 use terminal_size::terminal_size;
 #[cfg(unix)]
@@ -644,6 +644,34 @@ async fn countdown_with_escape(
     exiting
 }
 
+/// Shared holder for the message printed when the client exits.  Set by the
+/// exit-triggering path; read by [`restore_terminal_and_exit`].
+type ExitMsg = Arc<std::sync::Mutex<Option<&'static [u8]>>>;
+
+/// Restore the terminal and terminate the process.
+///
+/// Leaves the alternate screen (a server-side app may have entered it), shows
+/// the cursor, clears the *visible* screen, and homes the cursor so the next
+/// shell prompt starts cleanly at the top.  Scrollback is preserved (`\x1b[2J`,
+/// not `\x1b[3J`).  `exit_msg`, if present, is printed after the clear so it
+/// sits at the top of the fresh screen.
+///
+/// Everything is written directly to stdout in one flushed sequence so the
+/// ordering is deterministic (the async stdout writer thread is bypassed); the
+/// clear also wipes any residual diff bytes that thread may have flushed.
+#[cfg_attr(coverage_nightly, coverage(off))]
+fn restore_terminal_and_exit(exit_msg: Option<&[u8]>) -> ! {
+    let mut out = stdout();
+    // Leave alt-screen, show cursor, clear the visible screen, home + reset SGR.
+    drop(out.write_all(b"\x1b[?1049l\x1b[?25h\x1b[2J\x1b[H\x1b[0m"));
+    if let Some(msg) = exit_msg {
+        drop(out.write_all(msg));
+    }
+    drop(out.flush());
+    drop(disable_raw_mode());
+    std::process::exit(0);
+}
+
 /// Persistent reconnect loop.  Runs until the shell exits (via `process::exit`).
 #[cfg_attr(nightly, allow(clippy::too_many_lines))]
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -675,6 +703,11 @@ async fn run_session_loop(
     let mut reconnect_attempt: u32 = 0;
     // Shared exit token: cancelled when the user presses Ctrl-^ . to quit.
     let exit_token = CancellationToken::new();
+    // Message printed (after the screen is cleared) once the client exits.
+    // Set by whichever path triggers the exit: the stdin forwarder on Ctrl-^ .,
+    // the reader on a server PtyExit, or the reconnect countdown. `None` exits
+    // silently (e.g. OSC-title exit) but still clears the screen.
+    let exit_msg: ExitMsg = Arc::new(std::sync::Mutex::new(None));
 
     // Start the stdin reader before the first KEX so Ctrl-^ . is always
     // detectable.  with_cooked_term pauses it around interactive prompts.
@@ -713,7 +746,9 @@ async fn run_session_loop(
                     stdout_tx.clone(),
                     config.predict(),
                     config.diff_mode(),
+                    config.legacy_passthrough(),
                     exit_token.clone(),
+                    exit_msg.clone(),
                 )
                 .await;
                 if let Err(e) = session_result {
@@ -721,14 +756,12 @@ async fn run_session_loop(
                     return Err(e);
                 }
                 if exit_token.is_cancelled() {
-                    drop(crossterm::execute!(
-                        stdout(),
-                        crossterm::terminal::LeaveAlternateScreen,
-                        crossterm::cursor::Show,
-                    ));
-                    drop(disable_raw_mode());
+                    // Let the stdout channel settle before the direct teardown write.
                     time::sleep(Duration::from_millis(100)).await;
-                    std::process::exit(0);
+                    let msg = *exit_msg
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    restore_terminal_and_exit(msg);
                 }
                 // Session dropped — restore the terminal (the server-side app may
                 // have left us in alternate-screen mode) then show the reconnect banner.
@@ -799,16 +832,9 @@ async fn run_session_loop(
                 .await
                 {
                     clear_reconnect_banner(&stdout_tx).await;
-                    let msg = b"\r\n\x1b[0m[moshpit] Disconnected.\r\n";
-                    drop(stdout_tx.send(msg.to_vec()).await);
-                    drop(crossterm::execute!(
-                        stdout(),
-                        crossterm::terminal::LeaveAlternateScreen,
-                        crossterm::cursor::Show,
-                    ));
-                    drop(disable_raw_mode());
+                    // Let the stdout channel settle before the direct teardown write.
                     time::sleep(Duration::from_millis(100)).await;
-                    std::process::exit(0);
+                    restore_terminal_and_exit(Some(b"[moshpit] Disconnected.\r\n"));
                 }
                 backoff = (backoff * 2).min(max_backoff);
             }
@@ -996,7 +1022,9 @@ async fn run_udp_session(
     stdout_tx: Sender<Vec<u8>>,
     display_preference: DisplayPreference,
     diff_mode: DiffMode,
+    legacy_passthrough: bool,
     exit_token: CancellationToken,
+    exit_msg: ExitMsg,
 ) -> Result<()> {
     let (reconnect_tx, mut reconnect_rx) = channel::<()>(1);
     let token = CancellationToken::new();
@@ -1024,6 +1052,7 @@ async fn run_udp_session(
         .reconnect_tx(reconnect_tx)
         .query_response_tx(tx.clone())
         .diff_mode(diff_mode)
+        .passthrough(legacy_passthrough)
         .build();
 
     let mut udp_sender = UdpSender::builder()
@@ -1080,12 +1109,14 @@ async fn run_udp_session(
     let rend_reader = renderer.clone();
     let stdout_tx_reader = stdout_tx.clone();
     let exit_token_reader = exit_token.clone();
+    let exit_msg_reader = exit_msg.clone();
     let in_alt_screen_reader = Arc::clone(&in_alt_screen);
     let _reader = spawn(async move {
         udp_reader
             .client_frame_loop(
                 reader_token,
                 exit_token_reader,
+                exit_msg_reader,
                 stdout_tx_reader,
                 emu_reader,
                 pred_reader,
@@ -1106,10 +1137,12 @@ async fn run_udp_session(
     // Stdin forwarder: holds the shared kb_rx mutex for this session's lifetime.
     let fwd_token = token.clone();
     let exit_token_fwd = exit_token.clone();
+    let exit_msg_fwd = exit_msg.clone();
     let session_tx = tx;
     let uuid_wrapper = kex.uuid_wrapper();
     let emu_fwd = emulator.clone();
     let pred_fwd = prediction.clone();
+    let renderer_fwd = renderer.clone();
     let stdout_tx_fwd = stdout_tx;
     let in_alt_screen_fwd = Arc::clone(&in_alt_screen);
     let forwarder = spawn(async move {
@@ -1164,24 +1197,40 @@ async fn run_udp_session(
                             // a Tokio worker thread on std::sync::Mutex during vi rendering bursts.
                             let in_alt = in_alt_screen_fwd.load(Ordering::Relaxed);
                             if !in_alt {
-                                let (overlays, cursor) = {
-                                    let emu = emu_fwd.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                                    let screen = emu.screen();
-                                    let mut pred = pred_fwd.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                                    for byte in &to_forward {
-                                        pred.new_user_byte(*byte, screen);
-                                    }
-                                    pred.apply(screen)
+                                let preview = if legacy_passthrough {
+                                    // Legacy: paint the prediction out-of-band on top of
+                                    // the raw bytes the renderer is not tracking.
+                                    let (overlays, cursor) = {
+                                        let emu = emu_fwd.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                                        let screen = emu.screen();
+                                        let mut pred = pred_fwd.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                                        for byte in &to_forward {
+                                            pred.new_user_byte(*byte, screen);
+                                        }
+                                        pred.apply(screen)
+                                    };
+                                    paint_overlays_to_ansi(&overlays, cursor)
+                                } else {
+                                    // Unified: render the local echo through the single
+                                    // renderer so its `displayed` baseline stays exact and
+                                    // the prediction self-heals when the server echoes.
+                                    render_prediction_update(
+                                        &emu_fwd,
+                                        &pred_fwd,
+                                        &renderer_fwd,
+                                        &to_forward,
+                                    )
                                 };
-                                let preview = paint_overlays_to_ansi(&overlays, cursor);
                                 if !preview.is_empty() {
                                     drop(stdout_tx_fwd.send(preview).await);
                                 }
                             }
                         }
                         if exit_requested {
-                            let msg = b"\r\n\x1b[0m[moshpit] Disconnected.\r\n";
-                            drop(stdout_tx_fwd.send(msg.to_vec()).await);
+                            *exit_msg_fwd
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                Some(b"[moshpit] Disconnected.\r\n");
                             exit_token_fwd.cancel();
                             fwd_token.cancel();
                             break;

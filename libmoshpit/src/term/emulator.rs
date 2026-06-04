@@ -46,6 +46,17 @@ impl Emulator {
         self.parser.screen_mut().set_size(rows, cols);
     }
 
+    /// Replace the emulator's parser with an authoritative one.
+    ///
+    /// Used to resync the client emulator to a full-screen snapshot or a
+    /// reconstructed `StateSync` state so that the emulator remains the single
+    /// source of truth the renderer and prediction engine read from.  The
+    /// caller is responsible for building `parser` with the correct dimensions
+    /// and alternate-screen state.
+    pub fn replace_parser(&mut self, parser: vt100::Parser) {
+        self.parser = parser;
+    }
+
     /// Returns the current screen state.
     #[must_use]
     pub fn screen(&self) -> &vt100::Screen {
@@ -86,6 +97,20 @@ mod tests {
     fn emulator_process_bytes_moves_cursor() {
         let mut emu = Emulator::new(24, 80);
         emu.process(b"hello");
+        assert_eq!(emu.screen().cursor_position(), (0, 5));
+    }
+
+    #[test]
+    fn replace_parser_swaps_in_authoritative_state() {
+        let mut emu = Emulator::new(24, 80);
+        emu.process(b"stale");
+        let mut fresh = vt100::Parser::new(24, 80, 0);
+        fresh.process(b"fresh");
+        emu.replace_parser(fresh);
+        assert_eq!(
+            emu.screen().cell(0, 0).map(vt100::Cell::contents),
+            Some("f")
+        );
         assert_eq!(emu.screen().cursor_position(), (0, 5));
     }
 
