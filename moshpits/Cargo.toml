@@ -1,8 +1,8 @@
 [package]
 authors = ["Jason Ozias <jason.g.ozias@gmail.com>"]
 categories = ["command-line-interface", "network-programming", "cryptography"]
-description = "A Rust implementation of in the same vein as Mosh, the mobile shell."
-documentation = "https://docs.rs/libmoshpit"
+description = "moshpits server (mps) — server daemon for moshpit remote terminal sessions"
+documentation = "https://github.com/rustyhorde/moshpit#moshpits-server-mps"
 edition = "2024"
 homepage = "https://github.com/rustyhorde/moshpit"
 keywords = ["ssh", "mosh"]
@@ -10,7 +10,7 @@ license = "MIT OR Apache-2.0"
 name = "moshpits"
 readme = "../README.md"
 repository = "https://github.com/rustyhorde/moshpit"
-version = "0.8.11"
+version = "0.8.12"
 rust-version = "1.91.1"
 
 [[bin]]
@@ -26,8 +26,7 @@ bytes = { workspace = true }
 clap = { workspace = true }
 config = { workspace = true }
 getset = { workspace = true }
-libmoshpit = { version = "0.8.11", path = "../libmoshpit" }
-zstd = { workspace = true }
+libmoshpit = { version = "0.8.12", path = "../libmoshpit" }
 portable-pty = "0.9.0"
 serde = { workspace = true }
 tokio = { workspace = true, features = ["signal", "sync", "time"] }
@@ -37,6 +36,7 @@ tracing-subscriber-init = { workspace = true }
 uuid = { workspace = true }
 vergen-pretty = { workspace = true }
 vt100 = { workspace = true }
+zstd = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "1.0.0-alpha.3"
@@ -48,7 +48,3 @@ tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test
 anyhow = { workspace = true }
 rustversion = { workspace = true }
 vergen-gix = { workspace = true }
-
-[package.metadata.docs.rs]
-all-features = true
-rustdoc-args = ["--cfg", "docsrs"]

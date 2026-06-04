@@ -6,6 +6,8 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
+//! Configuration traits and structures shared by the moshpit binary crates.
+
 use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
 
 use anyhow::{Context as _, Result};

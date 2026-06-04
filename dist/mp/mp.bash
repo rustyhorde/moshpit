@@ -23,7 +23,7 @@ _mp() {
 
     case "${cmd}" in
         mp)
-            opts="-v -q -c -t -p -k -s -h -V --verbose --quiet --config-absolute-path --tracing-absolute-path --private-key-path --public-key-path --server-port --predict --help --version <SERVER_DESTINATION>"
+            opts="-v -q -c -t -p -k -s -h -V --verbose --quiet --config-absolute-path --tracing-absolute-path --private-key-path --public-key-path --server-port --predict --nat-warmup --nat-warmup-count --diff-mode --kex-algos --aead-algos --mac-algos --kdf-algos --help --version <SERVER_DESTINATION>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -71,6 +71,30 @@ _mp() {
                     ;;
                 --predict)
                     COMPREPLY=($(compgen -W "adaptive always never" -- "${cur}"))
+                    return 0
+                    ;;
+                --nat-warmup-count)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --diff-mode)
+                    COMPREPLY=($(compgen -W "reliable datagram statesync" -- "${cur}"))
+                    return 0
+                    ;;
+                --kex-algos)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --aead-algos)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --mac-algos)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --kdf-algos)
+                    COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;
                 *)

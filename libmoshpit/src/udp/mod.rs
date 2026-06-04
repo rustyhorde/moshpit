@@ -6,6 +6,8 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
+//! Encrypted UDP session: diff transport modes, client/server handles, and frame constants.
+
 use anyhow::Result;
 use aws_lc_rs::aead::{AES_256_GCM_SIV, LessSafeKey, UnboundKey};
 use bon::Builder;

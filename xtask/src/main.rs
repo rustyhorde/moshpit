@@ -183,6 +183,51 @@ fn mp_command() -> Command {
                 .default_value("adaptive")
                 .help("Local-echo prediction: adaptive (default), always, or never"),
         )
+        .arg(
+            Arg::new("nat-warmup")
+                .long("nat-warmup")
+                .action(ArgAction::SetTrue)
+                .help("Send NAT warmup keepalives at UDP session start (opt-in)"),
+        )
+        .arg(
+            Arg::new("nat-warmup-count")
+                .long("nat-warmup-count")
+                .value_name("N")
+                .default_value("3")
+                .help("Number of NAT warmup keepalives to send (default: 3)"),
+        )
+        .arg(
+            Arg::new("diff-mode")
+                .long("diff-mode")
+                .value_name("MODE")
+                .value_parser(["reliable", "datagram", "statesync"])
+                .default_value("reliable")
+                .help("UDP diff transport mode: reliable (default), datagram, or statesync"),
+        )
+        .arg(
+            Arg::new("kex-algos")
+                .long("kex-algos")
+                .value_name("ALGOS")
+                .help("Ordered KEX algorithms to offer, comma-separated [supported: x25519-sha256 (default), ml-kem-768-sha256, ml-kem-512-sha256, ml-kem-1024-sha256, p384-sha384, p256-sha256]"),
+        )
+        .arg(
+            Arg::new("aead-algos")
+                .long("aead-algos")
+                .value_name("ALGOS")
+                .help("Ordered AEAD algorithms to offer, comma-separated [supported: aes256-gcm-siv (default), aes256-gcm, chacha20-poly1305, aes128-gcm-siv]"),
+        )
+        .arg(
+            Arg::new("mac-algos")
+                .long("mac-algos")
+                .value_name("ALGOS")
+                .help("Ordered MAC algorithms to offer, comma-separated [supported: hmac-sha512 (default), hmac-sha256]"),
+        )
+        .arg(
+            Arg::new("kdf-algos")
+                .long("kdf-algos")
+                .value_name("ALGOS")
+                .help("Ordered KDF algorithms to offer, comma-separated [supported: hkdf-sha256 (default), hkdf-sha384, hkdf-sha512]"),
+        )
 }
 
 /// `mps` — moshpits server
@@ -203,6 +248,50 @@ fn mps_command() -> Command {
         .arg(tracing_absolute_path_arg())
         .arg(private_key_path_arg())
         .arg(public_key_path_arg())
+        .arg(
+            Arg::new("warmup-delay-ms")
+                .long("warmup-delay-ms")
+                .value_name("MILLIS")
+                .help("Extra delay (ms) after peer discovery before sending terminal data"),
+        )
+        .arg(
+            Arg::new("pacing-delay-us")
+                .long("pacing-delay-us")
+                .value_name("MICROS")
+                .default_value("1000")
+                .help("Min inter-packet delay (µs) between diff chunks [default: 1000]"),
+        )
+        .arg(
+            Arg::new("term-type")
+                .long("term-type")
+                .value_name("TERM")
+                .default_value("xterm-256color")
+                .help("TERM environment variable for spawned shells (default: xterm-256color)"),
+        )
+        .arg(
+            Arg::new("kex-algos")
+                .long("kex-algos")
+                .value_name("ALGOS")
+                .help("Ordered KEX algorithms to prefer, comma-separated [supported: x25519-sha256 (default), ml-kem-768-sha256, ml-kem-512-sha256, ml-kem-1024-sha256, p384-sha384, p256-sha256]"),
+        )
+        .arg(
+            Arg::new("aead-algos")
+                .long("aead-algos")
+                .value_name("ALGOS")
+                .help("Ordered AEAD algorithms to prefer, comma-separated [supported: aes256-gcm-siv (default), aes256-gcm, chacha20-poly1305, aes128-gcm-siv]"),
+        )
+        .arg(
+            Arg::new("mac-algos")
+                .long("mac-algos")
+                .value_name("ALGOS")
+                .help("Ordered MAC algorithms to prefer, comma-separated [supported: hmac-sha512 (default), hmac-sha256]"),
+        )
+        .arg(
+            Arg::new("kdf-algos")
+                .long("kdf-algos")
+                .value_name("ALGOS")
+                .help("Ordered KDF algorithms to prefer, comma-separated [supported: hkdf-sha256 (default), hkdf-sha384, hkdf-sha512]"),
+        )
 }
 
 /// `mp-keygen` — key generation tool
@@ -326,6 +415,26 @@ fn mpa_command() -> Command {
                         .long("foreground")
                         .action(ArgAction::SetTrue)
                         .help("Run in the foreground instead of daemonizing"),
+                )
+                .arg(
+                    Arg::new("shell")
+                        .long("shell")
+                        .value_name("SHELL")
+                        .value_parser(["fish", "bash"])
+                        .default_value("fish")
+                        .help("Shell syntax for the exported MOSHPIT_AGENT_SOCK variable (fish or bash)"),
+                )
+                .arg(
+                    Arg::new("backend")
+                        .long("backend")
+                        .value_name("BACKEND")
+                        .help("Unlock backend to use (passphrase, fido2, systemd-creds, ssh-agent-piggyback)"),
+                )
+                .arg(
+                    Arg::new("passphrase-stdin")
+                        .long("passphrase-stdin")
+                        .action(ArgAction::SetTrue)
+                        .help("Read the vault master passphrase from stdin instead of prompting"),
                 ),
         )
         .subcommand(
@@ -342,9 +451,24 @@ fn mpa_command() -> Command {
                         .long("passphrase-stdin")
                         .action(ArgAction::SetTrue)
                         .help("Read the key passphrase from stdin instead of prompting"),
+                )
+                .arg(
+                    Arg::new("no-hint")
+                        .long("no-hint")
+                        .action(ArgAction::SetTrue)
+                        .help("Suppress the key-selection hint shown when multiple keys are loaded"),
                 ),
         )
-        .subcommand(Command::new("list").about("List identities held by the agent"))
+        .subcommand(
+            Command::new("list")
+                .about("List identities held by the agent")
+                .arg(
+                    Arg::new("no-hint")
+                        .long("no-hint")
+                        .action(ArgAction::SetTrue)
+                        .help("Suppress the key-selection hint shown when multiple keys are loaded"),
+                ),
+        )
         .subcommand(
             Command::new("remove-key")
                 .about("Remove an identity from the agent")
@@ -357,6 +481,25 @@ fn mpa_command() -> Command {
         )
         .subcommand(Command::new("lock").about("Lock the agent (clear keys from memory)"))
         .subcommand(Command::new("unlock").about("Unlock the agent (reload keys from vault)"))
+        .subcommand(Command::new("status").about("Show the running status of the agent daemon"))
+        .subcommand(
+            Command::new("stop")
+                .about("Stop the running agent daemon")
+                .arg(
+                    Arg::new("socket")
+                        .long("socket")
+                        .value_name("PATH")
+                        .help("Override the Unix socket path (default: $MOSHPIT_AGENT_SOCK or XDG default)"),
+                )
+                .arg(
+                    Arg::new("shell")
+                        .long("shell")
+                        .value_name("SHELL")
+                        .value_parser(["fish", "bash"])
+                        .default_value("fish")
+                        .help("Shell syntax for unsetting MOSHPIT_AGENT_SOCK (fish or bash)"),
+                ),
+        )
 }
 
 // ── Shared argument helpers ───────────────────────────────────────────────────

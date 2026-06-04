@@ -473,6 +473,7 @@ mp-keygen generate --server -n -o ~/.mp/mps_host_key      # Server host key, no 
 | `--output-path <PATH>` | `-o` | Write keys to this path (skips the interactive path prompt) |
 | `--force` | `-f` | Overwrite existing key files without confirmation |
 | `--server` | `-s` | Generate a server host key |
+| `--passphrase-stdin` | | Read the passphrase from stdin instead of prompting interactively; mutually exclusive with `--no-passphrase`; useful for automated provisioning |
 
 Default key locations when accepting the default path prompt:
 
@@ -662,6 +663,24 @@ term_type = "xterm-256color"
 # Requires the daemon to run as root.  Set to false to disable.
 # namespace_escape = true
 
+# ── Environment & PATH forwarding ────────────────────────────────────────────
+# The server only accepts env vars whose names match at least one pattern in
+# accept_env (shell glob syntax, case-sensitive).  Clients send variables
+# matching their own send_env list; the server silently drops anything not
+# matched here.
+# accept_env = ["LANG", "LC_*", "TZ"]
+
+# Base PATH prepended to each spawned shell's PATH environment variable.
+# The client may extend this further via send_path (unless path_locked is true).
+# server_path = ["/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"]
+
+# When true, the client's requested PATH additions (send_path) are ignored and
+# only server_path is used.  Useful for hardened deployments.
+# path_locked = false
+
+# Note: HOME, USER, LOGNAME, SHELL, TERM, and PATH are always set from
+# server-side values and cannot be overridden by the client.
+
 # ── Algorithm preferences (optional) ─────────────────────────────────────────
 # Override the server's preferred algorithm order.  The server's order wins
 # during negotiation — the first algorithm from this list that the connecting
@@ -844,7 +863,11 @@ server_destination = "192.168.1.10" # "ip" or "user@ip"; overridden by the
                                     # positional argument on the command line
 
 # ── Reconnection ──────────────────────────────────────────────────────────────
-# Maximum back-off interval between automatic reconnect attempts (seconds).
+# When the server becomes unreachable, mp automatically reconnects using
+# exponential back-off: starts at 2 s, doubles on each failure, and is capped
+# at max_reconnect_backoff_secs.  The blue banner at the top of the terminal
+# shows the current countdown.  Press Ctrl-^ . (0x1E 0x2E) during any
+# countdown to abort reconnection and exit.
 # Clamped to the range [2, 86400].  Default: 3600 (1 hour).
 max_reconnect_backoff_secs = 3600
 
@@ -870,6 +893,17 @@ nat_warmup_count = 3  # Number of keepalive frames to send (default: 3)
 #   datagram             Fire-and-forget + 150 ms full-screen push; best on high-loss links
 #   statesync            Ack-based diffs (Mosh-style); best on moderate-loss, low-bandwidth links
 # diff_mode = "reliable"
+
+# ── Environment & PATH forwarding ────────────────────────────────────────────
+# Environment variables whose names match at least one glob pattern in send_env
+# are forwarded to the server at session start.  The server applies its own
+# accept_env filter; anything not accepted is silently dropped.
+# send_env = ["LANG", "LC_*", "TZ"]
+
+# Directories prepended to PATH on the server before the shell is spawned.
+# Useful for forwarding ~/bin or local toolchain paths to the remote session.
+# Ignored if the server has path_locked = true.
+# send_path = ["/home/alice/bin"]
 
 # ── Algorithm preferences (optional) ─────────────────────────────────────────
 # Override the algorithms this client offers during negotiation.  The server's
@@ -970,6 +1004,8 @@ mpa [OPTIONS] <COMMAND>
 
 Commands:
   start       Start the agent daemon
+  stop        Stop the running agent daemon
+  status      Show the running agent's status
   add-key     Add an identity key to the agent
   list        List identities held by the agent
   remove-key  Remove an identity from the agent
@@ -989,10 +1025,15 @@ Options:
 mpa start [OPTIONS]
 
 Options:
-  -s, --socket <PATH>   Override the Unix socket path
-                        (default: $XDG_RUNTIME_DIR/moshpit-agent-<uid>.sock)
-      --vault <PATH>    Path to the vault file (default: ~/.mp/agent-vault)
-      --foreground      Run in the foreground instead of daemonizing
+  -s, --socket <PATH>    Override the Unix socket path
+                         (default: $XDG_RUNTIME_DIR/moshpit-agent-<uid>.sock)
+      --vault <PATH>     Path to the vault file (default: ~/.mp/agent-vault)
+      --foreground       Run in the foreground instead of daemonizing
+      --shell <SHELL>    Shell syntax for the emitted export command: `fish` or `bash`
+                         (auto-detected from $SHELL when omitted)
+      --backend <NAME>   Explicitly select an unlock backend (e.g. `passphrase`,
+                         `systemd-creds`, `ssh-agent-piggyback`); auto-detected when omitted
+      --passphrase-stdin Read the vault master passphrase from stdin for non-interactive use
 ```
 
 #### `mpa add-key`
@@ -1005,6 +1046,7 @@ Arguments:
 
 Options:
       --passphrase-stdin   Read the key passphrase from stdin instead of prompting
+      --no-hint            Suppress the instructional hint printed after success (useful in scripts)
 ```
 
 #### `mpa list`
@@ -1015,6 +1057,8 @@ Lists each identity held in memory, one per line: fingerprint and key algorithm.
 mpa list
 # SHA256:AbCdEf...  x25519
 ```
+
+Pass `--no-hint` to suppress the instructional note printed after the list (useful in scripts that parse the output).
 
 #### `mpa remove-key`
 
@@ -1033,6 +1077,36 @@ Arguments:
 ```bash
 mpa lock
 mpa unlock          # prompts for master passphrase (or uses the configured unlock backend)
+```
+
+#### `mpa status`
+
+Prints the current state of the running agent: socket path, number of loaded identities, and whether the agent is locked or unlocked.
+
+```bash
+mpa status
+# socket: /run/user/1000/moshpit-agent-1000.sock
+# identities: 2 (unlocked)
+```
+
+#### `mpa stop`
+
+Shuts down the running agent daemon and prints the shell command to unset `MOSHPIT_AGENT_SOCK`.
+
+```
+mpa stop [OPTIONS]
+
+Options:
+  -s, --socket <PATH>   Socket path of the agent to stop (default: $MOSHPIT_AGENT_SOCK)
+      --shell <SHELL>   Shell syntax for the emitted unset command: `fish` or `bash`
+```
+
+```bash
+# bash / zsh
+eval $(mpa stop)
+
+# fish
+mpa stop | source
 ```
 
 ### Socket path and environment variable
@@ -1071,6 +1145,7 @@ Keys are loaded into memory once at `add-key` or `unlock` time.  On `lock`, memo
 | `secret-service` | **Secret Service** | GNOME Keyring / KWallet; auto-unlocks at desktop login |
 | `tpm` | **TPM 2.0** | Machine-bound sealing; requires `libtss2` (stub — full impl pending) |
 | `fprintd` | **Fingerprint (fprintd)** | Biometric via fprintd D-Bus; requires `fprintd` system package (stub — full impl pending) |
+| `macos-keychain` | **macOS Keychain** | Stores the vault key in the macOS system Keychain; auto-unlocks at login on macOS |
 
 Pre-compiled release binaries are provided for each feature variant:
 

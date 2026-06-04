@@ -6,6 +6,11 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
+//! Frame encoding and decryption: [`Frame`] ↔ [`EncryptedFrame`] via AES-256-GCM-SIV.
+//!
+//! [`Frame`]: crate::Frame
+//! [`EncryptedFrame`]: crate::EncryptedFrame
+
 use std::io::Cursor;
 
 use anyhow::Result;

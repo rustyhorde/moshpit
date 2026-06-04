@@ -6,7 +6,7 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-//! moshpit - A secure and efficient remote shell protocol implementation in the same vein as Mosh.
+//! `mp-keygen` — key generator for the moshpit suite: create, inspect, and verify asymmetric key pairs.
 
 // rustc lints
 #![cfg_attr(

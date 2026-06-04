@@ -6,6 +6,8 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
+//! Utility functions shared across the moshpit crates.
+
 use std::{net::SocketAddr, path::PathBuf, sync::LazyLock};
 
 use anyhow::Result;

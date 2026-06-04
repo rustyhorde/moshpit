@@ -34,6 +34,12 @@ _mpa() {
             mpa,start)
                 cmd="mpa__subcmd__start"
                 ;;
+            mpa,status)
+                cmd="mpa__subcmd__status"
+                ;;
+            mpa,stop)
+                cmd="mpa__subcmd__stop"
+                ;;
             mpa,unlock)
                 cmd="mpa__subcmd__unlock"
                 ;;
@@ -55,6 +61,12 @@ _mpa() {
             mpa__subcmd__help,start)
                 cmd="mpa__subcmd__help__subcmd__start"
                 ;;
+            mpa__subcmd__help,status)
+                cmd="mpa__subcmd__help__subcmd__status"
+                ;;
+            mpa__subcmd__help,stop)
+                cmd="mpa__subcmd__help__subcmd__stop"
+                ;;
             mpa__subcmd__help,unlock)
                 cmd="mpa__subcmd__help__subcmd__unlock"
                 ;;
@@ -65,7 +77,7 @@ _mpa() {
 
     case "${cmd}" in
         mpa)
-            opts="-v -q -h -V --verbose --quiet --help --version start add-key list remove-key lock unlock help"
+            opts="-v -q -h -V --verbose --quiet --help --version start add-key list remove-key lock unlock status stop help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -79,7 +91,7 @@ _mpa() {
             return 0
             ;;
         mpa__subcmd__add__subcmd__key)
-            opts="-h --passphrase-stdin --help <KEY_PATH>"
+            opts="-h --passphrase-stdin --no-hint --help <KEY_PATH>"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -93,7 +105,7 @@ _mpa() {
             return 0
             ;;
         mpa__subcmd__help)
-            opts="start add-key list remove-key lock unlock help"
+            opts="start add-key list remove-key lock unlock status stop help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -190,6 +202,34 @@ _mpa() {
             COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
             return 0
             ;;
+        mpa__subcmd__help__subcmd__status)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        mpa__subcmd__help__subcmd__stop)
+            opts=""
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
         mpa__subcmd__help__subcmd__unlock)
             opts=""
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 3 ]] ; then
@@ -205,7 +245,7 @@ _mpa() {
             return 0
             ;;
         mpa__subcmd__list)
-            opts="-h --help"
+            opts="-h --no-hint --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -247,7 +287,7 @@ _mpa() {
             return 0
             ;;
         mpa__subcmd__start)
-            opts="-s -h --socket --vault --foreground --help"
+            opts="-s -h --socket --vault --foreground --shell --backend --passphrase-stdin --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -263,6 +303,50 @@ _mpa() {
                     ;;
                 --vault)
                     COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --shell)
+                    COMPREPLY=($(compgen -W "fish bash" -- "${cur}"))
+                    return 0
+                    ;;
+                --backend)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        mpa__subcmd__status)
+            opts="-h --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                *)
+                    COMPREPLY=()
+                    ;;
+            esac
+            COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+            return 0
+            ;;
+        mpa__subcmd__stop)
+            opts="-h --socket --shell --help"
+            if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
+                return 0
+            fi
+            case "${prev}" in
+                --socket)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --shell)
+                    COMPREPLY=($(compgen -W "fish bash" -- "${cur}"))
                     return 0
                     ;;
                 *)

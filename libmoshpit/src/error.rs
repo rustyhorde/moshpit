@@ -1,3 +1,5 @@
+//! Error types for the moshpit library.
+
 use clap::error::ErrorKind;
 use thiserror::Error;
 

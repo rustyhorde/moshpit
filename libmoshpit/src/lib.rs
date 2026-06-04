@@ -6,7 +6,56 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-//! libmoshpit - moshpit library
+//! Core library powering the moshpit suite of tools ([`mp`], [`mps`], [`mpa`]).
+//!
+//! moshpit provides encrypted, resilient remote terminal sessions.  A client (`mp`) authenticates
+//! to a server (`mps`) over TCP, then switches to an encrypted UDP channel for low-latency
+//! terminal I/O that survives IP roaming, NAT rebinding, and short network outages.
+//!
+//! [`mp`]: https://github.com/rustyhorde/moshpit#moshpit-client-mp
+//! [`mps`]: https://github.com/rustyhorde/moshpit#moshpits-server-mps
+//! [`mpa`]: https://github.com/rustyhorde/moshpit#moshpit-agent-mpa
+//!
+//! # Connection model
+//!
+//! **Phase 1 — TCP key exchange**: the client opens a TCP connection and performs mutual
+//! asymmetric-key authentication.  A per-session AEAD key is derived via KDF and the TCP
+//! connection is closed.  See [`run_key_exchange`], [`Kex`], [`KexStateMachine`].
+//!
+//! **Phase 2 — UDP session**: all terminal I/O is encrypted with the negotiated AEAD cipher and
+//! delivered over UDP.  The server maintains a full VT100 emulator state and sends a clean screen
+//! snapshot on reconnect.  See [`UdpClient`], [`UdpSender`], [`UdpReader`], [`DiffMode`].
+//!
+//! # Cryptography
+//!
+//! All crypto goes through [`aws-lc-rs`](https://github.com/aws/aws-lc-rs) (no system OpenSSL).
+//!
+//! | Layer | Default | Alternatives |
+//! |-------|---------|--------------|
+//! | Identity key exchange | X25519 ([`KEX_X25519_SHA256`]) | P-384, P-256, ML-KEM-512/768/1024 |
+//! | Session encryption (AEAD) | AES-256-GCM-SIV ([`AEAD_AES256_GCM_SIV`]) | AES-256-GCM, ChaCha20-Poly1305, AES-128-GCM-SIV |
+//! | Frame authentication (MAC) | HMAC-SHA-512 ([`MAC_HMAC_SHA512`]) | HMAC-SHA-256 |
+//! | Key derivation (KDF) | HKDF-SHA-256 ([`KDF_HKDF_SHA256`]) | HKDF-SHA-384, HKDF-SHA-512 |
+//!
+//! Algorithm negotiation follows SSH "first-match-wins" semantics ([`negotiate`]).
+//!
+//! # Terminal emulation and prediction
+//!
+//! The server runs a VT100 state machine ([`Emulator`]) on the PTY output and sends compressed
+//! diffs to the client.  The client optionally renders predicted keystrokes ([`PredictionEngine`],
+//! [`DisplayPreference`]) to eliminate perceived latency.
+//!
+//! # Key agent
+//!
+//! `mpa` is an optional key-agent daemon.  The [`agent`] module provides the Unix-socket
+//! protocol types ([`AgentRequest`], [`AgentResponse`]) and an async client ([`AgentClient`])
+//! that `mp` uses to delegate identity-key operations without reading key files directly.
+//!
+//! # Feature flags
+//!
+//! | Flag | Effect |
+//! |------|--------|
+//! | `unstable` | Enables ML-DSA post-quantum identity key support (`KEY_ALGORITHM_ML_DSA_44`, `KEY_ALGORITHM_ML_DSA_65`, `KEY_ALGORITHM_ML_DSA_87`) |
 
 // rustc lints
 #![cfg_attr(

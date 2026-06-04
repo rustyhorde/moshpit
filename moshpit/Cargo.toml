@@ -1,8 +1,8 @@
 [package]
 authors = ["Jason Ozias <jason.g.ozias@gmail.com>"]
 categories = ["command-line-interface", "network-programming", "cryptography"]
-description = "A Rust implementation of in the same vein as Mosh, the mobile shell."
-documentation = "https://docs.rs/libmoshpit"
+description = "moshpit client (mp) — encrypted, resilient remote terminal session client"
+documentation = "https://github.com/rustyhorde/moshpit#moshpit-client-mp"
 edition = "2024"
 homepage = "https://github.com/rustyhorde/moshpit"
 keywords = ["ssh", "mosh"]
@@ -10,7 +10,7 @@ license = "MIT OR Apache-2.0"
 name = "moshpit"
 readme = "../README.md"
 repository = "https://github.com/rustyhorde/moshpit"
-version = "0.8.11"
+version = "0.8.12"
 rust-version = "1.91.1"
 
 [[bin]]
@@ -26,9 +26,9 @@ clap = { workspace = true }
 config = { workspace = true }
 crossterm = "0.29.0"
 dialoguer = "0.12.0"
-getset = { workspace = true }
-libmoshpit = { version = "0.8.11", path = "../libmoshpit" }
 dirs2 = "3.0.1"
+getset = { workspace = true }
+libmoshpit = { version = "0.8.12", path = "../libmoshpit" }
 serde = { workspace = true }
 terminal_size = "0.4.4"
 tokio = { workspace = true, features = ["io-std", "signal", "sync", "time"] }
@@ -44,7 +44,3 @@ libc = "1.0.0-alpha.3"
 anyhow = { workspace = true }
 rustversion = { workspace = true }
 vergen-gix = { workspace = true }
-
-[package.metadata.docs.rs]
-all-features = true
-rustdoc-args = ["--cfg", "docsrs"]

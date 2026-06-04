@@ -23,7 +23,7 @@ _mps() {
 
     case "${cmd}" in
         mps)
-            opts="-v -q -e -c -t -p -k -h -V --verbose --quiet --enable-std-output --config-absolute-path --tracing-absolute-path --private-key-path --public-key-path --help --version"
+            opts="-v -q -e -c -t -p -k -h -V --verbose --quiet --enable-std-output --config-absolute-path --tracing-absolute-path --private-key-path --public-key-path --warmup-delay-ms --pacing-delay-us --term-type --kex-algos --aead-algos --mac-algos --kdf-algos --help --version"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -58,6 +58,34 @@ _mps() {
                     return 0
                     ;;
                 -k)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --warmup-delay-ms)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --pacing-delay-us)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --term-type)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --kex-algos)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --aead-algos)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --mac-algos)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --kdf-algos)
                     COMPREPLY=($(compgen -f "${cur}"))
                     return 0
                     ;;

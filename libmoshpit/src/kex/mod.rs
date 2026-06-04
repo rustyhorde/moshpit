@@ -6,6 +6,8 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
+//! TCP key exchange protocol: mutual asymmetric authentication and per-session key derivation.
+
 use std::{
     fmt::{self, Display, Formatter},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},

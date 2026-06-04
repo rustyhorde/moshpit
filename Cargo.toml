@@ -9,10 +9,11 @@ aws-lc-rs = "1.17.0"
 bon = "3.9.1"
 bytes = "1.11.1"
 clap = { version = "4.6.1", features = ["derive"] }
-config = { version = "0.15.22", features = ["toml"] }
+config = { version = "0.15.23", features = ["toml"] }
 getset = "0.1.6"
 rustversion = "1.0.22"
 serde = { version = "1.0.228", features = ["derive"] }
+socket2 = { version = "0.6.4", features = ["all"] }
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = [
   "io-util",
@@ -26,7 +27,7 @@ tracing = { version = "0.1.44", features = [
   "release_max_level_trace",
 ] }
 tracing-subscriber-init = { version = "0.2.6", features = ["tstime"] }
-uuid = { version = "1.23.1", features = ["v4"] }
+uuid = { version = "1.23.2", features = ["v4"] }
 vergen-gix = { version = "10.0.0-beta.8", features = [
   "build",
   "cargo",
@@ -35,6 +36,5 @@ vergen-gix = { version = "10.0.0-beta.8", features = [
 ] }
 vergen-pretty = { version = "10.0.0-beta.8", features = ["color", "tracing", "rkyv", "serde"] }
 vt100 = "0.16.2"
-socket2 = { version = "0.6.3", features = ["all"] }
 zeroize = { version = "1.8.2", features = ["zeroize_derive"] }
 zstd = "0.13.3"

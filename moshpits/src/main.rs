@@ -6,7 +6,7 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-//! moshpit - A secure and efficient remote shell protocol implementation in the same vein as Mosh.
+//! `mps` — moshpits server: accepts mp clients, manages PTYs, and streams encrypted terminal state.
 
 // rustc lints
 #![cfg_attr(

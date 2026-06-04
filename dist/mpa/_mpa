@@ -37,7 +37,10 @@ _arguments "${_arguments_options[@]}" : \
 '-s+[Override the Unix socket path (default\: \$XDG_RUNTIME_DIR/moshpit-agent-<uid>.sock)]:PATH:_default' \
 '--socket=[Override the Unix socket path (default\: \$XDG_RUNTIME_DIR/moshpit-agent-<uid>.sock)]:PATH:_default' \
 '--vault=[Path to the vault file (default\: ~/.mp/agent-vault)]:PATH:_default' \
+'--shell=[Shell syntax for the exported MOSHPIT_AGENT_SOCK variable (fish or bash)]:SHELL:(fish bash)' \
+'--backend=[Unlock backend to use (passphrase, fido2, systemd-creds, ssh-agent-piggyback)]:BACKEND:_default' \
 '--foreground[Run in the foreground instead of daemonizing]' \
+'--passphrase-stdin[Read the vault master passphrase from stdin instead of prompting]' \
 '-h[Print help]' \
 '--help[Print help]' \
 && ret=0
@@ -45,6 +48,7 @@ _arguments "${_arguments_options[@]}" : \
 (add-key)
 _arguments "${_arguments_options[@]}" : \
 '--passphrase-stdin[Read the key passphrase from stdin instead of prompting]' \
+'--no-hint[Suppress the key-selection hint shown when multiple keys are loaded]' \
 '-h[Print help]' \
 '--help[Print help]' \
 ':key-path -- Path to the private key file to add:_default' \
@@ -52,6 +56,7 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (list)
 _arguments "${_arguments_options[@]}" : \
+'--no-hint[Suppress the key-selection hint shown when multiple keys are loaded]' \
 '-h[Print help]' \
 '--help[Print help]' \
 && ret=0
@@ -71,6 +76,20 @@ _arguments "${_arguments_options[@]}" : \
 ;;
 (unlock)
 _arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(status)
+_arguments "${_arguments_options[@]}" : \
+'-h[Print help]' \
+'--help[Print help]' \
+&& ret=0
+;;
+(stop)
+_arguments "${_arguments_options[@]}" : \
+'--socket=[Override the Unix socket path (default\: \$MOSHPIT_AGENT_SOCK or XDG default)]:PATH:_default' \
+'--shell=[Shell syntax for unsetting MOSHPIT_AGENT_SOCK (fish or bash)]:SHELL:(fish bash)' \
 '-h[Print help]' \
 '--help[Print help]' \
 && ret=0
@@ -111,6 +130,14 @@ _arguments "${_arguments_options[@]}" : \
 _arguments "${_arguments_options[@]}" : \
 && ret=0
 ;;
+(status)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
+(stop)
+_arguments "${_arguments_options[@]}" : \
+&& ret=0
+;;
 (help)
 _arguments "${_arguments_options[@]}" : \
 && ret=0
@@ -133,6 +160,8 @@ _mpa_commands() {
 'remove-key:Remove an identity from the agent' \
 'lock:Lock the agent (clear keys from memory)' \
 'unlock:Unlock the agent (reload keys from vault)' \
+'status:Show the running status of the agent daemon' \
+'stop:Stop the running agent daemon' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'mpa commands' commands "$@"
@@ -151,6 +180,8 @@ _mpa__subcmd__help_commands() {
 'remove-key:Remove an identity from the agent' \
 'lock:Lock the agent (clear keys from memory)' \
 'unlock:Unlock the agent (reload keys from vault)' \
+'status:Show the running status of the agent daemon' \
+'stop:Stop the running agent daemon' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
     _describe -t commands 'mpa help commands' commands "$@"
@@ -185,6 +216,16 @@ _mpa__subcmd__help__subcmd__start_commands() {
     local commands; commands=()
     _describe -t commands 'mpa help start commands' commands "$@"
 }
+(( $+functions[_mpa__subcmd__help__subcmd__status_commands] )) ||
+_mpa__subcmd__help__subcmd__status_commands() {
+    local commands; commands=()
+    _describe -t commands 'mpa help status commands' commands "$@"
+}
+(( $+functions[_mpa__subcmd__help__subcmd__stop_commands] )) ||
+_mpa__subcmd__help__subcmd__stop_commands() {
+    local commands; commands=()
+    _describe -t commands 'mpa help stop commands' commands "$@"
+}
 (( $+functions[_mpa__subcmd__help__subcmd__unlock_commands] )) ||
 _mpa__subcmd__help__subcmd__unlock_commands() {
     local commands; commands=()
@@ -209,6 +250,16 @@ _mpa__subcmd__remove-key_commands() {
 _mpa__subcmd__start_commands() {
     local commands; commands=()
     _describe -t commands 'mpa start commands' commands "$@"
+}
+(( $+functions[_mpa__subcmd__status_commands] )) ||
+_mpa__subcmd__status_commands() {
+    local commands; commands=()
+    _describe -t commands 'mpa status commands' commands "$@"
+}
+(( $+functions[_mpa__subcmd__stop_commands] )) ||
+_mpa__subcmd__stop_commands() {
+    local commands; commands=()
+    _describe -t commands 'mpa stop commands' commands "$@"
 }
 (( $+functions[_mpa__subcmd__unlock_commands] )) ||
 _mpa__subcmd__unlock_commands() {

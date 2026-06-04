@@ -1,10 +1,10 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH mp 1  "mp 0.8.2" 
+.TH mp 1  "mp 0.8.11" 
 .SH NAME
 mp \- Connect to a moshpits server
 .SH SYNOPSIS
-\fBmp\fR [\fB\-v\fR|\fB\-\-verbose\fR]... [\fB\-q\fR|\fB\-\-quiet\fR]... [\fB\-c\fR|\fB\-\-config\-absolute\-path\fR] [\fB\-t\fR|\fB\-\-tracing\-absolute\-path\fR] [\fB\-p\fR|\fB\-\-private\-key\-path\fR] [\fB\-k\fR|\fB\-\-public\-key\-path\fR] [\fB\-s\fR|\fB\-\-server\-port\fR] [\fB\-\-predict\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] <\fISERVER_DESTINATION\fR> 
+\fBmp\fR [\fB\-v\fR|\fB\-\-verbose\fR]... [\fB\-q\fR|\fB\-\-quiet\fR]... [\fB\-c\fR|\fB\-\-config\-absolute\-path\fR] [\fB\-t\fR|\fB\-\-tracing\-absolute\-path\fR] [\fB\-p\fR|\fB\-\-private\-key\-path\fR] [\fB\-k\fR|\fB\-\-public\-key\-path\fR] [\fB\-s\fR|\fB\-\-server\-port\fR] [\fB\-\-predict\fR] [\fB\-\-nat\-warmup\fR] [\fB\-\-nat\-warmup\-count\fR] [\fB\-\-diff\-mode\fR] [\fB\-\-kex\-algos\fR] [\fB\-\-aead\-algos\fR] [\fB\-\-mac\-algos\fR] [\fB\-\-kdf\-algos\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] <\fISERVER_DESTINATION\fR> 
 .SH DESCRIPTION
 Connect to a moshpits server
 .SH OPTIONS
@@ -45,6 +45,39 @@ always
 never
 .RE
 .TP
+\fB\-\-nat\-warmup\fR
+Send NAT warmup keepalives at UDP session start (opt\-in)
+.TP
+\fB\-\-nat\-warmup\-count\fR \fI<N>\fR [default: 3]
+Number of NAT warmup keepalives to send (default: 3)
+.TP
+\fB\-\-diff\-mode\fR \fI<MODE>\fR [default: reliable]
+UDP diff transport mode: reliable (default), datagram, or statesync
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+reliable
+.IP \(bu 2
+datagram
+.IP \(bu 2
+statesync
+.RE
+.TP
+\fB\-\-kex\-algos\fR \fI<ALGOS>\fR
+Ordered KEX algorithms to offer, comma\-separated [supported: x25519\-sha256 (default), ml\-kem\-768\-sha256, ml\-kem\-512\-sha256, ml\-kem\-1024\-sha256, p384\-sha384, p256\-sha256]
+.TP
+\fB\-\-aead\-algos\fR \fI<ALGOS>\fR
+Ordered AEAD algorithms to offer, comma\-separated [supported: aes256\-gcm\-siv (default), aes256\-gcm, chacha20\-poly1305, aes128\-gcm\-siv]
+.TP
+\fB\-\-mac\-algos\fR \fI<ALGOS>\fR
+Ordered MAC algorithms to offer, comma\-separated [supported: hmac\-sha512 (default), hmac\-sha256]
+.TP
+\fB\-\-kdf\-algos\fR \fI<ALGOS>\fR
+Ordered KDF algorithms to offer, comma\-separated [supported: hkdf\-sha256 (default), hkdf\-sha384, hkdf\-sha512]
+.TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help
 .TP
@@ -54,4 +87,4 @@ Print version
 <\fISERVER_DESTINATION\fR>
 The IP address of the server to connect to (user@address or address)
 .SH VERSION
-v0.8.2
+v0.8.11
