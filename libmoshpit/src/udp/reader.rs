@@ -40,7 +40,8 @@ use zstd::decode_all;
 use super::DiffMode;
 use crate::{
     Emulator, EncryptedFrame, MoshpitError, PredictionEngine, Renderer, TerminalMessage,
-    UuidWrapper, paint_overlays_to_ansi, udp::sender::RETRANSMIT_WINDOW, utils::is_exit_title,
+    UuidWrapper, paint_overlays_to_ansi, render_server_update, udp::sender::RETRANSMIT_WINDOW,
+    utils::is_exit_title,
 };
 
 /// Floor for the adaptive NAK check interval.  On LAN paths where `nak_timeout`
@@ -183,6 +184,12 @@ pub struct UdpReader {
     /// full-state push is dropped by a NAT device.
     #[builder(default)]
     initial_state_received: bool,
+    /// Legacy escape hatch: when `true`, raw server PTY bytes are written
+    /// straight to the terminal (the pre-unified behavior) instead of being
+    /// rendered exclusively through the [`Renderer`].  Defaults to `false`; the
+    /// rendered path is the artifact-free default.
+    #[builder(default)]
+    passthrough: bool,
     /// Total chunk count for the in-progress `StateChunk` assembly.  Zero = no assembly active.
     #[builder(default)]
     pending_chunk_total: u16,
@@ -971,19 +978,83 @@ impl UdpReader {
         Ok(())
     }
 
+    /// Apply an authoritative full-screen snapshot and return the bytes to
+    /// repaint the terminal.
+    ///
+    /// `payload` is the server's `vt100` `contents_formatted()` bytes.  This:
+    /// 1. Reconstructs the screen in a scratch parser, preserving the current
+    ///    alternate-screen state (which `contents_formatted()` omits).
+    /// 2. Refreshes `StateSync` ack bookkeeping when in that mode.
+    /// 3. Resyncs the authoritative client [`Emulator`] to the snapshot so the
+    ///    emulator stays the single source of truth for the renderer and the
+    ///    prediction engine.
+    /// 4. Renders a single clean update through the shared [`Renderer`] —
+    ///    reconciling predictions and emitting a minimal diff (no forced
+    ///    full-screen flash).
+    fn apply_full_state(
+        &mut self,
+        payload: &[u8],
+        emulator: &Arc<Mutex<Emulator>>,
+        prediction: &Arc<Mutex<PredictionEngine>>,
+        renderer: &Arc<Mutex<Renderer>>,
+        in_alt_screen: &Arc<AtomicBool>,
+    ) -> Vec<u8> {
+        let (rows, cols) = {
+            let emu = emulator
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            emu.screen().size()
+        };
+        // `contents_formatted()` omits the `?1049h` alt-screen enter sequence, so
+        // re-apply it when we are currently in alternate-screen mode to keep the
+        // reconstructed screen (and the local display) in the right buffer.  The
+        // prefix is display-only and does not affect diff content.
+        let was_alt = in_alt_screen.load(Ordering::Relaxed);
+        let mut tmp = vt100::Parser::new(rows, cols, 0);
+        if was_alt {
+            tmp.process(b"\x1b[?1049h");
+        }
+        tmp.process(payload);
+        let is_alt = tmp.screen().alternate_screen();
+        in_alt_screen.store(is_alt, Ordering::Relaxed);
+        if self.diff_mode == DiffMode::StateSync {
+            let mut ack = tmp.screen().contents_formatted();
+            if is_alt {
+                let mut prefixed = b"\x1b[?1049h".to_vec();
+                prefixed.extend_from_slice(&ack);
+                ack = prefixed;
+            }
+            self.ack_state = ack;
+            self.ack_state_seq = 0;
+            self.statesync_mismatch_count = 0;
+            self.initial_state_received = true;
+        }
+        // Resync the authoritative emulator to the snapshot, then render.
+        {
+            let mut emu = emulator
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            emu.replace_parser(tmp);
+        }
+        render_server_update(emulator, prediction, renderer, !is_alt)
+    }
+
     /// Process one `StateChunk` frame in `StateSync` client mode.
     ///
     /// Accumulates chunks in order.  When the assembly is complete the combined payload
-    /// is processed identically to a [`EncryptedFrame::ScreenStateCompressed`] frame:
-    /// decompressed, fed into a scratch [`vt100::Parser`], ack state reset, and rendered
-    /// via the shared renderer.  Out-of-order chunks trigger a [`EncryptedFrame::RepaintRequest`].
+    /// is processed identically to a [`EncryptedFrame::ScreenStateCompressed`] frame
+    /// via [`Self::apply_full_state`].  Out-of-order chunks trigger a
+    /// [`EncryptedFrame::RepaintRequest`].
+    #[cfg_attr(nightly, allow(clippy::too_many_arguments))]
     async fn handle_state_chunk(
         &mut self,
         seq: u16,
         total: u16,
         data: Vec<u8>,
         emulator: &Arc<Mutex<Emulator>>,
+        prediction: &Arc<Mutex<PredictionEngine>>,
         renderer: &Arc<Mutex<Renderer>>,
+        in_alt_screen: &Arc<AtomicBool>,
         stdout_tx: &Sender<Vec<u8>>,
     ) {
         if seq == 0 {
@@ -1010,34 +1081,13 @@ impl UdpReader {
             self.pending_chunk_total = 0;
             match decode_all(payload_compressed.as_slice()) {
                 Ok(payload) => {
-                    let (rows, cols) = {
-                        let emu = emulator
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        emu.screen().size()
-                    };
-                    let mut tmp = vt100::Parser::new(rows, cols, 0);
-                    tmp.process(&payload);
-                    if self.diff_mode == DiffMode::StateSync {
-                        let is_alt = tmp.screen().alternate_screen();
-                        let mut ack = tmp.screen().contents_formatted();
-                        if is_alt {
-                            let mut prefixed = b"\x1b[?1049h".to_vec();
-                            prefixed.extend_from_slice(&ack);
-                            ack = prefixed;
-                        }
-                        self.ack_state = ack;
-                        self.ack_state_seq = 0;
-                        self.statesync_mismatch_count = 0;
-                        self.initial_state_received = true;
-                    }
-                    let repaint = {
-                        let mut rend = renderer
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        rend.invalidate();
-                        rend.render(tmp.screen(), &[], None)
-                    };
+                    let repaint = self.apply_full_state(
+                        &payload,
+                        emulator,
+                        prediction,
+                        renderer,
+                        in_alt_screen,
+                    );
                     if !repaint.is_empty()
                         && let Err(e) = stdout_tx.send(repaint).await
                     {
@@ -1074,6 +1124,7 @@ impl UdpReader {
         &mut self,
         token: CancellationToken,
         exit_token: CancellationToken,
+        exit_msg: Arc<Mutex<Option<&'static [u8]>>>,
         stdout_tx: Sender<Vec<u8>>,
         emulator: Arc<Mutex<Emulator>>,
         prediction: Arc<Mutex<PredictionEngine>>,
@@ -1082,6 +1133,9 @@ impl UdpReader {
     ) {
         let mut prev_bytes = BytesMut::with_capacity(1024);
         let mut osc_started = false;
+        // Legacy raw-passthrough escape hatch (default off); captured once so the
+        // per-frame helpers can read it without re-borrowing `self`.
+        let passthrough = self.passthrough;
         // In Datagram and StateSync modes the NAK timer is never actually used
         // (check_nak_timeouts returns immediately), so we park the deadline far in
         // the future to keep the select! branch from firing on every loop iteration.
@@ -1117,6 +1171,8 @@ impl UdpReader {
                                     &emulator,
                                     &prediction,
                                     &in_alt_screen,
+                                    &renderer,
+                                    passthrough,
                                 )
                                 .await;
                             }
@@ -1157,21 +1213,13 @@ impl UdpReader {
                                 }
                             }
                             EncryptedFrame::ScreenState(payload) => {
-                                let (rows, cols) = {
-                                    let emu = emulator.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                                    emu.screen().size()
-                                };
-                                let mut tmp = vt100::Parser::new(rows, cols, 0);
-                                tmp.process(&payload);
-                                in_alt_screen.store(
-                                    tmp.screen().alternate_screen(),
-                                    Ordering::Relaxed,
+                                let repaint = self.apply_full_state(
+                                    &payload,
+                                    &emulator,
+                                    &prediction,
+                                    &renderer,
+                                    &in_alt_screen,
                                 );
-                                let repaint = {
-                                    let mut rend = renderer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                                    rend.invalidate();
-                                    rend.render(tmp.screen(), &[], None)
-                                };
                                 if !repaint.is_empty()
                                     && let Err(e) = stdout_tx.send(repaint).await
                                 {
@@ -1181,31 +1229,13 @@ impl UdpReader {
                             EncryptedFrame::ScreenStateCompressed(compressed) => {
                                 match decode_all(compressed.as_slice()) {
                                     Ok(payload) => {
-                                        let (rows, cols) = {
-                                            let emu = emulator.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                                            emu.screen().size()
-                                        };
-                                        let mut tmp = vt100::Parser::new(rows, cols, 0);
-                                        tmp.process(&payload);
-                                        let is_alt = tmp.screen().alternate_screen();
-                                        in_alt_screen.store(is_alt, Ordering::Relaxed);
-                                        if self.diff_mode == DiffMode::StateSync {
-                                            let mut ack = tmp.screen().contents_formatted();
-                                            if is_alt {
-                                                let mut prefixed = b"\x1b[?1049h".to_vec();
-                                                prefixed.extend_from_slice(&ack);
-                                                ack = prefixed;
-                                            }
-                                            self.ack_state = ack;
-                                            self.ack_state_seq = 0;
-                                            self.statesync_mismatch_count = 0;
-                                            self.initial_state_received = true;
-                                        }
-                                        let repaint = {
-                                            let mut rend = renderer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                                            rend.invalidate();
-                                            rend.render(tmp.screen(), &[], None)
-                                        };
+                                        let repaint = self.apply_full_state(
+                                            &payload,
+                                            &emulator,
+                                            &prediction,
+                                            &renderer,
+                                            &in_alt_screen,
+                                        );
                                         if !repaint.is_empty()
                                             && let Err(e) = stdout_tx.send(repaint).await
                                         {
@@ -1218,8 +1248,10 @@ impl UdpReader {
                                 }
                             }
                             EncryptedFrame::PtyExit => {
-                                let msg = b"\r\n\x1b[0m[moshpit] Remote session ended.\r\n";
-                                drop(stdout_tx.send(msg.to_vec()).await);
+                                *exit_msg
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                    Some(b"[moshpit] Remote session ended.\r\n");
                                 exit_token.cancel();
                                 break 'session;
                             }
@@ -1229,7 +1261,9 @@ impl UdpReader {
                                     total,
                                     data,
                                     &emulator,
+                                    &prediction,
                                     &renderer,
+                                    &in_alt_screen,
                                     &stdout_tx,
                                 )
                                 .await;
@@ -1249,6 +1283,8 @@ impl UdpReader {
                                             &emulator,
                                             &prediction,
                                             &in_alt_screen,
+                                            &renderer,
+                                            passthrough,
                                         )
                                         .await;
                                     }
@@ -1327,21 +1363,13 @@ impl UdpReader {
                                         }
                                     }
                                     EncryptedFrame::ScreenState(payload) => {
-                                        let (rows, cols) = {
-                                            let emu = emulator.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                                            emu.screen().size()
-                                        };
-                                        let mut tmp = vt100::Parser::new(rows, cols, 0);
-                                        tmp.process(&payload);
-                                        in_alt_screen.store(
-                                            tmp.screen().alternate_screen(),
-                                            Ordering::Relaxed,
+                                        let repaint = self.apply_full_state(
+                                            &payload,
+                                            &emulator,
+                                            &prediction,
+                                            &renderer,
+                                            &in_alt_screen,
                                         );
-                                        let repaint = {
-                                            let mut rend = renderer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                                            rend.invalidate();
-                                            rend.render(tmp.screen(), &[], None)
-                                        };
                                         if !repaint.is_empty()
                                             && let Err(e) = stdout_tx.send(repaint).await
                                         {
@@ -1351,31 +1379,13 @@ impl UdpReader {
                                     EncryptedFrame::ScreenStateCompressed(compressed) => {
                                         match decode_all(compressed.as_slice()) {
                                             Ok(payload) => {
-                                                let (rows, cols) = {
-                                                    let emu = emulator.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                                                    emu.screen().size()
-                                                };
-                                                let mut tmp = vt100::Parser::new(rows, cols, 0);
-                                                tmp.process(&payload);
-                                                let is_alt = tmp.screen().alternate_screen();
-                                                in_alt_screen.store(is_alt, Ordering::Relaxed);
-                                                if self.diff_mode == DiffMode::StateSync {
-                                                    let mut ack = tmp.screen().contents_formatted();
-                                                    if is_alt {
-                                                        let mut prefixed = b"\x1b[?1049h".to_vec();
-                                                        prefixed.extend_from_slice(&ack);
-                                                        ack = prefixed;
-                                                    }
-                                                    self.ack_state = ack;
-                                                    self.ack_state_seq = 0;
-                                                    self.statesync_mismatch_count = 0;
-                                                    self.initial_state_received = true;
-                                                }
-                                                let repaint = {
-                                                    let mut rend = renderer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                                                    rend.invalidate();
-                                                    rend.render(tmp.screen(), &[], None)
-                                                };
+                                                let repaint = self.apply_full_state(
+                                                    &payload,
+                                                    &emulator,
+                                                    &prediction,
+                                                    &renderer,
+                                                    &in_alt_screen,
+                                                );
                                                 if !repaint.is_empty()
                                                     && let Err(e) = stdout_tx.send(repaint).await
                                                 {
@@ -1402,6 +1412,8 @@ impl UdpReader {
                                                     &emulator,
                                                     &prediction,
                                                     &in_alt_screen,
+                                                    &renderer,
+                                                    passthrough,
                                                 )
                                                 .await;
                                             }
@@ -1423,6 +1435,8 @@ impl UdpReader {
                                             &emulator,
                                             &prediction,
                                             &in_alt_screen,
+                                            &renderer,
+                                            passthrough,
                                         )
                                         .await;
                                     }
@@ -1455,14 +1469,24 @@ impl UdpReader {
                                                     }
                                                     self.ack_state = new_ack;
                                                     self.ack_state_seq = diff_id;
-                                                    // Route through the renderer so displayed tracks
-                                                    // alt-screen state and ScreenStateCompressed
-                                                    // repaints compute correct diffs afterward.
-                                                    let repaint = {
-                                                        let mut rend = renderer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                                                        rend.render(tmp.screen(), &[], None)
-                                                    };
-                                                    if let Err(e) = stdout_tx.send(repaint).await {
+                                                    // Resync the authoritative emulator to the new
+                                                    // state so the prediction engine (and the
+                                                    // forwarder's local echo) work in StateSync mode,
+                                                    // then render a single clean update — predictions
+                                                    // reconciled — through the shared renderer.
+                                                    {
+                                                        let mut emu = emulator.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                                                        emu.replace_parser(tmp);
+                                                    }
+                                                    let repaint = render_server_update(
+                                                        &emulator,
+                                                        &prediction,
+                                                        &renderer,
+                                                        !is_alt,
+                                                    );
+                                                    if !repaint.is_empty()
+                                                        && let Err(e) = stdout_tx.send(repaint).await
+                                                    {
                                                         error!("Error sending StateSyncDiff to stdout channel: {e}");
                                                     }
                                                     if let Some(ref tx) = self.nak_out_tx
@@ -1488,8 +1512,10 @@ impl UdpReader {
                                         }
                                     }
                                     EncryptedFrame::PtyExit => {
-                                        let msg = b"\r\n\x1b[0m[moshpit] Remote session ended.\r\n";
-                                        drop(stdout_tx.send(msg.to_vec()).await);
+                                        *exit_msg
+                                            .lock()
+                                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                            Some(b"[moshpit] Remote session ended.\r\n");
                                         exit_token.cancel();
                                         break 'session;
                                     }
@@ -1499,7 +1525,9 @@ impl UdpReader {
                                             total,
                                             data,
                                             &emulator,
+                                            &prediction,
                                             &renderer,
+                                            &in_alt_screen,
                                             &stdout_tx,
                                         )
                                         .await;
@@ -1530,16 +1558,17 @@ impl UdpReader {
     }
 }
 
-/// Feed server bytes through the prediction pipeline and write output to
-/// the stdout channel.
+/// Feed server bytes through the emulator and render a single clean update.
 ///
-/// Pipeline:
+/// Pipeline (default, unified rendering):
 /// 1. Detect shell-exit via OSC title.
-/// 2. Forward raw bytes to stdout unchanged (preserves normal terminal
-///    rendering exactly as before prediction was added).
-/// 3. Feed raw bytes into the terminal emulator (for prediction state).
-/// 4. Cull confirmed/invalid predictions against the new screen state.
-/// 5. Paint any active prediction overlays on top via ANSI sequences.
+/// 2. Feed raw bytes into the terminal emulator (the single source of truth).
+/// 3. Render the emulator's screen — with predictions reconciled and merged —
+///    through the shared [`Renderer`], which is the sole writer to the terminal.
+///
+/// When `passthrough` is `true` the legacy behavior is used instead: raw bytes
+/// are written straight to the terminal and prediction overlays are painted on
+/// top out-of-band.  This is an escape hatch and is off by default.
 #[cfg_attr(nightly, allow(clippy::too_many_arguments))]
 async fn process_bytes_with_prediction(
     raw: Vec<u8>,
@@ -1552,6 +1581,8 @@ async fn process_bytes_with_prediction(
     emulator: &Arc<Mutex<Emulator>>,
     prediction: &Arc<Mutex<PredictionEngine>>,
     in_alt_screen: &Arc<AtomicBool>,
+    renderer: &Arc<Mutex<Renderer>>,
+    passthrough: bool,
 ) {
     // ── 1. OSC exit detection ─────────────────────────────────────────────
     let message = if prev_bytes.is_empty() {
@@ -1589,18 +1620,21 @@ async fn process_bytes_with_prediction(
         }
     }
 
-    // ── 2. Forward raw bytes to stdout ───────────────────────────────────
-    // The physical terminal drives its own display from the server's PTY
-    // bytes.  We do not replace them with a computed representation; the
-    // emulator is used only to track screen state for the prediction engine.
-    // In scrollback_mode the bytes are absorbed silently — the renderer will
-    // emit a single clean repaint when ScrollbackEnd arrives.
-    if !scrollback_mode && let Err(e) = stdout_tx.send(raw.clone()).await {
+    // ── 2. (legacy) forward raw bytes to stdout ──────────────────────────
+    // In passthrough mode the physical terminal is driven directly by the
+    // server's PTY bytes (the pre-unified behavior).  In the default rendered
+    // path the renderer is the sole writer and raw bytes are never emitted.
+    // In scrollback_mode the bytes are absorbed silently regardless — the
+    // renderer emits a single clean repaint when ScrollbackEnd arrives.
+    if passthrough
+        && !scrollback_mode
+        && let Err(e) = stdout_tx.send(raw.clone()).await
+    {
         error!("Error sending to stdout channel: {e}");
         return;
     }
 
-    // ── 3. Feed raw bytes into the emulator ──────────────────────────────
+    // ── 3. Feed raw bytes into the emulator (the single source of truth) ──
     let was_alt = in_alt_screen.load(Ordering::Relaxed);
     let is_alt = {
         let mut emu = emulator
@@ -1618,28 +1652,44 @@ async fn process_bytes_with_prediction(
         *osc_started = false;
     }
 
-    // ── 4+5. Cull predictions and paint overlays ─────────────────────────
-    // Skip overlay painting while absorbing scrollback — there are no active
-    // predictions during reconnect and we do not want flickering output.
-    // Also skip when in alternate-screen mode (vi, htop, etc.) — the app
-    // manages its own screen state and prediction adds only contention.
-    if !scrollback_mode && !is_alt {
-        let (overlays, cursor) = {
-            let emu = emulator
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let screen = emu.screen();
-            let mut pred = prediction
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            pred.cull(screen);
-            pred.apply(screen)
-        };
-        let overlay_out = paint_overlays_to_ansi(&overlays, cursor);
-        if !overlay_out.is_empty()
-            && let Err(e) = stdout_tx.send(overlay_out).await
+    // While absorbing scrollback we produce no output — the renderer emits a
+    // single clean repaint when ScrollbackEnd arrives.
+    if scrollback_mode {
+        return;
+    }
+
+    // ── 4. Render the update ──────────────────────────────────────────────
+    // Predictions are skipped in alternate-screen mode (vi, htop, etc.) — the
+    // app owns the screen and prediction only adds contention.
+    if passthrough {
+        // Legacy: paint prediction overlays on top of the raw bytes.
+        if !is_alt {
+            let (overlays, cursor) = {
+                let emu = emulator
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let screen = emu.screen();
+                let mut pred = prediction
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                pred.cull(screen);
+                pred.apply(screen)
+            };
+            let overlay_out = paint_overlays_to_ansi(&overlays, cursor);
+            if !overlay_out.is_empty()
+                && let Err(e) = stdout_tx.send(overlay_out).await
+            {
+                error!("Error sending overlays to stdout channel: {e}");
+            }
+        }
+    } else {
+        // Unified: the renderer is the sole writer; predictions are reconciled
+        // and merged into the diffed framebuffer so culled predictions heal.
+        let out = render_server_update(emulator, prediction, renderer, !is_alt);
+        if !out.is_empty()
+            && let Err(e) = stdout_tx.send(out).await
         {
-            error!("Error sending overlays to stdout channel: {e}");
+            error!("Error sending render to stdout channel: {e}");
         }
     }
 }
@@ -2763,6 +2813,7 @@ mod tests {
         Arc<Mutex<PredictionEngine>>,
         Arc<AtomicBool>,
         CancellationToken,
+        Arc<Mutex<Renderer>>,
     );
 
     /// Helper: build the shared state needed to call `process_bytes_with_prediction`.
@@ -2773,6 +2824,7 @@ mod tests {
         let prediction = Arc::new(Mutex::new(PredictionEngine::new(DisplayPreference::Never)));
         let in_alt_screen = Arc::new(AtomicBool::new(false));
         let exit_token = CancellationToken::new();
+        let renderer = Arc::new(Mutex::new(Renderer::new(24, 80)));
         (
             stdout_tx,
             stdout_rx,
@@ -2780,12 +2832,13 @@ mod tests {
             prediction,
             in_alt_screen,
             exit_token,
+            renderer,
         )
     }
 
     #[tokio::test]
     async fn process_bytes_with_prediction_sets_in_alt_screen_on_entry() {
-        let (stdout_tx, _rx, emulator, prediction, in_alt_screen, exit_token) =
+        let (stdout_tx, _rx, emulator, prediction, in_alt_screen, exit_token, renderer) =
             make_prediction_state();
         let mut prev_bytes = BytesMut::new();
         let mut osc_started = false;
@@ -2801,6 +2854,8 @@ mod tests {
             &emulator,
             &prediction,
             &in_alt_screen,
+            &renderer,
+            false,
         )
         .await;
 
@@ -2812,7 +2867,7 @@ mod tests {
 
     #[tokio::test]
     async fn process_bytes_with_prediction_clears_in_alt_screen_on_exit() {
-        let (stdout_tx, _rx, emulator, prediction, in_alt_screen, exit_token) =
+        let (stdout_tx, _rx, emulator, prediction, in_alt_screen, exit_token, renderer) =
             make_prediction_state();
         let mut prev_bytes = BytesMut::new();
         let mut osc_started = false;
@@ -2828,6 +2883,8 @@ mod tests {
             &emulator,
             &prediction,
             &in_alt_screen,
+            &renderer,
+            false,
         )
         .await;
         assert!(
@@ -2846,6 +2903,8 @@ mod tests {
             &emulator,
             &prediction,
             &in_alt_screen,
+            &renderer,
+            false,
         )
         .await;
 
@@ -2857,7 +2916,7 @@ mod tests {
 
     #[tokio::test]
     async fn process_bytes_with_prediction_resets_osc_started_on_alt_screen_entry() {
-        let (stdout_tx, _rx, emulator, prediction, in_alt_screen, exit_token) =
+        let (stdout_tx, _rx, emulator, prediction, in_alt_screen, exit_token, renderer) =
             make_prediction_state();
         let mut prev_bytes = BytesMut::new();
         let mut osc_started = true; // simulate a stuck OSC state machine
@@ -2873,6 +2932,8 @@ mod tests {
             &emulator,
             &prediction,
             &in_alt_screen,
+            &renderer,
+            false,
         )
         .await;
 
@@ -3094,6 +3155,10 @@ mod tests {
 
         let emulator = Arc::new(StdMutex::new(Emulator::new(24, 80)));
         let renderer = Arc::new(StdMutex::new(Renderer::new(24, 80)));
+        let prediction = Arc::new(StdMutex::new(PredictionEngine::new(
+            crate::DisplayPreference::Never,
+        )));
+        let in_alt_screen = Arc::new(AtomicBool::new(false));
         let (stdout_tx, _stdout_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
 
         let raw = b"hello";
@@ -3101,7 +3166,16 @@ mod tests {
 
         // Single-chunk assembly: seq=0, total=1
         reader
-            .handle_state_chunk(0, 1, compressed, &emulator, &renderer, &stdout_tx)
+            .handle_state_chunk(
+                0,
+                1,
+                compressed,
+                &emulator,
+                &prediction,
+                &renderer,
+                &in_alt_screen,
+                &stdout_tx,
+            )
             .await;
 
         // After completion the assembly state must be reset
@@ -3130,16 +3204,38 @@ mod tests {
 
         let emulator = Arc::new(StdMutex::new(Emulator::new(24, 80)));
         let renderer = Arc::new(StdMutex::new(Renderer::new(24, 80)));
+        let prediction = Arc::new(StdMutex::new(PredictionEngine::new(
+            crate::DisplayPreference::Never,
+        )));
+        let in_alt_screen = Arc::new(AtomicBool::new(false));
         let (stdout_tx, _stdout_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
 
         // Start assembly: seq=0, total=3
         reader
-            .handle_state_chunk(0, 3, vec![0xAA; 10], &emulator, &renderer, &stdout_tx)
+            .handle_state_chunk(
+                0,
+                3,
+                vec![0xAA; 10],
+                &emulator,
+                &prediction,
+                &renderer,
+                &in_alt_screen,
+                &stdout_tx,
+            )
             .await;
 
         // Out-of-order: seq=2 (skipping seq=1) → discard and send RepaintRequest
         reader
-            .handle_state_chunk(2, 3, vec![0xBB; 10], &emulator, &renderer, &stdout_tx)
+            .handle_state_chunk(
+                2,
+                3,
+                vec![0xBB; 10],
+                &emulator,
+                &prediction,
+                &renderer,
+                &in_alt_screen,
+                &stdout_tx,
+            )
             .await;
 
         assert!(
@@ -3270,9 +3366,10 @@ mod tests {
 
         // Cancel before the loop starts so we don't block on recv_buf.
         token.cancel();
+        let exit_msg = Arc::new(Mutex::new(None));
         reader
             .client_frame_loop(
-                token, exit_token, stdout_tx, emulator, prediction, renderer, in_alt,
+                token, exit_token, exit_msg, stdout_tx, emulator, prediction, renderer, in_alt,
             )
             .await;
         Ok(())
@@ -3309,10 +3406,11 @@ mod tests {
         let in_alt = Arc::new(AtomicBool::new(false));
 
         let t = token.clone();
+        let exit_msg = Arc::new(Mutex::new(None));
         let handle = tokio::spawn(async move {
             reader
                 .client_frame_loop(
-                    t, exit_token, stdout_tx, emulator, prediction, renderer, in_alt,
+                    t, exit_token, exit_msg, stdout_tx, emulator, prediction, renderer, in_alt,
                 )
                 .await;
         });

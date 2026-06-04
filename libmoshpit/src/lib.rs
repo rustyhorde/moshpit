@@ -376,7 +376,7 @@ pub use self::tcp::writer::ConnectionWriter;
 pub use self::term::TerminalMessage;
 pub use self::term::{
     DisplayPreference, Emulator, OverlayCell, OverlayCursor, PredictionEngine, Renderer,
-    paint_overlays_to_ansi,
+    paint_overlays_to_ansi, render_prediction_update, render_server_update,
 };
 pub use self::tracing::{TracingConfigExt, init_tracing};
 pub use self::udp::DiffMode;
