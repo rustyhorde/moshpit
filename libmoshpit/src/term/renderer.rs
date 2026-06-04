@@ -584,4 +584,159 @@ mod tests {
         assert!(r.initialized);
         assert!(!after_resize.is_empty());
     }
+
+    use super::super::prediction::DisplayPreference;
+
+    /// The shared `(emulator, prediction, renderer)` trio the free-function
+    /// renderers operate on.
+    type RenderTrio = (
+        Arc<Mutex<Emulator>>,
+        Arc<Mutex<PredictionEngine>>,
+        Arc<Mutex<Renderer>>,
+    );
+
+    // Build the render trio with a blank 24×80 screen.
+    fn render_trio() -> RenderTrio {
+        (
+            Arc::new(Mutex::new(Emulator::new(24, 80))),
+            Arc::new(Mutex::new(PredictionEngine::new(DisplayPreference::Always))),
+            Arc::new(Mutex::new(Renderer::new(24, 80))),
+        )
+    }
+
+    #[test]
+    fn render_server_update_paints_emulator_screen() {
+        let (emulator, prediction, renderer) = render_trio();
+        emulator.lock().unwrap().process(b"server text");
+        let mut term = vt100::Parser::new(24, 80, 0);
+        apply(
+            &mut term,
+            &render_server_update(&emulator, &prediction, &renderer, true),
+        );
+        assert_eq!(
+            term.screen().cell(0, 0).map(vt100::Cell::contents),
+            Some("s"),
+            "server screen content must be rendered to the terminal"
+        );
+    }
+
+    #[test]
+    fn render_server_update_culls_stale_predictions() {
+        let (emulator, prediction, renderer) = render_trio();
+        // The emulator already shows 'a' at (0,0); register a prediction that
+        // the server screen contradicts so cull must discard it.
+        emulator.lock().unwrap().process(b"a");
+        {
+            let emu = emulator.lock().unwrap();
+            let mut pred = prediction.lock().unwrap();
+            pred.new_user_byte(b'Z', emu.screen());
+        }
+        let mut term = vt100::Parser::new(24, 80, 0);
+        apply(
+            &mut term,
+            &render_server_update(&emulator, &prediction, &renderer, true),
+        );
+        assert_eq!(
+            term.screen().cell(0, 0).map(vt100::Cell::contents),
+            Some("a"),
+            "a prediction the server screen contradicts must be culled, leaving the real cell"
+        );
+    }
+
+    #[test]
+    fn render_server_update_without_predictions_skips_overlays() {
+        let (emulator, prediction, renderer) = render_trio();
+        emulator.lock().unwrap().process(b"hello");
+        // Stash a prediction that would change the display if applied.
+        {
+            let emu = emulator.lock().unwrap();
+            let mut pred = prediction.lock().unwrap();
+            pred.new_user_byte(b'X', emu.screen());
+        }
+        let mut term = vt100::Parser::new(24, 80, 0);
+        // with_predictions = false must ignore the pending prediction entirely.
+        apply(
+            &mut term,
+            &render_server_update(&emulator, &prediction, &renderer, false),
+        );
+        assert_eq!(
+            term.screen().cell(0, 0).map(vt100::Cell::contents),
+            Some("h"),
+            "with_predictions=false must render only the raw server screen"
+        );
+    }
+
+    #[test]
+    fn render_prediction_update_paints_keystroke_once_confirmed() {
+        let (emulator, prediction, renderer) = render_trio();
+        // Prime the prediction engine with the terminal dimensions so the first
+        // confirming cull doesn't reset everything.
+        {
+            let emu = emulator.lock().unwrap();
+            prediction.lock().unwrap().cull(emu.screen());
+        }
+        let mut term = vt100::Parser::new(24, 80, 0);
+
+        // Type 'k' at (0,0): a fresh prediction is tentative and not yet shown.
+        apply(
+            &mut term,
+            &render_prediction_update(&emulator, &prediction, &renderer, b"k"),
+        );
+        assert_eq!(
+            term.screen().cell(0, 0).map(vt100::Cell::contents),
+            Some(""),
+            "a fresh (tentative) prediction must not be painted yet"
+        );
+
+        // A server update advances the real cursor to the predicted column
+        // (0,1) without echoing the keystroke yet — this confirms the epoch.
+        emulator.lock().unwrap().process(b"\x1b[1;2H");
+        apply(
+            &mut term,
+            &render_server_update(&emulator, &prediction, &renderer, true),
+        );
+        assert_eq!(
+            term.screen().cell(0, 0).map(vt100::Cell::contents),
+            Some("k"),
+            "once the epoch is confirmed the predicted keystroke must be painted"
+        );
+    }
+
+    #[test]
+    fn render_prediction_update_does_not_cull_between_keystrokes() {
+        let (emulator, prediction, renderer) = render_trio();
+        {
+            let emu = emulator.lock().unwrap();
+            prediction.lock().unwrap().cull(emu.screen());
+        }
+        let mut term = vt100::Parser::new(24, 80, 0);
+
+        // Two predicted bytes in sequence; neither call culls, so both
+        // predictions survive to be confirmed together.
+        apply(
+            &mut term,
+            &render_prediction_update(&emulator, &prediction, &renderer, b"a"),
+        );
+        apply(
+            &mut term,
+            &render_prediction_update(&emulator, &prediction, &renderer, b"b"),
+        );
+
+        // Confirm both predictions: real cursor advances to (0,2).
+        emulator.lock().unwrap().process(b"\x1b[1;3H");
+        apply(
+            &mut term,
+            &render_server_update(&emulator, &prediction, &renderer, true),
+        );
+        assert_eq!(
+            term.screen().cell(0, 0).map(vt100::Cell::contents),
+            Some("a"),
+            "first prediction must survive the second keystroke"
+        );
+        assert_eq!(
+            term.screen().cell(0, 1).map(vt100::Cell::contents),
+            Some("b"),
+            "second prediction must be appended alongside the first"
+        );
+    }
 }

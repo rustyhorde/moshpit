@@ -1794,6 +1794,7 @@ mod tests {
     };
 
     use super::*;
+    use std::sync::Mutex as StdMutex;
 
     #[tokio::test]
     async fn test_handle_arrival_seq_jump() -> Result<()> {
@@ -2944,6 +2945,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn process_bytes_with_prediction_passthrough_forwards_raw_bytes() {
+        let (stdout_tx, mut rx, emulator, prediction, in_alt_screen, exit_token, renderer) =
+            make_prediction_state();
+        let mut prev_bytes = BytesMut::new();
+        let mut osc_started = false;
+
+        // Legacy passthrough: the raw server bytes must be written straight to
+        // stdout (the pre-unified behavior).
+        process_bytes_with_prediction(
+            b"hello".to_vec(),
+            &mut prev_bytes,
+            &mut osc_started,
+            &stdout_tx,
+            false,
+            &exit_token,
+            &emulator,
+            &prediction,
+            &in_alt_screen,
+            &renderer,
+            true,
+        )
+        .await;
+
+        let out = rx
+            .try_recv()
+            .expect("passthrough must forward the raw bytes");
+        assert_eq!(out, b"hello", "raw server bytes must be forwarded verbatim");
+    }
+
+    #[tokio::test]
+    async fn process_bytes_with_prediction_rendered_path_emits_rendered_output() {
+        let (stdout_tx, mut rx, emulator, prediction, in_alt_screen, exit_token, renderer) =
+            make_prediction_state();
+        let mut prev_bytes = BytesMut::new();
+        let mut osc_started = false;
+
+        // Default (rendered) path: the renderer is the sole writer.  The output
+        // is a clean rendered update, not the raw bytes, but it must contain the
+        // server content 'hi'.
+        process_bytes_with_prediction(
+            b"hi".to_vec(),
+            &mut prev_bytes,
+            &mut osc_started,
+            &stdout_tx,
+            false,
+            &exit_token,
+            &emulator,
+            &prediction,
+            &in_alt_screen,
+            &renderer,
+            false,
+        )
+        .await;
+
+        let out = rx
+            .try_recv()
+            .expect("rendered path must emit a rendered update");
+        // Feed the rendered bytes into a stand-in terminal and check the glyphs.
+        let mut term = vt100::Parser::new(24, 80, 0);
+        term.process(&out);
+        assert_eq!(
+            term.screen().cell(0, 0).map(vt100::Cell::contents),
+            Some("h"),
+            "rendered output must paint the server content"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_bytes_with_prediction_scrollback_absorbs_silently() {
+        let (stdout_tx, mut rx, emulator, prediction, in_alt_screen, exit_token, renderer) =
+            make_prediction_state();
+        let mut prev_bytes = BytesMut::new();
+        let mut osc_started = false;
+
+        // In scrollback_mode no output is emitted regardless of passthrough —
+        // the renderer emits a single clean repaint when ScrollbackEnd arrives.
+        process_bytes_with_prediction(
+            b"absorb me".to_vec(),
+            &mut prev_bytes,
+            &mut osc_started,
+            &stdout_tx,
+            true,
+            &exit_token,
+            &emulator,
+            &prediction,
+            &in_alt_screen,
+            &renderer,
+            false,
+        )
+        .await;
+
+        assert!(
+            rx.try_recv().is_err(),
+            "scrollback mode must absorb bytes without emitting output"
+        );
+        // ...but the emulator still tracked the bytes for later repaint.
+        assert_eq!(
+            emulator
+                .lock()
+                .unwrap()
+                .screen()
+                .cell(0, 0)
+                .map(vt100::Cell::contents),
+            Some("a"),
+            "scrollback bytes must still be fed into the emulator"
+        );
+    }
+
+    #[tokio::test]
     async fn handle_arrival_screen_state_compressed_also_obsoletes_gaps() -> Result<()> {
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
         let mut reader = UdpReader::builder()
@@ -3248,6 +3358,166 @@ mod tests {
             "expected RepaintRequest after out-of-order chunk"
         );
         Ok(())
+    }
+
+    // ── apply_full_state ──────────────────────────────────────────────────────
+
+    /// A reader plus the shared render state for `apply_full_state` tests.
+    type FullStateFixtures = (
+        UdpReader,
+        Arc<StdMutex<Emulator>>,
+        Arc<StdMutex<PredictionEngine>>,
+        Arc<StdMutex<Renderer>>,
+        Arc<AtomicBool>,
+    );
+
+    /// Build a reader plus the shared render state for `apply_full_state` tests.
+    fn make_full_state_fixtures(diff_mode: DiffMode) -> FullStateFixtures {
+        let reader = make_reader_sync_with_diff_mode(diff_mode);
+        let emulator = Arc::new(StdMutex::new(Emulator::new(24, 80)));
+        let prediction = Arc::new(StdMutex::new(PredictionEngine::new(
+            crate::DisplayPreference::Never,
+        )));
+        let renderer = Arc::new(StdMutex::new(Renderer::new(24, 80)));
+        let in_alt_screen = Arc::new(AtomicBool::new(false));
+        (reader, emulator, prediction, renderer, in_alt_screen)
+    }
+
+    fn make_reader_sync_with_diff_mode(diff_mode: DiffMode) -> UdpReader {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let socket = rt.block_on(async {
+            UdpSocket::bind("127.0.0.1:0")
+                .await
+                .expect("bind test socket")
+        });
+        UdpReader::builder()
+            .socket(Arc::new(socket))
+            .id(Uuid::new_v4())
+            .rnk(LessSafeKey::new(
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32])
+                    .expect("test AES-256-GCM-SIV key setup"),
+            ))
+            .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
+            .diff_mode(diff_mode)
+            .build()
+    }
+
+    #[test]
+    fn apply_full_state_resyncs_emulator_and_returns_repaint() {
+        let (mut reader, emulator, prediction, renderer, in_alt_screen) =
+            make_full_state_fixtures(DiffMode::Datagram);
+        // Pre-load the emulator with stale content that the snapshot replaces.
+        emulator.lock().unwrap().process(b"stale content");
+
+        let snapshot = {
+            let mut p = vt100::Parser::new(24, 80, 0);
+            p.process(b"fresh");
+            p.screen().contents_formatted()
+        };
+        let repaint =
+            reader.apply_full_state(&snapshot, &emulator, &prediction, &renderer, &in_alt_screen);
+
+        // The authoritative emulator must now reflect the snapshot.
+        assert_eq!(
+            emulator
+                .lock()
+                .unwrap()
+                .screen()
+                .cell(0, 0)
+                .map(vt100::Cell::contents),
+            Some("f"),
+            "emulator must be resynced to the snapshot"
+        );
+        // And the returned repaint must render that content to a terminal.
+        let mut term = vt100::Parser::new(24, 80, 0);
+        term.process(&repaint);
+        assert_eq!(
+            term.screen().cell(0, 0).map(vt100::Cell::contents),
+            Some("f"),
+            "repaint bytes must paint the snapshot content"
+        );
+        assert!(
+            !in_alt_screen.load(Ordering::Relaxed),
+            "a main-screen snapshot must clear the alt-screen flag"
+        );
+    }
+
+    #[test]
+    fn apply_full_state_preserves_alt_screen_across_snapshot() {
+        let (mut reader, emulator, prediction, renderer, in_alt_screen) =
+            make_full_state_fixtures(DiffMode::Datagram);
+        // We are already in the alternate screen buffer (set earlier by the
+        // DECSET passthrough).  `contents_formatted()` omits the `?1049h` enter
+        // sequence, so `apply_full_state` must re-apply it from `was_alt` to
+        // keep the reconstructed screen in the alt buffer.
+        in_alt_screen.store(true, Ordering::Relaxed);
+
+        let snapshot = {
+            let mut p = vt100::Parser::new(24, 80, 0);
+            p.process(b"app");
+            p.screen().contents_formatted()
+        };
+        drop(reader.apply_full_state(&snapshot, &emulator, &prediction, &renderer, &in_alt_screen));
+
+        assert!(
+            in_alt_screen.load(Ordering::Relaxed),
+            "alt-screen state must be preserved across a full-state snapshot"
+        );
+    }
+
+    #[test]
+    fn apply_full_state_statesync_refreshes_ack_bookkeeping() {
+        let (mut reader, emulator, prediction, renderer, in_alt_screen) =
+            make_full_state_fixtures(DiffMode::StateSync);
+        // Dirty the ack bookkeeping so we can observe it being refreshed.
+        reader.ack_state_seq = 42;
+        reader.statesync_mismatch_count = 7;
+        assert!(!reader.initial_state_received);
+
+        let snapshot = {
+            let mut p = vt100::Parser::new(24, 80, 0);
+            p.process(b"sync");
+            p.screen().contents_formatted()
+        };
+        drop(reader.apply_full_state(&snapshot, &emulator, &prediction, &renderer, &in_alt_screen));
+
+        assert_eq!(reader.ack_state_seq, 0, "ack sequence must reset to 0");
+        assert_eq!(
+            reader.statesync_mismatch_count, 0,
+            "mismatch counter must reset"
+        );
+        assert!(
+            reader.initial_state_received,
+            "initial_state_received must be set"
+        );
+        assert_eq!(
+            reader.ack_state, snapshot,
+            "ack_state must capture the reconstructed snapshot"
+        );
+    }
+
+    #[test]
+    fn apply_full_state_datagram_does_not_touch_ack_bookkeeping() {
+        let (mut reader, emulator, prediction, renderer, in_alt_screen) =
+            make_full_state_fixtures(DiffMode::Datagram);
+        assert!(!reader.initial_state_received);
+
+        let snapshot = {
+            let mut p = vt100::Parser::new(24, 80, 0);
+            p.process(b"data");
+            p.screen().contents_formatted()
+        };
+        drop(reader.apply_full_state(&snapshot, &emulator, &prediction, &renderer, &in_alt_screen));
+
+        // Datagram mode skips the StateSync ack-bookkeeping branch entirely.
+        assert!(
+            !reader.initial_state_received,
+            "Datagram mode must not set initial_state_received"
+        );
+        assert!(
+            reader.ack_state.is_empty(),
+            "Datagram mode must not populate ack_state"
+        );
     }
 
     // ── server_frame_loop / client_frame_loop integration tests ──────────────
