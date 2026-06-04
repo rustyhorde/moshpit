@@ -27,7 +27,6 @@ clap = { workspace = true }
 config = { workspace = true }
 getset = { workspace = true }
 libmoshpit = { version = "0.8.12", path = "../libmoshpit" }
-zstd = { workspace = true }
 portable-pty = "0.9.0"
 serde = { workspace = true }
 tokio = { workspace = true, features = ["signal", "sync", "time"] }
@@ -37,6 +36,7 @@ tracing-subscriber-init = { workspace = true }
 uuid = { workspace = true }
 vergen-pretty = { workspace = true }
 vt100 = { workspace = true }
+zstd = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "1.0.0-alpha.3"

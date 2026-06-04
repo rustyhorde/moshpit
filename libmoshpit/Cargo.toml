@@ -22,7 +22,7 @@ anyhow = { workspace = true }
 argon2 = { version = "0.6.0-rc.8", features = ["getrandom"] }
 aws-lc-rs = { workspace = true }
 base64 = "0.22.1"
-bincode-next = "3.0.0-rc.14"
+bincode-next = "3.0.0-rc.15"
 bishop = "1.0.0"
 bon = { workspace = true }
 bytes = { workspace = true }
@@ -34,7 +34,7 @@ regex = "1.12.3"
 serde = { workspace = true }
 socket2 = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["process","sync","time"] }
+tokio = { workspace = true, features = ["process", "sync", "time"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = "0.2.5"
@@ -49,6 +49,7 @@ vt100 = { workspace = true }
 whoami = "2.1.2"
 zeroize = { workspace = true }
 zstd = { workspace = true }
+
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
@@ -62,10 +63,15 @@ rustversion = { workspace = true }
 vergen-gix = { workspace = true }
 
 [dev-dependencies]
-bincode-next = "3.0.0-rc.14"
+bincode-next = "3.0.0-rc.15"
 proptest = "1.11.0"
 tempfile = "3.27.0"
-tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "time"] }
+tokio = { workspace = true, features = [
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "time",
+] }
 
 [package.metadata.docs.rs]
 all-features = true

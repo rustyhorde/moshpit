@@ -26,9 +26,9 @@ clap = { workspace = true }
 config = { workspace = true }
 crossterm = "0.29.0"
 dialoguer = "0.12.0"
+dirs2 = "3.0.1"
 getset = { workspace = true }
 libmoshpit = { version = "0.8.12", path = "../libmoshpit" }
-dirs2 = "3.0.1"
 serde = { workspace = true }
 terminal_size = "0.4.4"
 tokio = { workspace = true, features = ["io-std", "signal", "sync", "time"] }
