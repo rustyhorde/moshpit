@@ -36,5 +36,6 @@ vergen-gix = { version = "10.0.0-beta.8", features = [
 ] }
 vergen-pretty = { version = "10.0.0-beta.8", features = ["color", "tracing", "rkyv", "serde"] }
 vt100 = "0.16.2"
+zbus = "5.16.0"
 zeroize = { version = "1.8.2", features = ["zeroize_derive"] }
 zstd = "0.13.3"

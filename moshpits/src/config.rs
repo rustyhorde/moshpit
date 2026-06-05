@@ -49,6 +49,7 @@ impl AlgorithmPreferences {
 }
 
 #[derive(Clone, CloneGetters, CopyGetters, Debug, Deserialize, Getters, Serialize, Setters)]
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct Config {
     #[serde(skip_deserializing)]
     #[getset(get_copy = "pub(crate)", set = "pub(crate)")]
@@ -114,6 +115,14 @@ pub(crate) struct Config {
     #[serde(default = "default_true")]
     #[getset(get_copy = "pub(crate)")]
     namespace_escape: bool,
+    /// Register a systemd-logind session for each spawned login shell (like an
+    /// SSH login does via `pam_systemd`).  This starts the user's
+    /// `user@UID.service` and `systemctl --user` units, creates `/run/user/UID`,
+    /// and sets `XDG_RUNTIME_DIR`.  Requires the daemon to run as root and a
+    /// running systemd-logind.  Only active on Linux.  Default: `true`.
+    #[serde(default = "default_true")]
+    #[getset(get_copy = "pub(crate)")]
+    use_logind: bool,
 }
 
 fn default_term_type() -> String {
@@ -145,6 +154,7 @@ impl Default for Config {
             server_path: Self::default_server_path(),
             path_locked: false,
             namespace_escape: true,
+            use_logind: true,
         }
     }
 }
@@ -338,6 +348,21 @@ mod test {
             ..Config::default()
         };
         assert_eq!(config.term_type(), "screen-256color");
+    }
+
+    #[test]
+    fn config_use_logind_defaults_true() {
+        let config = Config::default();
+        assert!(config.use_logind());
+    }
+
+    #[test]
+    fn config_use_logind_can_be_disabled() {
+        let config = Config {
+            use_logind: false,
+            ..Config::default()
+        };
+        assert!(!config.use_logind());
     }
 
     #[test]

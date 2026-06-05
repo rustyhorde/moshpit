@@ -365,6 +365,8 @@ async fn handle_connection(
     server_token: CancellationToken,
     full_registry: FullSessionRegistry,
 ) -> Result<()> {
+    // Client IP for the logind session's remote-host marker (best-effort).
+    let remote_host = socket.peer_addr().ok().map(|addr| addr.ip().to_string());
     let (sock_read, sock_write) = socket.into_split();
     let port_pool = config.port_pool();
     let session_registry = config.session_registry();
@@ -376,6 +378,7 @@ async fn handle_connection(
     let server_path = config.server_path().clone();
     let path_locked = config.path_locked();
     let namespace_escape = config.namespace_escape();
+    let use_logind = config.use_logind();
     let (kex, udp_arc, skex_opt) =
         run_key_exchange(config, sock_read, sock_write, || Ok(None), None, None).await?;
     info!("Key exchange completed with moshpit");
@@ -764,6 +767,8 @@ async fn handle_connection(
             accepted_client_env,
             pty_path,
             namespace_escape,
+            use_logind,
+            remote_host,
         );
     }
 
@@ -1311,6 +1316,8 @@ fn spawn_pty(
     #[cfg_attr(not(unix), allow(unused_variables))] accepted_client_env: Vec<(String, String)>,
     #[cfg_attr(not(unix), allow(unused_variables))] pty_path: String,
     #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] namespace_escape: bool,
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] use_logind: bool,
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] remote_host: Option<String>,
 ) {
     let _term_handle = thread::spawn(move || {
         let pty_system = native_pty_system();
@@ -1326,6 +1333,12 @@ fn spawn_pty(
                 return;
             }
         };
+
+        // Held for the lifetime of the PTY thread; dropping it on thread exit
+        // releases the logind session (closes the session fifo) when the shell
+        // ends.
+        #[cfg(target_os = "linux")]
+        let mut logind_guard: Option<crate::logind::LogindSession> = None;
 
         #[cfg(unix)]
         {
@@ -1394,9 +1407,46 @@ fn spawn_pty(
                 }
             };
 
-            let mut cmd = std::process::Command::new(&account.shell);
-            let _ = cmd.arg("-li");
+            // Refuse the login like pam_nologin when /etc/nologin exists for a
+            // non-root user; we print the file's contents instead of a shell.
+            #[cfg(target_os = "linux")]
+            let nologin_deny = account.uid != 0 && std::path::Path::new("/etc/nologin").exists();
+
+            // Register a systemd-logind session (XDG_RUNTIME_DIR, user@UID.service,
+            // the user D-Bus bus) like an SSH login does via pam_systemd.  Needs
+            // root and a permitted (non-nologin) login.
+            #[cfg(target_os = "linux")]
+            let logind_enabled = use_logind && daemon_uid == 0 && !nologin_deny;
+            #[cfg(not(target_os = "linux"))]
+            let logind_enabled = false;
+
+            // Program to run: the login shell normally, or — when /etc/nologin
+            // denies a non-root login — print that message and exit.
+            #[cfg(target_os = "linux")]
+            let mut cmd = if nologin_deny {
+                let mut cmd = std::process::Command::new("/bin/cat");
+                let _ = cmd.arg("/etc/nologin");
+                cmd
+            } else {
+                let mut cmd = std::process::Command::new(&account.shell);
+                let _ = cmd.arg("-li");
+                cmd
+            };
+            #[cfg(not(target_os = "linux"))]
+            let mut cmd = {
+                let mut cmd = std::process::Command::new(&account.shell);
+                let _ = cmd.arg("-li");
+                cmd
+            };
+
             let _ = cmd.env_clear();
+
+            // /etc/environment (the pam_env system file) is the lowest-precedence
+            // source; the protected vars and XDG_RUNTIME_DIR below override it.
+            for (k, v) in parse_etc_environment() {
+                let _ = cmd.env(k, v);
+            }
+
             let _ = cmd.env("HOME", &account.home);
             let _ = cmd.env("USER", &account.username);
             let _ = cmd.env("LOGNAME", &account.username);
@@ -1404,10 +1454,11 @@ fn spawn_pty(
             let _ = cmd.env("TERM", &term_type);
             let _ = cmd.env("PATH", &pty_path);
 
-            // XDG_RUNTIME_DIR is derived server-side from the resolved UID;
-            // it is needed by fish and other XDG-aware tools even after env_clear().
+            // XDG_RUNTIME_DIR points at /run/user/UID.  With logind enabled the
+            // directory is created as part of the session registered below; in the
+            // fallback path we only set it when it already exists.
             let xdg_path = format!("/run/user/{}", account.uid);
-            if std::path::Path::new(&xdg_path).exists() {
+            if logind_enabled || std::path::Path::new(&xdg_path).exists() {
                 let _ = cmd.env("XDG_RUNTIME_DIR", &xdg_path);
             }
 
@@ -1464,6 +1515,28 @@ fn spawn_pty(
                 None
             };
 
+            // logind needs the session registered *before* the shell execs (so
+            // /run/user/UID and user@UID.service exist).  Registration needs the
+            // shell's PID, so the child blocks on this pipe at the end of
+            // pre_exec until the parent has called CreateSession.
+            #[cfg(target_os = "linux")]
+            let handshake: Option<(libc::c_int, libc::c_int)> = if logind_enabled {
+                let mut fds: [libc::c_int; 2] = [0; 2];
+                if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } == 0 {
+                    Some((fds[0], fds[1]))
+                } else {
+                    warn!(
+                        "Failed to create logind handshake pipe: {}",
+                        std::io::Error::last_os_error()
+                    );
+                    None
+                }
+            } else {
+                None
+            };
+            #[cfg(target_os = "linux")]
+            let handshake_read_fd = handshake.map(|(read_fd, _)| read_fd);
+
             let _ = unsafe {
                 cmd.pre_exec(move || {
                     let tiocsctty_request = tiocsctty_ioctl_request();
@@ -1507,6 +1580,25 @@ fn spawn_pty(
                     // Non-fatal: if home doesn't exist the shell starts at '/', matching SSH.
                     let _ = libc::chdir(home_cstr.as_ptr());
 
+                    // Block until the parent has registered the logind session, so
+                    // the shell execs inside the session scope with a live
+                    // XDG_RUNTIME_DIR and user manager.  Any error just proceeds.
+                    #[cfg(target_os = "linux")]
+                    if let Some(read_fd) = handshake_read_fd {
+                        let mut buf = [0u8; 1];
+                        loop {
+                            let n = libc::read(read_fd, buf.as_mut_ptr().cast(), 1);
+                            if n < 0
+                                && std::io::Error::last_os_error().kind()
+                                    == std::io::ErrorKind::Interrupted
+                            {
+                                continue;
+                            }
+                            break;
+                        }
+                        let _ = libc::close(read_fd);
+                    }
+
                     Ok(())
                 })
             };
@@ -1516,10 +1608,60 @@ fn spawn_pty(
                 .stdout(Stdio::from(stdout_file))
                 .stderr(Stdio::from(stderr_file));
 
-            if let Err(e) = cmd.spawn() {
-                error!("Failed to spawn shell for user {user}: {e}");
-                return;
+            let child = match cmd.spawn() {
+                Ok(child) => child,
+                Err(e) => {
+                    error!("Failed to spawn shell for user {user}: {e}");
+                    return;
+                }
+            };
+
+            // Now that the shell exists, register its logind session and unblock
+            // it so it execs inside the session scope.
+            #[cfg(target_os = "linux")]
+            if let Some((read_fd, write_fd)) = handshake {
+                // The parent never reads; close its copy of the read end.
+                unsafe {
+                    let _ = libc::close(read_fd);
+                }
+                let tty_name = tty_path.to_string_lossy();
+                let tty_name = tty_name.strip_prefix("/dev/").unwrap_or(&tty_name);
+                match crate::logind::create_session(
+                    account.uid,
+                    child.id(),
+                    tty_name,
+                    remote_host.as_deref(),
+                ) {
+                    Ok(session) => {
+                        info!(
+                            session = %session.session_id,
+                            runtime = %session.runtime_path,
+                            "registered logind session for {user}"
+                        );
+                        logind_guard = Some(session);
+                    }
+                    Err(e) => {
+                        warn!(
+                            "logind CreateSession failed for {user}: {e:#}; \
+                             continuing without a logind session"
+                        );
+                    }
+                }
+                // Unblock the child regardless of outcome so it never hangs.
+                unsafe {
+                    let byte = [1u8];
+                    let _ = libc::write(write_fd, byte.as_ptr().cast(), 1);
+                    let _ = libc::close(write_fd);
+                }
             }
+
+            // Reap the shell when it exits so it does not linger as a zombie
+            // (which would also keep its logind session scope from cleaning up).
+            // PTY master EOF — not this wait — drives moshpit session teardown.
+            let _reaper = thread::spawn(move || {
+                let mut child = child;
+                let _exit_status = child.wait();
+            });
 
             drop(pair.slave);
             drop(slave);
@@ -1595,7 +1737,48 @@ fn spawn_pty(
                 }
             }
         }
+
+        // PTY thread is ending: release the logind session (closes its fifo).
+        #[cfg(target_os = "linux")]
+        drop(logind_guard);
     });
+}
+
+/// Parse `/etc/environment` (the system file `pam_env` reads) into `KEY=VALUE`
+/// pairs.  A missing or unreadable file yields an empty list.
+#[cfg(unix)]
+fn parse_etc_environment() -> Vec<(String, String)> {
+    parse_environment_file(&std::fs::read_to_string("/etc/environment").unwrap_or_default())
+}
+
+/// Parse the contents of an `/etc/environment`-style file.  Blank lines and
+/// `#` comments are ignored, an optional `export ` prefix is stripped, and a
+/// single pair of surrounding single or double quotes is removed from values.
+#[cfg(unix)]
+fn parse_environment_file(contents: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").map_or(line, str::trim_start);
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        let value = value.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+            .unwrap_or(value);
+        out.push((key.to_string(), value.to_string()));
+    }
+    out
 }
 
 #[cfg(unix)]
@@ -1686,7 +1869,9 @@ mod test {
     use uuid::Uuid;
 
     #[cfg(unix)]
-    use super::{current_daemon_user, resolve_user_account};
+    use super::{
+        current_daemon_user, parse_environment_file, parse_etc_environment, resolve_user_account,
+    };
     use std::{
         sync::{
             Arc,
@@ -1708,6 +1893,50 @@ mod test {
     fn current_daemon_user_returns_some() {
         let user = current_daemon_user();
         assert!(user.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_environment_file_basic() {
+        let contents = "\
+            # a comment\n\
+            \n\
+            FOO=bar\n\
+            export BAZ=qux\n\
+            QUOTED=\"hello world\"\n\
+            SINGLE='tick'\n\
+            PATH=/usr/bin:/bin\n\
+            =novalue\n\
+            NOEQUALS\n";
+        let parsed = parse_environment_file(contents);
+        assert_eq!(
+            parsed,
+            vec![
+                ("FOO".to_string(), "bar".to_string()),
+                ("BAZ".to_string(), "qux".to_string()),
+                ("QUOTED".to_string(), "hello world".to_string()),
+                ("SINGLE".to_string(), "tick".to_string()),
+                ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_environment_file_empty() {
+        assert!(parse_environment_file("").is_empty());
+        assert!(parse_environment_file("# only a comment\n\n").is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_etc_environment_reads_system_file() {
+        // Exercises the wrapper; reads the host's real /etc/environment, or
+        // yields an empty Vec when the file is absent. Host-independent — every
+        // entry is a non-empty key parsed from a `KEY=VALUE` line.
+        for (key, _value) in parse_etc_environment() {
+            assert!(!key.is_empty());
+        }
     }
 
     #[cfg(unix)]

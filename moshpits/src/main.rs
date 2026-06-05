@@ -243,6 +243,8 @@ use crate::runtime::run;
 
 mod cli;
 mod config;
+#[cfg(target_os = "linux")]
+mod logind;
 mod runtime;
 mod session;
 
