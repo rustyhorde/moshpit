@@ -123,6 +123,14 @@ pub(crate) struct Config {
     #[serde(default = "default_true")]
     #[getset(get_copy = "pub(crate)")]
     use_logind: bool,
+    /// Record each spawned login shell in the classic login databases
+    /// `/var/run/utmp` and `/var/log/wtmp` (like an SSH login does), so the
+    /// session shows up in `who`, `w`, and `last`.  Requires the daemon to run
+    /// as root (those files are root/`utmp`-owned).  Only active on Linux.
+    /// Default: `true`.
+    #[serde(default = "default_true")]
+    #[getset(get_copy = "pub(crate)")]
+    use_utmp: bool,
 }
 
 fn default_term_type() -> String {
@@ -155,6 +163,7 @@ impl Default for Config {
             path_locked: false,
             namespace_escape: true,
             use_logind: true,
+            use_utmp: true,
         }
     }
 }
@@ -363,6 +372,21 @@ mod test {
             ..Config::default()
         };
         assert!(!config.use_logind());
+    }
+
+    #[test]
+    fn config_use_utmp_defaults_true() {
+        let config = Config::default();
+        assert!(config.use_utmp());
+    }
+
+    #[test]
+    fn config_use_utmp_can_be_disabled() {
+        let config = Config {
+            use_utmp: false,
+            ..Config::default()
+        };
+        assert!(!config.use_utmp());
     }
 
     #[test]
