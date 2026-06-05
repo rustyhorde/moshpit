@@ -1869,7 +1869,9 @@ mod test {
     use uuid::Uuid;
 
     #[cfg(unix)]
-    use super::{current_daemon_user, parse_environment_file, resolve_user_account};
+    use super::{
+        current_daemon_user, parse_environment_file, parse_etc_environment, resolve_user_account,
+    };
     use std::{
         sync::{
             Arc,
@@ -1924,6 +1926,17 @@ mod test {
     fn parse_environment_file_empty() {
         assert!(parse_environment_file("").is_empty());
         assert!(parse_environment_file("# only a comment\n\n").is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_etc_environment_reads_system_file() {
+        // Exercises the wrapper; reads the host's real /etc/environment, or
+        // yields an empty Vec when the file is absent. Host-independent — every
+        // entry is a non-empty key parsed from a `KEY=VALUE` line.
+        for (key, _value) in parse_etc_environment() {
+            assert!(!key.is_empty());
+        }
     }
 
     #[cfg(unix)]

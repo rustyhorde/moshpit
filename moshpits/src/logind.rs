@@ -79,6 +79,8 @@ pub(crate) struct LogindSession {
 ///
 /// Requires the caller to be privileged (root); logind rejects `CreateSession`
 /// from unprivileged callers.
+// Pure I/O against systemd-logind (needs root + a live login1); not unit-testable.
+#[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) fn create_session(
     uid: u32,
     leader_pid: u32,
@@ -116,4 +118,28 @@ pub(crate) fn create_session(
         runtime_path,
         _fifo: fifo,
     })
+}
+
+#[cfg(test)]
+mod test {
+    use super::create_session;
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn create_session_errors_without_bus() {
+        // Point at a nonexistent system bus so Connection::system() fails
+        // deterministically — exercises the error path with no real D-Bus or
+        // logind interaction and no side effects.
+        //
+        // SAFETY: nextest runs each test in its own process, and this is the
+        // only test that touches DBUS_SYSTEM_BUS_ADDRESS.
+        unsafe {
+            std::env::set_var(
+                "DBUS_SYSTEM_BUS_ADDRESS",
+                "unix:path=/nonexistent/moshpit-logind-test",
+            );
+        }
+        let result = create_session(0, 0, "pts/test", Some("203.0.113.1"));
+        assert!(result.is_err());
+    }
 }
