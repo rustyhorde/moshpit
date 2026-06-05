@@ -2258,9 +2258,9 @@ dependencies = [
 
 [[package]]
 name = "hashlink"
-version = "0.11.0"
+version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ea0b22561a9c04a7cb1a302c013e0259cd3b4bb619f145b32f72b8b4bcbed230"
+checksum = "824e001ac4f3012dd16a264bec811403a67ca9deb6c102fc5049b32c4574b35f"
 dependencies = [
  "hashbrown 0.16.1",
 ]
@@ -2491,7 +2491,7 @@ checksum = "e136bfa874086c78f34d6eba98c423fefe464ce57f38164d16893ba8ed358e70"
 
 [[package]]
 name = "libmoshpit"
-version = "0.8.15"
+version = "0.8.16"
 dependencies = [
  "ansi-control-codes",
  "anyhow",
@@ -2632,7 +2632,7 @@ dependencies = [
 
 [[package]]
 name = "moshpit"
-version = "0.8.15"
+version = "0.8.16"
 dependencies = [
  "anyhow",
  "clap",
@@ -2656,7 +2656,7 @@ dependencies = [
 
 [[package]]
 name = "moshpit-agent"
-version = "0.8.15"
+version = "0.8.16"
 dependencies = [
  "anyhow",
  "argon2",
@@ -2686,7 +2686,7 @@ dependencies = [
 
 [[package]]
 name = "moshpit-keygen"
-version = "0.8.15"
+version = "0.8.16"
 dependencies = [
  "anyhow",
  "clap",
@@ -2700,7 +2700,7 @@ dependencies = [
 
 [[package]]
 name = "moshpits"
-version = "0.8.15"
+version = "0.8.16"
 dependencies = [
  "anyhow",
  "bytes",
@@ -4854,7 +4854,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.8.15"
+version = "0.8.16"
 dependencies = [
  "anyhow",
  "clap",
