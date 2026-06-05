@@ -31,13 +31,14 @@ for arg in $argv
             echo "  3.  cargo matrix clippy --all-targets -- -D warnings"
             echo "  4.  cargo matrix build"
             echo "  5.  cargo nextest run ...              (skipped with --no-test)"
-            echo "  6.  cargo doc -p libmoshpit            (skipped with --no-docs)"
-            echo "  7.  cargo llvm-cov nextest ...         (skipped with --no-test or --no-coverage)"
-            echo "  8.  cargo llvm-cov report --lcov ...   (skipped with --no-test or --no-coverage)"
-            echo "  9.  cargo llvm-cov report --html       (skipped with --no-test or --no-coverage)"
-            echo "  10. run_install.fish                   (skipped with --no-install)"
-            echo "  11. run_musl.fish                      (skipped with --no-musl; --unstable passed through)"
-            echo "  12. cargo clean                        (only with --clean)"
+            echo "  6.  cargo test (libmoshpit-fuzz)       (skipped with --no-test)"
+            echo "  7.  cargo doc -p libmoshpit            (skipped with --no-docs)"
+            echo "  8.  cargo llvm-cov nextest ...         (skipped with --no-test or --no-coverage)"
+            echo "  9.  cargo llvm-cov report --lcov ...   (skipped with --no-test or --no-coverage)"
+            echo "  10. cargo llvm-cov report --html       (skipped with --no-test or --no-coverage)"
+            echo "  11. run_install.fish                   (skipped with --no-install)"
+            echo "  12. run_musl.fish                      (skipped with --no-musl; --unstable passed through)"
+            echo "  13. cargo clean                        (only with --clean)"
             exit 0
         case --no-test
             set run_tests false
@@ -78,6 +79,7 @@ run_step cargo matrix build
 
 if test $run_tests = true
     run_step cargo nextest run -p libmoshpit -p moshpits -p moshpit -p moshpit-keygen -p moshpit-agent
+    run_step cargo test --manifest-path libmoshpit/fuzz/Cargo.toml
 end
 
 if test $run_docs = true
