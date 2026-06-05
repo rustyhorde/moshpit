@@ -1515,28 +1515,6 @@ fn spawn_pty(
                 None
             };
 
-            // logind needs the session registered *before* the shell execs (so
-            // /run/user/UID and user@UID.service exist).  Registration needs the
-            // shell's PID, so the child blocks on this pipe at the end of
-            // pre_exec until the parent has called CreateSession.
-            #[cfg(target_os = "linux")]
-            let handshake: Option<(libc::c_int, libc::c_int)> = if logind_enabled {
-                let mut fds: [libc::c_int; 2] = [0; 2];
-                if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } == 0 {
-                    Some((fds[0], fds[1]))
-                } else {
-                    warn!(
-                        "Failed to create logind handshake pipe: {}",
-                        std::io::Error::last_os_error()
-                    );
-                    None
-                }
-            } else {
-                None
-            };
-            #[cfg(target_os = "linux")]
-            let handshake_read_fd = handshake.map(|(read_fd, _)| read_fd);
-
             let _ = unsafe {
                 cmd.pre_exec(move || {
                     let tiocsctty_request = tiocsctty_ioctl_request();
@@ -1580,25 +1558,6 @@ fn spawn_pty(
                     // Non-fatal: if home doesn't exist the shell starts at '/', matching SSH.
                     let _ = libc::chdir(home_cstr.as_ptr());
 
-                    // Block until the parent has registered the logind session, so
-                    // the shell execs inside the session scope with a live
-                    // XDG_RUNTIME_DIR and user manager.  Any error just proceeds.
-                    #[cfg(target_os = "linux")]
-                    if let Some(read_fd) = handshake_read_fd {
-                        let mut buf = [0u8; 1];
-                        loop {
-                            let n = libc::read(read_fd, buf.as_mut_ptr().cast(), 1);
-                            if n < 0
-                                && std::io::Error::last_os_error().kind()
-                                    == std::io::ErrorKind::Interrupted
-                            {
-                                continue;
-                            }
-                            break;
-                        }
-                        let _ = libc::close(read_fd);
-                    }
-
                     Ok(())
                 })
             };
@@ -1616,14 +1575,13 @@ fn spawn_pty(
                 }
             };
 
-            // Now that the shell exists, register its logind session and unblock
-            // it so it execs inside the session scope.
+            // Now that the shell exists, register its logind session using the
+            // shell's PID as the session scope leader.  The shell has already
+            // exec'd (spawn waits for exec), so the session is registered right
+            // after it starts; XDG_RUNTIME_DIR is already set in its env and
+            // logind creates /run/user/UID as part of CreateSession.
             #[cfg(target_os = "linux")]
-            if let Some((read_fd, write_fd)) = handshake {
-                // The parent never reads; close its copy of the read end.
-                unsafe {
-                    let _ = libc::close(read_fd);
-                }
+            if logind_enabled {
                 let tty_name = tty_path.to_string_lossy();
                 let tty_name = tty_name.strip_prefix("/dev/").unwrap_or(&tty_name);
                 match crate::logind::create_session(
@@ -1646,12 +1604,6 @@ fn spawn_pty(
                              continuing without a logind session"
                         );
                     }
-                }
-                // Unblock the child regardless of outcome so it never hangs.
-                unsafe {
-                    let byte = [1u8];
-                    let _ = libc::write(write_fd, byte.as_ptr().cast(), 1);
-                    let _ = libc::close(write_fd);
                 }
             }
 

@@ -73,7 +73,11 @@ impl Display for UuidWrapper {
 impl<Context> Decode<Context> for UuidWrapper {
     fn decode<D: Decoder<Context = Context>>(decoder: &mut D) -> Result<Self, DecodeError> {
         let s = String::decode(decoder)?;
-        let uuid = Uuid::parse_str(&s).map_err(|e| {
+        // `Uuid::try_parse` instead of `Uuid::parse_str`: the latter's error
+        // path (`InvalidUuid::into_err`) slices the input by byte offset and
+        // panics on non-ASCII multi-byte UTF-8.  `try_parse` returns a generic
+        // error without that slicing, so untrusted input can never panic here.
+        let uuid = Uuid::try_parse(&s).map_err(|e| {
             DecodeError::OtherString(format!("failed to parse Uuid from string: {e}"))
         })?;
         Ok(UuidWrapper(uuid))
@@ -85,7 +89,9 @@ impl<'de, Context> BorrowDecode<'de, Context> for UuidWrapper {
         decoder: &mut D,
     ) -> Result<Self, DecodeError> {
         let s = String::decode(decoder)?;
-        let uuid = Uuid::parse_str(&s).map_err(|e| {
+        // See the note in `Decode::decode`: `try_parse` avoids the panicking
+        // error path of `parse_str` on non-ASCII input.
+        let uuid = Uuid::try_parse(&s).map_err(|e| {
             DecodeError::OtherString(format!("failed to parse Uuid from string: {e}"))
         })?;
         Ok(UuidWrapper(uuid))
@@ -129,5 +135,18 @@ mod tests {
         let uuid = Uuid::new_v4();
         let wrapper = UuidWrapper::from(uuid);
         assert_eq!(wrapper.as_uuid(), uuid);
+    }
+
+    /// A bincode-encoded string that is valid UTF-8 but not a UUID — and
+    /// contains a multi-byte sequence (`0xc3 0xa9` = `é`) — must decode to a
+    /// structured error, not panic.  `Uuid::parse_str` would slice this string
+    /// on a non-char boundary in its error path and panic; `try_parse` does not.
+    #[test]
+    fn uuid_wrapper_decode_non_ascii_errors_without_panic() {
+        // bincode `standard`: varint length prefix (3) followed by the UTF-8
+        // bytes of "aé" (a, then 0xc3 0xa9).
+        let encoded = [3u8, b'a', 0xc3, 0xa9];
+        let result: Result<(UuidWrapper, usize), _> = decode_from_slice(&encoded, standard());
+        assert!(result.is_err(), "non-UUID string must yield Err, not panic");
     }
 }
