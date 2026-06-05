@@ -2544,6 +2544,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_kex_incompatible_protocol_version_fails() {
+        use crate::MoshpitError;
+        use crate::kex::negotiate::ProtocolSupport;
+
+        let (client_reader, _client_writer, _server_reader, mut server_writer) =
+            make_bidirectional_loopback().await;
+        let (mut kex_reader, _rx_frames, mut rx_events) = make_test_kex_reader(client_reader);
+
+        // Server advertises a protocol range that does not overlap the client's
+        // default support (`{min:1, max:1}`), so version negotiation must fail
+        // even though the algorithm lists agree.
+        server_writer
+            .write_frame(&Frame::KexInit(
+                supported_algorithms(),
+                ProtocolSupport { min: 2, max: 2 },
+            ))
+            .await
+            .expect("write KexInit frame");
+        drop(server_writer);
+
+        let result = kex_reader.client_kex().await;
+        assert!(
+            result
+                .expect_err("expected IncompatibleProtocolVersion error")
+                .downcast_ref::<MoshpitError>()
+                .is_some_and(|e| *e == MoshpitError::IncompatibleProtocolVersion),
+        );
+        // A Failure event is emitted so the state machine can tear the session down.
+        assert!(
+            std::iter::from_fn(|| rx_events.try_recv().ok())
+                .any(|e| matches!(e, KexEvent::Failure)),
+            "expected a KexEvent::Failure to be sent",
+        );
+    }
+
+    #[tokio::test]
+    async fn server_kex_incompatible_protocol_version_fails() {
+        use crate::MoshpitError;
+        use crate::kex::negotiate::ProtocolSupport;
+
+        // The server-side reader reads from the server end of the loopback while
+        // the client end writes the KexInit.
+        let (_client_reader, mut client_writer, server_reader, _server_writer) =
+            make_bidirectional_loopback().await;
+        // `_rx_frames` must stay bound: server_kex sends its own KexInit on this
+        // channel before negotiating, and a dropped receiver would fail that send
+        // first, masking the version error we are testing for.
+        let (mut kex_reader, _rx_frames, _rx_events) = make_test_kex_reader(server_reader);
+
+        // Client advertises a protocol range disjoint from the server's default.
+        client_writer
+            .write_frame(&Frame::KexInit(
+                supported_algorithms(),
+                ProtocolSupport { min: 2, max: 2 },
+            ))
+            .await
+            .expect("write KexInit frame");
+        drop(client_writer);
+
+        let mut pool = BTreeSet::new();
+        let _ = pool.insert(50123u16);
+        let port_pool = StdArc::new(TokioMutex::new(pool));
+        let socket_addr: std::net::SocketAddr =
+            "127.0.0.1:9000".parse().expect("hardcoded test address");
+        // The version error returns before the public key file is read, so this
+        // path never has to exist.
+        let dummy_pubkey = std::path::PathBuf::from("/nonexistent/pubkey");
+
+        let result = kex_reader
+            .server_kex(socket_addr, port_pool, &dummy_pubkey, None)
+            .await;
+        assert!(
+            result
+                .expect_err("expected IncompatibleProtocolVersion error")
+                .downcast_ref::<MoshpitError>()
+                .is_some_and(|e| *e == MoshpitError::IncompatibleProtocolVersion),
+        );
+    }
+
+    #[tokio::test]
     async fn client_kex_happy_path_sends_all_events() {
         use uuid::Uuid;
 

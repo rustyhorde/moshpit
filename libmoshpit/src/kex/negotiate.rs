@@ -435,6 +435,21 @@ mod tests {
     }
 
     #[test]
+    fn protocol_support_is_ordered_and_hashable() {
+        use std::collections::{BTreeSet, HashSet};
+
+        let lo = ProtocolSupport { min: 1, max: 1 };
+        let hi = ProtocolSupport { min: 1, max: 2 };
+        // Exercises the derived `Ord`/`PartialOrd`.
+        assert!(lo < hi);
+        let ordered: BTreeSet<ProtocolSupport> = [hi, lo].into_iter().collect();
+        assert_eq!(ordered.iter().next(), Some(&lo));
+        // Exercises the derived `Hash`.
+        let hashed: HashSet<ProtocolSupport> = [lo, hi, lo].into_iter().collect();
+        assert_eq!(hashed.len(), 2);
+    }
+
+    #[test]
     fn negotiate_protocol_version_equal_ranges() {
         let s = ProtocolSupport { min: 1, max: 3 };
         assert_eq!(negotiate_protocol_version(s, s).expect("overlap"), 3);

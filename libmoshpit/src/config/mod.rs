@@ -205,7 +205,13 @@ mod tests {
 
     // ── minimal KexConfig implementor ─────────────────────────────────────────
 
-    struct TestKexConfig;
+    // A minimal `KexConfig`. `min_protocol_version` is configurable so the same
+    // helper drives both the default-range and the clamp tests; `None` uses the
+    // trait's build-floor default.
+    #[derive(Default)]
+    struct TestKexConfig {
+        min_protocol_version: Option<u16>,
+    }
 
     impl KexConfig for TestKexConfig {
         fn mode(&self) -> KexMode {
@@ -220,26 +226,9 @@ mod tests {
         fn user(&self) -> Option<String> {
             Some("testuser".to_string())
         }
-    }
-
-    // A KexConfig whose minimum protocol version is configurable, for clamp tests.
-    struct MinVerConfig(u16);
-
-    impl KexConfig for MinVerConfig {
-        fn mode(&self) -> KexMode {
-            KexMode::Client
-        }
-        fn port_pool(&self) -> Option<Arc<Mutex<BTreeSet<u16>>>> {
-            None
-        }
-        fn key_pair_paths(&self) -> anyhow::Result<(PathBuf, PathBuf)> {
-            Ok((PathBuf::from("/tmp/pub"), PathBuf::from("/tmp/priv")))
-        }
-        fn user(&self) -> Option<String> {
-            None
-        }
         fn min_protocol_version(&self) -> u16 {
-            self.0
+            self.min_protocol_version
+                .unwrap_or(crate::kex::negotiate::MIN_PROTOCOL_VERSION)
         }
     }
 
@@ -248,7 +237,7 @@ mod tests {
     #[test]
     fn protocol_support_default_uses_build_range() {
         use crate::kex::negotiate::{MIN_PROTOCOL_VERSION, PROTOCOL_VERSION};
-        let s = TestKexConfig.protocol_support();
+        let s = TestKexConfig::default().protocol_support();
         assert_eq!(s.min, MIN_PROTOCOL_VERSION);
         assert_eq!(s.max, PROTOCOL_VERSION);
     }
@@ -257,31 +246,34 @@ mod tests {
     fn protocol_support_clamps_configured_min() {
         use crate::kex::negotiate::{MIN_PROTOCOL_VERSION, PROTOCOL_VERSION};
         // Below the build floor → clamped up to the floor.
-        assert_eq!(MinVerConfig(0).protocol_support().min, MIN_PROTOCOL_VERSION);
+        let too_low = TestKexConfig {
+            min_protocol_version: Some(0),
+        };
+        assert_eq!(too_low.protocol_support().min, MIN_PROTOCOL_VERSION);
         // Above the highest version we speak → clamped down to PROTOCOL_VERSION.
-        assert_eq!(
-            MinVerConfig(u16::MAX).protocol_support().min,
-            PROTOCOL_VERSION
-        );
+        let too_high = TestKexConfig {
+            min_protocol_version: Some(u16::MAX),
+        };
+        assert_eq!(too_high.protocol_support().min, PROTOCOL_VERSION);
     }
 
     #[test]
     fn kex_config_session_registry_default_is_none() {
-        let cfg = TestKexConfig;
+        let cfg = TestKexConfig::default();
         let reg: Option<SessionRegistry> = cfg.session_registry();
         assert!(reg.is_none());
     }
 
     #[test]
     fn kex_config_resume_session_uuid_default_is_none() {
-        let cfg = TestKexConfig;
+        let cfg = TestKexConfig::default();
         let uuid: Option<Uuid> = cfg.resume_session_uuid();
         assert!(uuid.is_none());
     }
 
     #[test]
     fn kex_config_server_id_default_is_none() {
-        let cfg = TestKexConfig;
+        let cfg = TestKexConfig::default();
         let sid: Option<String> = cfg.server_id();
         assert!(sid.is_none());
     }
@@ -369,7 +361,7 @@ mod tests {
 
     #[test]
     fn kex_config_send_env_default_is_empty() {
-        let cfg = TestKexConfig;
+        let cfg = TestKexConfig::default();
         assert!(
             cfg.send_env().is_empty(),
             "send_env() default must return an empty Vec"
@@ -378,7 +370,7 @@ mod tests {
 
     #[test]
     fn kex_config_send_path_default_is_empty() {
-        let cfg = TestKexConfig;
+        let cfg = TestKexConfig::default();
         assert!(
             cfg.send_path().is_empty(),
             "send_path() default must return an empty Vec"
@@ -388,7 +380,7 @@ mod tests {
     #[test]
     fn kex_config_agent_socket_default_is_none() {
         // The default impl always returns None, independent of env vars.
-        let cfg = TestKexConfig;
+        let cfg = TestKexConfig::default();
         assert!(
             cfg.agent_socket().is_none(),
             "agent_socket() default must return None"

@@ -450,6 +450,7 @@ pub async fn run_key_exchange<T: KexConfig>(
 }
 
 #[cfg_attr(nightly, allow(clippy::too_many_lines))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn run_client_kex<T: KexConfig>(
     config: T,
     tx: UnboundedSender<Frame>,
@@ -696,6 +697,7 @@ async fn run_client_kex<T: KexConfig>(
     }
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn run_server_kex<T: KexConfig>(
     config: T,
     socket_addr: SocketAddr,
@@ -879,6 +881,39 @@ mod tests {
         assert!(kex.session_uuid().is_none());
         assert!(!kex.is_resume());
         drop(NegotiatedAlgorithms::default());
+    }
+
+    #[test]
+    fn kex_protocol_version_returns_negotiated() {
+        use crate::kex::negotiate::NegotiatedAlgorithms;
+        let kex = Kex {
+            key: Vec::new(),
+            hmac_key: Vec::new(),
+            uuid: Uuid::nil(),
+            moshpits_addr: None,
+            session_uuid: None,
+            is_resume: false,
+            negotiated_algorithms: NegotiatedAlgorithms {
+                protocol_version: 42,
+                ..NegotiatedAlgorithms::default()
+            },
+        };
+        assert_eq!(kex.protocol_version(), 42);
+    }
+
+    #[test]
+    fn server_kex_protocol_version_returns_negotiated() {
+        use crate::kex::negotiate::NegotiatedAlgorithms;
+        let skex = ServerKex::builder()
+            .user(String::new())
+            .shell(String::new())
+            .session_uuid(Uuid::nil())
+            .negotiated_algorithms(NegotiatedAlgorithms {
+                protocol_version: 7,
+                ..NegotiatedAlgorithms::default()
+            })
+            .build();
+        assert_eq!(skex.protocol_version(), 7);
     }
 
     #[test]

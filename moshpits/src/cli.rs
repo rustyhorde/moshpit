@@ -409,6 +409,25 @@ mod test {
     }
 
     #[test]
+    fn cli_min_protocol_version_absent_by_default() {
+        let cli = parse(&["mps"]);
+        assert!(cli.min_protocol_version().is_none());
+        let map = cli.collect().expect("collect should succeed");
+        assert!(!map.contains_key("min_protocol_version"));
+    }
+
+    #[test]
+    fn cli_min_protocol_version_collected() {
+        let cli = parse(&["mps", "--min-protocol-version", "3"]);
+        assert_eq!(cli.min_protocol_version(), Some(3));
+        let map = cli.collect().expect("collect should succeed");
+        let value = map
+            .get("min_protocol_version")
+            .expect("min_protocol_version should be in map");
+        assert_eq!(value.clone().into_uint().ok(), Some(3));
+    }
+
+    #[test]
     fn cli_path_defaults() {
         use libmoshpit::PathDefaults as _;
         let cli = parse(&["mps"]);

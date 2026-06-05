@@ -428,6 +428,20 @@ mod tests {
     }
 
     #[test]
+    fn kex_init_display_includes_proto_range() {
+        use crate::kex::negotiate::{local_protocol_support, supported_algorithms};
+
+        let proto = local_protocol_support();
+        let frame = Frame::KexInit(supported_algorithms(), proto);
+        let rendered = format!("{frame}");
+        assert!(rendered.starts_with("KexInit("));
+        assert!(
+            rendered.contains(&format!("proto={}-{}", proto.min, proto.max)),
+            "expected proto range in Display output, got: {rendered}"
+        );
+    }
+
+    #[test]
     fn test_identity_proof_round_trips() -> Result<()> {
         let sig = vec![1u8, 2, 3, 4, 5];
         let frame = Frame::IdentityProof(sig.clone());

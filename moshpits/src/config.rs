@@ -404,6 +404,27 @@ mod test {
     }
 
     #[test]
+    fn config_min_protocol_version_defaults_to_build_floor() {
+        let config = Config::default();
+        // `None` → the trait impl falls back to the build floor.
+        assert_eq!(
+            libmoshpit::KexConfig::min_protocol_version(&config),
+            libmoshpit::MIN_PROTOCOL_VERSION
+        );
+        assert!(config.min_protocol_version().is_none());
+    }
+
+    #[test]
+    fn config_min_protocol_version_can_be_set() {
+        let config = Config {
+            min_protocol_version: Some(2),
+            ..Config::default()
+        };
+        assert_eq!(libmoshpit::KexConfig::min_protocol_version(&config), 2);
+        assert_eq!(config.min_protocol_version(), Some(2));
+    }
+
+    #[test]
     fn config_term_type_accepts_various_values() {
         let test_cases = vec!["xterm", "screen", "tmux-256color", "linux", "vt100"];
         for term in test_cases {
