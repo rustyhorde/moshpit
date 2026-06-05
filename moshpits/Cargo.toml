@@ -41,6 +41,9 @@ zstd = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 libc = "1.0.0-alpha.3"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { workspace = true }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }
 

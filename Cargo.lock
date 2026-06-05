@@ -2720,6 +2720,7 @@ dependencies = [
  "vergen-gix",
  "vergen-pretty",
  "vt100",
+ "zbus",
  "zstd",
 ]
 
