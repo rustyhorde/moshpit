@@ -49,9 +49,7 @@ use tokio::{
     time::{Instant as TokioInstant, sleep_until},
 };
 use tokio_util::sync::CancellationToken;
-#[cfg(target_os = "linux")]
-use tracing::warn;
-use tracing::{error, info, trace};
+use tracing::{error, info, trace, warn};
 use uuid::Uuid;
 use zstd::encode_all;
 
