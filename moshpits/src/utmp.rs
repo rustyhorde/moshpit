@@ -120,11 +120,25 @@ pub(crate) fn login(
     tty: &str,
     remote_host: Option<&str>,
 ) -> Result<UtmpSession> {
+    login_to(UTMP_PATH, WTMP_PATH, user, pid, tty, remote_host)
+}
+
+/// [`login`] against caller-supplied database paths, so tests can drive it
+/// against temp files instead of the root-owned `/var/run/utmp` and
+/// `/var/log/wtmp`.
+fn login_to(
+    utmp_path: &str,
+    wtmp_path: &str,
+    user: &str,
+    pid: u32,
+    tty: &str,
+    remote_host: Option<&str>,
+) -> Result<UtmpSession> {
     let id = ut_id_from_line(tty);
     let bytes = record_bytes(USER_PROCESS, pid, tty, id, user, remote_host);
 
-    put_utmp(UTMP_PATH, tty, &bytes).context("update /var/run/utmp")?;
-    put_wtmp(WTMP_PATH, &bytes).context("append /var/log/wtmp")?;
+    put_utmp(utmp_path, tty, &bytes).context("update /var/run/utmp")?;
+    put_wtmp(wtmp_path, &bytes).context("append /var/log/wtmp")?;
 
     Ok(UtmpSession {
         line: tty.to_owned(),
@@ -137,12 +151,17 @@ pub(crate) fn login(
 /// Record a logout: flip the session's `/var/run/utmp` slot to `DEAD_PROCESS`
 /// (clearing the user and host) and append a matching record to `/var/log/wtmp`.
 pub(crate) fn logout(session: &UtmpSession) -> Result<()> {
+    logout_to(UTMP_PATH, WTMP_PATH, session)
+}
+
+/// [`logout`] against caller-supplied database paths (see [`login_to`]).
+fn logout_to(utmp_path: &str, wtmp_path: &str, session: &UtmpSession) -> Result<()> {
     #[allow(clippy::cast_sign_loss)]
     let pid = session.pid as u32;
     let bytes = record_bytes_raw(DEAD_PROCESS, pid, &session.line, session.id, "", None);
 
-    put_utmp(UTMP_PATH, &session.line, &bytes).context("update /var/run/utmp")?;
-    put_wtmp(WTMP_PATH, &bytes).context("append /var/log/wtmp")?;
+    put_utmp(utmp_path, &session.line, &bytes).context("update /var/run/utmp")?;
+    put_wtmp(wtmp_path, &bytes).context("append /var/log/wtmp")?;
 
     Ok(())
 }
@@ -380,6 +399,16 @@ mod test {
     }
 
     #[test]
+    fn addr_v6_encodes_v6() {
+        // Each word holds 4 octets of the address in network order.
+        let words = addr_v6(Some("2001:db8::1"));
+        assert_eq!(words.map(u32::to_ne_bytes)[0], [0x20, 0x01, 0x0d, 0xb8]);
+        assert_eq!(words.map(u32::to_ne_bytes)[1], [0, 0, 0, 0]);
+        assert_eq!(words.map(u32::to_ne_bytes)[2], [0, 0, 0, 0]);
+        assert_eq!(words.map(u32::to_ne_bytes)[3], [0, 0, 0, 1]);
+    }
+
+    #[test]
     fn login_then_logout_reuses_the_same_utmp_slot() {
         let dir = std::env::temp_dir();
         let utmp = dir.join(format!("moshpit-utmp-test-{}", std::process::id()));
@@ -452,5 +481,145 @@ mod test {
             2 * RECORD_SIZE as u64
         );
         drop(std::fs::remove_file(wtmp));
+    }
+
+    #[test]
+    fn login_to_then_logout_to_round_trip() {
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let utmp = dir.join(format!("moshpit-utmp-rt-{pid}"));
+        let wtmp = dir.join(format!("moshpit-wtmp-rt-{pid}"));
+        let utmp = utmp.to_str().unwrap();
+        let wtmp = wtmp.to_str().unwrap();
+        drop(std::fs::remove_file(utmp));
+        drop(std::fs::remove_file(wtmp));
+
+        // Login records a USER_PROCESS in utmp and appends it to wtmp.
+        let session = login_to(utmp, wtmp, "carol", 4242, "pts/5", Some("203.0.113.9")).unwrap();
+        assert_eq!(session.line, "pts/5");
+        assert_eq!(session.id, ut_id_from_line("pts/5"));
+        assert_eq!(session.pid, 4242);
+
+        let after_login = std::fs::read(utmp).unwrap();
+        assert_eq!(after_login.len(), RECORD_SIZE);
+        assert_eq!(
+            i16::from_ne_bytes([after_login[OFF_TYPE], after_login[OFF_TYPE + 1]]),
+            USER_PROCESS
+        );
+        assert!(line_matches(
+            &after_login[OFF_LINE..OFF_LINE + LINE_LEN],
+            "pts/5"
+        ));
+        assert_eq!(std::fs::metadata(wtmp).unwrap().len(), RECORD_SIZE as u64);
+
+        // Logout reuses the same utmp slot as DEAD_PROCESS and appends to wtmp.
+        logout_to(utmp, wtmp, &session).unwrap();
+
+        let after_logout = std::fs::read(utmp).unwrap();
+        assert_eq!(after_logout.len(), RECORD_SIZE, "slot reused, not appended");
+        assert_eq!(
+            i16::from_ne_bytes([after_logout[OFF_TYPE], after_logout[OFF_TYPE + 1]]),
+            DEAD_PROCESS
+        );
+        assert!(line_matches(
+            &after_logout[OFF_LINE..OFF_LINE + LINE_LEN],
+            "pts/5"
+        ));
+        assert_eq!(
+            std::fs::metadata(wtmp).unwrap().len(),
+            2 * RECORD_SIZE as u64
+        );
+
+        drop(std::fs::remove_file(utmp));
+        drop(std::fs::remove_file(wtmp));
+    }
+
+    #[test]
+    fn put_utmp_reuses_first_free_slot() {
+        let dir = std::env::temp_dir();
+        let utmp = dir.join(format!("moshpit-utmp-free-{}", std::process::id()));
+        let utmp = utmp.to_str().unwrap();
+        drop(std::fs::remove_file(utmp));
+
+        // Pre-seed two records directly: a DEAD_PROCESS (free) slot, then a
+        // USER_PROCESS for pts/8.  Written as raw bytes so put_utmp doesn't
+        // reuse the free slot while seeding.
+        let dead = record_bytes_raw(DEAD_PROCESS, 1, "pts/2", ut_id_from_line("pts/2"), "", None);
+        let live = record_bytes(
+            USER_PROCESS,
+            2,
+            "pts/8",
+            ut_id_from_line("pts/8"),
+            "dave",
+            None,
+        );
+        let mut seed = Vec::with_capacity(2 * RECORD_SIZE);
+        seed.extend_from_slice(&dead);
+        seed.extend_from_slice(&live);
+        std::fs::write(utmp, &seed).unwrap();
+
+        // A new login for pts/4 takes the free slot 0, not a new record.
+        let fresh = record_bytes(
+            USER_PROCESS,
+            3,
+            "pts/4",
+            ut_id_from_line("pts/4"),
+            "erin",
+            None,
+        );
+        put_utmp(utmp, "pts/4", &fresh).unwrap();
+
+        let data = std::fs::read(utmp).unwrap();
+        assert_eq!(
+            data.len(),
+            2 * RECORD_SIZE,
+            "free slot reused, not appended"
+        );
+        assert_eq!(
+            i16::from_ne_bytes([data[OFF_TYPE], data[OFF_TYPE + 1]]),
+            USER_PROCESS
+        );
+        assert!(line_matches(&data[OFF_LINE..OFF_LINE + LINE_LEN], "pts/4"));
+
+        drop(std::fs::remove_file(utmp));
+    }
+
+    #[test]
+    fn put_utmp_appends_when_no_match_or_free() {
+        let dir = std::env::temp_dir();
+        let utmp = dir.join(format!("moshpit-utmp-append-{}", std::process::id()));
+        let utmp = utmp.to_str().unwrap();
+        drop(std::fs::remove_file(utmp));
+
+        // A single live slot for pts/8 — no match for pts/4, no free slot.
+        let live = record_bytes(
+            USER_PROCESS,
+            2,
+            "pts/8",
+            ut_id_from_line("pts/8"),
+            "dave",
+            None,
+        );
+        put_utmp(utmp, "pts/8", &live).unwrap();
+
+        let fresh = record_bytes(
+            USER_PROCESS,
+            3,
+            "pts/4",
+            ut_id_from_line("pts/4"),
+            "erin",
+            None,
+        );
+        put_utmp(utmp, "pts/4", &fresh).unwrap();
+
+        let data = std::fs::read(utmp).unwrap();
+        assert_eq!(data.len(), 2 * RECORD_SIZE, "new record appended");
+        let second = &data[RECORD_SIZE..];
+        assert!(line_matches(
+            &second[OFF_LINE..OFF_LINE + LINE_LEN],
+            "pts/4"
+        ));
+
+        drop(std::fs::remove_file(utmp));
     }
 }
