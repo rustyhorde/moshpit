@@ -37,7 +37,17 @@ const AEAD_TAG_LEN: usize = 16;
 /// still bounding the memory allocated per received UDP packet.
 pub(crate) const MAX_ENCFRAME_LENGTH: usize = 65536;
 
-/// A moshpit frame.
+/// A moshpit frame — the bincode-serialized payload of an encrypted UDP datagram.
+///
+/// # Wire compatibility
+///
+/// Editing these variants (adding, removing, reordering, or re-typing one, or any
+/// of its fields) is a **wire-format change**: bump
+/// [`PROTOCOL_VERSION`](crate::PROTOCOL_VERSION) and gate the new behaviour on the
+/// negotiated version (see that constant for the policy).  Keep
+/// [`EncryptedFrame::id`] in sync when adding a variant.  Note the negotiated
+/// version is not currently available in the UDP transport, so version-gated UDP
+/// frames also require threading it into `UdpSender` / `UdpReader`.
 #[derive(Clone, Debug, Decode, Encode, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum EncryptedFrame {
     /// An encrypted UDP packet.

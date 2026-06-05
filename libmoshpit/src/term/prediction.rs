@@ -526,8 +526,14 @@ impl PredictionEngine {
                     // shows what we predicted.
                     false
                 } else if actual == cell.original {
-                    // Server hasn't processed our keystroke yet — keep waiting.
-                    true
+                    // Server still shows the pre-prediction content.  This cell is
+                    // already non-tentative, so its epoch has been confirmed.  If a
+                    // *strictly later* epoch has been confirmed, the server has
+                    // processed past this keystroke without ever echoing it (e.g. a
+                    // no-echo password field committed on Enter) → drop the prediction
+                    // so it never flashes.  If only this cell's own epoch is confirmed,
+                    // the echo may still be in flight — keep waiting.
+                    self.confirmed_epoch <= cell.tentative_until_epoch
                 } else {
                     // Server shows something different from both the prediction
                     // and the pre-prediction content → invalidate this epoch.
@@ -824,6 +830,68 @@ mod tests {
         assert!(
             a_cell.is_none(),
             "confirmed prediction for 'a' must be culled"
+        );
+    }
+
+    /// Regression: typing into a no-echo (password) field and pressing Enter must
+    /// not flash the typed characters.  The keystrokes are predicted in epoch 1 but
+    /// never echoed; pressing Enter advances the confirmed epoch (the cursor moves to
+    /// the next line), which retroactively makes the epoch-1 cells non-tentative.
+    /// They must be dropped — not painted — because a strictly later epoch is confirmed.
+    #[test]
+    fn enter_does_not_flash_unechoed_password_predictions() {
+        let mut engine = PredictionEngine::new(DisplayPreference::Always);
+        let blank = make_screen(24, 80, b"");
+        // Prime dimensions so the first real cull doesn't reset everything.
+        engine.cull(blank.screen());
+
+        // Type a "password" at (0,0). No intervening cull → the server never echoes,
+        // so confirmed_epoch stays 0 and these epoch-1 cells stay tentative/hidden.
+        for &b in b"secret" {
+            engine.new_user_byte(b, blank.screen());
+        }
+        // Press Enter: become_tentative() (→ epoch 2) and predict the cursor at (1,0).
+        engine.new_user_byte(b'\r', blank.screen());
+
+        // Server response to Enter: row 0 still blank (password never echoed), cursor
+        // moved to (1,0) — confirming the epoch-2 newline cursor prediction.
+        let after_enter = make_screen(24, 80, b"\x1b[2;1H");
+        assert_eq!(after_enter.screen().cursor_position(), (1, 0));
+        engine.cull(after_enter.screen());
+
+        // The password characters must never appear in the overlay.
+        let (cells, _cursor) = engine.apply(after_enter.screen());
+        assert!(
+            cells.is_empty(),
+            "no-echo password predictions must not flash after Enter, got: {cells:?}"
+        );
+    }
+
+    /// Guard against over-culling: when only a prediction's *own* epoch is confirmed
+    /// (normal in-flight typing where the server echoes one char at a time), later
+    /// same-epoch predictions whose echo hasn't arrived yet must be kept and shown.
+    #[test]
+    fn inflight_prediction_survives_same_epoch_confirmation() {
+        let mut engine = PredictionEngine::new(DisplayPreference::Always);
+        let blank = make_screen(24, 80, b"");
+        engine.cull(blank.screen());
+
+        // Type "ab" — both in epoch 1; predicted cursors at (0,1) then (0,2).
+        engine.new_user_byte(b'a', blank.screen());
+        engine.new_user_byte(b'b', blank.screen());
+
+        // Server screen confirms epoch 1 via the *final* cursor at (0,2) (so the
+        // cursor-validity check doesn't reset), shows 'a' echoed, but leaves (0,1)
+        // still blank — i.e. the 'b' echo is genuinely still in flight.
+        let inflight = make_screen(24, 80, b"a\x1b[1;3H");
+        assert_eq!(inflight.screen().cursor_position(), (0, 2));
+        engine.cull(inflight.screen());
+
+        // 'b' shares the confirmed epoch (1 <= 1) → it must still be shown, not culled.
+        let (cells, _cursor) = engine.apply(inflight.screen());
+        assert!(
+            cells.iter().any(|c| c.ch == 'b'),
+            "in-flight same-epoch prediction 'b' must survive, got: {cells:?}"
         );
     }
 

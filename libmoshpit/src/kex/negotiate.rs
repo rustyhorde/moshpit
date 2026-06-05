@@ -44,6 +44,102 @@ pub const KDF_HKDF_SHA384: &str = "hkdf-sha384";
 /// HKDF-SHA512 key expansion (higher security margin)
 pub const KDF_HKDF_SHA512: &str = "hkdf-sha512";
 
+// ── Wire protocol version ──────────────────────────────────────────────────────
+
+/// Highest wire protocol version this build speaks.
+///
+/// # When to bump
+///
+/// Increment this for **any** change to the wire format or its interpretation:
+/// adding, removing, reordering, or re-typing a [`Frame`](crate::Frame) or
+/// [`EncryptedFrame`](crate::EncryptedFrame) variant or its fields, or changing
+/// the meaning of an existing frame.  Leave [`MIN_PROTOCOL_VERSION`] where it is
+/// (do **not** raise it for a normal feature bump) so this build keeps
+/// negotiating with older peers — see that constant for the retirement knob.
+///
+/// # Where to branch
+///
+/// Gate version-dependent behaviour on the value negotiated during key exchange,
+/// reachable via [`Kex::protocol_version`](crate::Kex::protocol_version) (client)
+/// and [`ServerKex::protocol_version`](crate::ServerKex::protocol_version)
+/// (server).  Never branch on the crate version (`CARGO_PKG_VERSION`): two builds
+/// with different crate versions can still share the same wire protocol, and a
+/// newer build must keep speaking the older format to an older peer.
+///
+/// ```text
+/// // Emitting or parsing a frame whose shape changed in v2:
+/// if kex.protocol_version() >= 2 {
+///     // v2 wire shape
+/// } else {
+///     // v1 fallback — keep talking to older peers
+/// }
+/// ```
+///
+/// The negotiated version is first available on [`Kex`](crate::Kex) /
+/// [`ServerKex`](crate::ServerKex) once key exchange completes.  To gate the
+/// format of **UDP** frames it must additionally be threaded into the UDP
+/// transport (`UdpSender` / `UdpReader`), which does not receive it today; the
+/// `Kex` value at session setup is the single source to pass down.
+pub const PROTOCOL_VERSION: u16 = 1;
+
+/// Lowest wire protocol version this build can implement.
+///
+/// This is the hard floor below which the code no longer carries the logic to
+/// speak: it is the oldest version still present in `protocol_version()` branches.
+///
+/// # When to raise (protocol retirement)
+///
+/// Raise this constant **only** to permanently drop support for an old protocol —
+/// for example after a security fix that makes an earlier version unsafe — and
+/// delete the now-dead `< new floor` branches at the same time.  This is a
+/// breaking change for peers that can only speak the retired versions.
+///
+/// Separately, a server **operator** can raise the *effective* floor at runtime
+/// via `mps --min-protocol-version` (or `MOSHPITS_MIN_PROTOCOL_VERSION`) without
+/// recompiling; that value is clamped to `[MIN_PROTOCOL_VERSION, PROTOCOL_VERSION]`
+/// by [`KexConfig::protocol_support`](crate::KexConfig::protocol_support) and can
+/// never drop below this constant.  See [`ProtocolSupport`] and
+/// [`negotiate_protocol_version`].
+pub const MIN_PROTOCOL_VERSION: u16 = 1;
+
+/// The inclusive range of wire protocol versions an endpoint supports, advertised
+/// in its [`Frame::KexInit`](crate::Frame) frame so the peer can negotiate a
+/// common version.
+#[derive(Clone, Copy, Debug, Decode, Encode, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ProtocolSupport {
+    /// Lowest version this endpoint will accept (its effective floor).
+    pub min: u16,
+    /// Highest version this endpoint speaks (always [`PROTOCOL_VERSION`]).
+    pub max: u16,
+}
+
+/// The build-default support range: `min` is [`MIN_PROTOCOL_VERSION`] and `max`
+/// is [`PROTOCOL_VERSION`].
+#[must_use]
+pub fn local_protocol_support() -> ProtocolSupport {
+    ProtocolSupport {
+        min: MIN_PROTOCOL_VERSION,
+        max: PROTOCOL_VERSION,
+    }
+}
+
+/// Negotiate the highest wire protocol version both peers support.
+///
+/// Picks `min(local.max, peer.max)` and accepts it only if it falls within both
+/// endpoints' supported ranges.  The computation is symmetric: both sides reach
+/// the same result from the two advertised [`ProtocolSupport`] ranges.
+///
+/// # Errors
+/// - [`MoshpitError::IncompatibleProtocolVersion`] — the supported ranges do not overlap
+pub fn negotiate_protocol_version(local: ProtocolSupport, peer: ProtocolSupport) -> Result<u16> {
+    let agreed = local.max.min(peer.max);
+    if agreed >= local.min && agreed >= peer.min {
+        Ok(agreed)
+    } else {
+        Err(MoshpitError::IncompatibleProtocolVersion.into())
+    }
+}
+
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 /// Ordered list of algorithm names offered during KEX negotiation.
@@ -73,6 +169,12 @@ pub struct NegotiatedAlgorithms {
     pub mac: String,
     /// Chosen KDF expand algorithm
     pub kdf: String,
+    /// Agreed wire protocol version (see [`negotiate_protocol_version`]).
+    ///
+    /// [`negotiate`] sets this to [`PROTOCOL_VERSION`] as a placeholder; the key
+    /// exchange readers overwrite it with the value negotiated from both peers'
+    /// advertised [`ProtocolSupport`] ranges.
+    pub protocol_version: u16,
 }
 
 impl Default for NegotiatedAlgorithms {
@@ -82,6 +184,7 @@ impl Default for NegotiatedAlgorithms {
             aead: AEAD_AES256_GCM_SIV.to_string(),
             mac: MAC_HMAC_SHA512.to_string(),
             kdf: KDF_HKDF_SHA256.to_string(),
+            protocol_version: PROTOCOL_VERSION,
         }
     }
 }
@@ -146,6 +249,9 @@ pub fn negotiate(
         aead,
         mac,
         kdf,
+        // Placeholder; the kex readers overwrite this with the result of
+        // negotiate_protocol_version() once both ProtocolSupport ranges are known.
+        protocol_version: PROTOCOL_VERSION,
     })
 }
 
@@ -317,6 +423,85 @@ mod tests {
             negotiated.kdf, KDF_HKDF_SHA512,
             "server prefers hkdf-sha512"
         );
+    }
+
+    // ── protocol version negotiation ───────────────────────────────────────────
+
+    #[test]
+    fn local_protocol_support_uses_build_constants() {
+        let s = local_protocol_support();
+        assert_eq!(s.min, MIN_PROTOCOL_VERSION);
+        assert_eq!(s.max, PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn protocol_support_is_ordered_and_hashable() {
+        use std::collections::{BTreeSet, HashSet};
+
+        let lo = ProtocolSupport { min: 1, max: 1 };
+        let hi = ProtocolSupport { min: 1, max: 2 };
+        // Exercises the derived `Ord`/`PartialOrd`.
+        assert!(lo < hi);
+        let ordered: BTreeSet<ProtocolSupport> = [hi, lo].into_iter().collect();
+        assert_eq!(ordered.iter().next(), Some(&lo));
+        // Exercises the derived `Hash`.
+        let hashed: HashSet<ProtocolSupport> = [lo, hi, lo].into_iter().collect();
+        assert_eq!(hashed.len(), 2);
+    }
+
+    #[test]
+    fn negotiate_protocol_version_equal_ranges() {
+        let s = ProtocolSupport { min: 1, max: 3 };
+        assert_eq!(negotiate_protocol_version(s, s).expect("overlap"), 3);
+    }
+
+    #[test]
+    fn negotiate_protocol_version_picks_min_of_maxes() {
+        let local = ProtocolSupport { min: 1, max: 3 };
+        let peer = ProtocolSupport { min: 1, max: 2 };
+        assert_eq!(negotiate_protocol_version(local, peer).expect("overlap"), 2);
+        assert_eq!(negotiate_protocol_version(peer, local).expect("overlap"), 2);
+    }
+
+    #[test]
+    fn negotiate_protocol_version_backward_compatible() {
+        // A server speaking up to v3 (floor v1) still talks to a v1-only client.
+        let server = ProtocolSupport { min: 1, max: 3 };
+        let client = ProtocolSupport { min: 1, max: 1 };
+        assert_eq!(
+            negotiate_protocol_version(server, client).expect("v1 overlap"),
+            1
+        );
+    }
+
+    #[test]
+    fn negotiate_protocol_version_no_overlap_client_too_old() {
+        // Server retired v1 (floor raised to 2); a v1-only client is rejected.
+        let server = ProtocolSupport { min: 2, max: 2 };
+        let client = ProtocolSupport { min: 1, max: 1 };
+        let err = negotiate_protocol_version(server, client).unwrap_err();
+        assert!(
+            err.downcast_ref::<MoshpitError>()
+                .is_some_and(|e| *e == MoshpitError::IncompatibleProtocolVersion)
+        );
+    }
+
+    #[test]
+    fn negotiate_protocol_version_no_overlap_client_too_new() {
+        // Symmetric: a client whose floor exceeds the server's max is rejected.
+        let server = ProtocolSupport { min: 1, max: 1 };
+        let client = ProtocolSupport { min: 2, max: 2 };
+        let err = negotiate_protocol_version(server, client).unwrap_err();
+        assert!(
+            err.downcast_ref::<MoshpitError>()
+                .is_some_and(|e| *e == MoshpitError::IncompatibleProtocolVersion)
+        );
+    }
+
+    #[test]
+    fn negotiate_sets_placeholder_protocol_version() {
+        let n = negotiate(&current(), &current()).expect("negotiate ok");
+        assert_eq!(n.protocol_version, PROTOCOL_VERSION);
     }
 
     #[test]

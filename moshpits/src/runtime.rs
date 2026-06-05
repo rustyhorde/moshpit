@@ -49,9 +49,7 @@ use tokio::{
     time::{Instant as TokioInstant, sleep_until},
 };
 use tokio_util::sync::CancellationToken;
-#[cfg(target_os = "linux")]
-use tracing::warn;
-use tracing::{error, info, trace};
+use tracing::{error, info, trace, warn};
 use uuid::Uuid;
 use zstd::encode_all;
 
@@ -172,6 +170,29 @@ where
 
     info!("Configuration loaded");
     info!("Tracing initialized");
+
+    // Report the accepted wire protocol range, warning if the operator-configured
+    // minimum had to be clamped to what this build can actually speak.
+    {
+        use libmoshpit::KexConfig as _;
+        let support = config.protocol_support();
+        // Qualify the trait call: Config also has an inherent getter of the same
+        // name returning Option<u16>; we want the trait's effective u16.
+        let configured_min = libmoshpit::KexConfig::min_protocol_version(&config);
+        if configured_min != support.min {
+            warn!(
+                "configured min protocol version {configured_min} clamped to v{} \
+                 (this build speaks v{}..=v{})",
+                support.min,
+                libmoshpit::MIN_PROTOCOL_VERSION,
+                libmoshpit::PROTOCOL_VERSION,
+            );
+        }
+        info!(
+            "accepting wire protocol versions v{}..=v{}",
+            support.min, support.max
+        );
+    }
 
     let socket_addr = SocketAddr::new(
         config
@@ -385,6 +406,9 @@ async fn handle_connection(
     info!("Key exchange completed with moshpit");
 
     let skex = skex_opt.ok_or_else(|| anyhow::anyhow!("missing server kex info"))?;
+    // Informational: the wire protocol version negotiated with this client.
+    // Future wire-format changes should branch on skex.protocol_version().
+    info!("negotiated wire protocol v{}", skex.protocol_version());
     let session_uuid = skex.session_uuid();
     let diff_mode = skex.diff_mode();
 

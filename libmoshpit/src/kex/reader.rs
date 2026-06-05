@@ -63,8 +63,8 @@ use crate::{
         AEAD_AES128_GCM_SIV, AEAD_AES256_GCM, AEAD_AES256_GCM_SIV, AEAD_CHACHA20_POLY1305,
         AlgorithmList, KDF_HKDF_SHA256, KDF_HKDF_SHA384, KDF_HKDF_SHA512, KEX_ML_KEM_512_SHA256,
         KEX_ML_KEM_768_SHA256, KEX_ML_KEM_1024_SHA256, KEX_P256_SHA256, KEX_P384_SHA384,
-        KEX_X25519_SHA256, MAC_HMAC_SHA256, MAC_HMAC_SHA512, NegotiatedAlgorithms, negotiate,
-        supported_algorithms,
+        KEX_X25519_SHA256, MAC_HMAC_SHA256, MAC_HMAC_SHA512, NegotiatedAlgorithms, ProtocolSupport,
+        local_protocol_support, negotiate, negotiate_protocol_version, supported_algorithms,
     },
     load_public_key,
     session::SessionRegistry,
@@ -313,6 +313,12 @@ pub struct KexReader {
     /// Defaults to [`supported_algorithms()`].
     #[builder(default = supported_algorithms())]
     server_preferred_algos: AlgorithmList,
+    /// Wire protocol version range this endpoint advertises in `KexInit` and uses
+    /// as the local side of version negotiation.  Set from
+    /// [`KexConfig::protocol_support`](crate::config::KexConfig::protocol_support);
+    /// defaults to the build range.
+    #[builder(default = local_protocol_support())]
+    protocol_support: ProtocolSupport,
     /// Username sent in `Initialize` frame (client mode only).
     #[builder(default)]
     user: String,
@@ -371,6 +377,7 @@ impl std::fmt::Debug for KexReader {
             .field("diff_mode", &self.diff_mode)
             .field("client_algos", &self.client_algos)
             .field("server_preferred_algos", &self.server_preferred_algos)
+            .field("protocol_support", &self.protocol_support)
             .field("user", &self.user)
             .field("full_public_key_bytes", &"<redacted>")
             .field("send_env", &"<redacted>")
@@ -398,13 +405,18 @@ impl KexReader {
     pub async fn client_kex(&mut self) -> Result<()> {
         trace!("client_kex: waiting for KexInit from server");
         let negotiated = match self.reader.read_frame().await? {
-            Some(Frame::KexInit(server_algos)) => {
+            Some(Frame::KexInit(server_algos, server_proto)) => {
                 trace!(
-                    "client_kex: KexInit received — server offered: kex={:?} aead={:?} mac={:?} kdf={:?}",
-                    server_algos.kex, server_algos.aead, server_algos.mac, server_algos.kdf
+                    "client_kex: KexInit received — server offered: kex={:?} aead={:?} mac={:?} kdf={:?} proto={}-{}",
+                    server_algos.kex,
+                    server_algos.aead,
+                    server_algos.mac,
+                    server_algos.kdf,
+                    server_proto.min,
+                    server_proto.max
                 );
                 // Server-preferred negotiation: first of server's list that client supports.
-                let negotiated = match negotiate(&server_algos, &self.client_algos) {
+                let mut negotiated = match negotiate(&server_algos, &self.client_algos) {
                     Ok(n) => n,
                     Err(e) => {
                         error!(
@@ -424,9 +436,30 @@ impl KexReader {
                         return Err(e);
                     }
                 };
+                // Negotiate the wire protocol version from both advertised ranges.
+                negotiated.protocol_version =
+                    match negotiate_protocol_version(self.protocol_support, server_proto) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            error!(
+                                "client_kex: incompatible wire protocol version — \
+                                 client supports [{}, {}], server supports [{}, {}]",
+                                self.protocol_support.min,
+                                self.protocol_support.max,
+                                server_proto.min,
+                                server_proto.max,
+                            );
+                            drop(self.tx_event.send(KexEvent::Failure));
+                            return Err(e);
+                        }
+                    };
                 trace!(
-                    "client_kex: negotiated: kex={} aead={} mac={} kdf={}",
-                    negotiated.kex, negotiated.aead, negotiated.mac, negotiated.kdf
+                    "client_kex: negotiated: kex={} aead={} mac={} kdf={} proto=v{}",
+                    negotiated.kex,
+                    negotiated.aead,
+                    negotiated.mac,
+                    negotiated.kdf,
+                    negotiated.protocol_version
                 );
                 negotiated
             }
@@ -760,13 +793,30 @@ impl KexReader {
     ) -> Result<(ServerKex, Arc<UdpSocket>)> {
         trace!("server_kex: waiting for KexInit from client");
         let negotiated = match self.reader.read_frame().await? {
-            Some(Frame::KexInit(client_algos)) => {
+            Some(Frame::KexInit(client_algos, client_proto)) => {
                 trace!(
-                    "server_kex: KexInit received — client offered: kex={:?} aead={:?} mac={:?} kdf={:?}",
-                    client_algos.kex, client_algos.aead, client_algos.mac, client_algos.kdf
+                    "server_kex: KexInit received — client offered: kex={:?} aead={:?} mac={:?} kdf={:?} proto={}-{}",
+                    client_algos.kex,
+                    client_algos.aead,
+                    client_algos.mac,
+                    client_algos.kdf,
+                    client_proto.min,
+                    client_proto.max
                 );
+                // Advertise our own capabilities first — before any negotiation —
+                // so the client always receives our KexInit and can self-diagnose a
+                // mismatch precisely (we still reject below via KexFailure when the
+                // ranges don't overlap).  The client needs this to pick the ephemeral
+                // key algorithm before sending Initialize.
+                self.tx.send(Frame::KexInit(
+                    self.server_preferred_algos.clone(),
+                    self.protocol_support,
+                ))?;
+                trace!("server_kex: sent KexInit to client");
+
                 // Server-preferred: first of server's list that client also offered.
-                let Ok(negotiated) = negotiate(&self.server_preferred_algos, &client_algos) else {
+                let Ok(mut negotiated) = negotiate(&self.server_preferred_algos, &client_algos)
+                else {
                     error!(
                         "server_kex: no algorithm in common — \
                          server preferred kex={:?} aead={:?} mac={:?} kdf={:?}, \
@@ -782,9 +832,29 @@ impl KexReader {
                     );
                     return Err(MoshpitError::NoCommonAlgorithm.into());
                 };
+                // Negotiate the wire protocol version from both advertised ranges.
+                negotiated.protocol_version =
+                    match negotiate_protocol_version(self.protocol_support, client_proto) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            error!(
+                                "server_kex: incompatible wire protocol version — \
+                                 server supports [{}, {}], client supports [{}, {}]",
+                                self.protocol_support.min,
+                                self.protocol_support.max,
+                                client_proto.min,
+                                client_proto.max,
+                            );
+                            return Err(e);
+                        }
+                    };
                 trace!(
-                    "server_kex: negotiated: kex={} aead={} mac={} kdf={}",
-                    negotiated.kex, negotiated.aead, negotiated.mac, negotiated.kdf
+                    "server_kex: negotiated: kex={} aead={} mac={} kdf={} proto=v{}",
+                    negotiated.kex,
+                    negotiated.aead,
+                    negotiated.mac,
+                    negotiated.kdf,
+                    negotiated.protocol_version
                 );
                 negotiated
             }
@@ -800,12 +870,6 @@ impl KexReader {
                 return Err(MoshpitError::InvalidFrame.into());
             }
         };
-
-        // Send our KexInit immediately so the client can generate the ephemeral key
-        // for the negotiated algorithm before sending Initialize.
-        self.tx
-            .send(Frame::KexInit(self.server_preferred_algos.clone()))?;
-        trace!("server_kex: sent KexInit to client");
 
         trace!("server_kex: waiting for Initialize/ResumeRequest from client");
         let (rnk, user_str, shell, requested_session_uuid_opt) =
@@ -1732,6 +1796,7 @@ mod tests {
                 aead: AEAD_AES256_GCM_SIV.to_string(),
                 mac: MAC_HMAC_SHA512.to_string(),
                 kdf: KDF_HKDF_SHA256.to_string(),
+                ..NegotiatedAlgorithms::default()
             };
             let salt = [7u8; 32];
             let server_keys = derive_session_keys(server_secret.as_ref(), &salt, &negotiated)
@@ -1786,6 +1851,7 @@ mod tests {
             aead: AEAD_AES256_GCM_SIV.to_string(),
             mac: MAC_HMAC_SHA512.to_string(),
             kdf: KDF_HKDF_SHA256.to_string(),
+            ..NegotiatedAlgorithms::default()
         };
         let transcript = super::identity_transcript(&super::IdentityTranscriptParts {
             role: b"client",
@@ -2410,7 +2476,10 @@ mod tests {
         let identity_key = vec![0u8; 32]; // fixed identity bytes (not used for ECDH)
         let salt = vec![0u8; 32];
         server_writer
-            .write_frame(&Frame::KexInit(supported_algorithms()))
+            .write_frame(&Frame::KexInit(
+                supported_algorithms(),
+                crate::kex::negotiate::local_protocol_support(),
+            ))
             .await
             .expect("write KexInit frame");
         server_writer
@@ -2443,7 +2512,10 @@ mod tests {
         let identity_key = vec![0u8; 32];
         let salt = vec![0u8; 32];
         server_writer
-            .write_frame(&Frame::KexInit(supported_algorithms()))
+            .write_frame(&Frame::KexInit(
+                supported_algorithms(),
+                crate::kex::negotiate::local_protocol_support(),
+            ))
             .await
             .expect("write KexInit frame");
         server_writer
@@ -2468,6 +2540,86 @@ mod tests {
                 .expect_err("expected KeyNotEstablished error")
                 .downcast_ref::<MoshpitError>()
                 .is_some_and(|e| *e == MoshpitError::KeyNotEstablished),
+        );
+    }
+
+    #[tokio::test]
+    async fn client_kex_incompatible_protocol_version_fails() {
+        use crate::MoshpitError;
+        use crate::kex::negotiate::ProtocolSupport;
+
+        let (client_reader, _client_writer, _server_reader, mut server_writer) =
+            make_bidirectional_loopback().await;
+        let (mut kex_reader, _rx_frames, mut rx_events) = make_test_kex_reader(client_reader);
+
+        // Server advertises a protocol range that does not overlap the client's
+        // default support (`{min:1, max:1}`), so version negotiation must fail
+        // even though the algorithm lists agree.
+        server_writer
+            .write_frame(&Frame::KexInit(
+                supported_algorithms(),
+                ProtocolSupport { min: 2, max: 2 },
+            ))
+            .await
+            .expect("write KexInit frame");
+        drop(server_writer);
+
+        let result = kex_reader.client_kex().await;
+        assert!(
+            result
+                .expect_err("expected IncompatibleProtocolVersion error")
+                .downcast_ref::<MoshpitError>()
+                .is_some_and(|e| *e == MoshpitError::IncompatibleProtocolVersion),
+        );
+        // A Failure event is emitted so the state machine can tear the session down.
+        assert!(
+            std::iter::from_fn(|| rx_events.try_recv().ok())
+                .any(|e| matches!(e, KexEvent::Failure)),
+            "expected a KexEvent::Failure to be sent",
+        );
+    }
+
+    #[tokio::test]
+    async fn server_kex_incompatible_protocol_version_fails() {
+        use crate::MoshpitError;
+        use crate::kex::negotiate::ProtocolSupport;
+
+        // The server-side reader reads from the server end of the loopback while
+        // the client end writes the KexInit.
+        let (_client_reader, mut client_writer, server_reader, _server_writer) =
+            make_bidirectional_loopback().await;
+        // `_rx_frames` must stay bound: server_kex sends its own KexInit on this
+        // channel before negotiating, and a dropped receiver would fail that send
+        // first, masking the version error we are testing for.
+        let (mut kex_reader, _rx_frames, _rx_events) = make_test_kex_reader(server_reader);
+
+        // Client advertises a protocol range disjoint from the server's default.
+        client_writer
+            .write_frame(&Frame::KexInit(
+                supported_algorithms(),
+                ProtocolSupport { min: 2, max: 2 },
+            ))
+            .await
+            .expect("write KexInit frame");
+        drop(client_writer);
+
+        let mut pool = BTreeSet::new();
+        let _ = pool.insert(50123u16);
+        let port_pool = StdArc::new(TokioMutex::new(pool));
+        let socket_addr: std::net::SocketAddr =
+            "127.0.0.1:9000".parse().expect("hardcoded test address");
+        // The version error returns before the public key file is read, so this
+        // path never has to exist.
+        let dummy_pubkey = std::path::PathBuf::from("/nonexistent/pubkey");
+
+        let result = kex_reader
+            .server_kex(socket_addr, port_pool, &dummy_pubkey, None)
+            .await;
+        assert!(
+            result
+                .expect_err("expected IncompatibleProtocolVersion error")
+                .downcast_ref::<MoshpitError>()
+                .is_some_and(|e| *e == MoshpitError::IncompatibleProtocolVersion),
         );
     }
 
@@ -2501,7 +2653,10 @@ mod tests {
         let server_handle = tokio::spawn(async move {
             // 1. Send KexInit so client can negotiate and generate its ephemeral key.
             server_writer
-                .write_frame(&Frame::KexInit(supported_algorithms()))
+                .write_frame(&Frame::KexInit(
+                    supported_algorithms(),
+                    crate::kex::negotiate::local_protocol_support(),
+                ))
                 .await
                 .expect("write KexInit frame");
             // 2. Drain the Initialize frame that client_kex sends after negotiation.
@@ -2566,7 +2721,10 @@ mod tests {
         let identity_key = vec![0u8; 32];
         let salt = vec![0u8; 32];
         server_writer
-            .write_frame(&Frame::KexInit(supported_algorithms()))
+            .write_frame(&Frame::KexInit(
+                supported_algorithms(),
+                crate::kex::negotiate::local_protocol_support(),
+            ))
             .await
             .expect("write KexInit frame");
         server_writer
@@ -2602,7 +2760,10 @@ mod tests {
         let identity_key = vec![0u8; 32];
         let salt = vec![0u8; 32];
         server_writer
-            .write_frame(&Frame::KexInit(supported_algorithms()))
+            .write_frame(&Frame::KexInit(
+                supported_algorithms(),
+                crate::kex::negotiate::local_protocol_support(),
+            ))
             .await
             .expect("write KexInit frame");
         server_writer
@@ -2644,7 +2805,10 @@ mod tests {
         let identity_key = vec![0u8; 32];
         let salt = vec![0u8; 32];
         server_writer
-            .write_frame(&Frame::KexInit(supported_algorithms()))
+            .write_frame(&Frame::KexInit(
+                supported_algorithms(),
+                crate::kex::negotiate::local_protocol_support(),
+            ))
             .await
             .expect("write KexInit frame");
         server_writer
@@ -2719,6 +2883,7 @@ mod tests {
             aead: AEAD_AES256_GCM_SIV.to_string(),
             mac: MAC_HMAC_SHA512.to_string(),
             kdf: KDF_HKDF_SHA256.to_string(),
+            ..NegotiatedAlgorithms::default()
         };
 
         for (signing_alg, alg_str) in [

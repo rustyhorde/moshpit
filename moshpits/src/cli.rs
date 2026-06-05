@@ -101,6 +101,17 @@ pub(crate) struct Cli {
     )]
     #[getset(get_copy = "pub(crate)")]
     pacing_delay_us: Option<u64>,
+    /// Minimum wire protocol version this server will accept.  Clients that cannot
+    /// speak at least this version are rejected during key exchange.  Raise this to
+    /// retire older protocols (e.g. after a security fix); clamped to the range this
+    /// build implements.
+    #[clap(
+        long,
+        value_name = "VERSION",
+        help = "Minimum wire protocol version to accept (older clients are rejected)"
+    )]
+    #[getset(get_copy = "pub(crate)")]
+    min_protocol_version: Option<u16>,
     /// TERM environment variable to set for spawned shells
     #[clap(
         long,
@@ -225,6 +236,15 @@ impl Source for Cli {
             let _old = map.insert(
                 "pacing_delay_us".to_string(),
                 Value::new(Some(&origin), ValueKind::U64(pacing_delay_us)),
+            );
+        }
+        if let Some(min_protocol_version) = self.min_protocol_version {
+            let _old = map.insert(
+                "min_protocol_version".to_string(),
+                Value::new(
+                    Some(&origin),
+                    ValueKind::U64(u64::from(min_protocol_version)),
+                ),
             );
         }
         let _old = map.insert(
@@ -386,6 +406,25 @@ mod test {
             term_type.clone().into_string().ok(),
             Some("tmux-256color".to_string())
         );
+    }
+
+    #[test]
+    fn cli_min_protocol_version_absent_by_default() {
+        let cli = parse(&["mps"]);
+        assert!(cli.min_protocol_version().is_none());
+        let map = cli.collect().expect("collect should succeed");
+        assert!(!map.contains_key("min_protocol_version"));
+    }
+
+    #[test]
+    fn cli_min_protocol_version_collected() {
+        let cli = parse(&["mps", "--min-protocol-version", "3"]);
+        assert_eq!(cli.min_protocol_version(), Some(3));
+        let map = cli.collect().expect("collect should succeed");
+        let value = map
+            .get("min_protocol_version")
+            .expect("min_protocol_version should be in map");
+        assert_eq!(value.clone().into_uint().ok(), Some(3));
     }
 
     #[test]

@@ -231,6 +231,17 @@ impl Kex {
             64
         }
     }
+
+    /// The wire protocol version agreed with the server during key exchange.
+    ///
+    /// This is the intended branch input for version-dependent behaviour — see
+    /// [`PROTOCOL_VERSION`](crate::PROTOCOL_VERSION) for when to bump the version
+    /// and how to gate on it.  To gate the format of UDP frames, thread this value
+    /// from session setup into the UDP transport (it is not carried there today).
+    #[must_use]
+    pub fn protocol_version(&self) -> u16 {
+        self.negotiated_algorithms.protocol_version
+    }
 }
 
 impl Default for Kex {
@@ -282,6 +293,19 @@ pub struct ServerKex {
     #[getset(get = "pub")]
     #[builder(default)]
     client_extra_path: Vec<String>,
+}
+
+impl ServerKex {
+    /// The wire protocol version agreed with the client during key exchange.
+    ///
+    /// This is the intended branch input for version-dependent behaviour — see
+    /// [`PROTOCOL_VERSION`](crate::PROTOCOL_VERSION) for when to bump the version
+    /// and how to gate on it.  To gate the format of UDP frames, thread this value
+    /// from session setup into the UDP transport (it is not carried there today).
+    #[must_use]
+    pub fn protocol_version(&self) -> u16 {
+        self.negotiated_algorithms.protocol_version
+    }
 }
 
 impl KexStateMachine {
@@ -426,6 +450,7 @@ pub async fn run_key_exchange<T: KexConfig>(
 }
 
 #[cfg_attr(nightly, allow(clippy::too_many_lines))]
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn run_client_kex<T: KexConfig>(
     config: T,
     tx: UnboundedSender<Frame>,
@@ -581,6 +606,7 @@ async fn run_client_kex<T: KexConfig>(
 
     let diff_mode = config.diff_mode();
     let client_algos = config.preferred_algorithms();
+    let client_protocol_support = config.protocol_support();
     let user = config.user().unwrap_or_default();
     let send_env_patterns = config.send_env();
     let send_env: Vec<(String, String)> = std::env::vars()
@@ -599,6 +625,7 @@ async fn run_client_kex<T: KexConfig>(
             .maybe_host_key_mismatch_fn(host_key_mismatch_fn)
             .diff_mode(diff_mode)
             .client_algos(client_algos)
+            .protocol_support(client_protocol_support)
             .user(user)
             .full_public_key_bytes(full_public_key_bytes)
             .client_identity_key_algorithm(client_identity_key_algorithm)
@@ -619,6 +646,7 @@ async fn run_client_kex<T: KexConfig>(
             .maybe_host_key_mismatch_fn(host_key_mismatch_fn)
             .diff_mode(diff_mode)
             .client_algos(client_algos)
+            .protocol_support(client_protocol_support)
             .user(user)
             .full_public_key_bytes(full_public_key_bytes)
             .maybe_agent_socket(agent_socket)
@@ -633,7 +661,10 @@ async fn run_client_kex<T: KexConfig>(
 
     // Send KexInit only — Initialize/ResumeRequest is sent inside client_kex() after
     // reading the server's KexInit and generating the correct ephemeral key.
-    tx.send(Frame::KexInit(config.preferred_algorithms()))?;
+    tx.send(Frame::KexInit(
+        config.preferred_algorithms(),
+        config.protocol_support(),
+    ))?;
 
     let kex = kex_handle.await??;
 
@@ -666,6 +697,7 @@ async fn run_client_kex<T: KexConfig>(
     }
 }
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 async fn run_server_kex<T: KexConfig>(
     config: T,
     socket_addr: SocketAddr,
@@ -686,11 +718,13 @@ async fn run_server_kex<T: KexConfig>(
     let tx_c = tx.clone();
     let tx_event_c = tx_event.clone();
     let server_preferred_algos = config.preferred_algorithms();
+    let server_protocol_support = config.protocol_support();
     let mut frame_reader = KexReader::builder()
         .reader(reader)
         .tx(tx_c)
         .tx_event(tx_event_c)
         .server_preferred_algos(server_preferred_algos)
+        .protocol_support(server_protocol_support)
         .build();
     if let Some(port_pool) = port_pool_opt {
         let (skex, udp_arc) = frame_reader
@@ -847,6 +881,39 @@ mod tests {
         assert!(kex.session_uuid().is_none());
         assert!(!kex.is_resume());
         drop(NegotiatedAlgorithms::default());
+    }
+
+    #[test]
+    fn kex_protocol_version_returns_negotiated() {
+        use crate::kex::negotiate::NegotiatedAlgorithms;
+        let kex = Kex {
+            key: Vec::new(),
+            hmac_key: Vec::new(),
+            uuid: Uuid::nil(),
+            moshpits_addr: None,
+            session_uuid: None,
+            is_resume: false,
+            negotiated_algorithms: NegotiatedAlgorithms {
+                protocol_version: 42,
+                ..NegotiatedAlgorithms::default()
+            },
+        };
+        assert_eq!(kex.protocol_version(), 42);
+    }
+
+    #[test]
+    fn server_kex_protocol_version_returns_negotiated() {
+        use crate::kex::negotiate::NegotiatedAlgorithms;
+        let skex = ServerKex::builder()
+            .user(String::new())
+            .shell(String::new())
+            .session_uuid(Uuid::nil())
+            .negotiated_algorithms(NegotiatedAlgorithms {
+                protocol_version: 7,
+                ..NegotiatedAlgorithms::default()
+            })
+            .build();
+        assert_eq!(skex.protocol_version(), 7);
     }
 
     #[test]

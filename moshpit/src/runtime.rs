@@ -735,6 +735,9 @@ async fn run_session_loop(
                 backoff = Duration::from_secs(2);
                 clear_reconnect_banner(&stdout_tx).await;
                 had_successful_kex = true;
+                // Informational: the wire protocol version both ends agreed on.
+                // Future wire-format changes should branch on kex.protocol_version().
+                info!("negotiated wire protocol v{}", kex.protocol_version());
 
                 let session_result = run_udp_session(
                     kex,
@@ -805,6 +808,17 @@ async fn run_session_loop(
                             eprintln!(
                                 "mp: check --kex-algos, --aead-algos, --mac-algos, \
                                  and --kdf-algos settings on both client and server"
+                            );
+                            drop(disable_raw_mode());
+                            return Err(e);
+                        }
+                        MoshpitError::IncompatibleProtocolVersion => {
+                            eprintln!(
+                                "mp: server's wire protocol is incompatible with this client"
+                            );
+                            eprintln!(
+                                "mp: upgrade moshpit on whichever side is older (the server may \
+                                 have raised its minimum supported version)"
                             );
                             drop(disable_raw_mode());
                             return Err(e);
