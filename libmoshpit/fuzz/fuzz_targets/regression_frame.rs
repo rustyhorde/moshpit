@@ -32,3 +32,17 @@ fn regression_crash_6720028039() {
     ];
     run_fuzz_frame(CRASH);
 }
+
+/// Regression test for crash artifact `crash-ff8e016881278559e9754b0116854ad9f5d0df33`.
+/// The frame decoded to a `ResumeRequest` whose leading `UuidWrapper` string field
+/// held non-ASCII multi-byte UTF-8; `Uuid::parse_str`'s error path sliced the string
+/// on a non-char boundary and panicked. Fixed by switching to `Uuid::try_parse`.
+#[test]
+fn regression_crash_ff8e0168() {
+    const CRASH: &[u8] = &[
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1d, 0x07, 0x19, 0x7b, 0x31, 0x36, 0x31,
+        0x35, 0x02, 0x00, 0x00, 0x00, 0x38, 0x39, 0x00, 0x26, 0x07, 0x19, 0x7b, 0x30, 0x30, 0x30,
+        0x30, 0x02, 0xdf, 0x84, 0x3b, 0x7d, 0x83, 0x31,
+    ];
+    run_fuzz_frame(CRASH);
+}
