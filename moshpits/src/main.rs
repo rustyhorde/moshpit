@@ -247,6 +247,8 @@ mod config;
 mod logind;
 mod runtime;
 mod session;
+#[cfg(target_os = "linux")]
+mod utmp;
 
 #[tokio::main]
 #[cfg_attr(coverage_nightly, coverage(off))]

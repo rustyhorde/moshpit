@@ -379,6 +379,7 @@ async fn handle_connection(
     let path_locked = config.path_locked();
     let namespace_escape = config.namespace_escape();
     let use_logind = config.use_logind();
+    let use_utmp = config.use_utmp();
     let (kex, udp_arc, skex_opt) =
         run_key_exchange(config, sock_read, sock_write, || Ok(None), None, None).await?;
     info!("Key exchange completed with moshpit");
@@ -768,6 +769,7 @@ async fn handle_connection(
             pty_path,
             namespace_escape,
             use_logind,
+            use_utmp,
             remote_host,
         );
     }
@@ -1317,6 +1319,7 @@ fn spawn_pty(
     #[cfg_attr(not(unix), allow(unused_variables))] pty_path: String,
     #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] namespace_escape: bool,
     #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] use_logind: bool,
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] use_utmp: bool,
     #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] remote_host: Option<String>,
 ) {
     let _term_handle = thread::spawn(move || {
@@ -1339,6 +1342,12 @@ fn spawn_pty(
         // ends.
         #[cfg(target_os = "linux")]
         let mut logind_guard: Option<crate::logind::LogindSession> = None;
+
+        // Held for the lifetime of the PTY thread; on thread exit we flip the
+        // utmp slot to DEAD_PROCESS and append a logout record to wtmp so the
+        // session disappears from `who`/`w` and shows a clean logout in `last`.
+        #[cfg(target_os = "linux")]
+        let mut utmp_guard: Option<crate::utmp::UtmpSession> = None;
 
         #[cfg(unix)]
         {
@@ -1607,6 +1616,29 @@ fn spawn_pty(
                 }
             }
 
+            // Record the session in /var/run/utmp and /var/log/wtmp like an SSH
+            // login does, so it shows up in `who`, `w`, and `last`.  Needs root
+            // (the login databases are root/utmp-owned); failures are non-fatal.
+            #[cfg(target_os = "linux")]
+            if use_utmp && daemon_uid == 0 {
+                let tty_name = tty_path.to_string_lossy();
+                let tty_name = tty_name.strip_prefix("/dev/").unwrap_or(&tty_name);
+                match crate::utmp::login(
+                    &account.username,
+                    child.id(),
+                    tty_name,
+                    remote_host.as_deref(),
+                ) {
+                    Ok(session) => utmp_guard = Some(session),
+                    Err(e) => {
+                        warn!(
+                            "utmp/wtmp login record failed for {user}: {e:#}; \
+                             continuing without login accounting"
+                        );
+                    }
+                }
+            }
+
             // Reap the shell when it exits so it does not linger as a zombie
             // (which would also keep its logind session scope from cleaning up).
             // PTY master EOF — not this wait — drives moshpit session teardown.
@@ -1690,7 +1722,14 @@ fn spawn_pty(
             }
         }
 
-        // PTY thread is ending: release the logind session (closes its fifo).
+        // PTY thread is ending: write the logout records (DEAD_PROCESS) before
+        // releasing the logind session (closes its fifo).
+        #[cfg(target_os = "linux")]
+        if let Some(session) = utmp_guard.take()
+            && let Err(e) = crate::utmp::logout(&session)
+        {
+            warn!("utmp/wtmp logout record failed: {e:#}");
+        }
         #[cfg(target_os = "linux")]
         drop(logind_guard);
     });
