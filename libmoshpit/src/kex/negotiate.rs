@@ -48,17 +48,58 @@ pub const KDF_HKDF_SHA512: &str = "hkdf-sha512";
 
 /// Highest wire protocol version this build speaks.
 ///
-/// Bump this when introducing a wire-format change; gate new behaviour on the
-/// version agreed during key exchange (see [`negotiate_protocol_version`]) so a
-/// newer peer stays compatible with older ones.
+/// # When to bump
+///
+/// Increment this for **any** change to the wire format or its interpretation:
+/// adding, removing, reordering, or re-typing a [`Frame`](crate::Frame) or
+/// [`EncryptedFrame`](crate::EncryptedFrame) variant or its fields, or changing
+/// the meaning of an existing frame.  Leave [`MIN_PROTOCOL_VERSION`] where it is
+/// (do **not** raise it for a normal feature bump) so this build keeps
+/// negotiating with older peers — see that constant for the retirement knob.
+///
+/// # Where to branch
+///
+/// Gate version-dependent behaviour on the value negotiated during key exchange,
+/// reachable via [`Kex::protocol_version`](crate::Kex::protocol_version) (client)
+/// and [`ServerKex::protocol_version`](crate::ServerKex::protocol_version)
+/// (server).  Never branch on the crate version (`CARGO_PKG_VERSION`): two builds
+/// with different crate versions can still share the same wire protocol, and a
+/// newer build must keep speaking the older format to an older peer.
+///
+/// ```text
+/// // Emitting or parsing a frame whose shape changed in v2:
+/// if kex.protocol_version() >= 2 {
+///     // v2 wire shape
+/// } else {
+///     // v1 fallback — keep talking to older peers
+/// }
+/// ```
+///
+/// The negotiated version is first available on [`Kex`](crate::Kex) /
+/// [`ServerKex`](crate::ServerKex) once key exchange completes.  To gate the
+/// format of **UDP** frames it must additionally be threaded into the UDP
+/// transport (`UdpSender` / `UdpReader`), which does not receive it today; the
+/// `Kex` value at session setup is the single source to pass down.
 pub const PROTOCOL_VERSION: u16 = 1;
 
 /// Lowest wire protocol version this build can implement.
 ///
-/// This is the hard floor below which the code no longer has the logic to speak.
-/// The *effective* minimum an endpoint accepts may be raised above this at
-/// runtime (e.g. a server operator retiring an insecure old protocol), but it can
-/// never be lowered below this constant.
+/// This is the hard floor below which the code no longer carries the logic to
+/// speak: it is the oldest version still present in `protocol_version()` branches.
+///
+/// # When to raise (protocol retirement)
+///
+/// Raise this constant **only** to permanently drop support for an old protocol —
+/// for example after a security fix that makes an earlier version unsafe — and
+/// delete the now-dead `< new floor` branches at the same time.  This is a
+/// breaking change for peers that can only speak the retired versions.
+///
+/// Separately, a server **operator** can raise the *effective* floor at runtime
+/// via `mps --min-protocol-version` (or `MOSHPITS_MIN_PROTOCOL_VERSION`) without
+/// recompiling; that value is clamped to `[MIN_PROTOCOL_VERSION, PROTOCOL_VERSION]`
+/// by [`KexConfig::protocol_support`](crate::KexConfig::protocol_support) and can
+/// never drop below this constant.  See [`ProtocolSupport`] and
+/// [`negotiate_protocol_version`].
 pub const MIN_PROTOCOL_VERSION: u16 = 1;
 
 /// The inclusive range of wire protocol versions an endpoint supports, advertised

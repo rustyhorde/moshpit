@@ -232,10 +232,12 @@ impl Kex {
         }
     }
 
-    /// The wire protocol version agreed during key exchange.
+    /// The wire protocol version agreed with the server during key exchange.
     ///
-    /// Currently informational; future wire-format changes should branch on this
-    /// so a newer build stays compatible with an older peer.
+    /// This is the intended branch input for version-dependent behaviour — see
+    /// [`PROTOCOL_VERSION`](crate::PROTOCOL_VERSION) for when to bump the version
+    /// and how to gate on it.  To gate the format of UDP frames, thread this value
+    /// from session setup into the UDP transport (it is not carried there today).
     #[must_use]
     pub fn protocol_version(&self) -> u16 {
         self.negotiated_algorithms.protocol_version
@@ -294,10 +296,12 @@ pub struct ServerKex {
 }
 
 impl ServerKex {
-    /// The wire protocol version agreed during key exchange.
+    /// The wire protocol version agreed with the client during key exchange.
     ///
-    /// Currently informational; future wire-format changes should branch on this
-    /// so a newer server stays compatible with an older client.
+    /// This is the intended branch input for version-dependent behaviour — see
+    /// [`PROTOCOL_VERSION`](crate::PROTOCOL_VERSION) for when to bump the version
+    /// and how to gate on it.  To gate the format of UDP frames, thread this value
+    /// from session setup into the UDP transport (it is not carried there today).
     #[must_use]
     pub fn protocol_version(&self) -> u16 {
         self.negotiated_algorithms.protocol_version

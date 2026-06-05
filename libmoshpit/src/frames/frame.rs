@@ -22,7 +22,16 @@ use crate::{
 /// The maximum size of a TCP frame payload in bytes (64KB).
 pub(crate) const MAX_FRAME_LENGTH: usize = 65536;
 
-/// A moshpit frame.
+/// A moshpit frame — the bincode-serialized payload of a TCP key-exchange message.
+///
+/// # Wire compatibility
+///
+/// Editing these variants (adding, removing, reordering, or re-typing one, or any
+/// of its fields) is a **wire-format change**: bump
+/// [`PROTOCOL_VERSION`](crate::PROTOCOL_VERSION) and gate the new behaviour on the
+/// negotiated version (see that constant for the policy).  A new variant also
+/// requires updating both [`Frame::id`] and the `Some(0..=N)` accepted-id range in
+/// [`Frame::parse`].
 #[derive(Clone, Debug, Decode, Encode, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Frame {
     /// An initialization frame from moshpit.
