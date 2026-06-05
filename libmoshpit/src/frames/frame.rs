@@ -15,7 +15,7 @@ use bytes::Buf as _;
 use crate::{
     error::Error,
     frames::{get_bytes, get_usize},
-    kex::negotiate::AlgorithmList,
+    kex::negotiate::{AlgorithmList, ProtocolSupport},
     uuid::UuidWrapper,
 };
 
@@ -57,8 +57,10 @@ pub enum Frame {
     /// the very start of the handshake (before `Initialize` / `PeerInitialize`).
     /// Each side lists its supported algorithms in preference order; the
     /// receiver runs [`negotiate`](crate::kex::negotiate::negotiate) to pick
-    /// the first common algorithm in each category.
-    KexInit(AlgorithmList),
+    /// the first common algorithm in each category.  The trailing
+    /// [`ProtocolSupport`] advertises this endpoint's wire-protocol version range
+    /// so the peer can [`negotiate_protocol_version`](crate::kex::negotiate::negotiate_protocol_version).
+    KexInit(AlgorithmList, ProtocolSupport),
     /// Experimental identity-key proof over the key-exchange transcript.
     IdentityProof(Vec<u8>),
     /// Environment variable passthrough and PATH additions from the client.
@@ -86,7 +88,7 @@ impl Frame {
             Frame::SessionToken(_) => 6,
             Frame::ResumeRequest(_, _, _, _) => 7,
             Frame::ClientOptions(_) => 8,
-            Frame::KexInit(_) => 9,
+            Frame::KexInit(_, _) => 9,
             Frame::IdentityProof(_) => 10,
             Frame::ClientEnv(_, _) => 11,
         }
@@ -160,10 +162,10 @@ impl Display for Frame {
                 fpk.len()
             ),
             Frame::ClientOptions(mode) => write!(f, "ClientOptions({mode})"),
-            Frame::KexInit(list) => write!(
+            Frame::KexInit(list, proto) => write!(
                 f,
-                "KexInit(kex={:?}, aead={:?}, mac={:?}, kdf={:?})",
-                list.kex, list.aead, list.mac, list.kdf
+                "KexInit(kex={:?}, aead={:?}, mac={:?}, kdf={:?}, proto={}-{})",
+                list.kex, list.aead, list.mac, list.kdf, proto.min, proto.max
             ),
             Frame::IdentityProof(signature) => {
                 write!(f, "IdentityProof({} bytes)", signature.len())
@@ -392,10 +394,11 @@ mod tests {
 
     #[test]
     fn test_kex_init_round_trips() -> Result<()> {
-        use crate::kex::negotiate::{AlgorithmList, supported_algorithms};
+        use crate::kex::negotiate::{AlgorithmList, local_protocol_support, supported_algorithms};
 
         let list: AlgorithmList = supported_algorithms();
-        let frame = Frame::KexInit(list.clone());
+        let proto = local_protocol_support();
+        let frame = Frame::KexInit(list.clone(), proto);
         let encoded_frame = encode_to_vec(&frame, standard())?;
         let length = encoded_frame.len();
         let length_bytes = length.to_be_bytes();
@@ -405,12 +408,13 @@ mod tests {
         all_data.extend_from_slice(&encoded_frame);
 
         let mut cursor = Cursor::new(&all_data[..]);
-        let Frame::KexInit(parsed_list) =
+        let Frame::KexInit(parsed_list, parsed_proto) =
             Frame::parse(&mut cursor)?.ok_or_else(|| anyhow::anyhow!("expected KexInit frame"))?
         else {
             panic!("expected KexInit");
         };
         assert_eq!(parsed_list, list);
+        assert_eq!(parsed_proto, proto);
         Ok(())
     }
 

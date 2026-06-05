@@ -231,6 +231,15 @@ impl Kex {
             64
         }
     }
+
+    /// The wire protocol version agreed during key exchange.
+    ///
+    /// Currently informational; future wire-format changes should branch on this
+    /// so a newer build stays compatible with an older peer.
+    #[must_use]
+    pub fn protocol_version(&self) -> u16 {
+        self.negotiated_algorithms.protocol_version
+    }
 }
 
 impl Default for Kex {
@@ -282,6 +291,17 @@ pub struct ServerKex {
     #[getset(get = "pub")]
     #[builder(default)]
     client_extra_path: Vec<String>,
+}
+
+impl ServerKex {
+    /// The wire protocol version agreed during key exchange.
+    ///
+    /// Currently informational; future wire-format changes should branch on this
+    /// so a newer server stays compatible with an older client.
+    #[must_use]
+    pub fn protocol_version(&self) -> u16 {
+        self.negotiated_algorithms.protocol_version
+    }
 }
 
 impl KexStateMachine {
@@ -581,6 +601,7 @@ async fn run_client_kex<T: KexConfig>(
 
     let diff_mode = config.diff_mode();
     let client_algos = config.preferred_algorithms();
+    let client_protocol_support = config.protocol_support();
     let user = config.user().unwrap_or_default();
     let send_env_patterns = config.send_env();
     let send_env: Vec<(String, String)> = std::env::vars()
@@ -599,6 +620,7 @@ async fn run_client_kex<T: KexConfig>(
             .maybe_host_key_mismatch_fn(host_key_mismatch_fn)
             .diff_mode(diff_mode)
             .client_algos(client_algos)
+            .protocol_support(client_protocol_support)
             .user(user)
             .full_public_key_bytes(full_public_key_bytes)
             .client_identity_key_algorithm(client_identity_key_algorithm)
@@ -619,6 +641,7 @@ async fn run_client_kex<T: KexConfig>(
             .maybe_host_key_mismatch_fn(host_key_mismatch_fn)
             .diff_mode(diff_mode)
             .client_algos(client_algos)
+            .protocol_support(client_protocol_support)
             .user(user)
             .full_public_key_bytes(full_public_key_bytes)
             .maybe_agent_socket(agent_socket)
@@ -633,7 +656,10 @@ async fn run_client_kex<T: KexConfig>(
 
     // Send KexInit only — Initialize/ResumeRequest is sent inside client_kex() after
     // reading the server's KexInit and generating the correct ephemeral key.
-    tx.send(Frame::KexInit(config.preferred_algorithms()))?;
+    tx.send(Frame::KexInit(
+        config.preferred_algorithms(),
+        config.protocol_support(),
+    ))?;
 
     let kex = kex_handle.await??;
 
@@ -686,11 +712,13 @@ async fn run_server_kex<T: KexConfig>(
     let tx_c = tx.clone();
     let tx_event_c = tx_event.clone();
     let server_preferred_algos = config.preferred_algorithms();
+    let server_protocol_support = config.protocol_support();
     let mut frame_reader = KexReader::builder()
         .reader(reader)
         .tx(tx_c)
         .tx_event(tx_event_c)
         .server_preferred_algos(server_preferred_algos)
+        .protocol_support(server_protocol_support)
         .build();
     if let Some(port_pool) = port_pool_opt {
         let (skex, udp_arc) = frame_reader

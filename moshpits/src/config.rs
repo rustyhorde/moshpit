@@ -85,6 +85,12 @@ pub(crate) struct Config {
     #[serde(default)]
     #[getset(get_copy = "pub(crate)")]
     pacing_delay_us: Option<u64>,
+    /// Minimum wire protocol version this server accepts.  Older clients are
+    /// rejected during key exchange.  Clamped to the range this build implements.
+    /// `None` means the build's default floor.
+    #[serde(default)]
+    #[getset(get_copy = "pub(crate)")]
+    min_protocol_version: Option<u16>,
     /// TERM environment variable to set for spawned shells.
     /// Default: "xterm-256color".
     #[serde(default = "default_term_type")]
@@ -156,6 +162,7 @@ impl Default for Config {
             public_key_path: None,
             warmup_delay_ms: None,
             pacing_delay_us: None,
+            min_protocol_version: None,
             term_type: default_term_type(),
             preferred_algorithms: AlgorithmPreferences::default(),
             accept_env: Self::default_accept_env(),
@@ -222,6 +229,13 @@ impl KexConfig for Config {
 
     fn preferred_algorithms(&self) -> AlgorithmList {
         self.preferred_algorithms.clone().into_algorithm_list()
+    }
+
+    fn min_protocol_version(&self) -> u16 {
+        // `None` → the build's default floor; the trait's protocol_support()
+        // clamps the result to the implementable range.
+        self.min_protocol_version
+            .unwrap_or(libmoshpit::MIN_PROTOCOL_VERSION)
     }
 }
 

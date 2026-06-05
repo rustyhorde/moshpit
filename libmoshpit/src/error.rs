@@ -90,6 +90,9 @@ pub enum Error {
     /// No common algorithm found during KEX negotiation
     #[error("No common algorithm found during key exchange negotiation")]
     NoCommonAlgorithm,
+    /// The client and server have no overlapping supported wire protocol version
+    #[error("Incompatible wire protocol version")]
+    IncompatibleProtocolVersion,
 }
 
 /// Converts an `anyhow::Error` into a suitable exit code or clap message for a CLI application.

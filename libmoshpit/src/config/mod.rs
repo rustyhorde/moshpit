@@ -20,7 +20,10 @@ use uuid::Uuid;
 use crate::{
     KexMode,
     error::Error,
-    kex::negotiate::{AlgorithmList, supported_algorithms},
+    kex::negotiate::{
+        AlgorithmList, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION, ProtocolSupport,
+        supported_algorithms,
+    },
     session::SessionRegistry,
     to_path_buf,
     udp::DiffMode,
@@ -89,6 +92,29 @@ pub trait KexConfig {
     /// category.  Defaults to the full set of algorithms supported by this build.
     fn preferred_algorithms(&self) -> AlgorithmList {
         supported_algorithms()
+    }
+    /// The effective minimum wire protocol version this endpoint will accept.
+    ///
+    /// Defaults to the build floor [`MIN_PROTOCOL_VERSION`].  Server
+    /// implementations override this from their configured
+    /// `--min-protocol-version` so an operator can retire old protocols without
+    /// recompiling; the value is clamped by [`protocol_support`](Self::protocol_support).
+    fn min_protocol_version(&self) -> u16 {
+        MIN_PROTOCOL_VERSION
+    }
+    /// The supported wire protocol range this endpoint advertises in its
+    /// `KexInit` frame and uses as the local side of version negotiation.
+    ///
+    /// The configured minimum is clamped to `[MIN_PROTOCOL_VERSION,
+    /// PROTOCOL_VERSION]`: it can never drop below what this build can speak, nor
+    /// rise above the highest version it implements.
+    fn protocol_support(&self) -> ProtocolSupport {
+        ProtocolSupport {
+            min: self
+                .min_protocol_version()
+                .clamp(MIN_PROTOCOL_VERSION, PROTOCOL_VERSION),
+            max: PROTOCOL_VERSION,
+        }
     }
     /// Environment variable name patterns to send to the server via `ClientEnv`.
     /// Supports exact names (`LANG`) and suffix wildcards (`LC_*`).
@@ -196,7 +222,48 @@ mod tests {
         }
     }
 
+    // A KexConfig whose minimum protocol version is configurable, for clamp tests.
+    struct MinVerConfig(u16);
+
+    impl KexConfig for MinVerConfig {
+        fn mode(&self) -> KexMode {
+            KexMode::Client
+        }
+        fn port_pool(&self) -> Option<Arc<Mutex<BTreeSet<u16>>>> {
+            None
+        }
+        fn key_pair_paths(&self) -> anyhow::Result<(PathBuf, PathBuf)> {
+            Ok((PathBuf::from("/tmp/pub"), PathBuf::from("/tmp/priv")))
+        }
+        fn user(&self) -> Option<String> {
+            None
+        }
+        fn min_protocol_version(&self) -> u16 {
+            self.0
+        }
+    }
+
     // ── default method impls ──────────────────────────────────────────────────
+
+    #[test]
+    fn protocol_support_default_uses_build_range() {
+        use crate::kex::negotiate::{MIN_PROTOCOL_VERSION, PROTOCOL_VERSION};
+        let s = TestKexConfig.protocol_support();
+        assert_eq!(s.min, MIN_PROTOCOL_VERSION);
+        assert_eq!(s.max, PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn protocol_support_clamps_configured_min() {
+        use crate::kex::negotiate::{MIN_PROTOCOL_VERSION, PROTOCOL_VERSION};
+        // Below the build floor → clamped up to the floor.
+        assert_eq!(MinVerConfig(0).protocol_support().min, MIN_PROTOCOL_VERSION);
+        // Above the highest version we speak → clamped down to PROTOCOL_VERSION.
+        assert_eq!(
+            MinVerConfig(u16::MAX).protocol_support().min,
+            PROTOCOL_VERSION
+        );
+    }
 
     #[test]
     fn kex_config_session_registry_default_is_none() {
