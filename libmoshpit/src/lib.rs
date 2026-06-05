@@ -39,6 +39,25 @@
 //!
 //! Algorithm negotiation follows SSH "first-match-wins" semantics ([`negotiate`]).
 //!
+//! # Wire protocol and framing
+//!
+//! Two bincode-serialized frame enums carry everything on the wire. [`Frame`]
+//! (`frames/frame.rs`) is the TCP key-exchange message; [`EncryptedFrame`]
+//! (`frames/encframe.rs`) is the payload of every encrypted UDP datagram. Each UDP
+//! packet is laid out as `[nonce (12)] [seq (8)] [hmac tag] [length (8)]
+//! [ciphertext]`; the sequence number is authenticated by the HMAC and reused as
+//! the AEAD AAD, so a frame can be retransmitted verbatim without re-encryption.
+//! See [`EncryptedFrame::parse`].
+//!
+//! Both peers advertise a [`ProtocolSupport`] range (min/max) in their
+//! [`Frame::KexInit`] frame, and [`negotiate_protocol_version`] picks the highest
+//! commonly supported [`PROTOCOL_VERSION`]. Any change to a [`Frame`] or
+//! [`EncryptedFrame`] variant is a wire-format change: bump [`PROTOCOL_VERSION`]
+//! (leaving [`MIN_PROTOCOL_VERSION`] in place so older peers still negotiate) and
+//! gate the new behaviour on the negotiated value, reachable via
+//! [`Kex::protocol_version`] / [`ServerKex::protocol_version`] — never on the
+//! crate version. See `kex/negotiate.rs` for the full bump/retirement policy.
+//!
 //! # Terminal emulation and prediction
 //!
 //! The server runs a VT100 state machine ([`Emulator`]) on the PTY output and sends compressed
