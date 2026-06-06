@@ -169,7 +169,18 @@ where
         .with_context(|| Error::ConfigDeserialize)
 }
 
-fn config_file_path<D>(defaults: &D) -> Result<PathBuf>
+/// Resolve the absolute path to the configuration file for the given defaults.
+///
+/// Returns the explicit `config_absolute_path()` when one is set, otherwise the
+/// platform default config path (`<config_dir>/<file_path>/<file_name>.toml`).
+/// This is the same path [`load`] reads from, exposed so callers (for example a
+/// client "effective config" command) can resolve and inspect it identically.
+///
+/// # Errors
+/// - [`Error::ConfigDir`] - No valid config directory could be found
+/// - Any other error encountered while building the path
+///
+pub fn config_file_path<D>(defaults: &D) -> Result<PathBuf>
 where
     D: PathDefaults,
 {

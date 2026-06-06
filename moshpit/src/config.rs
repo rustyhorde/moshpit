@@ -8,15 +8,18 @@
 
 use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
+use config::{Config as ConfigCrate, Environment, File, FileFormat};
 use getset::{CopyGetters, Getters, Setters};
 use libmoshpit::{
     AlgorithmList, DiffMode, DisplayPreference, FileLayer, KEY_ALGORITHM_X25519, KexConfig,
-    KexMode, KeyPair, supported_algorithms,
+    KexMode, KeyPair, PathDefaults as _, config_file_path, supported_algorithms,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use uuid::Uuid;
+
+use crate::cli::Cli;
 
 /// Per-category algorithm preferences for TOML config and CLI overrides.
 /// Each field is optional; missing categories fall back to `supported_algorithms()`.
@@ -60,10 +63,13 @@ pub(crate) struct Config {
     #[serde(skip_deserializing)]
     #[getset(get = "pub(crate)", set = "pub(crate)")]
     user: String,
+    #[serde(default)]
     #[getset(get = "pub(crate)")]
     tracing: ClientTracing,
+    #[serde(default = "Config::default_server_port")]
     #[getset(get_copy = "pub(crate)")]
     server_port: u16,
+    #[serde(default)]
     #[getset(get = "pub(crate)")]
     server_destination: String,
     #[getset(get = "pub(crate)")]
@@ -120,7 +126,46 @@ pub(crate) struct Config {
     send_path: Vec<String>,
 }
 
+/// Build the effective client [`Config`] from (in increasing precedence) the
+/// TOML config file, the command-line flags, and the `MOSHPIT_` environment
+/// variables.
+///
+/// This mirrors [`libmoshpit::load`] but with two client-specific corrections:
+/// the source order yields the documented `env > CLI > file` precedence (the
+/// `config` crate is last-source-wins), and the environment source strips only
+/// the `MOSHPIT_` prefix while preserving underscores in field names, so flat
+/// keys like `MOSHPIT_SERVER_PORT` and `MOSHPIT_NAT_WARMUP_COUNT` resolve
+/// correctly.  The config file is optional (missing → defaults).
+///
+/// Nested `[preferred_algorithms]` keys cannot be set via a single env var; use
+/// the TOML table or the `--kex-algos`/`--aead-algos`/`--mac-algos`/`--kdf-algos`
+/// flags instead.
+///
+/// # Errors
+/// Returns an error if the config file cannot be read/parsed, or the merged
+/// configuration cannot be built or deserialized.
+pub(crate) fn load(cli: &Cli) -> Result<Config> {
+    let path = config_file_path(cli)?;
+    ConfigCrate::builder()
+        // Lowest precedence first; later sources override earlier ones.
+        .add_source(File::from(path).format(FileFormat::Toml).required(false))
+        .add_source(cli.clone())
+        .add_source(
+            Environment::with_prefix(&cli.env_prefix())
+                .prefix_separator("_")
+                .try_parsing(true),
+        )
+        .build()
+        .context("failed to build client configuration")?
+        .try_deserialize::<Config>()
+        .context("failed to deserialize client configuration")
+}
+
 impl Config {
+    fn default_server_port() -> u16 {
+        40404
+    }
+
     fn default_max_reconnect_backoff_secs() -> u64 {
         3600
     }
@@ -154,7 +199,7 @@ impl Default for Config {
             mode: KexMode::Client,
             user: String::new(),
             tracing: ClientTracing::default(),
-            server_port: 60001,
+            server_port: Self::default_server_port(),
             server_destination: String::new(),
             private_key_path: None,
             public_key_path: None,
@@ -226,7 +271,7 @@ mod tests {
     fn test_default_config() {
         let config = Config::default();
         assert_eq!(config.mode(), KexMode::Client);
-        assert_eq!(config.server_port(), 60001);
+        assert_eq!(config.server_port(), 40404);
         assert_eq!(config.server_destination(), "");
         assert_eq!(config.private_key_path(), &None);
         assert_eq!(config.public_key_path(), &None);

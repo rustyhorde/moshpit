@@ -23,15 +23,14 @@ use std::{
 #[cfg(target_family = "unix")]
 use std::os::unix::fs::DirBuilderExt;
 
-use anyhow::{Context as _, Result};
-use clap::Parser as _;
+use anyhow::{Context as _, Result, bail};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use dialoguer::{Confirm, Password};
 use libmoshpit::{
     DiffMode, DisplayPreference, Emulator, EncryptedFrame, FileLayer, KEY_ALGORITHM_X25519, Kex,
     KexConfig as _, KexMode, KeyPair, MoshpitError, PredictionEngine, Renderer, UdpReader,
-    UdpSender, UuidWrapper, init_tracing, load, paint_overlays_to_ansi, parse_server_destination,
-    render_prediction_update, run_key_exchange,
+    UdpSender, UuidWrapper, config_file_path, init_tracing, paint_overlays_to_ansi,
+    parse_server_destination, render_prediction_update, run_key_exchange,
 };
 use terminal_size::terminal_size;
 #[cfg(unix)]
@@ -49,7 +48,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
-use crate::{cli::Cli, config::Config};
+use crate::{
+    cli::{Cli, Commands},
+    config::Config,
+    effective,
+};
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) async fn run<I, T>(args: Option<I>) -> Result<()>
@@ -57,17 +60,38 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
-    let cli = if let Some(args) = args {
-        Cli::try_parse_from(args)?
-    } else {
-        Cli::try_parse()?
+    // Collect the command line once so we can both parse the typed `Cli` and
+    // recover the raw `ArgMatches` provenance inside `Cli::parse_argv`.
+    let command_line: Vec<OsString> = match args {
+        Some(args) => args.into_iter().map(Into::into).collect(),
+        None => std::env::args_os().collect(),
     };
-    let mut config =
-        load::<Cli, Config, Cli>(&cli, &cli).with_context(|| MoshpitError::ConfigLoad)?;
+    let cli = Cli::parse_argv(command_line)?;
+
+    // `mp ec`: resolve and print the effective config, then exit — no tracing
+    // init, key loading, or session loop.
+    if let Some(Commands::Ec { json }) = cli.command() {
+        let config = crate::config::load(&cli).with_context(|| MoshpitError::ConfigLoad)?;
+        let config_path = config_file_path(&cli).with_context(|| MoshpitError::ConfigLoad)?;
+        let rows = effective::resolve_effective(&cli, &config, &config_path);
+        if *json {
+            effective::print_json(&rows);
+        } else {
+            effective::print_table(&rows);
+        }
+        return Ok(());
+    }
+
+    let mut config = crate::config::load(&cli).with_context(|| MoshpitError::ConfigLoad)?;
     init_tracing(&FileLayer::default(), config.tracing().file(), &cli, None)
         .with_context(|| MoshpitError::TracingInit)?;
     maybe_generate_keypair(&config)?;
 
+    if config.server_destination().is_empty() {
+        bail!(
+            "a server destination is required, e.g. `mp user@host` (run `mp ec` to inspect config)"
+        );
+    }
     let (user, socket_addr) =
         parse_server_destination(config.server_destination(), config.server_port())?;
     let server_ip = socket_addr.ip().to_string();
@@ -1668,7 +1692,6 @@ fn write_session_uuid(host: &str, port: u16, session_uuid: Uuid) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser;
 
     struct TestHome {
         path: PathBuf,
@@ -1927,7 +1950,7 @@ mod tests {
              with_level = false\n",
         )?;
 
-        let cli = Cli::try_parse_from([
+        let cli = Cli::parse_argv([
             "moshpit",
             "-c",
             config_path.to_str().expect("path is valid UTF-8"),
@@ -1937,7 +1960,7 @@ mod tests {
             pub_path.to_str().expect("path is valid UTF-8"),
             "user@host",
         ])?;
-        let config = load::<Cli, Config, Cli>(&cli, &cli)?;
+        let config = crate::config::load(&cli)?;
 
         // Should return Ok(()) immediately without prompting
         let result = maybe_generate_keypair(&config);
@@ -2008,7 +2031,7 @@ mod tests {
              with_line_number = false\n\
              with_level = false\n",
         )?;
-        let cli = Cli::try_parse_from([
+        let cli = Cli::parse_argv([
             "moshpit",
             "-c",
             config_path.to_str().expect("test path is valid UTF-8"),
@@ -2022,7 +2045,7 @@ mod tests {
                 .expect("test path is valid UTF-8"),
             "user@host",
         ])?;
-        let mut config = load::<Cli, Config, Cli>(&cli, &cli)?;
+        let mut config = crate::config::load(&cli)?;
 
         let pass_cache = Arc::new(std::sync::Mutex::new(PassCache::Uncached));
 
@@ -2084,7 +2107,6 @@ mod tests {
 
     #[tokio::test]
     async fn connect_and_kex_missing_key_file_wrapped_as_fatal_error() -> Result<()> {
-        use clap::Parser as _;
         // A live agent would supply an identity and bypass the missing-key-file path.
         let _agent_guard = EnvGuard::new("MOSHPIT_AGENT_SOCK", None);
         let home = TestHome::new();
@@ -2110,7 +2132,7 @@ mod tests {
              with_line_number = false\n\
              with_level = false\n",
         )?;
-        let cli = Cli::try_parse_from([
+        let cli = Cli::parse_argv([
             "moshpit",
             "-c",
             config_path.to_str().expect("path is valid UTF-8"),
@@ -2120,7 +2142,7 @@ mod tests {
             pub_path.to_str().expect("path is valid UTF-8"),
             "user@host",
         ])?;
-        let mut config = load::<Cli, Config, Cli>(&cli, &cli)?;
+        let mut config = crate::config::load(&cli)?;
         let pass_cache = Arc::new(std::sync::Mutex::new(PassCache::Uncached));
 
         // Bind a real listener so TCP connection succeeds
