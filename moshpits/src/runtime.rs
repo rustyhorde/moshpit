@@ -28,7 +28,6 @@ use std::{
 
 use anyhow::{Context as _, Result};
 use bytes::{Buf as _, BytesMut};
-use clap::Parser as _;
 use libmoshpit::{
     DiffMode, EncryptedFrame, KexMode, MAX_UDP_PAYLOAD, MoshpitError, SessionRegistry,
     TerminalMessage, UdpReader, UdpSender, UuidWrapper, env_var_matches, init_tracing,
@@ -145,21 +144,22 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
-    // Parse the command line
-    let cli = if let Some(args) = args {
-        Cli::try_parse_from(args)?
-    } else {
-        Cli::try_parse()?
+    // Collect the command line once so we can both parse the typed `Cli` and
+    // recover the raw `ArgMatches` provenance inside `Cli::parse_argv`.
+    let command_line: Vec<OsString> = match args {
+        Some(args) => args.into_iter().map(Into::into).collect(),
+        None => std::env::args_os().collect(),
     };
+    let cli = Cli::parse_argv(command_line)?;
 
     #[cfg(unix)]
     if unsafe { libc::getuid() } == 0 {
         info!("Running as root (multi-user mode enabled)");
     }
 
-    // Load the configuration
+    // Load the configuration.  The config file is required for the server.
     let mut config =
-        load::<Cli, Config, Cli>(&cli, &cli).with_context(|| MoshpitError::ConfigLoad)?;
+        load::<Cli, Config, Cli>(&cli, &cli, true).with_context(|| MoshpitError::ConfigLoad)?;
 
     // Initialize tracing
     let mut file_tracing = config.tracing().file().clone();

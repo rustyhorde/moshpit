@@ -6,9 +6,9 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-use std::{io::Cursor, sync::LazyLock};
+use std::{collections::BTreeSet, ffi::OsString, io::Cursor, sync::LazyLock};
 
-use clap::{ArgAction, Parser};
+use clap::{ArgAction, ArgMatches, CommandFactory, Parser, parser::ValueSource};
 use config::{ConfigError, Map, Source, Value, ValueKind};
 use getset::{CopyGetters, Getters};
 use libmoshpit::PathDefaults;
@@ -157,6 +157,48 @@ pub(crate) struct Cli {
     )]
     #[getset(get = "pub(crate)")]
     kdf_algos: Option<String>,
+    /// Set of clap argument ids the user actually supplied on the command line
+    /// (`ValueSource::CommandLine`), populated by [`Cli::parse_argv`].  This lets
+    /// [`Source::collect`] emit only user-provided values so clap defaults no
+    /// longer clobber the config file or environment.  Not a real CLI argument.
+    #[clap(skip)]
+    #[getset(get = "pub(crate)")]
+    explicit_args: BTreeSet<String>,
+}
+
+impl Cli {
+    /// Parse `argv` into a [`Cli`], recording which arguments the user actually
+    /// supplied on the command line.
+    ///
+    /// clap's derived struct cannot distinguish a value the user typed from a
+    /// `default_value`, so we parse twice: once into the typed struct and once
+    /// into raw [`ArgMatches`], whose [`ValueSource`] reveals the true origin of
+    /// each argument.  The resulting [`Cli::explicit_args`] set drives
+    /// [`Source::collect`] so clap defaults no longer clobber the config file or
+    /// environment.
+    ///
+    /// # Errors
+    /// Returns a clap error if `argv` fails to parse.
+    pub(crate) fn parse_argv<I, T>(argv: I) -> clap::error::Result<Self>
+    where
+        I: IntoIterator<Item = T> + Clone,
+        T: Into<OsString> + Clone,
+    {
+        let mut cli = Cli::try_parse_from(argv.clone())?;
+        let matches = <Cli as CommandFactory>::command().try_get_matches_from(argv)?;
+        cli.explicit_args = explicit_command_line_ids(&matches);
+        Ok(cli)
+    }
+}
+
+/// Collect the ids of all arguments whose value originated from the command
+/// line (as opposed to a default value or being unset).
+fn explicit_command_line_ids(matches: &ArgMatches) -> BTreeSet<String> {
+    matches
+        .ids()
+        .filter(|id| matches.value_source(id.as_str()) == Some(ValueSource::CommandLine))
+        .map(|id| id.as_str().to_string())
+        .collect()
 }
 
 fn build_algo_table(
@@ -190,55 +232,80 @@ impl Source for Cli {
     fn collect(&self) -> Result<Map<String, Value>, ConfigError> {
         let mut map = Map::new();
         let origin = String::from("command line");
-        let _old = map.insert(
-            "verbose".to_string(),
-            Value::new(Some(&origin), ValueKind::U64(u8::into(self.verbose))),
-        );
-        let _old = map.insert(
-            "quiet".to_string(),
-            Value::new(Some(&origin), ValueKind::U64(u8::into(self.quiet))),
-        );
-        let _old = map.insert(
-            "enable_std_output".to_string(),
-            Value::new(Some(&origin), ValueKind::Boolean(self.enable_std_output)),
-        );
-        if let Some(config_path) = &self.config_absolute_path {
+        // Only emit values the user actually typed on the command line.  Without
+        // this gate, clap's defaults would be emitted here and override the
+        // config file and environment (see `parse_argv` / `explicit_args`).
+        let on = |id: &str| self.explicit_args.contains(id);
+
+        if on("verbose") {
+            let _old = map.insert(
+                "verbose".to_string(),
+                Value::new(Some(&origin), ValueKind::U64(u8::into(self.verbose))),
+            );
+        }
+        if on("quiet") {
+            let _old = map.insert(
+                "quiet".to_string(),
+                Value::new(Some(&origin), ValueKind::U64(u8::into(self.quiet))),
+            );
+        }
+        if on("enable_std_output") {
+            let _old = map.insert(
+                "enable_std_output".to_string(),
+                Value::new(Some(&origin), ValueKind::Boolean(self.enable_std_output)),
+            );
+        }
+        if on("config_absolute_path")
+            && let Some(config_path) = &self.config_absolute_path
+        {
             let _old = map.insert(
                 "config_path".to_string(),
                 Value::new(Some(&origin), ValueKind::String(config_path.clone())),
             );
         }
-        if let Some(tracing_path) = &self.tracing_absolute_path {
+        if on("tracing_absolute_path")
+            && let Some(tracing_path) = &self.tracing_absolute_path
+        {
             let _old = map.insert(
                 "tracing_path".to_string(),
                 Value::new(Some(&origin), ValueKind::String(tracing_path.clone())),
             );
         }
-        if let Some(private_key_path) = &self.private_key_path {
+        if on("private_key_path")
+            && let Some(private_key_path) = &self.private_key_path
+        {
             let _old = map.insert(
                 "private_key_path".to_string(),
                 Value::new(Some(&origin), ValueKind::String(private_key_path.clone())),
             );
         }
-        if let Some(public_key_path) = &self.public_key_path {
+        if on("public_key_path")
+            && let Some(public_key_path) = &self.public_key_path
+        {
             let _old = map.insert(
                 "public_key_path".to_string(),
                 Value::new(Some(&origin), ValueKind::String(public_key_path.clone())),
             );
         }
-        if let Some(warmup_delay_ms) = self.warmup_delay_ms {
+        if on("warmup_delay_ms")
+            && let Some(warmup_delay_ms) = self.warmup_delay_ms
+        {
             let _old = map.insert(
                 "warmup_delay_ms".to_string(),
                 Value::new(Some(&origin), ValueKind::U64(warmup_delay_ms)),
             );
         }
-        if let Some(pacing_delay_us) = self.pacing_delay_us {
+        if on("pacing_delay_us")
+            && let Some(pacing_delay_us) = self.pacing_delay_us
+        {
             let _old = map.insert(
                 "pacing_delay_us".to_string(),
                 Value::new(Some(&origin), ValueKind::U64(pacing_delay_us)),
             );
         }
-        if let Some(min_protocol_version) = self.min_protocol_version {
+        if on("min_protocol_version")
+            && let Some(min_protocol_version) = self.min_protocol_version
+        {
             let _old = map.insert(
                 "min_protocol_version".to_string(),
                 Value::new(
@@ -247,15 +314,17 @@ impl Source for Cli {
                 ),
             );
         }
-        let _old = map.insert(
-            "term_type".to_string(),
-            Value::new(Some(&origin), ValueKind::String(self.term_type.clone())),
-        );
+        if on("term_type") {
+            let _old = map.insert(
+                "term_type".to_string(),
+                Value::new(Some(&origin), ValueKind::String(self.term_type.clone())),
+            );
+        }
         if let Some(table) = build_algo_table(
-            self.kex_algos.as_deref(),
-            self.aead_algos.as_deref(),
-            self.mac_algos.as_deref(),
-            self.kdf_algos.as_deref(),
+            self.kex_algos.as_deref().filter(|_| on("kex_algos")),
+            self.aead_algos.as_deref().filter(|_| on("aead_algos")),
+            self.mac_algos.as_deref().filter(|_| on("mac_algos")),
+            self.kdf_algos.as_deref().filter(|_| on("kdf_algos")),
         ) {
             let _old = map.insert(
                 "preferred_algorithms".to_string(),
@@ -303,7 +372,7 @@ mod test {
     use super::Cli;
 
     fn parse(args: &[&str]) -> Cli {
-        <Cli as clap::Parser>::parse_from(args)
+        Cli::parse_argv(args).expect("args parse")
     }
 
     #[test]
@@ -368,15 +437,28 @@ mod test {
     fn cli_source_collect() {
         let cli = parse(&["mps"]);
         let map = cli.collect().expect("collect should succeed");
-        assert!(map.contains_key("verbose"));
-        assert!(map.contains_key("quiet"));
-        assert!(map.contains_key("enable_std_output"));
-        assert!(map.contains_key("term_type"));
+        // Defaulted values are NOT emitted (no clap-default pollution that would
+        // clobber the config file / environment).
+        assert!(!map.contains_key("verbose"));
+        assert!(!map.contains_key("quiet"));
+        assert!(!map.contains_key("enable_std_output"));
+        assert!(!map.contains_key("term_type"));
         // Optional keys absent when not provided
         assert!(!map.contains_key("private_key_path"));
         assert!(!map.contains_key("public_key_path"));
         assert!(!map.contains_key("config_path"));
         assert!(!map.contains_key("tracing_path"));
+    }
+
+    #[test]
+    fn cli_source_collect_emits_explicit_flags() {
+        let cli = parse(&["mps", "-vv", "--enable-std-output", "--term-type", "screen"]);
+        let map = cli.collect().expect("collect should succeed");
+        assert!(map.contains_key("verbose"));
+        assert!(map.contains_key("enable_std_output"));
+        assert!(map.contains_key("term_type"));
+        // quiet was not supplied, so it is omitted.
+        assert!(!map.contains_key("quiet"));
     }
 
     #[test]

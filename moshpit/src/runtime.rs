@@ -29,7 +29,7 @@ use dialoguer::{Confirm, Password};
 use libmoshpit::{
     DiffMode, DisplayPreference, Emulator, EncryptedFrame, FileLayer, KEY_ALGORITHM_X25519, Kex,
     KexConfig as _, KexMode, KeyPair, MoshpitError, PredictionEngine, Renderer, UdpReader,
-    UdpSender, UuidWrapper, config_file_path, init_tracing, paint_overlays_to_ansi,
+    UdpSender, UuidWrapper, config_file_path, init_tracing, load, paint_overlays_to_ansi,
     parse_server_destination, render_prediction_update, run_key_exchange,
 };
 use terminal_size::terminal_size;
@@ -71,7 +71,8 @@ where
     // `mp ec`: resolve and print the effective config, then exit — no tracing
     // init, key loading, or session loop.
     if let Some(Commands::Ec { json }) = cli.command() {
-        let config = crate::config::load(&cli).with_context(|| MoshpitError::ConfigLoad)?;
+        let config = load::<Cli, Config, Cli>(&cli, &cli, false)
+            .with_context(|| MoshpitError::ConfigLoad)?;
         let config_path = config_file_path(&cli).with_context(|| MoshpitError::ConfigLoad)?;
         let rows = effective::resolve_effective(&cli, &config, &config_path);
         if *json {
@@ -82,7 +83,8 @@ where
         return Ok(());
     }
 
-    let mut config = crate::config::load(&cli).with_context(|| MoshpitError::ConfigLoad)?;
+    let mut config =
+        load::<Cli, Config, Cli>(&cli, &cli, false).with_context(|| MoshpitError::ConfigLoad)?;
     init_tracing(&FileLayer::default(), config.tracing().file(), &cli, None)
         .with_context(|| MoshpitError::TracingInit)?;
     maybe_generate_keypair(&config)?;
@@ -1960,7 +1962,7 @@ mod tests {
             pub_path.to_str().expect("path is valid UTF-8"),
             "user@host",
         ])?;
-        let config = crate::config::load(&cli)?;
+        let config = load::<Cli, Config, Cli>(&cli, &cli, false)?;
 
         // Should return Ok(()) immediately without prompting
         let result = maybe_generate_keypair(&config);
@@ -2045,7 +2047,7 @@ mod tests {
                 .expect("test path is valid UTF-8"),
             "user@host",
         ])?;
-        let mut config = crate::config::load(&cli)?;
+        let mut config = load::<Cli, Config, Cli>(&cli, &cli, false)?;
 
         let pass_cache = Arc::new(std::sync::Mutex::new(PassCache::Uncached));
 
@@ -2142,7 +2144,7 @@ mod tests {
             pub_path.to_str().expect("path is valid UTF-8"),
             "user@host",
         ])?;
-        let mut config = crate::config::load(&cli)?;
+        let mut config = load::<Cli, Config, Cli>(&cli, &cli, false)?;
         let pass_cache = Arc::new(std::sync::Mutex::new(PassCache::Uncached));
 
         // Bind a real listener so TCP connection succeeds
