@@ -350,10 +350,14 @@ fn elide(value: &str) -> String {
     }
 }
 
-/// Print the rows as an aligned, colored table.  Color is applied to the
-/// `SOURCE` column only when stdout is a TTY, so piped output stays plain.
-/// Long values are elided (see [`elide`]); use `--json` for full values.
+/// Print the rows as an aligned, colored table.  When stdout is a TTY the
+/// header/separator are bold blue, the `FIELD` column is bold green, the `VALUE`
+/// column is bold, and the `SOURCE` column is colored per origin; piped output
+/// stays plain.  Long values are elided (see [`elide`]); use `--json` for full
+/// values.
 pub(crate) fn print_table(rows: &[EffectiveRow]) {
+    use crossterm::style::Stylize as _;
+
     let color = std::io::stdout().is_terminal();
     let values: Vec<String> = rows.iter().map(|r| elide(&r.value)).collect();
     let field_w = rows
@@ -369,19 +373,40 @@ pub(crate) fn print_table(rows: &[EffectiveRow]) {
         .unwrap_or(5)
         .max("VALUE".len());
 
-    println!("{:<field_w$}  {:<value_w$}  SOURCE", "FIELD", "VALUE");
-    println!(
+    // Style the header/separator on the plain strings so the ANSI codes don't
+    // disturb the width padding.
+    let header = format!("{:<field_w$}  {:<value_w$}  SOURCE", "FIELD", "VALUE");
+    let separator = format!(
         "{:<field_w$}  {:<value_w$}  ------",
         "-".repeat(field_w),
         "-".repeat(value_w),
     );
+    if color {
+        println!("{}", header.blue().bold());
+        println!("{}", separator.blue().bold());
+    } else {
+        println!("{header}");
+        println!("{separator}");
+    }
     for (r, value) in rows.iter().zip(&values) {
-        let source = if color {
-            r.origin.colored()
+        if color {
+            // Pad on the plain strings, then style, so ANSI codes don't disturb
+            // column alignment.
+            let field = format!("{:<field_w$}", r.field);
+            let value = format!("{value:<value_w$}");
+            println!(
+                "{}  {}  {}",
+                field.green().bold(),
+                value.bold(),
+                r.origin.colored()
+            );
         } else {
-            r.origin.label().to_string()
-        };
-        println!("{:<field_w$}  {value:<value_w$}  {source}", r.field);
+            println!(
+                "{:<field_w$}  {value:<value_w$}  {}",
+                r.field,
+                r.origin.label()
+            );
+        }
     }
 }
 
