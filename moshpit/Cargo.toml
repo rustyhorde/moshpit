@@ -42,6 +42,9 @@ vergen-pretty = { workspace = true }
 [target.'cfg(unix)'.dependencies]
 libc = "1.0.0-alpha.3"
 
+[dev-dependencies]
+tempfile = "3"
+
 [build-dependencies]
 anyhow = { workspace = true }
 rustversion = { workspace = true }

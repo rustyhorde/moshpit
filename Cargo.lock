@@ -2646,6 +2646,7 @@ dependencies = [
  "rustversion",
  "serde",
  "serde_json",
+ "tempfile",
  "terminal_size",
  "tokio",
  "tokio-util",

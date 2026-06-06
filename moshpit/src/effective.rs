@@ -428,10 +428,64 @@ pub(crate) fn print_json(rows: &[EffectiveRow]) {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{io::Write as _, path::Path};
 
-    use super::{Origin, classify, resolve_effective, toml_keys};
+    use tempfile::TempDir;
+
+    use super::{
+        EffectiveRow, MAX_VALUE_WIDTH, Origin, classify, elide, list, opt, print_json, print_table,
+        resolve_effective, toml_keys,
+    };
     use crate::{cli::Cli, config::Config};
+
+    /// RAII guard that temporarily overrides (or removes) an env var, restoring
+    /// the original value on drop.  Mirrors the helper in `runtime.rs`.
+    struct EnvGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvGuard {
+        #[allow(unsafe_code)]
+        fn new(key: &'static str, value: Option<&str>) -> Self {
+            let original = std::env::var(key).ok();
+            // SAFETY: test-only; nextest runs each test in its own process so
+            // there is no concurrent env access from other threads.
+            match value {
+                Some(v) => unsafe { std::env::set_var(key, v) },
+                None => unsafe { std::env::remove_var(key) },
+            }
+            Self { key, original }
+        }
+    }
+
+    #[allow(unsafe_code)]
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: same as EnvGuard::new.
+            match &self.original {
+                Some(v) => unsafe { std::env::set_var(self.key, v) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    /// Write `contents` to a `config.toml` inside a fresh temp dir, returning both
+    /// (keep the `TempDir` alive for the duration of the test).
+    fn write_toml(contents: &str) -> (TempDir, std::path::PathBuf) {
+        let dir = TempDir::new().expect("temp dir creation");
+        let path = dir.path().join("config.toml");
+        let mut file = std::fs::File::create(&path).expect("create config.toml");
+        file.write_all(contents.as_bytes()).expect("write config");
+        (dir, path)
+    }
+
+    /// Find the row for `field`, panicking if it is absent.
+    fn row<'a>(rows: &'a [EffectiveRow], field: &str) -> &'a EffectiveRow {
+        rows.iter()
+            .find(|r| r.field == field)
+            .unwrap_or_else(|| panic!("row {field} not found"))
+    }
 
     #[test]
     fn classify_precedence_is_env_cli_file() {
@@ -447,9 +501,40 @@ mod tests {
     }
 
     #[test]
+    fn origin_labels_and_colors() {
+        for (origin, label) in [
+            (Origin::CommandLine, "command line"),
+            (Origin::Environment, "environment"),
+            (Origin::ConfigFile, "config file"),
+            (Origin::Default, "default"),
+        ] {
+            assert_eq!(origin.label(), label);
+            // `.colored()` wraps the label in ANSI codes; the plain label remains
+            // a substring.  Exercises all four match arms.
+            assert!(origin.colored().contains(label));
+        }
+    }
+
+    #[test]
     fn toml_keys_missing_file_is_empty() {
         let keys = toml_keys(Path::new("/nonexistent/moshpit-test-config.toml"));
         assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn toml_keys_reads_top_level_and_nested() {
+        let (_dir, path) =
+            write_toml("server_port = 1\n\n[preferred_algorithms]\nkex = [\"x25519-sha256\"]\n");
+        let keys = toml_keys(&path);
+        assert!(keys.contains("server_port"));
+        assert!(keys.contains("preferred_algorithms"));
+        assert!(keys.contains("preferred_algorithms.kex"));
+    }
+
+    #[test]
+    fn toml_keys_unparseable_is_empty() {
+        let (_dir, path) = write_toml("not = = toml");
+        assert!(toml_keys(&path).is_empty());
     }
 
     #[test]
@@ -463,5 +548,90 @@ mod tests {
         assert!(fields.contains(&"tracing"));
         assert!(fields.contains(&"config_path"));
         Ok(())
+    }
+
+    #[test]
+    fn resolve_marks_cli_provenance() -> anyhow::Result<()> {
+        let cli = Cli::parse_argv(["moshpit", "-s", "1234", "host"])?;
+        let config = Config::default();
+        let rows = resolve_effective(&cli, &config, Path::new("/nonexistent/cfg.toml"));
+        assert_eq!(row(&rows, "server_port").origin, Origin::CommandLine);
+        // A defaulted field falls through to `Default`.
+        assert_eq!(row(&rows, "predict").origin, Origin::Default);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_marks_file_provenance() -> anyhow::Result<()> {
+        let (_dir, path) =
+            write_toml("server_port = 4242\n\n[preferred_algorithms]\nkex = [\"x25519-sha256\"]\n");
+        let cli = Cli::parse_argv(["moshpit", "host"])?;
+        let config = Config::default();
+        let rows = resolve_effective(&cli, &config, &path);
+        assert_eq!(row(&rows, "server_port").origin, Origin::ConfigFile);
+        assert_eq!(
+            row(&rows, "preferred_algorithms.kex").origin,
+            Origin::ConfigFile
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_marks_env_provenance() -> anyhow::Result<()> {
+        // `nat_warmup_count` has a flat scalar env var and no list/nesting.
+        let _guard = EnvGuard::new("MOSHPIT_NAT_WARMUP_COUNT", Some("9"));
+        let cli = Cli::parse_argv(["moshpit", "host"])?;
+        let config = Config::default();
+        let rows = resolve_effective(&cli, &config, Path::new("/nonexistent/cfg.toml"));
+        assert_eq!(row(&rows, "nat_warmup_count").origin, Origin::Environment);
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_server_destination_unset_vs_set() -> anyhow::Result<()> {
+        let cli = Cli::parse_argv(["moshpit", "ec"])?;
+
+        // The displayed value comes from the merged `Config`, not the CLI.  A
+        // default config has an empty destination -> `<unset>`.
+        let config = Config::default();
+        let rows = resolve_effective(&cli, &config, Path::new("/nonexistent/cfg.toml"));
+        assert_eq!(row(&rows, "server_destination").value, "<unset>");
+
+        // A config carrying a destination is rendered verbatim.
+        let config: Config = toml::from_str("server_destination = \"user@host\"")?;
+        let rows = resolve_effective(&cli, &config, Path::new("/nonexistent/cfg.toml"));
+        assert_eq!(row(&rows, "server_destination").value, "user@host");
+        Ok(())
+    }
+
+    #[test]
+    fn print_table_and_json_smoke() -> anyhow::Result<()> {
+        let cli = Cli::parse_argv(["moshpit", "host"])?;
+        let config = Config::default();
+        let rows = resolve_effective(&cli, &config, Path::new("/nonexistent/cfg.toml"));
+        // In the test process stdout is not a TTY, so the plain (non-color) table
+        // branch and the JSON `Ok` branch run.  Smoke test: must not panic.
+        print_table(&rows);
+        print_json(&rows);
+        Ok(())
+    }
+
+    #[test]
+    fn elide_long_value() {
+        let short = "abc";
+        assert_eq!(elide(short), short);
+
+        let long = "x".repeat(MAX_VALUE_WIDTH + 50);
+        let elided = elide(&long);
+        assert!(elided.ends_with('…'));
+        assert_eq!(elided.chars().count(), MAX_VALUE_WIDTH);
+    }
+
+    #[test]
+    fn opt_and_list_helpers() {
+        assert_eq!(opt(None), "<unset>");
+        assert_eq!(opt(Some("x")), "x");
+        assert_eq!(list(&[]), "<empty>");
+        assert_eq!(list(&["a".to_string(), "b".to_string()]), "a, b");
     }
 }

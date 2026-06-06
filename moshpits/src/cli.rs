@@ -510,6 +510,47 @@ mod test {
     }
 
     #[test]
+    fn cli_source_collect_optional_delays() {
+        let cli = parse(&["mps", "--warmup-delay-ms", "50", "--pacing-delay-us", "250"]);
+        let map = cli.collect().expect("collect should succeed");
+        let warmup = map
+            .get("warmup_delay_ms")
+            .expect("warmup_delay_ms should be in map");
+        assert_eq!(warmup.clone().into_uint().ok(), Some(50));
+        let pacing = map
+            .get("pacing_delay_us")
+            .expect("pacing_delay_us should be in map");
+        assert_eq!(pacing.clone().into_uint().ok(), Some(250));
+    }
+
+    #[test]
+    fn cli_source_collect_algo_table() {
+        let cli = parse(&[
+            "mps",
+            "--kex-algos",
+            "x25519-sha256, ml-kem-768-sha256",
+            "--aead-algos",
+            "aes256-gcm-siv",
+            "--mac-algos",
+            "hmac-sha512",
+            "--kdf-algos",
+            "hkdf-sha256",
+        ]);
+        let map = cli.collect().expect("collect should succeed");
+        let value = map
+            .get("preferred_algorithms")
+            .expect("preferred_algorithms should be in map");
+        let table = value
+            .clone()
+            .into_table()
+            .expect("preferred_algorithms should be a table");
+        assert!(table.contains_key("kex"));
+        assert!(table.contains_key("aead"));
+        assert!(table.contains_key("mac"));
+        assert!(table.contains_key("kdf"));
+    }
+
+    #[test]
     fn cli_path_defaults() {
         use libmoshpit::PathDefaults as _;
         let cli = parse(&["mps"]);

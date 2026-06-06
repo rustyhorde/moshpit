@@ -587,6 +587,76 @@ mod tests {
     }
 
     #[test]
+    fn collect_emits_all_explicit_value_flags() -> anyhow::Result<()> {
+        let cli = Cli::parse_argv([
+            "moshpit",
+            "--predict",
+            "always",
+            "--nat-warmup",
+            "--nat-warmup-count",
+            "5",
+            "--diff-mode",
+            "datagram",
+            "--legacy-passthrough",
+            "host",
+        ])?;
+        let map = cli.collect()?;
+        assert!(map.contains_key("nat_warmup"));
+        assert!(map.contains_key("nat_warmup_count"));
+        assert!(map.contains_key("legacy_passthrough"));
+        if let ValueKind::String(ref s) = map
+            .get("predict")
+            .ok_or_else(|| anyhow::anyhow!("\"predict\" not found in map"))?
+            .kind
+        {
+            assert_eq!(s, "always");
+        } else {
+            panic!("Expected String for predict");
+        }
+        if let ValueKind::String(ref s) = map
+            .get("diff_mode")
+            .ok_or_else(|| anyhow::anyhow!("\"diff_mode\" not found in map"))?
+            .kind
+        {
+            assert_eq!(s, "datagram");
+        } else {
+            panic!("Expected String for diff_mode");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn collect_emits_algo_table() -> anyhow::Result<()> {
+        // Surrounding spaces exercise the `trim` in the parse closure.
+        let cli = Cli::parse_argv([
+            "moshpit",
+            "--kex-algos",
+            "x25519-sha256, ml-kem-768-sha256",
+            "--aead-algos",
+            "aes256-gcm-siv",
+            "--mac-algos",
+            "hmac-sha512",
+            "--kdf-algos",
+            "hkdf-sha256",
+            "host",
+        ])?;
+        let map = cli.collect()?;
+        if let ValueKind::Table(ref table) = map
+            .get("preferred_algorithms")
+            .ok_or_else(|| anyhow::anyhow!("\"preferred_algorithms\" not found in map"))?
+            .kind
+        {
+            assert!(table.contains_key("kex"));
+            assert!(table.contains_key("aead"));
+            assert!(table.contains_key("mac"));
+            assert!(table.contains_key("kdf"));
+        } else {
+            panic!("Expected Table for preferred_algorithms");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn test_path_defaults() -> anyhow::Result<()> {
         let cli = Cli::try_parse_from(["moshpit", "-c", "cfg", "-t", "trc", "host"])?;
         assert_eq!(cli.env_prefix(), "MOSHPIT");
