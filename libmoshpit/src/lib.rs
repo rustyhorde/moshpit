@@ -324,6 +324,7 @@ pub use self::agent::AgentRequest;
 pub use self::agent::AgentResponse;
 pub use self::config::KexConfig;
 pub use self::config::PathDefaults;
+pub use self::config::config_file_path;
 pub use self::config::load;
 pub use self::config::mps::Mps;
 pub use self::config::tracing::FileLayer;

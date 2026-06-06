@@ -60,10 +60,13 @@ pub(crate) struct Config {
     #[serde(skip)]
     #[getset(get_clone = "pub(crate)", set = "pub(crate)")]
     session_registry: SessionRegistry,
+    #[serde(default)]
     #[getset(get_copy = "pub(crate)")]
     verbose: u8,
+    #[serde(default)]
     #[getset(get_copy = "pub(crate)")]
     quiet: u8,
+    #[serde(default)]
     #[getset(get_copy = "pub(crate)", set = "pub(crate)")]
     enable_std_output: bool,
     #[getset(get = "pub(crate)")]

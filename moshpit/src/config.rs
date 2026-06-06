@@ -60,10 +60,13 @@ pub(crate) struct Config {
     #[serde(skip_deserializing)]
     #[getset(get = "pub(crate)", set = "pub(crate)")]
     user: String,
+    #[serde(default)]
     #[getset(get = "pub(crate)")]
     tracing: ClientTracing,
+    #[serde(default = "Config::default_server_port")]
     #[getset(get_copy = "pub(crate)")]
     server_port: u16,
+    #[serde(default)]
     #[getset(get = "pub(crate)")]
     server_destination: String,
     #[getset(get = "pub(crate)")]
@@ -121,6 +124,10 @@ pub(crate) struct Config {
 }
 
 impl Config {
+    fn default_server_port() -> u16 {
+        40404
+    }
+
     fn default_max_reconnect_backoff_secs() -> u64 {
         3600
     }
@@ -154,7 +161,7 @@ impl Default for Config {
             mode: KexMode::Client,
             user: String::new(),
             tracing: ClientTracing::default(),
-            server_port: 60001,
+            server_port: Self::default_server_port(),
             server_destination: String::new(),
             private_key_path: None,
             public_key_path: None,
@@ -226,7 +233,7 @@ mod tests {
     fn test_default_config() {
         let config = Config::default();
         assert_eq!(config.mode(), KexMode::Client);
-        assert_eq!(config.server_port(), 60001);
+        assert_eq!(config.server_port(), 40404);
         assert_eq!(config.server_destination(), "");
         assert_eq!(config.private_key_path(), &None);
         assert_eq!(config.public_key_path(), &None);

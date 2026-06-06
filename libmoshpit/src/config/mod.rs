@@ -139,7 +139,22 @@ pub trait KexConfig {
     }
 }
 
-/// Load the configuration
+/// Load the configuration.
+///
+/// Sources are merged in increasing precedence: TOML config file, then CLI
+/// flags, then `<PREFIX>_*` environment variables (the `config` crate is
+/// last-source-wins, so the effective precedence is `env > CLI > file` as
+/// documented).  The CLI [`Source`] must emit only values the user actually
+/// supplied (not clap defaults), otherwise those defaults would clobber the
+/// file and environment.
+///
+/// The environment source strips only the `<PREFIX>_` prefix and preserves
+/// underscores in the remaining key, so flat fields like `MOSHPIT_SERVER_PORT`
+/// resolve correctly.  Nested tables (e.g. `[preferred_algorithms]`) cannot be
+/// set via a single env var; use the TOML table or the dedicated CLI flags.
+///
+/// When `config_file_required` is `true`, a missing config file is an error;
+/// when `false`, a missing file is ignored and built-in defaults apply.
 ///
 /// # Errors
 /// - [`Error::ConfigDir`] - No valid config directory could be found
@@ -147,7 +162,7 @@ pub trait KexConfig {
 /// - [`Error::ConfigDeserialize`] - Unable to deserialize configuration
 /// - Any other error encountered while trying to read the config file
 ///
-pub fn load<'a, S, T, D>(cli: &S, defaults: &D) -> Result<T>
+pub fn load<'a, S, T, D>(cli: &S, defaults: &D, config_file_required: bool) -> Result<T>
 where
     T: Deserialize<'a>,
     S: Source + Clone + Send + Sync + 'static,
@@ -155,13 +170,18 @@ where
 {
     let config_file_path = config_file_path(defaults)?;
     let config = Config::builder()
+        // Lowest precedence first; later sources override earlier ones.
         .add_source(
-            Environment::with_prefix(&defaults.env_prefix())
-                .separator("_")
-                .try_parsing(true),
+            File::from(config_file_path)
+                .format(FileFormat::Toml)
+                .required(config_file_required),
         )
         .add_source(cli.clone())
-        .add_source(File::from(config_file_path).format(FileFormat::Toml))
+        .add_source(
+            Environment::with_prefix(&defaults.env_prefix())
+                .prefix_separator("_")
+                .try_parsing(true),
+        )
         .build()
         .with_context(|| Error::ConfigBuild)?;
     config
@@ -169,7 +189,18 @@ where
         .with_context(|| Error::ConfigDeserialize)
 }
 
-fn config_file_path<D>(defaults: &D) -> Result<PathBuf>
+/// Resolve the absolute path to the configuration file for the given defaults.
+///
+/// Returns the explicit `config_absolute_path()` when one is set, otherwise the
+/// platform default config path (`<config_dir>/<file_path>/<file_name>.toml`).
+/// This is the same path [`load`] reads from, exposed so callers (for example a
+/// client "effective config" command) can resolve and inspect it identically.
+///
+/// # Errors
+/// - [`Error::ConfigDir`] - No valid config directory could be found
+/// - Any other error encountered while building the path
+///
+pub fn config_file_path<D>(defaults: &D) -> Result<PathBuf>
 where
     D: PathDefaults,
 {

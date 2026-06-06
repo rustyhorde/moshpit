@@ -242,6 +242,7 @@ use crate::runtime::run;
 
 mod cli;
 mod config;
+mod effective;
 mod runtime;
 
 #[cfg_attr(coverage_nightly, coverage(off))]
