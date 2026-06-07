@@ -2049,7 +2049,7 @@ dependencies = [
 
 [[package]]
 name = "libmoshpit"
-version = "0.8.20"
+version = "0.8.21"
 dependencies = [
  "ansi-control-codes",
  "anyhow",
