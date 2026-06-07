@@ -366,11 +366,35 @@ sudo pacman -Rs moshpits moshpit moshpit-keygen
 
 ## Installation (Debian / Ubuntu)
 
-Pre-built `.deb` packages for `amd64` are available as assets on each [GitHub release](https://github.com/rustyhorde/moshpit/releases).
+### Install from the apt repository (recommended)
+
+The signed apt repository at <https://rustyhorde.github.io/moshpit-packages/> tracks every release, so `apt upgrade` keeps moshpit current.  Packages are available for `amd64` and `arm64`:
+
+```bash
+# Add the repository signing key
+sudo install -d /etc/apt/keyrings
+curl -fsSL https://rustyhorde.github.io/moshpit-packages/gpg.key \
+    | sudo gpg --dearmor -o /etc/apt/keyrings/moshpit.gpg
+
+# Add the apt source
+echo "deb [arch=amd64,arm64 signed-by=/etc/apt/keyrings/moshpit.gpg] \
+  https://rustyhorde.github.io/moshpit-packages/apt stable main" \
+    | sudo tee /etc/apt/sources.list.d/moshpit.list
+
+# Install
+sudo apt update
+sudo apt install moshpit-keygen moshpits moshpit moshpit-agent
+```
+
+The same repository also carries the `-unstable` builds (ML-DSA support) and the per-feature agent builds — install them by name, e.g. `moshpit-unstable`, `moshpit-agent-fido2`, or `moshpit-agent-full`.  Each binary's variants conflict with one another, so only one variant of a given binary can be installed at a time.
+
+### Install a downloaded `.deb` directly
+
+Pre-built `.deb` packages are also attached to each [GitHub release](https://github.com/rustyhorde/moshpit/releases) if you prefer not to add the repository.
 
 > **Note**: Place `.deb` files in `/tmp/` before installing with `apt`.  When accessing a local file `apt` drops privileges to the `_apt` system user, which cannot read files under `/home/`.  Using `/tmp/` (world-readable by default) avoids the resulting permission warning entirely.  Alternatively, use `dpkg -i` — it runs as root and has no sandboxing step.
 
-### Install with apt (recommended)
+### Install with apt
 
 ```bash
 # Download the packages to /tmp (substitute the desired version)
@@ -413,6 +437,33 @@ sudo apt remove moshpit moshpits moshpit-keygen
 
 # Also remove configuration files
 sudo apt purge moshpit moshpits moshpit-keygen
+```
+
+---
+
+## Installation (Fedora / RHEL)
+
+Pre-built `.rpm` packages for `x86_64` and `aarch64` are served from the signed dnf repository at <https://rustyhorde.github.io/moshpit-packages/>, so `dnf upgrade` keeps moshpit current.
+
+```bash
+# Add the repository (imports the signing key on first install)
+sudo dnf config-manager \
+    --add-repo https://rustyhorde.github.io/moshpit-packages/rpm/moshpit.repo
+
+# Install
+sudo dnf install moshpit-keygen moshpits moshpit moshpit-agent
+```
+
+> On older releases the subcommand is `sudo dnf config-manager addrepo --from-repofile=…`, and on dnf 4 you may need `sudo dnf install dnf-plugins-core` first.
+
+The `-unstable` builds and per-feature agent builds (`moshpit-agent-fido2`, `moshpit-agent-full`, …) are available from the same repository by name.  Variants of a given binary conflict, so only one can be installed at a time.
+
+`.rpm` files are also attached to each [GitHub release](https://github.com/rustyhorde/moshpit/releases) for direct `sudo dnf install ./<pkg>.rpm` use.
+
+### Removing packages
+
+```bash
+sudo dnf remove moshpit moshpits moshpit-keygen
 ```
 
 ---
