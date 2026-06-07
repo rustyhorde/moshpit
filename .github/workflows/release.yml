@@ -514,6 +514,144 @@ jobs:
             release-assets/*
             moshpit-${{ needs.build.outputs.pkgver }}.tar.gz
 
+  # ── Publish apt/dnf package repository (GitHub Pages) ────────────────────────
+  publish-packages:
+    name: 📦 Publish Package Repository 📦
+    if: "!contains(github.ref_name, '-rc')"
+    needs: [build, release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Download release assets
+        # v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: release-assets
+          path: release-assets/
+
+      - name: Install tools
+        run: sudo apt-get install -y apt-utils dpkg-dev createrepo-c
+
+      - name: Import GPG signing key
+        run: echo "${{ secrets.PACKAGES_GPG_PRIVATE_KEY }}" | gpg --batch --import
+
+      - name: Clone moshpit-packages repo
+        env:
+          PACKAGES_REPO_TOKEN: ${{ secrets.PACKAGES_REPO_TOKEN }}
+        run: |
+          git clone \
+            "https://oauth2:${PACKAGES_REPO_TOKEN}@github.com/rustyhorde/moshpit-packages.git" \
+            /tmp/moshpit-packages
+          cd /tmp/moshpit-packages
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add DEB packages to APT pool
+        run: |
+          # Glob-copy every variant (standard, unstable, per-feature agent) — the
+          # package names are distinct, so apt-ftparchive indexes them all.
+          mkdir -p /tmp/moshpit-packages/apt/pool/main
+          rm -f /tmp/moshpit-packages/apt/pool/main/*.deb
+          cp release-assets/*_amd64.deb /tmp/moshpit-packages/apt/pool/main/
+          cp release-assets/*_arm64.deb /tmp/moshpit-packages/apt/pool/main/
+
+      - name: Add RPM packages to RPM pool
+        run: |
+          mkdir -p /tmp/moshpit-packages/rpm/x86_64 /tmp/moshpit-packages/rpm/aarch64
+          rm -f /tmp/moshpit-packages/rpm/x86_64/*.rpm /tmp/moshpit-packages/rpm/aarch64/*.rpm
+          cp release-assets/*.x86_64.rpm  /tmp/moshpit-packages/rpm/x86_64/
+          cp release-assets/*.aarch64.rpm /tmp/moshpit-packages/rpm/aarch64/
+
+      - name: Generate APT repo metadata
+        env:
+          PACKAGES_GPG_KEY_ID: ${{ secrets.PACKAGES_GPG_KEY_ID }}
+        run: |
+          cd /tmp/moshpit-packages
+          mkdir -p apt/dists/stable/main/binary-amd64 apt/dists/stable/main/binary-arm64
+          mkdir -p /tmp/apt-ftparchive-cache
+
+          cat > apt-ftparchive.conf << 'APTCONF'
+          Dir {
+            ArchiveDir "apt";
+            CacheDir "/tmp/apt-ftparchive-cache";
+          };
+
+          Default {
+            Packages::Compress ". gzip xz";
+          };
+
+          BinDirectory "pool/main" {
+            Packages "dists/stable/main/binary-amd64/Packages";
+            Architecture "amd64";
+          };
+
+          BinDirectory "pool/main" {
+            Packages "dists/stable/main/binary-arm64/Packages";
+            Architecture "arm64";
+          };
+          APTCONF
+
+          apt-ftparchive generate apt-ftparchive.conf
+
+          apt-ftparchive \
+            -o APT::FTPArchive::Release::Origin=moshpit \
+            -o APT::FTPArchive::Release::Label=moshpit \
+            -o APT::FTPArchive::Release::Suite=stable \
+            -o APT::FTPArchive::Release::Codename=stable \
+            -o APT::FTPArchive::Release::Architectures="amd64 arm64" \
+            -o APT::FTPArchive::Release::Components=main \
+            -o APT::FTPArchive::Release::Description="moshpit package repository" \
+            release apt/dists/stable > apt/dists/stable/Release
+
+          gpg --batch --yes \
+            --pinentry-mode loopback \
+            --local-user "$PACKAGES_GPG_KEY_ID" \
+            --armor --clearsign \
+            -o apt/dists/stable/InRelease \
+            apt/dists/stable/Release
+
+          gpg --batch --yes \
+            --pinentry-mode loopback \
+            --local-user "$PACKAGES_GPG_KEY_ID" \
+            --armor --detach-sign \
+            -o apt/dists/stable/Release.gpg \
+            apt/dists/stable/Release
+
+      - name: Generate RPM repo metadata
+        env:
+          PACKAGES_GPG_KEY_ID: ${{ secrets.PACKAGES_GPG_KEY_ID }}
+        run: |
+          cd /tmp/moshpit-packages
+          for arch in x86_64 aarch64; do
+            createrepo_c --update rpm/${arch}/
+            gpg --batch --yes \
+              --pinentry-mode loopback \
+              --local-user "$PACKAGES_GPG_KEY_ID" \
+              --armor --detach-sign \
+              -o rpm/${arch}/repodata/repomd.xml.asc \
+              rpm/${arch}/repodata/repomd.xml
+          done
+
+      - name: Commit and push
+        env:
+          PKGVER: ${{ needs.build.outputs.pkgver }}
+        run: |
+          cd /tmp/moshpit-packages
+          git add .
+          git diff-index --quiet HEAD || git commit \
+            -m "Update to v${PKGVER}"
+          for attempt in 1 2 3; do
+            if git push origin main; then break; fi
+            if [[ $attempt -lt 3 ]]; then
+              echo "Push attempt ${attempt} failed, retrying in 10s..."
+              sleep 10
+            else
+              echo "All push attempts failed."
+              exit 1
+            fi
+          done
+
   # ── Update PKGBUILDs ─────────────────────────────────────────────────────────
   update-pkgbuilds:
     name: 📦 Update PKGBUILDs 📦
