@@ -98,7 +98,7 @@ All crypto is through `aws-lc-rs` (no `ring`, no system OpenSSL). Building on Li
 
 ## CI Pipeline
 
-CI (`moshpit.yml`) runs rustfmt → clippy (nightly, all platforms) → tests (1.91.1, stable, beta, nightly on Linux/macOS/Windows) → coverage. Clippy runs on nightly and all warnings are errors (`-D warnings`). Tests use the reusable `rustyhorde/workflows` workflow with all features enabled.
+CI (`moshpit.yml`) runs rustfmt → clippy (nightly, all platforms) → tests (1.95.0, stable, beta, nightly on Linux/macOS/Windows) → coverage. Clippy runs on nightly and all warnings are errors (`-D warnings`). Tests use the reusable `rustyhorde/workflows` workflow with all features enabled.
 
 The `package-test.yml` workflow simulates a release tarball build by running `--locked` builds against a git archive, catching issues with `Cargo.lock` and `cargo xtask dist` before a real release.
 
@@ -116,7 +116,7 @@ Tagging `v<semver>` triggers `release.yml`, which:
 ## Key Configuration Details
 
 - **Rust edition**: 2024 (all crates)
-- **MSRV**: 1.91.1 — when updating `rust-version` in any `Cargo.toml`, also update the required status check names on the `master` branch (GitHub → Settings → Branches → master protection rule). The MSRV check names embed the version string, e.g. `🧪 Test (Linux) 🧪 (ubuntu-latest, 1.91.1, x86_64-unknown-linux-gnu)` — replace the old version with the new one for all three platform variants (Linux × 1, MacOS × 1, Windows × 2 targets).
+- **MSRV**: 1.95.0 — when updating `rust-version` in any `Cargo.toml`, also update the required status check names on the `master` branch (GitHub → Settings → Branches → master protection rule). The MSRV check names embed the version string, e.g. `🧪 Test (Linux) 🧪 (ubuntu-latest, 1.95.0, x86_64-unknown-linux-gnu)` — replace the old version with the new one for all three platform variants (Linux × 1, MacOS × 1, Windows × 2 targets).
 - **`unstable` feature flag**: Exists in libmoshpit/moshpit/moshpits/keygen but is currently a no-op placeholder
 - **Config precedence** (both client and server): env vars > CLI flags > TOML config file. Implemented by `libmoshpit::load` (the `config` crate is last-source-wins, so sources are added file → CLI → env). Each binary's `Cli::collect` emits only values the user actually passed (tracked via `Cli::parse_argv`/`explicit_args`) so clap defaults don't clobber the file/env; fields needing a fallback carry `#[serde(default)]`. The client's config file is optional (`load(..., false)`); the server's is required (`load(..., true)`).
 - **Client env prefix**: `MOSHPIT_`; **Server env prefix**: `MOSHPITS_`. Env var names are `<PREFIX>_<FIELD>` with underscores preserved (e.g. `MOSHPIT_SERVER_PORT`, `MOSHPITS_TERM_TYPE`). Nested tables (e.g. `[preferred_algorithms]`) are **not** settable via a single env var — use the TOML table or the dedicated CLI flags.
