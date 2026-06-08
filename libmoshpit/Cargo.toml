@@ -65,7 +65,7 @@ vergen-gix = { workspace = true }
 [dev-dependencies]
 bincode-next = "3.0.0-rc.15"
 proptest = "1.11.0"
-tempfile = "3.27.0"
+tempfile = { workspace = true }
 tokio = { workspace = true, features = [
     "macros",
     "net",

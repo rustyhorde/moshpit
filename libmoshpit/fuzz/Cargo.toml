@@ -9,10 +9,10 @@ cargo-fuzz = true
 
 [dependencies]
 arbitrary = { version = "1.4.2", features = ["derive"] }
-aws-lc-rs = { version = "1.17.0", features = ["bindgen"] }
-libfuzzer-sys = "0.4.12"
+aws-lc-rs = { workspace = true, features = ["bindgen"] }
+libfuzzer-sys = "0.4.13"
 libmoshpit = { path = ".." }
-uuid = "1.23.2"
+uuid = { workspace = true }
 
 # Prevent the workspace from treating this crate as a member.
 [workspace]
