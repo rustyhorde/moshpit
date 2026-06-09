@@ -332,8 +332,9 @@ mod test {
     use core::mem::offset_of;
 
     use super::{
-        LINE_LEN, OFF_ADDR, OFF_HOST, OFF_ID, OFF_LINE, OFF_PID, OFF_TV, OFF_TYPE, OFF_USER,
-        RECORD_SIZE, USER_PROCESS, Utmpx, addr_v6, line_matches, record_bytes, ut_id_from_line,
+        DEAD_PROCESS, LINE_LEN, OFF_ADDR, OFF_HOST, OFF_ID, OFF_LINE, OFF_PID, OFF_TV, OFF_TYPE,
+        OFF_USER, RECORD_SIZE, USER_PROCESS, Utmpx, addr_v6, line_matches, login_to, logout_to,
+        put_utmp, put_wtmp, record_bytes, record_bytes_raw, ut_id_from_line,
     };
 
     #[test]
