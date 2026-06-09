@@ -148,8 +148,8 @@ impl AgentClient {
 #[cfg(test)]
 #[cfg(unix)]
 mod tests {
-    use tempfile::TempDir;
     use std::path::PathBuf;
+    use tempfile::TempDir;
 
     use bincode_next::{config::standard, encode_to_vec};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};

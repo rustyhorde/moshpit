@@ -291,7 +291,7 @@ mod tests {
     use base64::engine::general_purpose::STANDARD;
     use bytes::BytesMut;
 
-    use super::{Vault, VAULT_HEADER, default_vault_path, read_lv, write_lv};
+    use super::{VAULT_HEADER, Vault, default_vault_path, read_lv, write_lv};
 
     #[test]
     fn vault_upsert_and_entries() {

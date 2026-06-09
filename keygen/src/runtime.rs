@@ -329,8 +329,8 @@ mod tests {
     use libmoshpit::{KEY_ALGORITHM_X25519, KexMode, KeyPair};
 
     use super::{
-        check_paths_inner, display_fingerprint, generate_and_write_keys_inner,
-        setup_paths_inner, verify_key,
+        check_paths_inner, display_fingerprint, generate_and_write_keys_inner, setup_paths_inner,
+        verify_key,
     };
 
     static DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);

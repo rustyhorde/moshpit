@@ -43,9 +43,9 @@ mod tests {
         sync::mpsc::unbounded_channel,
     };
 
-    use anyhow::Result;
     use super::{ConnectionWriter, Frame, KexSender};
     use crate::ConnectionReader;
+    use anyhow::Result;
 
     async fn make_loopback() -> Result<(ConnectionReader, ConnectionWriter)> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;

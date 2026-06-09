@@ -84,8 +84,8 @@ pub(crate) fn default_socket_path() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
     use super::{AgentConfig, ShellKind};
+    use std::path::PathBuf;
 
     #[test]
     fn resolve_with_overrides() {

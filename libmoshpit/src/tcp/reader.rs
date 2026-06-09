@@ -126,9 +126,9 @@ impl ConnectionReader {
 mod tests {
     use tokio::net::{TcpListener, TcpStream};
 
-    use anyhow::Result;
     use super::{ConnectionReader, Frame};
     use crate::ConnectionWriter;
+    use anyhow::Result;
 
     async fn make_loopback() -> Result<(ConnectionReader, ConnectionWriter)> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;

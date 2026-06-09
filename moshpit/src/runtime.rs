@@ -1705,15 +1705,14 @@ mod tests {
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
-    use super::{
-        Cli, Config, FatalKexError, PassCache,
-        clear_reconnect_banner, client_id_in_home, client_id_path,
-        connect_and_kex, countdown_reconnect_banner, create_key_dir,
-        load, maybe_generate_keypair, read_uuid_from_path,
-        session_file_path_in_home, show_reconnect_banner, write_uuid_to_path,
-    };
     #[cfg(not(unix))]
     use super::key_event_to_bytes;
+    use super::{
+        Cli, Config, FatalKexError, PassCache, clear_reconnect_banner, client_id_in_home,
+        client_id_path, connect_and_kex, countdown_reconnect_banner, create_key_dir, load,
+        maybe_generate_keypair, read_uuid_from_path, session_file_path_in_home,
+        show_reconnect_banner, write_uuid_to_path,
+    };
 
     struct TestHome {
         path: PathBuf,

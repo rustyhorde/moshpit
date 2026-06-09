@@ -746,7 +746,9 @@ mod tests {
     use tokio::sync::mpsc::unbounded_channel;
     use uuid::Uuid;
 
-    use super::{Kex, KexEvent, KexMode, KexStateMachine, MoshpitError, ServerKex, env_var_matches};
+    use super::{
+        Kex, KexEvent, KexMode, KexStateMachine, MoshpitError, ServerKex, env_var_matches,
+    };
 
     #[tokio::test]
     async fn kex_state_machine_server_mode_completes_after_uuid() -> Result<()> {
