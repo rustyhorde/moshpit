@@ -470,7 +470,7 @@ sudo dnf remove moshpit moshpits moshpit-keygen
 
 ## Installation (cargo)
 
-Requires a Rust toolchain (stable, 1.91.1 or later).  Install all three binaries directly from [crates.io](https://crates.io):
+Requires a Rust toolchain (stable, 1.95.0 or later).  Install all three binaries directly from [crates.io](https://crates.io):
 
 ```bash
 # Key management tool (install first — the others depend on it)

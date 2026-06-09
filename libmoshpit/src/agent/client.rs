@@ -149,7 +149,6 @@ impl AgentClient {
 #[cfg(unix)]
 mod tests {
     use tempfile::TempDir;
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::net::UnixListener;
 
     use super::*;

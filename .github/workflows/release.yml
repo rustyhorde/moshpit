@@ -40,7 +40,7 @@ jobs:
         # stable
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with:
-          toolchain: "1.91.1"
+          toolchain: "1.95.0"
 
       - name: 💾 Install (cargo-binstall) 💾
         uses: cargo-bins/cargo-binstall@1c2b96c2b86875d56caeec7b7ee9980812daf0d9 # main

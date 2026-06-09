@@ -10,8 +10,8 @@ license = "MIT OR Apache-2.0"
 name = "moshpits"
 readme = "../README.md"
 repository = "https://github.com/rustyhorde/moshpit"
-version = "0.8.20"
-rust-version = "1.91.1"
+version = "0.8.21"
+rust-version = "1.95.0"
 
 [[bin]]
 name = "mps"
@@ -26,7 +26,7 @@ bytes = { workspace = true }
 clap = { workspace = true }
 config = { workspace = true }
 getset = { workspace = true }
-libmoshpit = { version = "0.8.20", path = "../libmoshpit" }
+libmoshpit = { version = "0.8.21", path = "../libmoshpit" }
 portable-pty = "0.9.0"
 serde = { workspace = true }
 tokio = { workspace = true, features = ["signal", "sync", "time"] }
@@ -39,7 +39,7 @@ vt100 = { workspace = true }
 zstd = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
-libc = "1.0.0-alpha.3"
+libc = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = { workspace = true }
