@@ -126,7 +126,8 @@ impl ConnectionReader {
 mod tests {
     use tokio::net::{TcpListener, TcpStream};
 
-    use super::*;
+    use anyhow::Result;
+    use super::{ConnectionReader, Frame};
     use crate::ConnectionWriter;
 
     async fn make_loopback() -> Result<(ConnectionReader, ConnectionWriter)> {

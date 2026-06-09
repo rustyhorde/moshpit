@@ -108,7 +108,7 @@ pub enum AgentResponse {
 mod tests {
     use bincode_next::{config::standard, decode_from_slice, encode_to_vec};
 
-    use super::*;
+    use super::{AgentIdentityInfo, AgentRequest, AgentResponse};
 
     #[test]
     fn roundtrip_request_lock() -> anyhow::Result<()> {

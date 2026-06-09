@@ -321,9 +321,17 @@ fn display_fingerprint(public_key_path: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::fs;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use anyhow::Result;
+    use libmoshpit::{KEY_ALGORITHM_X25519, KexMode, KeyPair};
+
+    use super::{
+        check_paths_inner, display_fingerprint, generate_and_write_keys_inner,
+        setup_paths_inner, verify_key,
+    };
 
     static DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
 

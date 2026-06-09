@@ -1793,8 +1793,34 @@ mod tests {
         hmac::HMAC_SHA512,
     };
 
-    use super::*;
+    use std::{
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, AtomicU64, Ordering},
+        },
+        time::{Duration, Instant},
+    };
     use std::sync::Mutex as StdMutex;
+
+    use anyhow::Result;
+    use aws_lc_rs::aead::LessSafeKey;
+    use aws_lc_rs::hmac::Key;
+    use bytes::BytesMut;
+    use tokio::{
+        net::UdpSocket,
+        sync::mpsc::Sender,
+    };
+    use tokio_util::sync::CancellationToken;
+    use uuid::Uuid;
+
+    use crate::{Emulator, PredictionEngine, Renderer, TerminalMessage};
+    use super::{
+        DiffMode, EncryptedFrame, MAX_SEQ_JUMP, UdpReader,
+        MAX_NAK_RETRIES, MAX_NAK_TIMEOUT, MIN_NAK_CHECK_INTERVAL, MIN_NAK_TIMEOUT,
+        RECV_BUFFER_REPAINT_THRESHOLD, REPAINT_REQUEST_THRESHOLD,
+        process_bytes_with_prediction,
+    };
+    use crate::udp::sender::RETRANSMIT_WINDOW;
 
     #[tokio::test]
     async fn test_handle_arrival_seq_jump() -> Result<()> {
@@ -1845,7 +1871,7 @@ mod tests {
     // Property tests (proptest)
     // -----------------------------------------------------------------------
 
-    use proptest::prelude::*;
+    use proptest::{prop_assert, prop_assert_eq, proptest};
 
     fn make_reader_sync() -> UdpReader {
         // Build a UdpReader synchronously using a blocking socket creation.

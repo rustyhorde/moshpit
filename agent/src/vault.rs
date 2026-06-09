@@ -287,7 +287,11 @@ pub(crate) fn default_vault_path() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use anyhow::Result;
+    use base64::engine::general_purpose::STANDARD;
+    use bytes::BytesMut;
+
+    use super::{Vault, VAULT_HEADER, default_vault_path, read_lv, write_lv};
 
     #[test]
     fn vault_upsert_and_entries() {

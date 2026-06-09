@@ -740,7 +740,13 @@ async fn run_server_kex<T: KexConfig>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::net::SocketAddr;
+
+    use anyhow::Result;
+    use tokio::sync::mpsc::unbounded_channel;
+    use uuid::Uuid;
+
+    use super::{Kex, KexEvent, KexMode, KexStateMachine, MoshpitError, ServerKex, env_var_matches};
 
     #[tokio::test]
     async fn kex_state_machine_server_mode_completes_after_uuid() -> Result<()> {

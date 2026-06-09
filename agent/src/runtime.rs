@@ -971,9 +971,20 @@ async fn run_daemon(
 
 #[cfg(test)]
 mod tests {
-    use tempfile::tempdir;
+    use std::{fs, path::{Path, PathBuf}, sync::Arc};
 
-    use super::*;
+    use bincode_next::{config::standard, decode_from_slice, encode_to_vec};
+    use tempfile::tempdir;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::net::{UnixListener, UnixStream};
+    use tokio::sync::Mutex;
+
+    use super::{
+        AgentConfig, AgentIdentityInfo, AgentRequest, AgentResponse, Identity, ShellKind, Vault,
+        best_identity, check_not_already_running, dispatch_request, format_socket_env,
+        format_unset_socket_env, handle_connection, is_process_alive, new_identity_map,
+        sign_data, socket_from_env, unlock_backend,
+    };
 
     const TEST_KEY_PATH: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),

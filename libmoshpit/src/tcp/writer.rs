@@ -63,7 +63,8 @@ impl ConnectionWriter {
 mod tests {
     use tokio::net::{TcpListener, TcpStream};
 
-    use super::*;
+    use anyhow::Result;
+    use super::{ConnectionWriter, Frame};
 
     #[tokio::test]
     async fn write_frame_succeeds() -> Result<()> {

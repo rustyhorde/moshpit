@@ -386,7 +386,12 @@ fn detect_scroll_up(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    use super::{
+        Emulator, PredictionEngine, Renderer,
+        detect_scroll_up, paint_overlays_to_ansi, render_prediction_update, render_server_update,
+    };
 
     // Drive a real emulator + renderer and feed every emitted byte into a model
     // terminal that *has* a scrollback buffer, so tests can assert on whether

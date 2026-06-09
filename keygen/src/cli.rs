@@ -132,7 +132,9 @@ pub(crate) enum Commands {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use clap::Parser as _;
+
+    use super::{Cli, Commands};
 
     #[test]
     fn verify_cli() {

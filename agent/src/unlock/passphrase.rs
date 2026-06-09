@@ -39,7 +39,7 @@ impl UnlockBackend for PassphraseBackend {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{PassphraseBackend, UnlockBackend};
 
     #[test]
     fn backend_name() {

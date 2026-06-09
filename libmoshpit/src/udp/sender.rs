@@ -278,7 +278,18 @@ mod tests {
     };
     use tokio::sync::mpsc::channel;
 
-    use super::*;
+    use std::{net::SocketAddr, sync::Arc, time::Duration};
+
+    use anyhow::Result;
+    use aws_lc_rs::aead::LessSafeKey;
+    use aws_lc_rs::hmac::Key;
+    use tokio::net::UdpSocket;
+    use tokio::sync::{mpsc::Receiver, oneshot};
+    use tokio::time::sleep;
+    use tokio_util::sync::CancellationToken;
+    use uuid::Uuid;
+
+    use super::{EncryptedFrame, UdpSender, now_micros};
 
     fn make_sender(
         socket: Arc<UdpSocket>,

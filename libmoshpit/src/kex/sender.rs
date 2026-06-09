@@ -43,7 +43,8 @@ mod tests {
         sync::mpsc::unbounded_channel,
     };
 
-    use super::*;
+    use anyhow::Result;
+    use super::{ConnectionWriter, Frame, KexSender};
     use crate::ConnectionReader;
 
     async fn make_loopback() -> Result<(ConnectionReader, ConnectionWriter)> {

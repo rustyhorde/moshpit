@@ -329,7 +329,12 @@ fn line_matches(field: &[u8], line: &str) -> bool {
 
 #[cfg(test)]
 mod test {
-    use super::*;
+    use core::mem::offset_of;
+
+    use super::{
+        LINE_LEN, OFF_ADDR, OFF_HOST, OFF_ID, OFF_LINE, OFF_PID, OFF_TV, OFF_TYPE, OFF_USER,
+        RECORD_SIZE, USER_PROCESS, Utmpx, addr_v6, line_matches, record_bytes, ut_id_from_line,
+    };
 
     #[test]
     fn record_is_glibc_sized() {

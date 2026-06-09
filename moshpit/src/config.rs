@@ -227,7 +227,12 @@ impl KexConfig for Config {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::path::PathBuf;
+
+    use anyhow::Result;
+    use uuid::Uuid;
+
+    use super::{Config, DisplayPreference, KexConfig, KexMode};
 
     #[test]
     fn test_default_config() {

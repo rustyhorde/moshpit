@@ -149,9 +149,13 @@ impl AgentClient {
 #[cfg(unix)]
 mod tests {
     use tempfile::TempDir;
+    use std::path::PathBuf;
+
+    use bincode_next::{config::standard, encode_to_vec};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::net::UnixListener;
 
-    use super::*;
+    use super::{AgentClient, AgentIdentityInfo, AgentResponse};
 
     fn spawn_mock_agent(
         socket_path: &PathBuf,

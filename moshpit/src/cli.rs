@@ -397,7 +397,11 @@ impl PathDefaults for Cli {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use clap::Parser as _;
+    use config::{Source as _, ValueKind};
+    use libmoshpit::PathDefaults as _;
+
+    use super::{Cli, Commands};
 
     #[test]
     fn test_cli_defaults() -> anyhow::Result<()> {
