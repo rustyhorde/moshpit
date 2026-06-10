@@ -124,3 +124,5 @@ Tagging `v<semver>` triggers `release.yml`, which:
 ## Coding Conventions
 
 - **No glob imports**: Always use explicit named imports (`use foo::{Bar, Baz};`). Glob imports (`use foo::*`) hide dependencies and make refactoring harder. This applies everywhere — test modules, production code, and re-exports (`pub use`).
+- **Prefer leaf names over FQDNs**: Import a type or function and refer to it by its leaf name (`Bar`) rather than writing it fully qualified inline (`foo::bar::Bar`). Only use a fully-qualified path when a name collision would otherwise occur (e.g. two `Error` types in scope).
+- **Gate imports with the code that uses them**: When an import is only needed by code behind a `cfg` (e.g. `#[cfg(target_os = "linux")]`), put the same `cfg` on the `use` if the import isn't used elsewhere. An unconditional `use` for cfg-gated code triggers unused-import warnings on other platforms.
