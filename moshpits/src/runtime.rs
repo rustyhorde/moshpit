@@ -24,16 +24,14 @@ use std::{
 use std::{
     ffi::{CStr, CString},
     fs::{OpenOptions, read_to_string},
+    io::Error,
     os::unix::{fs::OpenOptionsExt as _, process::CommandExt},
     path::Path,
     process::{Command, Stdio},
 };
 
 #[cfg(target_os = "linux")]
-use std::{
-    fs::{File, metadata},
-    io::Error,
-};
+use std::fs::{File, metadata};
 
 use anyhow::{Context as _, Result};
 use bytes::{Buf as _, BytesMut};
@@ -1840,7 +1838,7 @@ fn initgroups_base_group(group_id: libc::gid_t) -> libc::gid_t {
 #[cfg(all(unix, target_os = "macos"))]
 fn initgroups_base_group(group_id: libc::gid_t) -> std::io::Result<libc::c_int> {
     group_id.try_into().map_err(|_| {
-        std::io::Error::new(
+        Error::new(
             std::io::ErrorKind::InvalidInput,
             "gid does not fit into c_int for initgroups",
         )
