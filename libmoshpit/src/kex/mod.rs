@@ -8,8 +8,9 @@
 
 //! TCP key exchange protocol: mutual asymmetric authentication and per-session key derivation.
 
+#[cfg(unix)]
+use std::cmp::Reverse;
 use std::{
-    cmp::Reverse,
     env::vars,
     fmt::{self, Display, Formatter},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
