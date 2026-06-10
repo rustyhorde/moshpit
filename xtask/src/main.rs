@@ -205,6 +205,12 @@ fn mp_command() -> Command {
                 .help("UDP diff transport mode: reliable (default), datagram, or statesync"),
         )
         .arg(
+            Arg::new("escape-key")
+                .long("escape-key")
+                .value_name("KEY")
+                .help("Force-quit prefix key, e.g. ctrl-^ (default), ctrl-a, ctrl-] — combined with . to quit"),
+        )
+        .arg(
             Arg::new("kex-algos")
                 .long("kex-algos")
                 .value_name("ALGOS")

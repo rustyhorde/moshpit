@@ -121,6 +121,12 @@ pub(crate) struct Config {
     #[serde(default)]
     #[getset(get = "pub(crate)")]
     send_path: Vec<String>,
+    /// Force-quit escape prefix key, e.g. `"ctrl-^"` (default).  Pressed and then
+    /// followed by `.` to disconnect.  Must resolve to a control byte; parsed and
+    /// validated at startup by `runtime::parse_escape_key`.
+    #[serde(default = "Config::default_escape_key")]
+    #[getset(get = "pub(crate)")]
+    escape_key: String,
 }
 
 impl Config {
@@ -138,6 +144,10 @@ impl Config {
 
     fn default_send_env() -> Vec<String> {
         vec!["LANG".into(), "LC_*".into(), "TZ".into()]
+    }
+
+    fn default_escape_key() -> String {
+        "ctrl-^".to_string()
     }
 
     fn load_key_paths(&self) -> Result<(PathBuf, PathBuf)> {
@@ -175,6 +185,7 @@ impl Default for Config {
             preferred_algorithms: AlgorithmPreferences::default(),
             send_env: Self::default_send_env(),
             send_path: Vec::new(),
+            escape_key: Self::default_escape_key(),
         }
     }
 }
@@ -245,6 +256,7 @@ mod tests {
         assert_eq!(config.resume_session_uuid(), None);
         assert_eq!(config.max_reconnect_backoff_secs(), 3600);
         assert_eq!(config.predict(), DisplayPreference::default());
+        assert_eq!(config.escape_key(), "ctrl-^");
     }
 
     #[test]

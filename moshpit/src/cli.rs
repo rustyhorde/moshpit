@@ -187,6 +187,15 @@ pub(crate) struct Cli {
     )]
     #[getset(get = "pub(crate)")]
     kdf_algos: Option<String>,
+    /// Force-quit escape prefix key, e.g. `ctrl-^` (default).  Pressed and then
+    /// followed by `.` to disconnect.
+    #[clap(
+        long,
+        value_name = "KEY",
+        help = "Force-quit prefix key, e.g. ctrl-^ (default), ctrl-a, ctrl-] — combined with . to quit"
+    )]
+    #[getset(get = "pub(crate)")]
+    escape_key: Option<String>,
     /// Set of clap argument ids the user actually supplied on the command line
     /// (`ValueSource::CommandLine`), populated by [`Cli::parse_argv`].  This is
     /// the source of truth for "came from the command line": it lets
@@ -263,6 +272,7 @@ impl Source for Cli {
         Box::new((*self).clone())
     }
 
+    #[allow(clippy::too_many_lines)] // a flat enumeration of every CLI argument
     fn collect(&self) -> Result<Map<String, Value>, ConfigError> {
         let mut map = Map::new();
         let origin = String::from("command line");
@@ -348,6 +358,14 @@ impl Source for Cli {
             let _old = map.insert(
                 "legacy_passthrough".to_string(),
                 Value::new(Some(&origin), ValueKind::Boolean(self.legacy_passthrough)),
+            );
+        }
+        if on("escape_key")
+            && let Some(escape_key) = &self.escape_key
+        {
+            let _old = map.insert(
+                "escape_key".to_string(),
+                Value::new(Some(&origin), ValueKind::String(escape_key.clone())),
             );
         }
         if let Some(table) = build_algo_table(
@@ -626,6 +644,32 @@ mod tests {
         } else {
             panic!("Expected String for diff_mode");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn collect_emits_escape_key() -> anyhow::Result<()> {
+        let cli = Cli::parse_argv(["moshpit", "--escape-key", "ctrl-a", "host"])?;
+        assert_eq!(cli.escape_key().as_deref(), Some("ctrl-a"));
+        let map = cli.collect()?;
+        if let ValueKind::String(ref s) = map
+            .get("escape_key")
+            .ok_or_else(|| anyhow::anyhow!("\"escape_key\" not found in map"))?
+            .kind
+        {
+            assert_eq!(s, "ctrl-a");
+        } else {
+            panic!("Expected String for escape_key");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn collect_omits_unset_escape_key() -> anyhow::Result<()> {
+        let cli = Cli::parse_argv(["moshpit", "host"])?;
+        assert_eq!(cli.escape_key().as_deref(), None);
+        let map = cli.collect()?;
+        assert!(!map.contains_key("escape_key"));
         Ok(())
     }
 

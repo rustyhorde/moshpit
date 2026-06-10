@@ -845,6 +845,8 @@ Options:
                                        [default: 3]
       --diff-mode <MODE>               UDP diff transport mode: reliable (default),
                                        datagram, or statesync
+      --escape-key <KEY>               Force-quit prefix key, e.g. ctrl-^ (default),
+                                       ctrl-a, ctrl-] — combined with . to quit
       --kex-algos <ALGOS>              Ordered KEX algorithms to offer, comma-separated
                                        [supported: x25519-sha256 (default),
                                        ml-kem-768-sha256, ml-kem-512-sha256,
@@ -890,6 +892,9 @@ mp --aead-algos chacha20-poly1305,aes256-gcm-siv user@remote-server.com
 # Prefer P-384 and save bandwidth with a smaller MAC tag
 mp --kex-algos p384-sha384 --mac-algos hmac-sha256 user@remote-server.com
 
+# Rebind the force-quit prefix key (then press . to quit)
+mp --escape-key ctrl-a user@remote-server.com
+
 # Use datagram mode on a lossy mobile connection
 mp --diff-mode datagram user@remote-server.com
 
@@ -917,10 +922,17 @@ server_destination = "192.168.1.10" # "ip" or "user@ip"; overridden by the
 # When the server becomes unreachable, mp automatically reconnects using
 # exponential back-off: starts at 2 s, doubles on each failure, and is capped
 # at max_reconnect_backoff_secs.  The blue banner at the top of the terminal
-# shows the current countdown.  Press Ctrl-^ . (0x1E 0x2E) during any
-# countdown to abort reconnection and exit.
+# shows the current countdown.  Press the force-quit sequence (escape_key then
+# ".", e.g. Ctrl-^ .) during any countdown to abort reconnection and exit.
 # Clamped to the range [2, 86400].  Default: 3600 (1 hour).
 max_reconnect_backoff_secs = 3600
+
+# ── Force-quit key ────────────────────────────────────────────────────────────
+# Prefix key pressed (then followed by ".") to disconnect and quit a session.
+# Written as "ctrl-<key>" and must resolve to a control key: "ctrl-^" (default),
+# "ctrl-a", "ctrl-]", etc.  The trailing "." confirm key is fixed.  Override on
+# the command line with --escape-key or via MOSHPIT_ESCAPE_KEY.
+escape_key = "ctrl-^"
 
 # ── Key files ─────────────────────────────────────────────────────────────────
 # Defaults to ~/.mp/id_x25519 and ~/.mp/id_x25519.pub when not set.

@@ -262,6 +262,13 @@ pub(crate) fn resolve_effective(
             Some("predict"),
         ),
         ctx.row(
+            "escape_key",
+            config.escape_key().clone(),
+            Some("escape_key"),
+            Some("ESCAPE_KEY"),
+            Some("escape_key"),
+        ),
+        ctx.row(
             "nat_warmup",
             config.nat_warmup().to_string(),
             Some("nat_warmup"),

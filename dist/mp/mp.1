@@ -1,10 +1,10 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH mp 1  "mp 0.8.11" 
+.TH mp 1  "mp 0.8.21" 
 .SH NAME
 mp \- Connect to a moshpits server
 .SH SYNOPSIS
-\fBmp\fR [\fB\-v\fR|\fB\-\-verbose\fR]... [\fB\-q\fR|\fB\-\-quiet\fR]... [\fB\-c\fR|\fB\-\-config\-absolute\-path\fR] [\fB\-t\fR|\fB\-\-tracing\-absolute\-path\fR] [\fB\-p\fR|\fB\-\-private\-key\-path\fR] [\fB\-k\fR|\fB\-\-public\-key\-path\fR] [\fB\-s\fR|\fB\-\-server\-port\fR] [\fB\-\-predict\fR] [\fB\-\-nat\-warmup\fR] [\fB\-\-nat\-warmup\-count\fR] [\fB\-\-diff\-mode\fR] [\fB\-\-kex\-algos\fR] [\fB\-\-aead\-algos\fR] [\fB\-\-mac\-algos\fR] [\fB\-\-kdf\-algos\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] <\fISERVER_DESTINATION\fR> 
+\fBmp\fR [\fB\-v\fR|\fB\-\-verbose\fR]... [\fB\-q\fR|\fB\-\-quiet\fR]... [\fB\-c\fR|\fB\-\-config\-absolute\-path\fR] [\fB\-t\fR|\fB\-\-tracing\-absolute\-path\fR] [\fB\-p\fR|\fB\-\-private\-key\-path\fR] [\fB\-k\fR|\fB\-\-public\-key\-path\fR] [\fB\-s\fR|\fB\-\-server\-port\fR] [\fB\-\-predict\fR] [\fB\-\-nat\-warmup\fR] [\fB\-\-nat\-warmup\-count\fR] [\fB\-\-diff\-mode\fR] [\fB\-\-escape\-key\fR] [\fB\-\-kex\-algos\fR] [\fB\-\-aead\-algos\fR] [\fB\-\-mac\-algos\fR] [\fB\-\-kdf\-algos\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] <\fISERVER_DESTINATION\fR> 
 .SH DESCRIPTION
 Connect to a moshpits server
 .SH OPTIONS
@@ -66,6 +66,9 @@ datagram
 statesync
 .RE
 .TP
+\fB\-\-escape\-key\fR \fI<KEY>\fR
+Force\-quit prefix key, e.g. ctrl\-^ (default), ctrl\-a, ctrl\-] — combined with . to quit
+.TP
 \fB\-\-kex\-algos\fR \fI<ALGOS>\fR
 Ordered KEX algorithms to offer, comma\-separated [supported: x25519\-sha256 (default), ml\-kem\-768\-sha256, ml\-kem\-512\-sha256, ml\-kem\-1024\-sha256, p384\-sha384, p256\-sha256]
 .TP
@@ -87,4 +90,4 @@ Print version
 <\fISERVER_DESTINATION\fR>
 The IP address of the server to connect to (user@address or address)
 .SH VERSION
-v0.8.11
+v0.8.21

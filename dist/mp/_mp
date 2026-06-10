@@ -28,6 +28,7 @@ _mp() {
 '--predict=[Local-echo prediction\: adaptive (default), always, or never]:MODE:(adaptive always never)' \
 '--nat-warmup-count=[Number of NAT warmup keepalives to send (default\: 3)]:N:_default' \
 '--diff-mode=[UDP diff transport mode\: reliable (default), datagram, or statesync]:MODE:(reliable datagram statesync)' \
+'--escape-key=[Force-quit prefix key, e.g. ctrl-^ (default), ctrl-a, ctrl-\] — combined with . to quit]:KEY:_default' \
 '--kex-algos=[Ordered KEX algorithms to offer, comma-separated \[supported\: x25519-sha256 (default), ml-kem-768-sha256, ml-kem-512-sha256, ml-kem-1024-sha256, p384-sha384, p256-sha256\]]:ALGOS:_default' \
 '--aead-algos=[Ordered AEAD algorithms to offer, comma-separated \[supported\: aes256-gcm-siv (default), aes256-gcm, chacha20-poly1305, aes128-gcm-siv\]]:ALGOS:_default' \
 '--mac-algos=[Ordered MAC algorithms to offer, comma-separated \[supported\: hmac-sha512 (default), hmac-sha256\]]:ALGOS:_default' \

@@ -94,13 +94,17 @@ where
             "a server destination is required, e.g. `mp user@host` (run `mp ec` to inspect config)"
         );
     }
+    // Resolve and validate the force-quit prefix key up front so a bad value
+    // fails fast with a clear message instead of mid-session.
+    let escape_byte = parse_escape_key(config.escape_key())
+        .with_context(|| format!("invalid escape_key {:?}", config.escape_key()))?;
     let (user, socket_addr) =
         parse_server_destination(config.server_destination(), config.server_port())?;
     let server_ip = socket_addr.ip().to_string();
     let server_port = config.server_port();
     let _ = config.set_user(user);
 
-    run_session_loop(config, socket_addr, server_ip, server_port).await
+    run_session_loop(config, socket_addr, server_ip, server_port, escape_byte).await
 }
 
 /// Cached passphrase state, avoiding re-prompting across reconnects.
@@ -160,6 +164,75 @@ enum EscapeState {
     PendingDot,
 }
 
+/// Map a key character to the control byte produced by pressing `Ctrl` with it.
+///
+/// Covers the canonical ASCII control mappings: `@` → `0x00`, `a`–`z`
+/// (case-insensitive) → `0x01`–`0x1A`, `\` → `0x1C`, `]` → `0x1D`, `^` → `0x1E`,
+/// `_` → `0x1F`.  `[` (which maps to `0x1B` / `ESC`) is intentionally excluded:
+/// using `ESC` as the escape prefix would swallow arrow keys and every other
+/// terminal escape sequence.  Returns `None` for any other character.
+fn ctrl_byte(c: char) -> Option<u8> {
+    match c.to_ascii_lowercase() {
+        '@' => Some(0x00),
+        c @ 'a'..='z' => Some(c as u8 - b'a' + 1),
+        '\\' => Some(0x1c),
+        ']' => Some(0x1d),
+        '^' => Some(0x1e),
+        '_' => Some(0x1f),
+        _ => None,
+    }
+}
+
+/// Parse a force-quit escape-prefix key (e.g. `"ctrl-^"`) into its control byte.
+///
+/// Accepts a leading `ctrl-` or `c-` prefix (case-insensitive) followed by a
+/// single key character resolved via [`ctrl_byte`].  The prefix must resolve to
+/// a control byte so it never collides with normal typed input.
+///
+/// # Errors
+/// Returns an error for an empty value, a missing/garbled `ctrl-` prefix, more
+/// than one key character, or a key that does not map to a control byte
+/// (including `ctrl-[`, which would be `ESC`).
+fn parse_escape_key(s: &str) -> Result<u8> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        bail!("escape_key is empty; expected something like \"ctrl-^\"");
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let key = lower
+        .strip_prefix("ctrl-")
+        .or_else(|| lower.strip_prefix("c-"))
+        .with_context(|| {
+            format!("escape_key {trimmed:?} must start with \"ctrl-\" (e.g. \"ctrl-^\")")
+        })?;
+    let mut chars = key.chars();
+    let (Some(c), None) = (chars.next(), chars.next()) else {
+        bail!("escape_key {trimmed:?} must name exactly one key after \"ctrl-\"");
+    };
+    ctrl_byte(c).with_context(|| {
+        if c == '[' {
+            "escape_key \"ctrl-[\" is ESC and cannot be used as the escape key".to_string()
+        } else {
+            format!("escape_key {trimmed:?} does not map to a control key")
+        }
+    })
+}
+
+/// Render a control byte as a human-readable `Ctrl-<key>` label for the
+/// reconnect banner hint.  Inverse of [`ctrl_byte`].
+fn ctrl_label(byte: u8) -> String {
+    let key = match byte {
+        0x00 => '@',
+        0x01..=0x1a => (b'A' + (byte - 1)) as char,
+        0x1c => '\\',
+        0x1d => ']',
+        0x1e => '^',
+        0x1f => '_',
+        _ => '?',
+    };
+    format!("Ctrl-{key}")
+}
+
 /// Show a mosh-style reconnecting banner at the top of the terminal.
 ///
 /// The banner is white-on-blue, occupies the entire first row, and is
@@ -191,11 +264,12 @@ async fn countdown_reconnect_banner(
     attempt: u32,
     max_backoff_secs: u64,
     exit_token: &CancellationToken,
+    escape_label: &str,
 ) -> bool {
     for remaining in (0..=total_secs).rev() {
         let msg = format!(
             "\x1b[s\x1b[1;1H\x1b[44;97;1m [moshpit] server unreachable, reconnecting \
-(attempt #{attempt}, {remaining}s, max {max_backoff_secs}s, Ctrl-^ . to quit)... \x1b[K\x1b[0m\x1b[u"
+(attempt #{attempt}, {remaining}s, max {max_backoff_secs}s, {escape_label} . to quit)... \x1b[K\x1b[0m\x1b[u"
         );
         drop(stdout_tx.send(msg.into_bytes()).await);
         if remaining > 0 {
@@ -216,6 +290,7 @@ async fn run_escape_listener(
     exit_token: CancellationToken,
     done_token: CancellationToken,
     ready_tx: tokio::sync::oneshot::Sender<()>,
+    escape_byte: u8,
 ) {
     let mut state = EscapeState::Normal;
     // Acquire the lock interruptibly: if the countdown finishes before we can
@@ -236,13 +311,13 @@ async fn run_escape_listener(
                     for &byte in &data {
                         state = match state {
                             EscapeState::Normal => {
-                                if byte == 0x1E { EscapeState::PendingDot } else { EscapeState::Normal }
+                                if byte == escape_byte { EscapeState::PendingDot } else { EscapeState::Normal }
                             }
                             EscapeState::PendingDot => {
                                 if byte == 0x2E {
                                     exit_token.cancel();
                                     return;
-                                } else if byte == 0x1E {
+                                } else if byte == escape_byte {
                                     EscapeState::PendingDot
                                 } else {
                                     EscapeState::Normal
@@ -637,6 +712,7 @@ fn stdin_reader_loop(kb_tx: &Sender<Vec<u8>>, paused: &AtomicBool) {
 
 /// Runs the reconnect countdown alongside an escape-sequence listener.
 /// Returns `true` if the user pressed `Ctrl-^ .` to quit.
+#[cfg_attr(nightly, allow(clippy::too_many_arguments))]
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn countdown_with_escape(
     stdout_tx: &Sender<Vec<u8>>,
@@ -645,6 +721,8 @@ async fn countdown_with_escape(
     max_backoff_secs: u64,
     exit_token: &CancellationToken,
     kb_rx: Arc<Mutex<Receiver<Vec<u8>>>>,
+    escape_byte: u8,
+    escape_label: &str,
 ) -> bool {
     let escape_done = CancellationToken::new();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
@@ -653,6 +731,7 @@ async fn countdown_with_escape(
         exit_token.clone(),
         escape_done.clone(),
         ready_tx,
+        escape_byte,
     ));
     // Wait for the listener to acquire kb_rx before showing the Ctrl-^. hint.
     // In practice nearly instant; 200ms guards against a slow forwarder cleanup.
@@ -663,6 +742,7 @@ async fn countdown_with_escape(
         attempt,
         max_backoff_secs,
         exit_token,
+        escape_label,
     )
     .await;
     escape_done.cancel();
@@ -706,9 +786,12 @@ async fn run_session_loop(
     socket_addr: SocketAddr,
     server_ip: String,
     server_port: u16,
+    escape_byte: u8,
 ) -> Result<()> {
     // Clamp to [2 s, 24 h].
     let max_backoff = Duration::from_secs(config.max_reconnect_backoff_secs().clamp(2, 86_400));
+    // Human-readable label (e.g. "Ctrl-^") for the reconnect-countdown hint.
+    let escape_label = ctrl_label(escape_byte);
 
     // Persistent stdout writer — survives reconnects.
     let (stdout_tx, mut stdout_rx) = channel::<Vec<u8>>(256);
@@ -776,6 +859,7 @@ async fn run_session_loop(
                     config.predict(),
                     config.diff_mode(),
                     config.legacy_passthrough(),
+                    escape_byte,
                     exit_token.clone(),
                     exit_msg.clone(),
                 )
@@ -868,6 +952,8 @@ async fn run_session_loop(
                     max_backoff.as_secs(),
                     &exit_token,
                     kb_rx_shared.clone(),
+                    escape_byte,
+                    &escape_label,
                 )
                 .await
                 {
@@ -1063,6 +1149,7 @@ async fn run_udp_session(
     display_preference: DisplayPreference,
     diff_mode: DiffMode,
     legacy_passthrough: bool,
+    escape_byte: u8,
     exit_token: CancellationToken,
     exit_msg: ExitMsg,
 ) -> Result<()> {
@@ -1198,7 +1285,7 @@ async fn run_udp_session(
                         for &byte in &data {
                             escape_state = match escape_state {
                                 EscapeState::Normal => {
-                                    if byte == 0x1E {
+                                    if byte == escape_byte {
                                         EscapeState::PendingDot
                                     } else {
                                         to_forward.push(byte);
@@ -1209,12 +1296,12 @@ async fn run_udp_session(
                                     if byte == 0x2E {
                                         exit_requested = true;
                                         break;
-                                    } else if byte == 0x1E {
+                                    } else if byte == escape_byte {
                                         // Repeated prefix: discard, stay pending
                                         EscapeState::PendingDot
                                     } else {
-                                        // Forward the held 0x1E and the current byte
-                                        to_forward.push(0x1E);
+                                        // Forward the held prefix byte and the current byte
+                                        to_forward.push(escape_byte);
                                         to_forward.push(byte);
                                         EscapeState::Normal
                                     }
@@ -1823,12 +1910,13 @@ mod tests {
         assert!(String::from_utf8_lossy(&msg).ends_with("\x1b[0m\x1b[K\x1b[u"));
 
         let token = CancellationToken::new();
-        let _ = countdown_reconnect_banner(&tx, 0, 1, 10, &token).await;
+        let _ = countdown_reconnect_banner(&tx, 0, 1, 10, &token, "Ctrl-^").await;
         let msg = rx
             .recv()
             .await
             .ok_or_else(|| anyhow::anyhow!("channel closed"))?;
         assert!(String::from_utf8_lossy(&msg).contains("attempt #1"));
+        assert!(String::from_utf8_lossy(&msg).contains("Ctrl-^ . to quit"));
         Ok(())
     }
 
@@ -1837,7 +1925,7 @@ mod tests {
         let (tx, mut _rx) = channel(10);
         let token = CancellationToken::new();
         token.cancel();
-        let result = countdown_reconnect_banner(&tx, 0, 1, 10, &token).await;
+        let result = countdown_reconnect_banner(&tx, 0, 1, 10, &token, "Ctrl-^").await;
         assert!(result);
     }
 
@@ -2236,6 +2324,7 @@ mod tests {
                 exit_token.clone(),
                 done_token,
                 tokio::sync::oneshot::channel().0,
+                0x1E,
             )
             .await;
             assert!(!exit_token.is_cancelled());
@@ -2254,6 +2343,7 @@ mod tests {
                 exit_token.clone(),
                 done_token,
                 tokio::sync::oneshot::channel().0,
+                0x1E,
             )
             .await;
             assert!(!exit_token.is_cancelled());
@@ -2272,6 +2362,7 @@ mod tests {
                 exit_token.clone(),
                 done_token,
                 tokio::sync::oneshot::channel().0,
+                0x1E,
             )
             .await;
             assert!(!exit_token.is_cancelled());
@@ -2292,6 +2383,7 @@ mod tests {
                 exit_token.clone(),
                 done_token,
                 tokio::sync::oneshot::channel().0,
+                0x1E,
             )
             .await;
             assert!(!exit_token.is_cancelled());
@@ -2313,6 +2405,7 @@ mod tests {
                 exit_token.clone(),
                 done_token,
                 tokio::sync::oneshot::channel().0,
+                0x1E,
             )
             .await;
             assert!(!exit_token.is_cancelled());
@@ -2331,6 +2424,7 @@ mod tests {
                 exit_token.clone(),
                 done_token,
                 tokio::sync::oneshot::channel().0,
+                0x1E,
             )
             .await;
             assert!(exit_token.is_cancelled());
@@ -2350,9 +2444,82 @@ mod tests {
                 exit_token.clone(),
                 done_token,
                 tokio::sync::oneshot::channel().0,
+                0x1E,
             )
             .await;
             assert!(exit_token.is_cancelled());
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn custom_escape_byte_triggers_and_default_does_not() -> anyhow::Result<()> {
+            // With a custom prefix (0x01 / Ctrl-a), the old default prefix (0x1E)
+            // must NOT trigger, and the custom prefix + '.' MUST trigger.
+            let (tx, rx) = channel::<Vec<u8>>(8);
+            let kb_rx = Arc::new(Mutex::new(rx));
+            let exit_token = CancellationToken::new();
+            let done_token = CancellationToken::new();
+            // Old default sequence under a custom binding: must be ignored.
+            tx.send(vec![0x1E, 0x2E]).await?;
+            // Custom sequence: must trigger exit.
+            tx.send(vec![0x01, 0x2E]).await?;
+            run_escape_listener(
+                kb_rx,
+                exit_token.clone(),
+                done_token,
+                tokio::sync::oneshot::channel().0,
+                0x01,
+            )
+            .await;
+            assert!(exit_token.is_cancelled());
+            Ok(())
+        }
+    }
+
+    mod escape_key_parsing {
+        use super::super::{ctrl_byte, ctrl_label, parse_escape_key};
+
+        #[test]
+        fn parses_valid_escape_keys() -> anyhow::Result<()> {
+            assert_eq!(parse_escape_key("ctrl-^")?, 0x1E);
+            assert_eq!(parse_escape_key("ctrl-a")?, 0x01);
+            assert_eq!(parse_escape_key("CTRL-A")?, 0x01);
+            assert_eq!(parse_escape_key("C-]")?, 0x1D);
+            assert_eq!(parse_escape_key("  ctrl-@  ")?, 0x00);
+            assert_eq!(parse_escape_key("ctrl-_")?, 0x1F);
+            Ok(())
+        }
+
+        #[test]
+        fn rejects_invalid_escape_keys() {
+            assert!(parse_escape_key("").is_err());
+            assert!(parse_escape_key("   ").is_err());
+            assert!(parse_escape_key("^").is_err()); // missing ctrl- prefix
+            assert!(parse_escape_key("ctrl-").is_err()); // no key char
+            assert!(parse_escape_key("ctrl-ab").is_err()); // more than one key
+            assert!(parse_escape_key("ctrl-[").is_err()); // ESC is rejected
+            assert!(parse_escape_key("ctrl-1").is_err()); // not a control key
+            assert!(parse_escape_key("nope").is_err());
+        }
+
+        #[test]
+        fn ctrl_byte_excludes_esc() {
+            assert_eq!(ctrl_byte('['), None);
+            assert_eq!(ctrl_byte('^'), Some(0x1E));
+            assert_eq!(ctrl_byte('A'), Some(0x01));
+        }
+
+        #[test]
+        fn labels_round_trip_with_parse() -> anyhow::Result<()> {
+            assert_eq!(ctrl_label(0x1E), "Ctrl-^");
+            assert_eq!(ctrl_label(0x01), "Ctrl-A");
+            assert_eq!(ctrl_label(0x1D), "Ctrl-]");
+            assert_eq!(ctrl_label(0x00), "Ctrl-@");
+            assert_eq!(ctrl_label(0x1F), "Ctrl-_");
+            for key in ["ctrl-^", "ctrl-a", "ctrl-]", "ctrl-@", "ctrl-_"] {
+                let byte = parse_escape_key(key)?;
+                assert_eq!(parse_escape_key(&ctrl_label(byte))?, byte);
+            }
             Ok(())
         }
     }
