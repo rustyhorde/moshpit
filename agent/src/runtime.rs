@@ -676,9 +676,13 @@ where
 }
 
 fn socket_from_env() -> Result<PathBuf> {
-    var("MOSHPIT_AGENT_SOCK")
+    socket_from_value(var("MOSHPIT_AGENT_SOCK").ok())
+}
+
+fn socket_from_value(value: Option<String>) -> Result<PathBuf> {
+    value
         .map(PathBuf::from)
-        .map_err(|_| anyhow!("MOSHPIT_AGENT_SOCK not set — is the agent running?"))
+        .ok_or_else(|| anyhow!("MOSHPIT_AGENT_SOCK not set — is the agent running?"))
 }
 
 fn unlock_backend(config: &AgentConfig) -> Box<dyn UnlockBackend> {
@@ -981,7 +985,6 @@ async fn run_daemon(
 #[cfg(test)]
 mod tests {
     use std::{
-        env::{remove_var, set_var},
         fs,
         path::{Path, PathBuf},
         process::Command,
@@ -999,7 +1002,7 @@ mod tests {
         AgentConfig, AgentIdentityInfo, AgentRequest, AgentResponse, ConnectionState, Identity,
         ShellKind, Vault, best_identity, check_not_already_running, dispatch_request,
         format_socket_env, format_unset_socket_env, handle_connection, is_process_alive,
-        new_identity_map, sign_data, socket_from_env, unlock_backend,
+        new_identity_map, sign_data, socket_from_value, unlock_backend,
     };
 
     const TEST_KEY_PATH: &str = concat!(
@@ -1612,21 +1615,14 @@ mod tests {
     }
 
     #[test]
-    #[allow(unsafe_code)]
     fn socket_from_env_set() {
-        // Safety: nextest runs each test in its own process; no concurrent set_var calls.
-        unsafe { set_var("MOSHPIT_AGENT_SOCK", "/tmp/mpa-test-socket.sock") };
-        let result = socket_from_env();
-        unsafe { remove_var("MOSHPIT_AGENT_SOCK") };
+        let result = socket_from_value(Some("/tmp/mpa-test-socket.sock".to_string()));
         assert_eq!(result.unwrap(), PathBuf::from("/tmp/mpa-test-socket.sock"));
     }
 
     #[test]
-    #[allow(unsafe_code)]
     fn socket_from_env_not_set() {
-        // Safety: nextest runs each test in its own process; no concurrent env access.
-        unsafe { remove_var("MOSHPIT_AGENT_SOCK") };
-        assert!(socket_from_env().is_err());
+        assert!(socket_from_value(None).is_err());
     }
 
     #[test]
