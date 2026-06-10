@@ -2,6 +2,7 @@
 
 set run_tests true
 set run_coverage true
+set run_fuzz true
 set run_docs true
 set run_install true
 set run_musl true
@@ -18,6 +19,7 @@ for arg in $argv
             echo "Options:"
             echo "  --no-test      Skip nextest and all coverage steps"
             echo "  --no-coverage  Skip coverage steps only (lcov + html reports)"
+            echo "  --no-fuzz      Skip the cargo fuzz steps"
             echo "  --no-docs      Skip the documentation step"
             echo "  --no-install   Skip the cargo install step"
             echo "  --no-musl      Skip the MUSL Docker build step"
@@ -36,15 +38,18 @@ for arg in $argv
             echo "  8.  cargo llvm-cov nextest ...         (skipped with --no-test or --no-coverage)"
             echo "  9.  cargo llvm-cov report --lcov ...   (skipped with --no-test or --no-coverage)"
             echo "  10. cargo llvm-cov report --html       (skipped with --no-test or --no-coverage)"
-            echo "  11. run_install.fish                   (skipped with --no-install)"
-            echo "  12. run_musl.fish                      (skipped with --no-musl; --unstable passed through)"
-            echo "  13. cargo clean                        (only with --clean)"
+            echo "  11. cargo fuzz run (30s each target)   (skipped with --no-fuzz)"
+            echo "  12. run_install.fish                   (skipped with --no-install)"
+            echo "  13. run_musl.fish                      (skipped with --no-musl; --unstable passed through)"
+            echo "  14. cargo clean                        (only with --clean)"
             exit 0
         case --no-test
             set run_tests false
             set run_coverage false
         case --no-coverage
             set run_coverage false
+        case --no-fuzz
+            set run_fuzz false
         case --no-docs
             set run_docs false
         case --no-install
@@ -90,6 +95,11 @@ if test $run_coverage = true
     run_step cargo llvm-cov nextest -F unstable --exclude xtask --no-report --workspace
     run_step cargo llvm-cov report --lcov --output-path lcov.info
     run_step cargo llvm-cov report --html
+end
+
+if test $run_fuzz = true
+    run_step cargo fuzz run --fuzz-dir libmoshpit/fuzz fuzz_frame -- -max_total_time=30
+    run_step cargo fuzz run --fuzz-dir libmoshpit/fuzz fuzz_encframe -- -max_total_time=30
 end
 
 if test $run_install = true
