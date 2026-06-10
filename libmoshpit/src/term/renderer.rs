@@ -36,7 +36,7 @@
 
 use std::{
     fmt,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, PoisonError},
 };
 
 use super::emulator::Emulator;
@@ -255,22 +255,16 @@ pub fn render_server_update(
     renderer: &Arc<Mutex<Renderer>>,
     with_predictions: bool,
 ) -> Vec<u8> {
-    let emu = emulator
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let emu = emulator.lock().unwrap_or_else(PoisonError::into_inner);
     let screen = emu.screen();
     let (overlays, cursor) = if with_predictions {
-        let mut pred = prediction
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut pred = prediction.lock().unwrap_or_else(PoisonError::into_inner);
         pred.cull(screen);
         pred.apply(screen)
     } else {
         (Vec::new(), None)
     };
-    let mut rend = renderer
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut rend = renderer.lock().unwrap_or_else(PoisonError::into_inner);
     rend.render(screen, &overlays, cursor)
 }
 
@@ -292,22 +286,16 @@ pub fn render_prediction_update(
     renderer: &Arc<Mutex<Renderer>>,
     new_bytes: &[u8],
 ) -> Vec<u8> {
-    let emu = emulator
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let emu = emulator.lock().unwrap_or_else(PoisonError::into_inner);
     let screen = emu.screen();
     let (overlays, cursor) = {
-        let mut pred = prediction
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut pred = prediction.lock().unwrap_or_else(PoisonError::into_inner);
         for &byte in new_bytes {
             pred.new_user_byte(byte, screen);
         }
         pred.apply(screen)
     };
-    let mut rend = renderer
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut rend = renderer.lock().unwrap_or_else(PoisonError::into_inner);
     rend.render(screen, &overlays, cursor)
 }
 

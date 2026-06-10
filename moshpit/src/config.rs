@@ -6,7 +6,7 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
+use std::{collections::BTreeSet, env::var, path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use getset::{CopyGetters, Getters, Setters};
@@ -232,7 +232,7 @@ impl KexConfig for Config {
     }
 
     fn agent_socket(&self) -> Option<PathBuf> {
-        std::env::var("MOSHPIT_AGENT_SOCK").ok().map(PathBuf::from)
+        var("MOSHPIT_AGENT_SOCK").ok().map(PathBuf::from)
     }
 }
 

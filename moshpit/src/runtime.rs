@@ -7,13 +7,17 @@
 // modified, or distributed except according to those terms.
 
 use std::{
+    env::args_os,
+    error::Error,
     ffi::OsString,
-    fs::{DirBuilder, OpenOptions},
+    fmt::{Display, Formatter, Result as FmtResult},
+    fs::{DirBuilder, File, OpenOptions, create_dir_all},
     io::{Read as _, Write as _, stdin, stdout},
     net::SocketAddr,
     path::{Path, PathBuf},
+    process::exit,
     sync::{
-        Arc,
+        Arc, PoisonError,
         atomic::{AtomicBool, Ordering},
     },
     thread,
@@ -41,7 +45,9 @@ use tokio::{
     sync::{
         Mutex,
         mpsc::{Receiver, Sender, channel},
+        oneshot,
     },
+    task::{block_in_place, yield_now},
     time,
 };
 use tokio_util::sync::CancellationToken;
@@ -64,7 +70,7 @@ where
     // recover the raw `ArgMatches` provenance inside `Cli::parse_argv`.
     let command_line: Vec<OsString> = match args {
         Some(args) => args.into_iter().map(Into::into).collect(),
-        None => std::env::args_os().collect(),
+        None => args_os().collect(),
     };
     let cli = Cli::parse_argv(command_line)?;
 
@@ -149,13 +155,13 @@ struct FatalKexError {
     key_path: PathBuf,
 }
 
-impl std::fmt::Display for FatalKexError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for FatalKexError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         write!(f, "{} (key: {})", self.inner, self.key_path.display())
     }
 }
 
-impl std::error::Error for FatalKexError {}
+impl Error for FatalKexError {}
 
 #[derive(Clone, Copy, Default)]
 enum EscapeState {
@@ -289,7 +295,7 @@ async fn run_escape_listener(
     kb_rx: Arc<Mutex<Receiver<Vec<u8>>>>,
     exit_token: CancellationToken,
     done_token: CancellationToken,
-    ready_tx: tokio::sync::oneshot::Sender<()>,
+    ready_tx: oneshot::Sender<()>,
     escape_byte: u8,
 ) {
     let mut state = EscapeState::Normal;
@@ -725,7 +731,7 @@ async fn countdown_with_escape(
     escape_label: &str,
 ) -> bool {
     let escape_done = CancellationToken::new();
-    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (ready_tx, ready_rx) = oneshot::channel();
     let escape_handle = spawn(run_escape_listener(
         kb_rx,
         exit_token.clone(),
@@ -775,7 +781,7 @@ fn restore_terminal_and_exit(exit_msg: Option<&[u8]>) -> ! {
     }
     drop(out.flush());
     drop(disable_raw_mode());
-    std::process::exit(0);
+    exit(0);
 }
 
 /// Persistent reconnect loop.  Runs until the shell exits (via `process::exit`).
@@ -871,9 +877,7 @@ async fn run_session_loop(
                 if exit_token.is_cancelled() {
                     // Let the stdout channel settle before the direct teardown write.
                     time::sleep(Duration::from_millis(100)).await;
-                    let msg = *exit_msg
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let msg = *exit_msg.lock().unwrap_or_else(PoisonError::into_inner);
                     restore_terminal_and_exit(msg);
                 }
                 // Session dropped — restore the terminal (the server-side app may
@@ -941,9 +945,8 @@ async fn run_session_loop(
                 // Reset passphrase cache on early failures so the user can
                 // re-enter it on the next attempt.
                 if !had_successful_kex {
-                    *pass_cache
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = PassCache::Uncached;
+                    *pass_cache.lock().unwrap_or_else(PoisonError::into_inner) =
+                        PassCache::Uncached;
                 }
                 if countdown_with_escape(
                     &stdout_tx,
@@ -989,9 +992,7 @@ async fn connect_and_kex(
     let cache = pass_cache.clone();
     let paused_pass = stdin_paused.clone();
     let pass_fn = move || -> Result<Option<String>> {
-        let guard = cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = cache.lock().unwrap_or_else(PoisonError::into_inner);
         if guard.is_cached() {
             info!(
                 "passphrase: returning cached value (has_passphrase={})",
@@ -1001,17 +1002,14 @@ async fn connect_and_kex(
         }
         drop(guard);
         info!("passphrase: prompting user");
-        let result =
-            tokio::task::block_in_place(|| with_cooked_term(&paused_pass, read_passpharase));
+        let result = block_in_place(|| with_cooked_term(&paused_pass, read_passpharase));
         match &result {
             Ok(Some(_)) => info!("passphrase: prompt returned a passphrase"),
             Ok(None) => info!("passphrase: prompt returned None (key may be unencrypted)"),
             Err(e) => error!("passphrase: prompt failed: {e}"),
         }
         if let Ok(ref pass) = result {
-            *cache
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = match pass {
+            *cache.lock().unwrap_or_else(PoisonError::into_inner) = match pass {
                 Some(s) => PassCache::Passphrase(s.clone()),
                 None => PassCache::NoPassphrase,
             };
@@ -1024,7 +1022,7 @@ async fn connect_and_kex(
     let paused_tofu = stdin_paused.clone();
     let tofu_fn: libmoshpit::TofuFn =
         Arc::new(move |host: &str, fingerprint: &str| -> Result<bool> {
-            tokio::task::block_in_place(|| {
+            block_in_place(|| {
                 with_cooked_term(&paused_tofu, || {
                     let prompt = format!(
                         "The authenticity of host '{host}' can't be established.\n\
@@ -1042,7 +1040,7 @@ async fn connect_and_kex(
     let paused_mismatch = stdin_paused;
     let mismatch_fn: libmoshpit::HostKeyMismatchFn = Arc::new(
         move |host: &str, old_fingerprint: &str, new_fingerprint: &str| -> Result<bool> {
-            tokio::task::block_in_place(|| {
+            block_in_place(|| {
                 with_cooked_term(&paused_mismatch, || {
                     eprintln!("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@");
                     eprintln!("@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @");
@@ -1328,9 +1326,9 @@ async fn run_udp_session(
                                     // Legacy: paint the prediction out-of-band on top of
                                     // the raw bytes the renderer is not tracking.
                                     let (overlays, cursor) = {
-                                        let emu = emu_fwd.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                                        let emu = emu_fwd.lock().unwrap_or_else(PoisonError::into_inner);
                                         let screen = emu.screen();
-                                        let mut pred = pred_fwd.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                                        let mut pred = pred_fwd.lock().unwrap_or_else(PoisonError::into_inner);
                                         for byte in &to_forward {
                                             pred.new_user_byte(*byte, screen);
                                         }
@@ -1356,7 +1354,7 @@ async fn run_udp_session(
                         if exit_requested {
                             *exit_msg_fwd
                                 .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                .unwrap_or_else(PoisonError::into_inner) =
                                 Some(b"[moshpit] Disconnected.\r\n");
                             exit_token_fwd.cancel();
                             fwd_token.cancel();
@@ -1385,7 +1383,7 @@ async fn run_udp_session(
     {
         forwarder_abort.abort();
         // Yield so the executor can drop the aborted task and release the lock.
-        tokio::task::yield_now().await;
+        yield_now().await;
     }
     Ok(())
 }
@@ -1406,8 +1404,8 @@ fn spawn_resize_handler(
                     _ = sigwinch.recv() => {
                         let (columns, rows) = terminal_size()
                             .map_or((80, 24), |(width, height)| (width.0, height.0));
-                        emulator.lock().unwrap_or_else(std::sync::PoisonError::into_inner).set_size(rows, columns);
-                        renderer.lock().unwrap_or_else(std::sync::PoisonError::into_inner).set_size(rows, columns);
+                        emulator.lock().unwrap_or_else(PoisonError::into_inner).set_size(rows, columns);
+                        renderer.lock().unwrap_or_else(PoisonError::into_inner).set_size(rows, columns);
                         if let Err(e) =
                             resize_tx.send(EncryptedFrame::Resize((resize_uuid, columns, rows))).await
                         {
@@ -1447,11 +1445,11 @@ fn spawn_resize_handler(
                 let (columns, rows) = current_size;
                 emulator
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .unwrap_or_else(PoisonError::into_inner)
                     .set_size(rows, columns);
                 renderer
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .unwrap_or_else(PoisonError::into_inner)
                     .set_size(rows, columns);
                 if let Err(e) =
                     resize_tx.blocking_send(EncryptedFrame::Resize((resize_uuid, columns, rows)))
@@ -1658,7 +1656,7 @@ fn client_id() -> Option<Uuid> {
 #[allow(clippy::unnecessary_wraps)]
 fn client_id_in_home(home: &Path) -> Option<Uuid> {
     let path = client_id_path(home);
-    if let Ok(mut f) = std::fs::File::open(&path) {
+    if let Ok(mut f) = File::open(&path) {
         let mut buf = String::new();
         drop(f.read_to_string(&mut buf));
         if let Ok(uuid) = buf.trim().parse::<Uuid>() {
@@ -1668,9 +1666,9 @@ fn client_id_in_home(home: &Path) -> Option<Uuid> {
     // First run: generate a new client ID and persist it.
     let id = Uuid::new_v4();
     if let Some(parent) = path.parent() {
-        drop(std::fs::create_dir_all(parent));
+        drop(create_dir_all(parent));
     }
-    if let Ok(mut f) = std::fs::File::create(&path) {
+    if let Ok(mut f) = File::create(&path) {
         drop(write!(f, "{id}"));
     }
     Some(id)
@@ -1727,7 +1725,7 @@ fn session_file_path_in_home(home: &Path, host: &str, port: u16) -> Option<PathB
 }
 
 fn read_uuid_from_path(path: &Path) -> Option<Uuid> {
-    let mut file = std::fs::File::open(path).ok()?;
+    let mut file = File::open(path).ok()?;
     let mut buf = String::new();
     let _ = file.read_to_string(&mut buf).ok();
     buf.trim().parse::<Uuid>().ok()
@@ -1760,7 +1758,7 @@ fn write_uuid_to_path(path: &Path, uuid: Uuid) -> Result<()> {
         }
         #[cfg(not(unix))]
         {
-            std::fs::File::create(path)?
+            File::create(path)?
         }
     };
     write!(file, "{uuid}")?;
@@ -1781,8 +1779,9 @@ fn write_session_uuid(host: &str, port: u16, session_uuid: Uuid) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::{
-        fs::DirBuilder,
-        io::Read as _,
+        env::{remove_var, set_var, temp_dir, var},
+        fs::{DirBuilder, File, create_dir_all, remove_dir_all, write},
+        io::{ErrorKind, Read as _},
         path::{Path, PathBuf},
         sync::{Arc, atomic::AtomicBool},
     };
@@ -1807,8 +1806,8 @@ mod tests {
 
     impl TestHome {
         fn new() -> Self {
-            let path = std::env::temp_dir().join(Uuid::new_v4().to_string());
-            std::fs::create_dir_all(&path).expect("failed to create temp dir");
+            let path = temp_dir().join(Uuid::new_v4().to_string());
+            create_dir_all(&path).expect("failed to create temp dir");
             Self { path }
         }
 
@@ -1819,7 +1818,7 @@ mod tests {
 
     impl Drop for TestHome {
         fn drop(&mut self) {
-            drop(std::fs::remove_dir_all(&self.path));
+            drop(remove_dir_all(&self.path));
         }
     }
 
@@ -1833,12 +1832,12 @@ mod tests {
     impl EnvGuard {
         #[allow(unsafe_code)]
         fn new(key: &'static str, value: Option<&str>) -> Self {
-            let original = std::env::var(key).ok();
+            let original = var(key).ok();
             // SAFETY: test-only; nextest runs each test in its own process so
             // there is no concurrent env access from other threads.
             match value {
-                Some(v) => unsafe { std::env::set_var(key, v) },
-                None => unsafe { std::env::remove_var(key) },
+                Some(v) => unsafe { set_var(key, v) },
+                None => unsafe { remove_var(key) },
             }
             Self { key, original }
         }
@@ -1849,8 +1848,8 @@ mod tests {
         fn drop(&mut self) {
             // SAFETY: same as EnvGuard::new.
             match &self.original {
-                Some(v) => unsafe { std::env::set_var(self.key, v) },
-                None => unsafe { std::env::remove_var(self.key) },
+                Some(v) => unsafe { set_var(self.key, v) },
+                None => unsafe { remove_var(self.key) },
             }
         }
     }
@@ -1860,13 +1859,13 @@ mod tests {
     fn env_guard_restores_original_value() {
         // Safety: nextest runs each test in its own process; no concurrent env access.
         const KEY: &str = "MOSHPIT_TEST_ENV_GUARD_RESTORE";
-        unsafe { std::env::set_var(KEY, "original") };
+        unsafe { set_var(KEY, "original") };
         {
             let _guard = EnvGuard::new(KEY, Some("overridden"));
-            assert_eq!(std::env::var(KEY).ok().as_deref(), Some("overridden"));
+            assert_eq!(var(KEY).ok().as_deref(), Some("overridden"));
         }
-        assert_eq!(std::env::var(KEY).ok().as_deref(), Some("original"));
-        unsafe { std::env::remove_var(KEY) };
+        assert_eq!(var(KEY).ok().as_deref(), Some("original"));
+        unsafe { remove_var(KEY) };
     }
 
     #[test]
@@ -1931,23 +1930,23 @@ mod tests {
 
     #[test]
     fn read_uuid_from_path_missing_file_returns_none() {
-        let dir = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        let dir = temp_dir().join(Uuid::new_v4().to_string());
         let path = dir.join("session");
         assert!(read_uuid_from_path(&path).is_none());
     }
 
     #[test]
     fn read_uuid_from_path_garbage_returns_none() {
-        let dir = std::env::temp_dir().join(Uuid::new_v4().to_string());
-        std::fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let dir = temp_dir().join(Uuid::new_v4().to_string());
+        create_dir_all(&dir).expect("failed to create temp dir");
         let path = dir.join("session");
-        std::fs::write(&path, "not-a-uuid").expect("failed to write test file");
+        write(&path, "not-a-uuid").expect("failed to write test file");
         assert!(read_uuid_from_path(&path).is_none());
     }
 
     #[test]
     fn write_and_read_uuid_roundtrip() -> Result<()> {
-        let dir = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        let dir = temp_dir().join(Uuid::new_v4().to_string());
         let path = dir.join("sub").join("session");
         let uuid = Uuid::new_v4();
         write_uuid_to_path(&path, uuid)?;
@@ -1957,7 +1956,7 @@ mod tests {
 
     #[test]
     fn write_uuid_creates_parent_directories() -> Result<()> {
-        let dir = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        let dir = temp_dir().join(Uuid::new_v4().to_string());
         let nested = dir.join("a").join("b").join("c").join("session");
         let uuid = Uuid::new_v4();
         write_uuid_to_path(&nested, uuid)?;
@@ -1995,11 +1994,11 @@ mod tests {
         if let Some(parent) = path.parent() {
             DirBuilder::new().recursive(true).create(parent)?;
         }
-        std::fs::write(&path, uuid.to_string())?;
+        write(&path, uuid.to_string())?;
 
         // Read it back
         let read_uuid = {
-            let mut file = std::fs::File::open(&path)?;
+            let mut file = File::open(&path)?;
             let mut buf = String::new();
             let _ = file.read_to_string(&mut buf)?;
             buf.trim().parse::<Uuid>()?
@@ -2022,7 +2021,7 @@ mod tests {
 
     #[test]
     fn test_create_key_dir() -> Result<()> {
-        let dir = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        let dir = temp_dir().join(Uuid::new_v4().to_string());
         let key_dir = dir.join("keys");
         create_key_dir(&key_dir)?;
         assert!(key_dir.exists());
@@ -2032,15 +2031,15 @@ mod tests {
 
     #[test]
     fn test_maybe_generate_keypair_existing() -> Result<()> {
-        let dir = std::env::temp_dir().join(Uuid::new_v4().to_string());
-        std::fs::create_dir_all(&dir)?;
+        let dir = temp_dir().join(Uuid::new_v4().to_string());
+        create_dir_all(&dir)?;
         let priv_path = dir.join("id_x25519");
         let pub_path = dir.join("id_x25519.pub");
         let config_path = dir.join("config.toml");
 
-        std::fs::write(&priv_path, "fake private key")?;
-        std::fs::write(&pub_path, "fake public key")?;
-        std::fs::write(
+        write(&priv_path, "fake private key")?;
+        write(&pub_path, "fake public key")?;
+        write(
             &config_path,
             "[tracing.stdout]\n\
              with_target = false\n\
@@ -2114,15 +2113,15 @@ mod tests {
     async fn test_connect_and_kex_kex_failure() -> Result<()> {
         // A live agent would supply an identity and bypass the empty-key-file path.
         let _agent_guard = EnvGuard::new("MOSHPIT_AGENT_SOCK", None);
-        let dir = std::env::temp_dir().join(Uuid::new_v4().to_string());
-        std::fs::create_dir_all(&dir)?;
+        let dir = temp_dir().join(Uuid::new_v4().to_string());
+        create_dir_all(&dir)?;
         let config_path = dir.join("config.toml");
         // Empty key files: /dev/null doesn't exist on Windows, so create real empty files.
         let empty_priv_key_path = dir.join("empty_priv_key");
         let empty_pub_key_path = dir.join("empty_pub_key");
-        std::fs::write(&empty_priv_key_path, b"")?;
-        std::fs::write(&empty_pub_key_path, b"")?;
-        std::fs::write(
+        write(&empty_priv_key_path, b"")?;
+        write(&empty_pub_key_path, b"")?;
+        write(
             &config_path,
             "[tracing.stdout]\n\
              with_target = false\n\
@@ -2161,7 +2160,7 @@ mod tests {
         // Bind a real listener
         let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
             Ok(listener) => listener,
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return Ok(()),
+            Err(e) if e.kind() == ErrorKind::PermissionDenied => return Ok(()),
             Err(e) => return Err(e.into()),
         };
         let port = listener.local_addr()?.port();
@@ -2223,7 +2222,7 @@ mod tests {
         // Non-existent key paths
         let priv_path = home.path().join("nonexistent_id_x25519");
         let pub_path = home.path().join("nonexistent_id_x25519.pub");
-        std::fs::write(
+        write(
             &config_path,
             "[tracing.stdout]\n\
              with_target = false\n\
@@ -2306,8 +2305,8 @@ mod tests {
 
     mod escape_listener {
         use std::sync::Arc;
-        use tokio::sync::Mutex;
         use tokio::sync::mpsc::channel;
+        use tokio::sync::{Mutex, oneshot};
         use tokio_util::sync::CancellationToken;
 
         use super::super::run_escape_listener;
@@ -2323,7 +2322,7 @@ mod tests {
                 kb_rx,
                 exit_token.clone(),
                 done_token,
-                tokio::sync::oneshot::channel().0,
+                oneshot::channel().0,
                 0x1E,
             )
             .await;
@@ -2342,7 +2341,7 @@ mod tests {
                 kb_rx,
                 exit_token.clone(),
                 done_token,
-                tokio::sync::oneshot::channel().0,
+                oneshot::channel().0,
                 0x1E,
             )
             .await;
@@ -2361,7 +2360,7 @@ mod tests {
                 kb_rx,
                 exit_token.clone(),
                 done_token,
-                tokio::sync::oneshot::channel().0,
+                oneshot::channel().0,
                 0x1E,
             )
             .await;
@@ -2382,7 +2381,7 @@ mod tests {
                 kb_rx,
                 exit_token.clone(),
                 done_token,
-                tokio::sync::oneshot::channel().0,
+                oneshot::channel().0,
                 0x1E,
             )
             .await;
@@ -2404,7 +2403,7 @@ mod tests {
                 kb_rx,
                 exit_token.clone(),
                 done_token,
-                tokio::sync::oneshot::channel().0,
+                oneshot::channel().0,
                 0x1E,
             )
             .await;
@@ -2423,7 +2422,7 @@ mod tests {
                 kb_rx,
                 exit_token.clone(),
                 done_token,
-                tokio::sync::oneshot::channel().0,
+                oneshot::channel().0,
                 0x1E,
             )
             .await;
@@ -2443,7 +2442,7 @@ mod tests {
                 kb_rx,
                 exit_token.clone(),
                 done_token,
-                tokio::sync::oneshot::channel().0,
+                oneshot::channel().0,
                 0x1E,
             )
             .await;
@@ -2467,7 +2466,7 @@ mod tests {
                 kb_rx,
                 exit_token.clone(),
                 done_token,
-                tokio::sync::oneshot::channel().0,
+                oneshot::channel().0,
                 0x01,
             )
             .await;

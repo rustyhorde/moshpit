@@ -27,6 +27,7 @@ use std::{
     fs::{File, OpenOptions},
     io::{Read as _, Write as _},
     path::{Path, PathBuf},
+    str::from_utf8,
 };
 
 #[cfg(target_family = "unix")]
@@ -38,7 +39,7 @@ use argon2::{
     password_hash::phc::SaltString,
 };
 use aws_lc_rs::{
-    aead::{AES_256_GCM_SIV, Aad, Nonce, RandomizedNonceKey},
+    aead::{AES_256_GCM_SIV, Aad, LessSafeKey, Nonce, RandomizedNonceKey, UnboundKey},
     hkdf::{HKDF_SHA512, Salt},
     rand::fill,
 };
@@ -187,10 +188,9 @@ impl Vault {
         }
 
         let cipher = read_lv(&mut buf)?;
-        let cipher_str =
-            std::str::from_utf8(&cipher).map_err(|_| anyhow!("invalid vault cipher"))?;
+        let cipher_str = from_utf8(&cipher).map_err(|_| anyhow!("invalid vault cipher"))?;
         let kdf = read_lv(&mut buf)?;
-        let kdf_str = std::str::from_utf8(&kdf).map_err(|_| anyhow!("invalid vault kdf"))?;
+        let kdf_str = from_utf8(&kdf).map_err(|_| anyhow!("invalid vault kdf"))?;
 
         if cipher_str == VAULT_NONE_CIPHER && kdf_str == VAULT_NONE_KDF {
             let payload = read_lv(&mut buf)?;
@@ -203,7 +203,7 @@ impl Vault {
         }
 
         // Verify passphrase via Argon2
-        let hash_str = std::str::from_utf8(&kdf).map_err(|_| anyhow!("invalid kdf string"))?;
+        let hash_str = from_utf8(&kdf).map_err(|_| anyhow!("invalid kdf string"))?;
         let parsed =
             PasswordHash::new(hash_str).map_err(|e| anyhow!("invalid argon2 hash: {e}"))?;
         Argon2::default()
@@ -219,8 +219,8 @@ impl Vault {
         prk.expand(&[HKDF_INFO], &AES_256_GCM_SIV)?
             .fill(&mut key_bytes)?;
         let nonce = Nonce::try_assume_unique_for_key(&nonce_bytes)?;
-        let unbound = aws_lc_rs::aead::UnboundKey::new(&AES_256_GCM_SIV, &key_bytes)?;
-        let key = aws_lc_rs::aead::LessSafeKey::new(unbound);
+        let unbound = UnboundKey::new(&AES_256_GCM_SIV, &key_bytes)?;
+        let key = LessSafeKey::new(unbound);
         let plaintext = key
             .open_in_place(nonce, Aad::empty(), &mut ciphertext)
             .map_err(|_| anyhow!("vault decryption failed"))?;
@@ -287,6 +287,8 @@ pub(crate) fn default_vault_path() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::write;
+
     use anyhow::Result;
     use base64::engine::general_purpose::STANDARD;
     use bytes::BytesMut;
@@ -366,7 +368,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("vault");
         let garbage = STANDARD.encode(b"not-a-valid-vault");
-        std::fs::write(&path, garbage.as_bytes()).expect("write test file");
+        write(&path, garbage.as_bytes()).expect("write test file");
         let result = Vault::load_encrypted(&path, "any");
         assert!(
             result
@@ -385,7 +387,7 @@ mod tests {
         write_lv(&mut out, b"unknown-cipher")?;
         write_lv(&mut out, b"none")?;
         let encoded = STANDARD.encode(&out);
-        std::fs::write(&path, encoded.as_bytes()).expect("write test file");
+        write(&path, encoded.as_bytes()).expect("write test file");
         let result = Vault::load_encrypted(&path, "any");
         assert!(
             result

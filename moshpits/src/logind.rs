@@ -122,6 +122,8 @@ pub(crate) fn create_session(
 
 #[cfg(test)]
 mod test {
+    use std::env::set_var;
+
     use super::create_session;
 
     #[test]
@@ -134,7 +136,7 @@ mod test {
         // SAFETY: nextest runs each test in its own process, and this is the
         // only test that touches DBUS_SYSTEM_BUS_ADDRESS.
         unsafe {
-            std::env::set_var(
+            set_var(
                 "DBUS_SYSTEM_BUS_ADDRESS",
                 "unix:path=/nonexistent/moshpit-logind-test",
             );

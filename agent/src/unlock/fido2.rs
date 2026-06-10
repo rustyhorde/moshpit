@@ -40,6 +40,8 @@ use std::{
     fs,
     io::Write as _,
     path::{Path, PathBuf},
+    ptr::null,
+    slice::from_raw_parts,
     sync::LazyLock,
 };
 
@@ -433,7 +435,7 @@ fn enroll(dev: &Dev) -> Result<Fido2State> {
             USER_ID.len(),
             c"moshpit-agent".as_ptr(),
             c"Moshpit Agent".as_ptr(),
-            std::ptr::null(),
+            null(),
         )
     })?;
 
@@ -444,14 +446,14 @@ fn enroll(dev: &Dev) -> Result<Fido2State> {
     fido_check(unsafe { sys::fido_cred_set_rk(cred.ptr, sys::FIDO_OPT_FALSE) })?;
 
     eprintln!("Touch your FIDO2 security key to enroll with moshpit-agent...");
-    fido_check(unsafe { sys::fido_dev_make_cred(dev.ptr, cred.ptr, std::ptr::null()) })?;
+    fido_check(unsafe { sys::fido_dev_make_cred(dev.ptr, cred.ptr, null()) })?;
 
     let id_ptr = unsafe { sys::fido_cred_id_ptr(cred.ptr) };
     let id_len = unsafe { sys::fido_cred_id_len(cred.ptr) };
     if id_ptr.is_null() || id_len == 0 {
         return Err(anyhow!("fido2: credential ID is empty after make_cred"));
     }
-    let credential_id = unsafe { std::slice::from_raw_parts(id_ptr, id_len) }.to_vec();
+    let credential_id = unsafe { from_raw_parts(id_ptr, id_len) }.to_vec();
 
     Fido2State::generate(credential_id)
 }
@@ -484,7 +486,7 @@ fn hmac_secret(dev: &Dev, state: &Fido2State) -> Result<[u8; 32]> {
     fido_check(unsafe { sys::fido_assert_set_up(assert.ptr, sys::FIDO_OPT_TRUE) })?;
 
     eprintln!("Touch your FIDO2 security key to unlock...");
-    fido_check(unsafe { sys::fido_dev_get_assert(dev.ptr, assert.ptr, std::ptr::null()) })?;
+    fido_check(unsafe { sys::fido_dev_get_assert(dev.ptr, assert.ptr, null()) })?;
 
     let hmac_ptr = unsafe { sys::fido_assert_hmac_secret_ptr(assert.ptr, 0) };
     let hmac_len = unsafe { sys::fido_assert_hmac_secret_len(assert.ptr, 0) };
@@ -498,7 +500,7 @@ fn hmac_secret(dev: &Dev, state: &Fido2State) -> Result<[u8; 32]> {
         ));
     }
 
-    Ok(unsafe { std::slice::from_raw_parts(hmac_ptr, hmac_len) }
+    Ok(unsafe { from_raw_parts(hmac_ptr, hmac_len) }
         .try_into()
         .expect("length is 32"))
 }

@@ -68,6 +68,24 @@ rustversion = { workspace = true }
 vergen-gix = { workspace = true }
 
 [[package.metadata.cargo-matrix.channel]]
+name = "default"
+# secret-service matches the dep name so cargo-matrix treats it as an implicit dep-feature;
+# include_optional re-adds it explicitly to the powerset seed.
+include_optional = ["secret-service"]
+# security-framework is guarded #![cfg(target_vendor = "apple")] — hard compile error on Linux.
+always_deny = ["macos-keychain"]
+mutually_exclusive = [
+  [
+    "fido2",
+    "fprintd",
+    "secret-service",
+    "ssh-agent-piggyback",
+    "systemd-creds",
+    "tpm",
+  ],
+]
+
+[[package.metadata.cargo-matrix.channel]]
 name = "linux"
 # secret-service matches the dep name so cargo-matrix treats it as an implicit dep-feature;
 # include_optional re-adds it explicitly to the powerset seed.

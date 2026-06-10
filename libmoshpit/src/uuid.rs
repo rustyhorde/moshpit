@@ -8,7 +8,7 @@
 
 //! UUID wrapper for session identifiers.
 
-use std::fmt::{Display, Formatter};
+use std::fmt::{Display, Formatter, Result as FmtResult};
 
 use bincode_next::{
     BorrowDecode, Decode, Encode,
@@ -65,7 +65,7 @@ impl Mock for UuidWrapper {
 }
 
 impl Display for UuidWrapper {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         write!(f, "{}", self.0)
     }
 }

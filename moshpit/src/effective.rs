@@ -21,7 +21,13 @@
 //! `mode` and `user` (`#[serde(skip_deserializing)]`, derived at connect time)
 //! and `resume_session_uuid` (`#[serde(skip)]`, read from disk per session).
 
-use std::{collections::BTreeSet, io::IsTerminal as _, path::Path};
+use std::{
+    collections::BTreeSet,
+    env::var_os,
+    fs::read_to_string,
+    io::{IsTerminal as _, stdout},
+    path::Path,
+};
 
 use libmoshpit::{KexConfig as _, PathDefaults as _};
 use serde::Serialize;
@@ -100,7 +106,7 @@ fn classify(from_env: bool, from_cli: bool, from_file: bool) -> Origin {
 /// contributes nothing.
 fn toml_keys(path: &Path) -> BTreeSet<String> {
     let mut keys = BTreeSet::new();
-    let Ok(text) = std::fs::read_to_string(path) else {
+    let Ok(text) = read_to_string(path) else {
         return keys;
     };
     let Ok(table) = text.parse::<toml::Table>() else {
@@ -159,8 +165,7 @@ impl Ctx<'_> {
         env_suffix: Option<&str>,
         toml_key: Option<&str>,
     ) -> EffectiveRow {
-        let from_env =
-            env_suffix.is_some_and(|s| std::env::var_os(format!("{}_{s}", self.prefix)).is_some());
+        let from_env = env_suffix.is_some_and(|s| var_os(format!("{}_{s}", self.prefix)).is_some());
         let from_cli = clap_id.is_some_and(|id| self.cli.explicit_args().contains(id));
         let from_file = toml_key.is_some_and(|k| self.toml.contains(k));
         EffectiveRow {
@@ -365,7 +370,7 @@ fn elide(value: &str) -> String {
 pub(crate) fn print_table(rows: &[EffectiveRow]) {
     use crossterm::style::Stylize as _;
 
-    let color = std::io::stdout().is_terminal();
+    let color = stdout().is_terminal();
     let values: Vec<String> = rows.iter().map(|r| elide(&r.value)).collect();
     let field_w = rows
         .iter()
@@ -435,7 +440,12 @@ pub(crate) fn print_json(rows: &[EffectiveRow]) {
 
 #[cfg(test)]
 mod tests {
-    use std::{io::Write as _, path::Path};
+    use std::{
+        env::{remove_var, set_var, var},
+        fs::File,
+        io::Write as _,
+        path::{Path, PathBuf},
+    };
 
     use tempfile::TempDir;
 
@@ -455,12 +465,12 @@ mod tests {
     impl EnvGuard {
         #[allow(unsafe_code)]
         fn new(key: &'static str, value: Option<&str>) -> Self {
-            let original = std::env::var(key).ok();
+            let original = var(key).ok();
             // SAFETY: test-only; nextest runs each test in its own process so
             // there is no concurrent env access from other threads.
             match value {
-                Some(v) => unsafe { std::env::set_var(key, v) },
-                None => unsafe { std::env::remove_var(key) },
+                Some(v) => unsafe { set_var(key, v) },
+                None => unsafe { remove_var(key) },
             }
             Self { key, original }
         }
@@ -471,18 +481,18 @@ mod tests {
         fn drop(&mut self) {
             // SAFETY: same as EnvGuard::new.
             match &self.original {
-                Some(v) => unsafe { std::env::set_var(self.key, v) },
-                None => unsafe { std::env::remove_var(self.key) },
+                Some(v) => unsafe { set_var(self.key, v) },
+                None => unsafe { remove_var(self.key) },
             }
         }
     }
 
     /// Write `contents` to a `config.toml` inside a fresh temp dir, returning both
     /// (keep the `TempDir` alive for the duration of the test).
-    fn write_toml(contents: &str) -> (TempDir, std::path::PathBuf) {
+    fn write_toml(contents: &str) -> (TempDir, PathBuf) {
         let dir = TempDir::new().expect("temp dir creation");
         let path = dir.path().join("config.toml");
-        let mut file = std::fs::File::create(&path).expect("create config.toml");
+        let mut file = File::create(&path).expect("create config.toml");
         file.write_all(contents.as_bytes()).expect("write config");
         (dir, path)
     }

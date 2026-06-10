@@ -239,6 +239,9 @@
 use std::process::exit;
 
 #[cfg(unix)]
+use tokio::runtime::Builder;
+
+#[cfg(unix)]
 use libmoshpit::{clap_or_error, success};
 
 #[cfg(unix)]
@@ -258,7 +261,7 @@ mod vault;
 fn main() {
     #[cfg(unix)]
     exit(
-        tokio::runtime::Builder::new_multi_thread()
+        Builder::new_multi_thread()
             .enable_all()
             .build()
             .expect("tokio runtime")

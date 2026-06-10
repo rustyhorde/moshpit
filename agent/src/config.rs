@@ -6,6 +6,7 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
+use std::env::var;
 use std::path::PathBuf;
 
 use crate::cli::ShellKind;
@@ -71,7 +72,7 @@ impl AgentConfig {
 pub(crate) fn default_socket_path() -> PathBuf {
     #[cfg(target_family = "unix")]
     {
-        if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
+        if let Ok(runtime_dir) = var("XDG_RUNTIME_DIR") {
             let uid = nix::unistd::getuid().as_raw();
             return PathBuf::from(runtime_dir).join(format!("moshpit-agent-{uid}.sock"));
         }

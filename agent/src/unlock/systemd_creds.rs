@@ -15,7 +15,9 @@
 //! This backend reads the plaintext credential file and returns it as the
 //! vault master passphrase — no interactive prompt needed.
 
+use std::env::var;
 use std::fs;
+use std::path::Path;
 
 use anyhow::{Result, anyhow};
 
@@ -28,9 +30,9 @@ pub(crate) struct SystemdCredsBackend;
 
 impl UnlockBackend for SystemdCredsBackend {
     fn retrieve_passphrase(&self) -> Result<String> {
-        let creds_dir = std::env::var("CREDENTIALS_DIRECTORY")
+        let creds_dir = var("CREDENTIALS_DIRECTORY")
             .map_err(|_| anyhow!("CREDENTIALS_DIRECTORY not set — not running under systemd"))?;
-        let path = std::path::Path::new(&creds_dir).join(CREDENTIAL_NAME);
+        let path = Path::new(&creds_dir).join(CREDENTIAL_NAME);
         let passphrase = fs::read_to_string(&path)
             .map_err(|e| anyhow!("failed to read systemd credential {}: {e}", path.display()))?;
         Ok(passphrase.trim_end_matches(['\n', '\r']).to_string())
