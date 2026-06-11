@@ -25,8 +25,8 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 config = { workspace = true }
 crossterm = "0.29.0"
-dialoguer = "0.12.0"
-dirs2 = "3.0.1"
+dialoguer = { workspace = true }
+dirs2 = { workspace = true }
 getset = { workspace = true }
 libmoshpit = { version = "0.8.22", path = "../libmoshpit" }
 serde = { workspace = true }

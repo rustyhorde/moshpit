@@ -23,7 +23,7 @@ unstable = ["libmoshpit/unstable"]
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true }
-dialoguer = "0.12.0"
+dialoguer = { workspace = true }
 getset = { workspace = true }
 libmoshpit = { version = "0.8.22", path = "../libmoshpit" }
 vergen-pretty = { workspace = true }

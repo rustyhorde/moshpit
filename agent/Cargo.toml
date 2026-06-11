@@ -36,14 +36,14 @@ ssh-agent-piggyback = []
 
 [dependencies]
 anyhow = { workspace = true }
-argon2 = { version = "0.6.0-rc.8", features = ["getrandom"] }
+argon2 = { workspace = true }
 aws-lc-rs = { workspace = true }
-base64 = "0.22.1"
-bincode-next = "3.0.0-rc.14"
+base64 = { workspace = true }
+bincode-next = { workspace = true }
 bytes = { workspace = true }
 clap = { workspace = true }
-dialoguer = "0.12.0"
-dirs2 = "3.0.1"
+dialoguer = { workspace = true }
+dirs2 = { workspace = true }
 getset = { workspace = true }
 libmoshpit = { version = "0.8.22", path = "../libmoshpit" }
 nix = { version = "0.31.3", features = ["process", "signal", "socket", "user"] }
@@ -71,7 +71,7 @@ tempfile = "3.27.0"
 
 [build-dependencies]
 anyhow = { workspace = true }
-pkg-config = "0.3"
+pkg-config = "0.3.33"
 rustversion = { workspace = true }
 vergen-gix = { workspace = true }
 
