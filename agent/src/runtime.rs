@@ -1002,7 +1002,7 @@ mod tests {
         AgentConfig, AgentIdentityInfo, AgentRequest, AgentResponse, ConnectionState, Identity,
         ShellKind, Vault, best_identity, check_not_already_running, dispatch_request,
         format_socket_env, format_unset_socket_env, handle_connection, is_process_alive,
-        new_identity_map, sign_data, socket_from_value, unlock_backend,
+        new_identity_map, reload_from_vault, sign_data, socket_from_value, unlock_backend,
     };
 
     const TEST_KEY_PATH: &str = concat!(
@@ -1738,5 +1738,156 @@ mod tests {
         let listener = UnixListener::bind(&sock).unwrap();
         drop(spawn(async move { drop(listener.accept().await) }));
         assert!(check_not_already_running(&lock, &sock).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn reload_from_vault_roundtrip() {
+        let dir = tempdir().unwrap();
+        let vault_path = dir.path().join("vault");
+
+        let mut v = Vault::new();
+        v.upsert(TEST_KEY_PATH.to_string(), String::new());
+        v.save_encrypted(&vault_path, "master").unwrap();
+
+        let ids = new_identity_map();
+        let vault = empty_vault();
+        let count = reload_from_vault(&ids, &vault, &vault_path, "master")
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "one identity should load from the vault");
+
+        let map = ids.lock().await;
+        assert_eq!(map.len(), 1);
+        let id = map.values().next().unwrap();
+        assert!(
+            id.fingerprint.starts_with("SHA256:"),
+            "fingerprint should have SHA256: prefix"
+        );
+        assert_eq!(id.algorithm, "X25519");
+        drop(map);
+
+        assert!(
+            vault.lock().await.is_some(),
+            "the loaded vault should be cached in the shared slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_from_vault_skips_missing_key() {
+        let dir = tempdir().unwrap();
+        let vault_path = dir.path().join("vault");
+
+        let mut v = Vault::new();
+        v.upsert("/nonexistent/key/path".to_string(), String::new());
+        v.save_encrypted(&vault_path, "master").unwrap();
+
+        let ids = new_identity_map();
+        let vault = empty_vault();
+        let count = reload_from_vault(&ids, &vault, &vault_path, "master")
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "a missing key should be skipped, not loaded");
+        assert!(ids.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reload_from_vault_wrong_passphrase() {
+        let dir = tempdir().unwrap();
+        let vault_path = dir.path().join("vault");
+
+        let mut v = Vault::new();
+        v.upsert(TEST_KEY_PATH.to_string(), String::new());
+        v.save_encrypted(&vault_path, "right").unwrap();
+
+        let ids = new_identity_map();
+        let vault = empty_vault();
+        let result = reload_from_vault(&ids, &vault, &vault_path, "wrong").await;
+        assert!(
+            result.is_err(),
+            "decrypting with the wrong passphrase should fail"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_from_vault_no_file_returns_zero() {
+        let dir = tempdir().unwrap();
+        let vault_path = dir.path().join("does-not-exist");
+
+        let ids = new_identity_map();
+        let vault = empty_vault();
+        let count = reload_from_vault(&ids, &vault, &vault_path, "master")
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        assert!(ids.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_add_identity_with_master_passphrase() {
+        let ids = new_identity_map();
+        let vault = empty_vault();
+        let dir = tempdir().unwrap();
+        let vault_path = dir.path().join("vault");
+        let mp = Arc::new(Mutex::new("master".to_string()));
+        let resp = dispatch_request(
+            AgentRequest::AddIdentity {
+                key_path: TEST_KEY_PATH.to_string(),
+                passphrase: None,
+            },
+            &ids,
+            &vault,
+            &vault_path,
+            &mp,
+            &unlocked_state(),
+        )
+        .await;
+        assert!(matches!(resp, AgentResponse::Ok));
+        assert_eq!(ids.lock().await.len(), 1);
+
+        // The vault must have been written encrypted (decodable only with the
+        // master passphrase) and contain the added key.
+        let loaded = Vault::load_encrypted(&vault_path, "master").unwrap();
+        assert_eq!(loaded.entries().len(), 1);
+        assert_eq!(loaded.entries()[0].key_path, TEST_KEY_PATH);
+    }
+
+    #[tokio::test]
+    async fn dispatch_remove_identity_with_master_passphrase() {
+        let ids = new_identity_map();
+        let vault = empty_vault();
+        let dir = tempdir().unwrap();
+        let vault_path = dir.path().join("vault");
+        let mp = Arc::new(Mutex::new("master".to_string()));
+
+        // Seed an encrypted vault + populated map via AddIdentity.
+        let add = dispatch_request(
+            AgentRequest::AddIdentity {
+                key_path: TEST_KEY_PATH.to_string(),
+                passphrase: None,
+            },
+            &ids,
+            &vault,
+            &vault_path,
+            &mp,
+            &unlocked_state(),
+        )
+        .await;
+        assert!(matches!(add, AgentResponse::Ok));
+        let fp = ids.lock().await.keys().next().unwrap().clone();
+
+        let resp = dispatch_request(
+            AgentRequest::RemoveIdentity(fp),
+            &ids,
+            &vault,
+            &vault_path,
+            &mp,
+            &unlocked_state(),
+        )
+        .await;
+        assert!(matches!(resp, AgentResponse::Ok));
+        assert!(ids.lock().await.is_empty());
+
+        // The encrypted re-save on removal must keep the vault decryptable.
+        assert!(Vault::load_encrypted(&vault_path, "master").is_ok());
     }
 }
