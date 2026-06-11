@@ -31,10 +31,10 @@ use anyhow::{Context as _, Result, bail};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use dialoguer::{Confirm, Password};
 use libmoshpit::{
-    DiffMode, DisplayPreference, Emulator, EncryptedFrame, FileLayer, KEY_ALGORITHM_X25519, Kex,
-    KexConfig as _, KexMode, KeyPair, MoshpitError, PredictionEngine, Renderer, UdpReader,
-    UdpSender, UuidWrapper, config_file_path, init_tracing, load, paint_overlays_to_ansi,
-    parse_server_destination, render_prediction_update, run_key_exchange,
+    ClientRenderCtx, DiffMode, DisplayPreference, Emulator, EncryptedFrame, FileLayer,
+    KEY_ALGORITHM_X25519, Kex, KexConfig as _, KexMode, KeyPair, MoshpitError, PredictionEngine,
+    Renderer, UdpReader, UdpSender, UuidWrapper, config_file_path, init_tracing, load,
+    paint_overlays_to_ansi, parse_server_destination, render_prediction_update, run_key_exchange,
 };
 use terminal_size::terminal_size;
 #[cfg(unix)]
@@ -1242,11 +1242,13 @@ async fn run_udp_session(
                 reader_token,
                 exit_token_reader,
                 exit_msg_reader,
-                stdout_tx_reader,
-                emu_reader,
-                pred_reader,
-                rend_reader,
-                in_alt_screen_reader,
+                ClientRenderCtx::new(
+                    stdout_tx_reader,
+                    emu_reader,
+                    pred_reader,
+                    rend_reader,
+                    in_alt_screen_reader,
+                ),
             )
             .await;
     });

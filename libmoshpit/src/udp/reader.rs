@@ -8,6 +8,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet, hash_map::Entry},
+    fmt,
     future::pending,
     io::Cursor,
     mem::take,
@@ -1042,17 +1043,12 @@ impl UdpReader {
     /// is processed identically to a [`EncryptedFrame::ScreenStateCompressed`] frame
     /// via [`Self::apply_full_state`].  Out-of-order chunks trigger a
     /// [`EncryptedFrame::RepaintRequest`].
-    #[cfg_attr(nightly, allow(clippy::too_many_arguments))]
     async fn handle_state_chunk(
         &mut self,
         seq: u16,
         total: u16,
         data: Vec<u8>,
-        emulator: &Arc<Mutex<Emulator>>,
-        prediction: &Arc<Mutex<PredictionEngine>>,
-        renderer: &Arc<Mutex<Renderer>>,
-        in_alt_screen: &Arc<AtomicBool>,
-        stdout_tx: &Sender<Vec<u8>>,
+        ctx: &ClientRenderCtx,
     ) {
         if seq == 0 {
             self.pending_chunk_total = total;
@@ -1080,13 +1076,13 @@ impl UdpReader {
                 Ok(payload) => {
                     let repaint = self.apply_full_state(
                         &payload,
-                        emulator,
-                        prediction,
-                        renderer,
-                        in_alt_screen,
+                        &ctx.emulator,
+                        &ctx.prediction,
+                        &ctx.renderer,
+                        &ctx.in_alt_screen,
                     );
                     if !repaint.is_empty()
-                        && let Err(e) = stdout_tx.send(repaint).await
+                        && let Err(e) = ctx.stdout_tx.send(repaint).await
                     {
                         error!("Error sending StateChunk repaint to stdout channel: {e}");
                     }
@@ -1116,18 +1112,22 @@ impl UdpReader {
     ///   arrive so that confirmed/invalidated overlays are reconciled.
     /// * `renderer` – differential renderer; used to emit a single clean
     ///   repaint after a scrollback replay block completes.
-    #[cfg_attr(nightly, allow(clippy::too_many_lines, clippy::too_many_arguments))]
+    #[cfg_attr(nightly, allow(clippy::too_many_lines))]
     pub async fn client_frame_loop(
         &mut self,
         token: CancellationToken,
         exit_token: CancellationToken,
         exit_msg: Arc<Mutex<Option<&'static [u8]>>>,
-        stdout_tx: Sender<Vec<u8>>,
-        emulator: Arc<Mutex<Emulator>>,
-        prediction: Arc<Mutex<PredictionEngine>>,
-        renderer: Arc<Mutex<Renderer>>,
-        in_alt_screen: Arc<AtomicBool>,
+        ctx: ClientRenderCtx,
     ) {
+        // Cheap handle clones so the loop body can use the shared state directly
+        // while `ctx` itself is still borrowed by the per-frame helpers below.
+        let stdout_tx = ctx.stdout_tx.clone();
+        let emulator = ctx.emulator.clone();
+        let prediction = ctx.prediction.clone();
+        let renderer = ctx.renderer.clone();
+        let in_alt_screen = ctx.in_alt_screen.clone();
+
         let mut prev_bytes = BytesMut::with_capacity(1024);
         let mut osc_started = false;
         // Legacy raw-passthrough escape hatch (default off); captured once so the
@@ -1162,13 +1162,9 @@ impl UdpReader {
                                     message,
                                     &mut prev_bytes,
                                     &mut osc_started,
-                                    &stdout_tx,
+                                    &ctx,
                                     scrollback_mode,
                                     &exit_token,
-                                    &emulator,
-                                    &prediction,
-                                    &in_alt_screen,
-                                    &renderer,
                                     passthrough,
                                 )
                                 .await;
@@ -1253,17 +1249,8 @@ impl UdpReader {
                                 break 'session;
                             }
                             EncryptedFrame::StateChunk((seq, total, data)) => {
-                                self.handle_state_chunk(
-                                    seq,
-                                    total,
-                                    data,
-                                    &emulator,
-                                    &prediction,
-                                    &renderer,
-                                    &in_alt_screen,
-                                    &stdout_tx,
-                                )
-                                .await;
+                                self.handle_state_chunk(seq, total, data, &ctx)
+                                    .await;
                             }
                             EncryptedFrame::CompressedBytes((_id, compressed)) => {
                                 match decode_all(compressed.as_slice()) {
@@ -1274,13 +1261,9 @@ impl UdpReader {
                                             message,
                                             &mut prev_bytes,
                                             &mut osc_started,
-                                            &stdout_tx,
+                                            &ctx,
                                             scrollback_mode,
                                             &exit_token,
-                                            &emulator,
-                                            &prediction,
-                                            &in_alt_screen,
-                                            &renderer,
                                             passthrough,
                                         )
                                         .await;
@@ -1403,13 +1386,9 @@ impl UdpReader {
                                                     message,
                                                     &mut prev_bytes,
                                                     &mut osc_started,
-                                                    &stdout_tx,
+                                                    &ctx,
                                                     scrollback_mode,
                                                     &exit_token,
-                                                    &emulator,
-                                                    &prediction,
-                                                    &in_alt_screen,
-                                                    &renderer,
                                                     passthrough,
                                                 )
                                                 .await;
@@ -1426,13 +1405,9 @@ impl UdpReader {
                                             message,
                                             &mut prev_bytes,
                                             &mut osc_started,
-                                            &stdout_tx,
+                                            &ctx,
                                             scrollback_mode,
                                             &exit_token,
-                                            &emulator,
-                                            &prediction,
-                                            &in_alt_screen,
-                                            &renderer,
                                             passthrough,
                                         )
                                         .await;
@@ -1517,17 +1492,8 @@ impl UdpReader {
                                         break 'session;
                                     }
                                     EncryptedFrame::StateChunk((seq, total, data)) => {
-                                        self.handle_state_chunk(
-                                            seq,
-                                            total,
-                                            data,
-                                            &emulator,
-                                            &prediction,
-                                            &renderer,
-                                            &in_alt_screen,
-                                            &stdout_tx,
-                                        )
-                                        .await;
+                                        self.handle_state_chunk(seq, total, data, &ctx)
+                                            .await;
                                     }
                                 }
                             }
@@ -1555,6 +1521,47 @@ impl UdpReader {
     }
 }
 
+/// Shared client-side render state threaded through [`UdpReader::client_frame_loop`]
+/// and its per-frame helpers (`handle_state_chunk`, `process_bytes_with_prediction`).
+///
+/// Bundling these handles into one value keeps the per-frame helper signatures
+/// small; they are all cheap-to-clone shared handles (`Arc`/channel `Sender`).
+pub struct ClientRenderCtx {
+    stdout_tx: Sender<Vec<u8>>,
+    emulator: Arc<Mutex<Emulator>>,
+    prediction: Arc<Mutex<PredictionEngine>>,
+    renderer: Arc<Mutex<Renderer>>,
+    in_alt_screen: Arc<AtomicBool>,
+}
+
+impl fmt::Debug for ClientRenderCtx {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClientRenderCtx")
+            .field("in_alt_screen", &self.in_alt_screen)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ClientRenderCtx {
+    /// Build the shared render context for [`UdpReader::client_frame_loop`].
+    #[must_use]
+    pub fn new(
+        stdout_tx: Sender<Vec<u8>>,
+        emulator: Arc<Mutex<Emulator>>,
+        prediction: Arc<Mutex<PredictionEngine>>,
+        renderer: Arc<Mutex<Renderer>>,
+        in_alt_screen: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            stdout_tx,
+            emulator,
+            prediction,
+            renderer,
+            in_alt_screen,
+        }
+    }
+}
+
 /// Feed server bytes through the emulator and render a single clean update.
 ///
 /// Pipeline (default, unified rendering):
@@ -1566,19 +1573,14 @@ impl UdpReader {
 /// When `passthrough` is `true` the legacy behavior is used instead: raw bytes
 /// are written straight to the terminal and prediction overlays are painted on
 /// top out-of-band.  This is an escape hatch and is off by default.
-#[cfg_attr(nightly, allow(clippy::too_many_arguments))]
 async fn process_bytes_with_prediction(
     raw: Vec<u8>,
     prev_bytes: &mut BytesMut,
     osc_started: &mut bool,
-    stdout_tx: &Sender<Vec<u8>>,
+    ctx: &ClientRenderCtx,
     // When true, raw bytes are silently fed into the emulator only; no stdout output is produced.
     scrollback_mode: bool,
     exit_token: &CancellationToken,
-    emulator: &Arc<Mutex<Emulator>>,
-    prediction: &Arc<Mutex<PredictionEngine>>,
-    in_alt_screen: &Arc<AtomicBool>,
-    renderer: &Arc<Mutex<Renderer>>,
     passthrough: bool,
 ) {
     // ── 1. OSC exit detection ─────────────────────────────────────────────
@@ -1625,19 +1627,19 @@ async fn process_bytes_with_prediction(
     // renderer emits a single clean repaint when ScrollbackEnd arrives.
     if passthrough
         && !scrollback_mode
-        && let Err(e) = stdout_tx.send(raw.clone()).await
+        && let Err(e) = ctx.stdout_tx.send(raw.clone()).await
     {
         error!("Error sending to stdout channel: {e}");
         return;
     }
 
     // ── 3. Feed raw bytes into the emulator (the single source of truth) ──
-    let was_alt = in_alt_screen.load(Ordering::Relaxed);
+    let was_alt = ctx.in_alt_screen.load(Ordering::Relaxed);
     let is_alt = {
-        let mut emu = emulator.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut emu = ctx.emulator.lock().unwrap_or_else(PoisonError::into_inner);
         emu.process(&raw);
         let is_alt = emu.screen().alternate_screen();
-        in_alt_screen.store(is_alt, Ordering::Relaxed);
+        ctx.in_alt_screen.store(is_alt, Ordering::Relaxed);
         is_alt
     };
     // A full-screen app (vi, htop) entering alternate screen can leave the OSC
@@ -1660,15 +1662,18 @@ async fn process_bytes_with_prediction(
         // Legacy: paint prediction overlays on top of the raw bytes.
         if !is_alt {
             let (overlays, cursor) = {
-                let emu = emulator.lock().unwrap_or_else(PoisonError::into_inner);
+                let emu = ctx.emulator.lock().unwrap_or_else(PoisonError::into_inner);
                 let screen = emu.screen();
-                let mut pred = prediction.lock().unwrap_or_else(PoisonError::into_inner);
+                let mut pred = ctx
+                    .prediction
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
                 pred.cull(screen);
                 pred.apply(screen)
             };
             let overlay_out = paint_overlays_to_ansi(&overlays, cursor);
             if !overlay_out.is_empty()
-                && let Err(e) = stdout_tx.send(overlay_out).await
+                && let Err(e) = ctx.stdout_tx.send(overlay_out).await
             {
                 error!("Error sending overlays to stdout channel: {e}");
             }
@@ -1676,9 +1681,9 @@ async fn process_bytes_with_prediction(
     } else {
         // Unified: the renderer is the sole writer; predictions are reconciled
         // and merged into the diffed framebuffer so culled predictions heal.
-        let out = render_server_update(emulator, prediction, renderer, !is_alt);
+        let out = render_server_update(&ctx.emulator, &ctx.prediction, &ctx.renderer, !is_alt);
         if !out.is_empty()
-            && let Err(e) = stdout_tx.send(out).await
+            && let Err(e) = ctx.stdout_tx.send(out).await
         {
             error!("Error sending render to stdout channel: {e}");
         }
@@ -1801,14 +1806,14 @@ mod tests {
         net::UdpSocket,
         runtime::Runtime,
         spawn,
-        sync::mpsc::{Receiver, Sender, channel},
+        sync::mpsc::{Receiver, channel},
         time::sleep,
     };
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
     use super::{
-        DiffMode, EncryptedFrame, MAX_NAK_RETRIES, MAX_NAK_TIMEOUT, MAX_SEQ_JUMP,
+        ClientRenderCtx, DiffMode, EncryptedFrame, MAX_NAK_RETRIES, MAX_NAK_TIMEOUT, MAX_SEQ_JUMP,
         MIN_NAK_CHECK_INTERVAL, MIN_NAK_TIMEOUT, RECV_BUFFER_REPAINT_THRESHOLD,
         REPAINT_REQUEST_THRESHOLD, UdpReader, process_bytes_with_prediction,
     };
@@ -2825,18 +2830,10 @@ mod tests {
 
     // ── process_bytes_with_prediction: alternate screen tracking ─────────────
 
-    type PredState = (
-        Sender<Vec<u8>>,
-        Receiver<Vec<u8>>,
-        Arc<Mutex<Emulator>>,
-        Arc<Mutex<PredictionEngine>>,
-        Arc<AtomicBool>,
-        CancellationToken,
-        Arc<Mutex<Renderer>>,
-    );
-
-    /// Helper: build the shared state needed to call `process_bytes_with_prediction`.
-    fn make_prediction_state() -> PredState {
+    /// Helper: build the shared render context needed to call
+    /// [`process_bytes_with_prediction`], plus the stdout receiver and exit token
+    /// that the tests inspect.
+    fn make_prediction_state() -> (ClientRenderCtx, Receiver<Vec<u8>>, CancellationToken) {
         use crate::DisplayPreference;
         let (stdout_tx, stdout_rx) = channel::<Vec<u8>>(16);
         let emulator = make_emulator();
@@ -2844,21 +2841,13 @@ mod tests {
         let in_alt_screen = Arc::new(AtomicBool::new(false));
         let exit_token = CancellationToken::new();
         let renderer = Arc::new(Mutex::new(Renderer::new(24, 80)));
-        (
-            stdout_tx,
-            stdout_rx,
-            emulator,
-            prediction,
-            in_alt_screen,
-            exit_token,
-            renderer,
-        )
+        let ctx = ClientRenderCtx::new(stdout_tx, emulator, prediction, renderer, in_alt_screen);
+        (ctx, stdout_rx, exit_token)
     }
 
     #[tokio::test]
     async fn process_bytes_with_prediction_sets_in_alt_screen_on_entry() {
-        let (stdout_tx, _rx, emulator, prediction, in_alt_screen, exit_token, renderer) =
-            make_prediction_state();
+        let (ctx, _rx, exit_token) = make_prediction_state();
         let mut prev_bytes = BytesMut::new();
         let mut osc_started = false;
 
@@ -2867,27 +2856,22 @@ mod tests {
             b"\x1b[?1049h".to_vec(),
             &mut prev_bytes,
             &mut osc_started,
-            &stdout_tx,
+            &ctx,
             false,
             &exit_token,
-            &emulator,
-            &prediction,
-            &in_alt_screen,
-            &renderer,
             false,
         )
         .await;
 
         assert!(
-            in_alt_screen.load(Ordering::Relaxed),
+            ctx.in_alt_screen.load(Ordering::Relaxed),
             "in_alt_screen must be true after ESC[?1049h"
         );
     }
 
     #[tokio::test]
     async fn process_bytes_with_prediction_clears_in_alt_screen_on_exit() {
-        let (stdout_tx, _rx, emulator, prediction, in_alt_screen, exit_token, renderer) =
-            make_prediction_state();
+        let (ctx, _rx, exit_token) = make_prediction_state();
         let mut prev_bytes = BytesMut::new();
         let mut osc_started = false;
 
@@ -2896,18 +2880,14 @@ mod tests {
             b"\x1b[?1049h".to_vec(),
             &mut prev_bytes,
             &mut osc_started,
-            &stdout_tx,
+            &ctx,
             false,
             &exit_token,
-            &emulator,
-            &prediction,
-            &in_alt_screen,
-            &renderer,
             false,
         )
         .await;
         assert!(
-            in_alt_screen.load(Ordering::Relaxed),
+            ctx.in_alt_screen.load(Ordering::Relaxed),
             "precondition: must be in alt screen"
         );
 
@@ -2916,27 +2896,22 @@ mod tests {
             b"\x1b[?1049l".to_vec(),
             &mut prev_bytes,
             &mut osc_started,
-            &stdout_tx,
+            &ctx,
             false,
             &exit_token,
-            &emulator,
-            &prediction,
-            &in_alt_screen,
-            &renderer,
             false,
         )
         .await;
 
         assert!(
-            !in_alt_screen.load(Ordering::Relaxed),
+            !ctx.in_alt_screen.load(Ordering::Relaxed),
             "in_alt_screen must be false after ESC[?1049l"
         );
     }
 
     #[tokio::test]
     async fn process_bytes_with_prediction_resets_osc_started_on_alt_screen_entry() {
-        let (stdout_tx, _rx, emulator, prediction, in_alt_screen, exit_token, renderer) =
-            make_prediction_state();
+        let (ctx, _rx, exit_token) = make_prediction_state();
         let mut prev_bytes = BytesMut::new();
         let mut osc_started = true; // simulate a stuck OSC state machine
 
@@ -2945,13 +2920,9 @@ mod tests {
             b"\x1b[?1049h".to_vec(),
             &mut prev_bytes,
             &mut osc_started,
-            &stdout_tx,
+            &ctx,
             false,
             &exit_token,
-            &emulator,
-            &prediction,
-            &in_alt_screen,
-            &renderer,
             false,
         )
         .await;
@@ -2964,8 +2935,7 @@ mod tests {
 
     #[tokio::test]
     async fn process_bytes_with_prediction_passthrough_forwards_raw_bytes() {
-        let (stdout_tx, mut rx, emulator, prediction, in_alt_screen, exit_token, renderer) =
-            make_prediction_state();
+        let (ctx, mut rx, exit_token) = make_prediction_state();
         let mut prev_bytes = BytesMut::new();
         let mut osc_started = false;
 
@@ -2975,13 +2945,9 @@ mod tests {
             b"hello".to_vec(),
             &mut prev_bytes,
             &mut osc_started,
-            &stdout_tx,
+            &ctx,
             false,
             &exit_token,
-            &emulator,
-            &prediction,
-            &in_alt_screen,
-            &renderer,
             true,
         )
         .await;
@@ -2994,8 +2960,7 @@ mod tests {
 
     #[tokio::test]
     async fn process_bytes_with_prediction_rendered_path_emits_rendered_output() {
-        let (stdout_tx, mut rx, emulator, prediction, in_alt_screen, exit_token, renderer) =
-            make_prediction_state();
+        let (ctx, mut rx, exit_token) = make_prediction_state();
         let mut prev_bytes = BytesMut::new();
         let mut osc_started = false;
 
@@ -3006,13 +2971,9 @@ mod tests {
             b"hi".to_vec(),
             &mut prev_bytes,
             &mut osc_started,
-            &stdout_tx,
+            &ctx,
             false,
             &exit_token,
-            &emulator,
-            &prediction,
-            &in_alt_screen,
-            &renderer,
             false,
         )
         .await;
@@ -3032,8 +2993,7 @@ mod tests {
 
     #[tokio::test]
     async fn process_bytes_with_prediction_scrollback_absorbs_silently() {
-        let (stdout_tx, mut rx, emulator, prediction, in_alt_screen, exit_token, renderer) =
-            make_prediction_state();
+        let (ctx, mut rx, exit_token) = make_prediction_state();
         let mut prev_bytes = BytesMut::new();
         let mut osc_started = false;
 
@@ -3043,13 +3003,9 @@ mod tests {
             b"absorb me".to_vec(),
             &mut prev_bytes,
             &mut osc_started,
-            &stdout_tx,
+            &ctx,
             true,
             &exit_token,
-            &emulator,
-            &prediction,
-            &in_alt_screen,
-            &renderer,
             false,
         )
         .await;
@@ -3060,7 +3016,7 @@ mod tests {
         );
         // ...but the emulator still tracked the bytes for later repaint.
         assert_eq!(
-            emulator
+            ctx.emulator
                 .lock()
                 .unwrap()
                 .screen()
@@ -3288,23 +3244,13 @@ mod tests {
         )));
         let in_alt_screen = Arc::new(AtomicBool::new(false));
         let (stdout_tx, _stdout_rx) = channel::<Vec<u8>>(8);
+        let ctx = ClientRenderCtx::new(stdout_tx, emulator, prediction, renderer, in_alt_screen);
 
         let raw = b"hello";
         let compressed = encode_all(raw.as_slice(), 0).expect("zstd compression");
 
         // Single-chunk assembly: seq=0, total=1
-        reader
-            .handle_state_chunk(
-                0,
-                1,
-                compressed,
-                &emulator,
-                &prediction,
-                &renderer,
-                &in_alt_screen,
-                &stdout_tx,
-            )
-            .await;
+        reader.handle_state_chunk(0, 1, compressed, &ctx).await;
 
         // After completion the assembly state must be reset
         assert_eq!(reader.pending_chunk_seq, 0);
@@ -3337,34 +3283,13 @@ mod tests {
         )));
         let in_alt_screen = Arc::new(AtomicBool::new(false));
         let (stdout_tx, _stdout_rx) = channel::<Vec<u8>>(8);
+        let ctx = ClientRenderCtx::new(stdout_tx, emulator, prediction, renderer, in_alt_screen);
 
         // Start assembly: seq=0, total=3
-        reader
-            .handle_state_chunk(
-                0,
-                3,
-                vec![0xAA; 10],
-                &emulator,
-                &prediction,
-                &renderer,
-                &in_alt_screen,
-                &stdout_tx,
-            )
-            .await;
+        reader.handle_state_chunk(0, 3, vec![0xAA; 10], &ctx).await;
 
         // Out-of-order: seq=2 (skipping seq=1) → discard and send RepaintRequest
-        reader
-            .handle_state_chunk(
-                2,
-                3,
-                vec![0xBB; 10],
-                &emulator,
-                &prediction,
-                &renderer,
-                &in_alt_screen,
-                &stdout_tx,
-            )
-            .await;
+        reader.handle_state_chunk(2, 3, vec![0xBB; 10], &ctx).await;
 
         assert!(
             reader.pending_chunk_data.is_empty(),
@@ -3650,14 +3575,13 @@ mod tests {
         )));
         let renderer = Arc::new(Mutex::new(Renderer::new(24, 80)));
         let in_alt = Arc::new(AtomicBool::new(false));
+        let ctx = ClientRenderCtx::new(stdout_tx, emulator, prediction, renderer, in_alt);
 
         // Cancel before the loop starts so we don't block on recv_buf.
         token.cancel();
         let exit_msg = Arc::new(Mutex::new(None));
         reader
-            .client_frame_loop(
-                token, exit_token, exit_msg, stdout_tx, emulator, prediction, renderer, in_alt,
-            )
+            .client_frame_loop(token, exit_token, exit_msg, ctx)
             .await;
         Ok(())
     }
@@ -3691,15 +3615,12 @@ mod tests {
         )));
         let renderer = Arc::new(Mutex::new(Renderer::new(24, 80)));
         let in_alt = Arc::new(AtomicBool::new(false));
+        let ctx = ClientRenderCtx::new(stdout_tx, emulator, prediction, renderer, in_alt);
 
         let t = token.clone();
         let exit_msg = Arc::new(Mutex::new(None));
         let handle = spawn(async move {
-            reader
-                .client_frame_loop(
-                    t, exit_token, exit_msg, stdout_tx, emulator, prediction, renderer, in_alt,
-                )
-                .await;
+            reader.client_frame_loop(t, exit_token, exit_msg, ctx).await;
         });
 
         // Let the NAK timer fire at least once (nak_check_interval ≈ 5–12ms on loopback)
