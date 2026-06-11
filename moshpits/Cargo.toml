@@ -10,7 +10,7 @@ license = "MIT OR Apache-2.0"
 name = "moshpits"
 readme = "../README.md"
 repository = "https://github.com/rustyhorde/moshpit"
-version = "0.8.21"
+version = "0.8.22"
 rust-version = "1.95.0"
 
 [[bin]]
@@ -26,7 +26,7 @@ bytes = { workspace = true }
 clap = { workspace = true }
 config = { workspace = true }
 getset = { workspace = true }
-libmoshpit = { version = "0.8.21", path = "../libmoshpit" }
+libmoshpit = { version = "0.8.22", path = "../libmoshpit" }
 portable-pty = "0.9.0"
 serde = { workspace = true }
 tokio = { workspace = true, features = ["signal", "sync", "time"] }
