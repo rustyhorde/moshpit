@@ -8,8 +8,9 @@
 
 use std::{
     collections::{BTreeSet, VecDeque},
+    env::args_os,
     ffi::OsString,
-    io::Read as _,
+    io::Read,
     net::SocketAddr,
     sync::{
         Arc,
@@ -22,9 +23,15 @@ use std::{
 #[cfg(unix)]
 use std::{
     ffi::{CStr, CString},
+    fs::{OpenOptions, read_to_string},
+    io::Error,
     os::unix::{fs::OpenOptionsExt as _, process::CommandExt},
-    process::Stdio,
+    path::Path,
+    process::{Command, Stdio},
 };
+
+#[cfg(target_os = "linux")]
+use std::fs::{File, metadata};
 
 use anyhow::{Context as _, Result};
 use bytes::{Buf as _, BytesMut};
@@ -39,13 +46,15 @@ use portable_pty::{PtySize, native_pty_system};
 
 use tokio::{
     net::{TcpListener, TcpStream},
-    select, spawn,
+    select,
+    signal::ctrl_c,
+    spawn,
     sync::{
         Mutex,
         mpsc::{Receiver, Sender, channel},
         oneshot,
     },
-    time::{Instant as TokioInstant, sleep_until},
+    time::{Instant as TokioInstant, MissedTickBehavior, interval, sleep_until},
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, trace, warn};
@@ -148,7 +157,7 @@ where
     // recover the raw `ArgMatches` provenance inside `Cli::parse_argv`.
     let command_line: Vec<OsString> = match args {
         Some(args) => args.into_iter().map(Into::into).collect(),
-        None => std::env::args_os().collect(),
+        None => args_os().collect(),
     };
     let cli = Cli::parse_argv(command_line)?;
 
@@ -223,7 +232,7 @@ where
         let st = server_token.clone();
         let fr_c = full_registry.clone();
         select! {
-            _ = tokio::signal::ctrl_c() => {
+            _ = ctrl_c() => {
                 info!("Received Ctrl-C, shutting down server");
                 server_token.cancel();
                 // Allow active connections time to send Shutdown frames to clients
@@ -519,8 +528,8 @@ async fn handle_connection(
         let ss_tx = data_tx.clone();
         let ss_token = conn_token.clone();
         let _state_sync = spawn(async move {
-            let mut ticker = tokio::time::interval(STATESYNC_INTERVAL);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut ticker = interval(STATESYNC_INTERVAL);
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
             let mut sent_states: VecDeque<(u64, Vec<u8>)> = VecDeque::new();
             let mut ack_diff_id: u64 = 0;
             let mut ack_state: Vec<u8> = Vec::new();
@@ -825,8 +834,8 @@ fn spawn_connection_watchdogs(
         // 3 s interval: with a client silence timeout of max(nak_timeout × 30, 9 s),
         // three keepalives fit within the minimum 9 s window, tolerating one lost
         // keepalive before a false disconnect would occur.
-        let mut ticker = tokio::time::interval(Duration::from_secs(3));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut ticker = interval(Duration::from_secs(3));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             select! {
                 () = conn_token.cancelled() => break,
@@ -885,8 +894,8 @@ async fn send_state_chunked(ss_tx: &Sender<EncryptedFrame>, compressed: Vec<u8>)
 /// [`CLIENT_SILENCE_TIMEOUT_US`] microseconds.  Fires every 5 s; low overhead.
 fn spawn_silence_watchdog(token: CancellationToken, last_rx_us: Arc<AtomicU64>) {
     let _watchdog = spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_secs(5));
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut ticker = interval(Duration::from_secs(5));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         loop {
             select! {
                 () = token.cancelled() => break,
@@ -1152,7 +1161,7 @@ fn server_intercept_queries(buf: &[u8], rows: u16, cols: u16) -> Vec<u8> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 fn spawn_pty_reader(
     session_uuid: Uuid,
-    mut term_out: Box<dyn std::io::Read + Send>,
+    mut term_out: Box<dyn Read + Send>,
     term_tx: Sender<TerminalMessage>,
     output_handle: Arc<Mutex<SessionOutputHandle>>,
     scrollback: Arc<Mutex<VecDeque<u8>>>,
@@ -1397,7 +1406,7 @@ fn spawn_pty(
             // controlling terminal.  Without this flag, the kernel would silently
             // assign the slave to the server's session, causing the subsequent
             // ioctl(TIOCSCTTY) in the child to fail with EPERM.
-            let slave = match std::fs::OpenOptions::new()
+            let slave = match OpenOptions::new()
                 .read(true)
                 .write(true)
                 .custom_flags(libc::O_NOCTTY)
@@ -1443,7 +1452,7 @@ fn spawn_pty(
             // Refuse the login like pam_nologin when /etc/nologin exists for a
             // non-root user; we print the file's contents instead of a shell.
             #[cfg(target_os = "linux")]
-            let nologin_deny = account.uid != 0 && std::path::Path::new("/etc/nologin").exists();
+            let nologin_deny = account.uid != 0 && Path::new("/etc/nologin").exists();
 
             // Register a systemd-logind session (XDG_RUNTIME_DIR, user@UID.service,
             // the user D-Bus bus) like an SSH login does via pam_systemd.  Needs
@@ -1457,17 +1466,17 @@ fn spawn_pty(
             // denies a non-root login — print that message and exit.
             #[cfg(target_os = "linux")]
             let mut cmd = if nologin_deny {
-                let mut cmd = std::process::Command::new("/bin/cat");
+                let mut cmd = Command::new("/bin/cat");
                 let _ = cmd.arg("/etc/nologin");
                 cmd
             } else {
-                let mut cmd = std::process::Command::new(&account.shell);
+                let mut cmd = Command::new(&account.shell);
                 let _ = cmd.arg("-li");
                 cmd
             };
             #[cfg(not(target_os = "linux"))]
             let mut cmd = {
-                let mut cmd = std::process::Command::new(&account.shell);
+                let mut cmd = Command::new(&account.shell);
                 let _ = cmd.arg("-li");
                 cmd
             };
@@ -1491,7 +1500,7 @@ fn spawn_pty(
             // directory is created as part of the session registered below; in the
             // fallback path we only set it when it already exists.
             let xdg_path = format!("/run/user/{}", account.uid);
-            if logind_enabled || std::path::Path::new(&xdg_path).exists() {
+            if logind_enabled || Path::new(&xdg_path).exists() {
                 let _ = cmd.env("XDG_RUNTIME_DIR", &xdg_path);
             }
 
@@ -1526,15 +1535,15 @@ fn spawn_pty(
             let ns_escape_fd: Option<i32> = if namespace_escape && daemon_uid == 0 {
                 use std::os::unix::fs::MetadataExt as _;
                 use std::os::unix::io::IntoRawFd as _;
-                let self_ino = std::fs::metadata("/proc/self/ns/mnt").ok().map(|m| m.ino());
-                let init_ino = std::fs::metadata("/proc/1/ns/mnt").ok().map(|m| m.ino());
+                let self_ino = metadata("/proc/self/ns/mnt").ok().map(|m| m.ino());
+                let init_ino = metadata("/proc/1/ns/mnt").ok().map(|m| m.ino());
                 if self_ino.is_some() && self_ino != init_ino {
                     warn!(
                         "Daemon is in a restricted mount namespace (inode {:?} vs PID 1 {:?}); \
                          spawned shell will join the host mount namespace",
                         self_ino, init_ino
                     );
-                    match std::fs::File::open("/proc/1/ns/mnt") {
+                    match File::open("/proc/1/ns/mnt") {
                         Ok(f) => Some(f.into_raw_fd()),
                         Err(e) => {
                             warn!("Cannot open /proc/1/ns/mnt for namespace escape: {e}");
@@ -1553,10 +1562,10 @@ fn spawn_pty(
                     let tiocsctty_request = tiocsctty_ioctl_request();
 
                     if libc::setsid() < 0 {
-                        return Err(std::io::Error::last_os_error());
+                        return Err(Error::last_os_error());
                     }
                     if libc::ioctl(0, tiocsctty_request, 0) < 0 {
-                        return Err(std::io::Error::last_os_error());
+                        return Err(Error::last_os_error());
                     }
 
                     // Escape restricted mount namespace before dropping root — setns(CLONE_NEWNS)
@@ -1576,13 +1585,13 @@ fn spawn_pty(
                         let initgroups_basegroup = initgroups_base_group(*primary_group_id)?;
 
                         if libc::initgroups(username_c.as_ptr(), initgroups_basegroup) < 0 {
-                            return Err(std::io::Error::last_os_error());
+                            return Err(Error::last_os_error());
                         }
                         if libc::setgid(*primary_group_id) < 0 {
-                            return Err(std::io::Error::last_os_error());
+                            return Err(Error::last_os_error());
                         }
                         if libc::setuid(*login_uid) < 0 {
-                            return Err(std::io::Error::last_os_error());
+                            return Err(Error::last_os_error());
                         }
                     }
 
@@ -1763,7 +1772,7 @@ fn spawn_pty(
 /// pairs.  A missing or unreadable file yields an empty list.
 #[cfg(unix)]
 fn parse_etc_environment() -> Vec<(String, String)> {
-    parse_environment_file(&std::fs::read_to_string("/etc/environment").unwrap_or_default())
+    parse_environment_file(&read_to_string("/etc/environment").unwrap_or_default())
 }
 
 /// Parse the contents of an `/etc/environment`-style file.  Blank lines and
@@ -1829,7 +1838,7 @@ fn initgroups_base_group(group_id: libc::gid_t) -> libc::gid_t {
 #[cfg(all(unix, target_os = "macos"))]
 fn initgroups_base_group(group_id: libc::gid_t) -> std::io::Result<libc::c_int> {
     group_id.try_into().map_err(|_| {
-        std::io::Error::new(
+        Error::new(
             std::io::ErrorKind::InvalidInput,
             "gid does not fit into c_int for initgroups",
         )
@@ -1879,7 +1888,9 @@ fn resolve_user_account(username: &str, fallback_shell: &str) -> Result<Resolved
 #[allow(dead_code, clippy::all)]
 mod test {
     use libmoshpit::{EncryptedFrame, Kex, ServerKex};
-    use tokio::sync::mpsc::channel;
+    use tokio::sync::{Mutex, mpsc::channel};
+    use tokio::task::yield_now;
+    use tokio::time::{advance, timeout};
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
@@ -2106,7 +2117,7 @@ mod test {
         spawn_connection_watchdogs(control_tx, conn_token.clone(), server_token);
 
         // The keepalive fires every 3 s with an immediate first tick.
-        let frame = tokio::time::timeout(Duration::from_millis(200), control_rx.recv()).await;
+        let frame = timeout(Duration::from_millis(200), control_rx.recv()).await;
         conn_token.cancel();
         let frame = frame
             .expect("timeout waiting for keepalive")
@@ -2157,7 +2168,7 @@ mod test {
         // Drain any already-queued frames
         while control_rx.try_recv().is_ok() {}
         // No further Keepalive frames should arrive
-        let result = tokio::time::timeout(Duration::from_millis(100), control_rx.recv()).await;
+        let result = timeout(Duration::from_millis(100), control_rx.recv()).await;
         // Either timeout (no frame) or channel closed — both are acceptable
         assert!(result.map_or(true, |v| v.is_none()));
     }
@@ -2409,7 +2420,7 @@ mod test {
         let token = CancellationToken::new();
         let nak_count = Arc::new(AtomicU64::new(0));
         let effective_mtu = Arc::new(AtomicUsize::new(MTU_TIERS[0]));
-        let emulator = Arc::new(tokio::sync::Mutex::new(vt100::Parser::new(24, 80, 0)));
+        let emulator = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
         spawn_connection_health_task(
             tx,
             token.clone(),
@@ -2429,7 +2440,7 @@ mod test {
         let token = CancellationToken::new();
         let nak_count = Arc::new(AtomicU64::new(0));
         let effective_mtu = Arc::new(AtomicUsize::new(MTU_TIERS[0]));
-        let emulator = Arc::new(tokio::sync::Mutex::new(vt100::Parser::new(24, 80, 0)));
+        let emulator = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
 
         spawn_connection_health_task(
             tx,
@@ -2443,7 +2454,7 @@ mod test {
         nak_count.store(PROACTIVE_REPAINT_NAK_THRESHOLD, Ordering::Relaxed);
 
         // The watchdog polls every 200 ms — give it up to 500 ms to fire.
-        let frame = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await;
+        let frame = timeout(Duration::from_millis(500), rx.recv()).await;
         token.cancel();
 
         let frame = frame
@@ -2458,7 +2469,7 @@ mod test {
         let token = CancellationToken::new();
         let nak_count = Arc::new(AtomicU64::new(0));
         let effective_mtu = Arc::new(AtomicUsize::new(MTU_TIERS[0]));
-        let emulator = Arc::new(tokio::sync::Mutex::new(vt100::Parser::new(24, 80, 0)));
+        let emulator = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
 
         spawn_connection_health_task(
             tx,
@@ -2472,7 +2483,7 @@ mod test {
         nak_count.store(PROACTIVE_REPAINT_NAK_THRESHOLD - 1, Ordering::Relaxed);
 
         // Wait for at least one poll cycle — no frame should arrive.
-        let result = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await;
+        let result = timeout(Duration::from_millis(300), rx.recv()).await;
         token.cancel();
 
         assert!(
@@ -2487,7 +2498,7 @@ mod test {
         let token = CancellationToken::new();
         let nak_count = Arc::new(AtomicU64::new(PROACTIVE_REPAINT_NAK_THRESHOLD));
         let effective_mtu = Arc::new(AtomicUsize::new(MTU_TIERS[0]));
-        let emulator = Arc::new(tokio::sync::Mutex::new(vt100::Parser::new(24, 80, 0)));
+        let emulator = Arc::new(Mutex::new(vt100::Parser::new(24, 80, 0)));
 
         spawn_connection_health_task(tx, token.clone(), nak_count, effective_mtu, emulator);
 
@@ -2497,7 +2508,7 @@ mod test {
 
         // Channel should be drained and no further frames arrive.
         while rx.try_recv().is_ok() {}
-        let result = tokio::time::timeout(Duration::from_millis(100), rx.recv()).await;
+        let result = timeout(Duration::from_millis(100), rx.recv()).await;
         assert!(
             result.map_or(true, |v| v.is_none()),
             "watchdog kept sending after cancellation"
@@ -2651,10 +2662,10 @@ mod test {
         spawn_silence_watchdog(token.clone(), last_rx_us);
 
         // Advance past two 5-second ticker intervals + the 30-second silence threshold.
-        tokio::time::advance(Duration::from_secs(35)).await;
+        advance(Duration::from_secs(35)).await;
         // Yield so the spawned task can run.
-        tokio::task::yield_now().await;
-        tokio::task::yield_now().await;
+        yield_now().await;
+        yield_now().await;
 
         assert!(
             token.is_cancelled(),
@@ -2669,9 +2680,9 @@ mod test {
         spawn_silence_watchdog(token.clone(), last_rx_us.clone());
 
         // Advance one tick (5s) — well within the 30s silence threshold.
-        tokio::time::advance(Duration::from_secs(5)).await;
-        tokio::task::yield_now().await;
-        tokio::task::yield_now().await;
+        advance(Duration::from_secs(5)).await;
+        yield_now().await;
+        yield_now().await;
 
         assert!(
             !token.is_cancelled(),
@@ -2688,8 +2699,8 @@ mod test {
 
         token.cancel();
         // Even with a stale timestamp the watchdog should not panic or loop.
-        tokio::time::advance(Duration::from_mins(1)).await;
-        tokio::task::yield_now().await;
+        advance(Duration::from_mins(1)).await;
+        yield_now().await;
         // Token is cancelled — just verify no crash.
         assert!(token.is_cancelled());
     }

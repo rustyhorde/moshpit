@@ -8,7 +8,10 @@
 
 //! TCP key exchange protocol: mutual asymmetric authentication and per-session key derivation.
 
+#[cfg(unix)]
+use std::cmp::Reverse;
 use std::{
+    env::vars,
     fmt::{self, Display, Formatter},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
@@ -17,7 +20,8 @@ use std::{
 use anyhow::Result;
 use aws_lc_rs::{
     aead::{
-        AES_128_GCM_SIV, AES_256_GCM, AES_256_GCM_SIV, CHACHA20_POLY1305, LessSafeKey, UnboundKey,
+        AES_128_GCM_SIV, AES_256_GCM, AES_256_GCM_SIV, Algorithm, CHACHA20_POLY1305, LessSafeKey,
+        UnboundKey,
     },
     hmac::{HMAC_SHA256, HMAC_SHA512, Key},
 };
@@ -191,14 +195,13 @@ impl Kex {
         use negotiate::{
             AEAD_AES128_GCM_SIV, AEAD_AES256_GCM, AEAD_AES256_GCM_SIV, AEAD_CHACHA20_POLY1305,
         };
-        let alg: &'static aws_lc_rs::aead::Algorithm =
-            match self.negotiated_algorithms.aead.as_str() {
-                AEAD_AES256_GCM_SIV => &AES_256_GCM_SIV,
-                AEAD_AES256_GCM => &AES_256_GCM,
-                AEAD_CHACHA20_POLY1305 => &CHACHA20_POLY1305,
-                AEAD_AES128_GCM_SIV => &AES_128_GCM_SIV,
-                _ => return Err(MoshpitError::NoCommonAlgorithm.into()),
-            };
+        let alg: &'static Algorithm = match self.negotiated_algorithms.aead.as_str() {
+            AEAD_AES256_GCM_SIV => &AES_256_GCM_SIV,
+            AEAD_AES256_GCM => &AES_256_GCM,
+            AEAD_CHACHA20_POLY1305 => &CHACHA20_POLY1305,
+            AEAD_AES128_GCM_SIV => &AES_128_GCM_SIV,
+            _ => return Err(MoshpitError::NoCommonAlgorithm.into()),
+        };
         debug!(
             aead = %self.negotiated_algorithms.aead,
             key_len = self.key.len(),
@@ -473,7 +476,7 @@ async fn run_client_kex<T: KexConfig>(
             .await
         {
             Ok(mut ids) if !ids.is_empty() => {
-                ids.sort_by_key(|id| std::cmp::Reverse(algorithm_strength_rank(&id.algorithm)));
+                ids.sort_by_key(|id| Reverse(algorithm_strength_rank(&id.algorithm)));
                 let id = &ids[0];
                 info!(
                     "Using agent identity: {} ({})",
@@ -609,7 +612,7 @@ async fn run_client_kex<T: KexConfig>(
     let client_protocol_support = config.protocol_support();
     let user = config.user().unwrap_or_default();
     let send_env_patterns = config.send_env();
-    let send_env: Vec<(String, String)> = std::env::vars()
+    let send_env: Vec<(String, String)> = vars()
         .filter(|(k, _)| env_var_matches(k, &send_env_patterns))
         .collect();
     let send_path = config.send_path();
@@ -740,7 +743,15 @@ async fn run_server_kex<T: KexConfig>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::net::SocketAddr;
+
+    use anyhow::Result;
+    use tokio::sync::mpsc::unbounded_channel;
+    use uuid::Uuid;
+
+    use super::{
+        Kex, KexEvent, KexMode, KexStateMachine, MoshpitError, ServerKex, env_var_matches,
+    };
 
     #[tokio::test]
     async fn kex_state_machine_server_mode_completes_after_uuid() -> Result<()> {

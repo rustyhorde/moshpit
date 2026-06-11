@@ -6,7 +6,11 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-use std::{fmt::Display, io::Cursor, net::SocketAddr};
+use std::{
+    fmt::{Display, Formatter, Result as FmtResult},
+    io::Cursor,
+    net::SocketAddr,
+};
 
 use anyhow::Result;
 use bincode_next::{Decode, Encode, config::standard, decode_from_slice};
@@ -138,7 +142,7 @@ fn get_u8(src: &mut Cursor<&[u8]>) -> Option<u8> {
 }
 
 impl Display for Frame {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         match self {
             Frame::Initialize(user, pk, full_pk) => {
                 write!(

@@ -8,7 +8,8 @@
 
 use std::{
     collections::BTreeSet,
-    fs::OpenOptions,
+    fmt::{Debug, Formatter, Result as FmtResult},
+    fs::{OpenOptions, create_dir_all, read_to_string, write},
     io::{BufRead, BufReader},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
@@ -349,8 +350,8 @@ pub struct KexReader {
     agent_fingerprint: Option<String>,
 }
 
-impl std::fmt::Debug for KexReader {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for KexReader {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         let mut debug = f.debug_struct("KexReader");
         let _ = debug
             .field("reader", &self.reader)
@@ -1607,7 +1608,7 @@ fn check_known_hosts(
     let pk_b64 = STANDARD.encode(pk);
 
     if known_hosts_path.exists() {
-        let content = std::fs::read_to_string(&known_hosts_path)?;
+        let content = read_to_string(&known_hosts_path)?;
         for line in content.lines() {
             let mut parts = line.split_whitespace();
             if let (Some(h), Some(k)) = (parts.next(), parts.next())
@@ -1637,7 +1638,7 @@ fn check_known_hosts(
             // Save it
             use std::io::Write;
             if let Some(parent) = known_hosts_path.parent() {
-                std::fs::create_dir_all(parent)?;
+                create_dir_all(parent)?;
             }
             let mut file = OpenOptions::new()
                 .create(true)
@@ -1667,14 +1668,14 @@ fn replace_known_host_key(host: &str, new_pk_b64: &str) -> Result<()> {
     let home = dirs2::home_dir().ok_or_else(|| anyhow::anyhow!("No home directory found"))?;
     let known_hosts_path = home.join(".mp").join("known_hosts");
     if let Some(parent) = known_hosts_path.parent() {
-        std::fs::create_dir_all(parent)?;
+        create_dir_all(parent)?;
     }
 
     let mut replaced = false;
     let mut out_lines: Vec<String> = Vec::new();
 
     if known_hosts_path.exists() {
-        let content = std::fs::read_to_string(&known_hosts_path)?;
+        let content = read_to_string(&known_hosts_path)?;
         for line in content.lines() {
             let trimmed = line.trim();
             if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -1703,7 +1704,7 @@ fn replace_known_host_key(host: &str, new_pk_b64: &str) -> Result<()> {
     if !updated.is_empty() {
         updated.push('\n');
     }
-    std::fs::write(known_hosts_path, updated)?;
+    write(known_hosts_path, updated)?;
     Ok(())
 }
 
@@ -1712,14 +1713,22 @@ fn replace_known_host_key(host: &str, new_pk_b64: &str) -> Result<()> {
 #[allow(unsafe_code)]
 mod tests {
     use std::{
+        env::set_var,
+        fs::{DirBuilder, File, OpenOptions, create_dir_all, read_to_string},
         io::Write,
+        iter::from_fn,
+        net::SocketAddr,
         os::unix::fs::{DirBuilderExt, OpenOptionsExt},
+        path::PathBuf,
         sync::{Arc, Mutex, OnceLock},
     };
 
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use tempfile::TempDir;
+    use tokio::spawn;
+    use tokio::sync::mpsc::UnboundedReceiver;
 
+    use aws_lc_rs::aead::Nonce;
     use aws_lc_rs::kem::{
         Ciphertext, DecapsulationKey, EncapsulationKey, ML_KEM_512, ML_KEM_768, ML_KEM_1024,
     };
@@ -1745,9 +1754,9 @@ mod tests {
     /// Write a `.mp/known_hosts` file inside `dir` with `host <pk_b64>` line.
     fn write_known_hosts(dir: &TempDir, host: &str, pk: &[u8]) {
         let mp = dir.path().join(".mp");
-        std::fs::create_dir_all(&mp).expect("create .mp dir");
+        create_dir_all(&mp).expect("create .mp dir");
         let kh = mp.join("known_hosts");
-        let mut f = std::fs::File::create(kh).expect("create known_hosts file");
+        let mut f = File::create(kh).expect("create known_hosts file");
         writeln!(f, "{host} {}", STANDARD.encode(pk)).expect("write known_hosts entry");
     }
 
@@ -1755,12 +1764,12 @@ mod tests {
     /// apply the supplied `mode` bits.
     fn write_authorized_keys(dir: &TempDir, content: &[u8], mode: u32) {
         let mp = dir.path().join(".mp");
-        std::fs::DirBuilder::new()
+        DirBuilder::new()
             .mode(0o700)
             .create(&mp)
             .expect("create .mp dir with 0o700");
         let ak = mp.join("authorized_keys");
-        let mut f = std::fs::OpenOptions::new()
+        let mut f = OpenOptions::new()
             .create(true)
             .write(true)
             .mode(mode)
@@ -1893,7 +1902,7 @@ mod tests {
         write_known_hosts(&dir, host, pk);
         // Point HOME at the temp dir so check_known_hosts finds our file.
         // SAFETY: test-only; serialized via home_lock.
-        unsafe { std::env::set_var("HOME", dir.path()) };
+        unsafe { set_var("HOME", dir.path()) };
         let result = check_known_hosts(host, pk, None, None).expect("check_known_hosts");
         assert!(result, "matching key should be accepted");
     }
@@ -1908,7 +1917,7 @@ mod tests {
         let host = "192.0.2.2";
         write_known_hosts(&dir, host, pinned_pk);
         // SAFETY: test-only; serialized via home_lock.
-        unsafe { std::env::set_var("HOME", dir.path()) };
+        unsafe { set_var("HOME", dir.path()) };
         let result = check_known_hosts(host, attacker_pk, None, None).expect("check_known_hosts");
         assert!(!result, "mismatched host key must be rejected");
     }
@@ -1923,14 +1932,14 @@ mod tests {
         let host = "192.0.2.20";
         write_known_hosts(&dir, host, old_pk);
         // SAFETY: test-only; serialized via home_lock.
-        unsafe { std::env::set_var("HOME", dir.path()) };
+        unsafe { set_var("HOME", dir.path()) };
 
         let mismatch_fn: HostKeyMismatchFn = Arc::new(|_h, _old_fp, _new_fp| Ok(true));
         let result =
             check_known_hosts(host, new_pk, None, Some(&mismatch_fn)).expect("check_known_hosts");
         assert!(result, "accepted replacement should return true");
 
-        let content = std::fs::read_to_string(dir.path().join(".mp").join("known_hosts"))
+        let content = read_to_string(dir.path().join(".mp").join("known_hosts"))
             .expect("read known_hosts file");
         assert!(content.contains(host));
         assert!(content.contains(&STANDARD.encode(new_pk)));
@@ -1947,14 +1956,14 @@ mod tests {
         let host = "192.0.2.21";
         write_known_hosts(&dir, host, old_pk);
         // SAFETY: test-only; serialized via home_lock.
-        unsafe { std::env::set_var("HOME", dir.path()) };
+        unsafe { set_var("HOME", dir.path()) };
 
         let mismatch_fn: HostKeyMismatchFn = Arc::new(|_h, _old_fp, _new_fp| Ok(false));
         let result =
             check_known_hosts(host, new_pk, None, Some(&mismatch_fn)).expect("check_known_hosts");
         assert!(!result, "rejected replacement should return false");
 
-        let content = std::fs::read_to_string(dir.path().join(".mp").join("known_hosts"))
+        let content = read_to_string(dir.path().join(".mp").join("known_hosts"))
             .expect("read known_hosts file");
         assert!(content.contains(host));
         assert!(content.contains(&STANDARD.encode(old_pk)));
@@ -1976,14 +1985,14 @@ mod tests {
         let pk = b"brand-new-server-key";
         let host = "192.0.2.3";
         // No existing known_hosts file; just ensure the .mp dir exists.
-        std::fs::create_dir_all(dir.path().join(".mp")).expect("create .mp dir");
+        create_dir_all(dir.path().join(".mp")).expect("create .mp dir");
         // SAFETY: test-only; serialized via home_lock.
-        unsafe { std::env::set_var("HOME", dir.path()) };
+        unsafe { set_var("HOME", dir.path()) };
         let tofu_fn: TofuFn = Arc::new(|_host, _fp| Ok(true));
         let result = check_known_hosts(host, pk, Some(&tofu_fn), None).expect("check_known_hosts");
         assert!(result, "TOFU accept should return true");
         // Key should now be persisted.
-        let kh_content = std::fs::read_to_string(dir.path().join(".mp").join("known_hosts"))
+        let kh_content = read_to_string(dir.path().join(".mp").join("known_hosts"))
             .expect("read known_hosts file");
         assert!(
             kh_content.contains(host),
@@ -1998,9 +2007,9 @@ mod tests {
         let dir = TempDir::new().expect("temp dir creation");
         let pk = b"unknown-server-key";
         let host = "192.0.2.4";
-        std::fs::create_dir_all(dir.path().join(".mp")).expect("create .mp dir");
+        create_dir_all(dir.path().join(".mp")).expect("create .mp dir");
         // SAFETY: test-only; serialized via home_lock.
-        unsafe { std::env::set_var("HOME", dir.path()) };
+        unsafe { set_var("HOME", dir.path()) };
         let tofu_fn: TofuFn = Arc::new(|_host, _fp| Ok(false));
         let result = check_known_hosts(host, pk, Some(&tofu_fn), None).expect("check_known_hosts");
         assert!(!result, "TOFU reject should return false");
@@ -2013,9 +2022,9 @@ mod tests {
         let dir = TempDir::new().expect("temp dir creation");
         let pk = b"some-server-key";
         let host = "192.0.2.5";
-        std::fs::create_dir_all(dir.path().join(".mp")).expect("create .mp dir");
+        create_dir_all(dir.path().join(".mp")).expect("create .mp dir");
         // SAFETY: test-only; serialized via home_lock.
-        unsafe { std::env::set_var("HOME", dir.path()) };
+        unsafe { set_var("HOME", dir.path()) };
         let result = check_known_hosts(host, pk, None, None).expect("check_known_hosts");
         assert!(!result, "no TOFU callback must fail closed");
     }
@@ -2211,8 +2220,8 @@ mod tests {
         reader: ConnectionReader,
     ) -> (
         super::super::KexReader,
-        tokio::sync::mpsc::UnboundedReceiver<Frame>,
-        tokio::sync::mpsc::UnboundedReceiver<KexEvent>,
+        UnboundedReceiver<Frame>,
+        UnboundedReceiver<KexEvent>,
     ) {
         let (tx, rx_frames) = unbounded_channel::<Frame>();
         let (tx_event, rx_events) = unbounded_channel::<KexEvent>();
@@ -2245,8 +2254,7 @@ mod tests {
         let mut pool = BTreeSet::new();
         let _ = pool.insert(free_port);
         let port_pool = StdArc::new(TokioMutex::new(pool));
-        let socket_addr: std::net::SocketAddr =
-            "127.0.0.1:9000".parse().expect("hardcoded test address");
+        let socket_addr: SocketAddr = "127.0.0.1:9000".parse().expect("hardcoded test address");
 
         let udp_arc = kex_reader.handle_udp_setup(socket_addr, port_pool).await?;
 
@@ -2268,8 +2276,7 @@ mod tests {
 
         let pool: BTreeSet<u16> = BTreeSet::new();
         let port_pool = StdArc::new(TokioMutex::new(pool));
-        let socket_addr: std::net::SocketAddr =
-            "127.0.0.1:9000".parse().expect("hardcoded test address");
+        let socket_addr: SocketAddr = "127.0.0.1:9000".parse().expect("hardcoded test address");
 
         let result = kex_reader.handle_udp_setup(socket_addr, port_pool).await;
         assert!(result.is_err(), "expected error when pool is empty");
@@ -2305,8 +2312,7 @@ mod tests {
         let _ = pool.insert(occupied_port);
         let _ = pool.insert(free_port);
         let port_pool = StdArc::new(TokioMutex::new(pool));
-        let socket_addr: std::net::SocketAddr =
-            "127.0.0.1:9000".parse().expect("hardcoded test address");
+        let socket_addr: SocketAddr = "127.0.0.1:9000".parse().expect("hardcoded test address");
 
         // occupied_sock is still alive — occupied_port is held at the OS level.
         let udp_arc = kex_reader
@@ -2350,8 +2356,7 @@ mod tests {
         let mut plaintext = b"Yoda".to_vec();
         let mut nonce_bytes = [0u8; NONCE_LEN];
         fill(&mut nonce_bytes).expect("fill nonce bytes");
-        let nonce =
-            aws_lc_rs::aead::Nonce::try_assume_unique_for_key(&nonce_bytes).expect("create nonce");
+        let nonce = Nonce::try_assume_unique_for_key(&nonce_bytes).expect("create nonce");
         rnk.seal_in_place_append_tag(nonce, Aad::empty(), &mut plaintext)
             .expect("seal in place");
 
@@ -2573,8 +2578,7 @@ mod tests {
         );
         // A Failure event is emitted so the state machine can tear the session down.
         assert!(
-            std::iter::from_fn(|| rx_events.try_recv().ok())
-                .any(|e| matches!(e, KexEvent::Failure)),
+            from_fn(|| rx_events.try_recv().ok()).any(|e| matches!(e, KexEvent::Failure)),
             "expected a KexEvent::Failure to be sent",
         );
     }
@@ -2606,11 +2610,10 @@ mod tests {
         let mut pool = BTreeSet::new();
         let _ = pool.insert(50123u16);
         let port_pool = StdArc::new(TokioMutex::new(pool));
-        let socket_addr: std::net::SocketAddr =
-            "127.0.0.1:9000".parse().expect("hardcoded test address");
+        let socket_addr: SocketAddr = "127.0.0.1:9000".parse().expect("hardcoded test address");
         // The version error returns before the public key file is read, so this
         // path never has to exist.
-        let dummy_pubkey = std::path::PathBuf::from("/nonexistent/pubkey");
+        let dummy_pubkey = PathBuf::from("/nonexistent/pubkey");
 
         let result = kex_reader
             .server_kex(socket_addr, port_pool, &dummy_pubkey, None)
@@ -2646,11 +2649,10 @@ mod tests {
 
         let conn_uuid = Uuid::new_v4();
         let session_uuid = Uuid::new_v4();
-        let moshpits_addr: std::net::SocketAddr =
-            "127.0.0.1:50002".parse().expect("hardcoded test address");
+        let moshpits_addr: SocketAddr = "127.0.0.1:50002".parse().expect("hardcoded test address");
 
         // Spawn mock server task
-        let server_handle = tokio::spawn(async move {
+        let server_handle = spawn(async move {
             // 1. Send KexInit so client can negotiate and generate its ephemeral key.
             server_writer
                 .write_frame(&Frame::KexInit(

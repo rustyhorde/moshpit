@@ -15,6 +15,8 @@
 //! This provides seamless unlock when the user already has an ssh-agent session,
 //! without exposing the vault passphrase directly.
 
+use std::env::var;
+
 use anyhow::{Result, anyhow};
 
 use super::UnlockBackend;
@@ -31,7 +33,7 @@ impl UnlockBackend for SshAgentBackend {
         //    (b"moshpit-vault-challenge-v1" padded to 64 bytes)
         // 4. Hash the returned signature with SHA256, base64-encode → use as passphrase
         drop(
-            std::env::var("SSH_AUTH_SOCK")
+            var("SSH_AUTH_SOCK")
                 .map_err(|_| anyhow!("SSH_AUTH_SOCK not set — no ssh-agent running"))?,
         );
         Err(anyhow!(

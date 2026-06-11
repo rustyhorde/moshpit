@@ -148,17 +148,20 @@ impl AgentClient {
 #[cfg(test)]
 #[cfg(unix)]
 mod tests {
+    use std::path::PathBuf;
     use tempfile::TempDir;
+
+    use bincode_next::{config::standard, encode_to_vec};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::net::UnixListener;
+    use tokio::spawn;
+    use tokio::task::JoinHandle;
 
-    use super::*;
+    use super::{AgentClient, AgentIdentityInfo, AgentResponse};
 
-    fn spawn_mock_agent(
-        socket_path: &PathBuf,
-        response: AgentResponse,
-    ) -> tokio::task::JoinHandle<()> {
+    fn spawn_mock_agent(socket_path: &PathBuf, response: AgentResponse) -> JoinHandle<()> {
         let listener = UnixListener::bind(socket_path).expect("bind test agent socket");
-        tokio::spawn(async move {
+        spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept test connection");
             let req_len = stream.read_u32().await.expect("read request length") as usize;
             let mut buf = vec![0u8; req_len];

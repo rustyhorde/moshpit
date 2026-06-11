@@ -6,7 +6,7 @@
 // option. All files in the project carrying such notice may not be copied,
 // modified, or distributed except according to those terms.
 
-use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
+use std::{collections::BTreeSet, env::var, path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use getset::{CopyGetters, Getters, Setters};
@@ -121,6 +121,12 @@ pub(crate) struct Config {
     #[serde(default)]
     #[getset(get = "pub(crate)")]
     send_path: Vec<String>,
+    /// Force-quit escape prefix key, e.g. `"ctrl-^"` (default).  Pressed and then
+    /// followed by `.` to disconnect.  Must resolve to a control byte; parsed and
+    /// validated at startup by `runtime::parse_escape_key`.
+    #[serde(default = "Config::default_escape_key")]
+    #[getset(get = "pub(crate)")]
+    escape_key: String,
 }
 
 impl Config {
@@ -138,6 +144,10 @@ impl Config {
 
     fn default_send_env() -> Vec<String> {
         vec!["LANG".into(), "LC_*".into(), "TZ".into()]
+    }
+
+    fn default_escape_key() -> String {
+        "ctrl-^".to_string()
     }
 
     fn load_key_paths(&self) -> Result<(PathBuf, PathBuf)> {
@@ -175,6 +185,7 @@ impl Default for Config {
             preferred_algorithms: AlgorithmPreferences::default(),
             send_env: Self::default_send_env(),
             send_path: Vec::new(),
+            escape_key: Self::default_escape_key(),
         }
     }
 }
@@ -221,13 +232,18 @@ impl KexConfig for Config {
     }
 
     fn agent_socket(&self) -> Option<PathBuf> {
-        std::env::var("MOSHPIT_AGENT_SOCK").ok().map(PathBuf::from)
+        var("MOSHPIT_AGENT_SOCK").ok().map(PathBuf::from)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::path::PathBuf;
+
+    use anyhow::Result;
+    use uuid::Uuid;
+
+    use super::{Config, DisplayPreference, KexConfig, KexMode};
 
     #[test]
     fn test_default_config() {
@@ -240,6 +256,7 @@ mod tests {
         assert_eq!(config.resume_session_uuid(), None);
         assert_eq!(config.max_reconnect_backoff_secs(), 3600);
         assert_eq!(config.predict(), DisplayPreference::default());
+        assert_eq!(config.escape_key(), "ctrl-^");
     }
 
     #[test]

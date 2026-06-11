@@ -278,7 +278,19 @@ mod tests {
     };
     use tokio::sync::mpsc::channel;
 
-    use super::*;
+    use std::{net::SocketAddr, sync::Arc, time::Duration};
+
+    use anyhow::Result;
+    use aws_lc_rs::aead::LessSafeKey;
+    use aws_lc_rs::hmac::Key;
+    use tokio::net::UdpSocket;
+    use tokio::spawn;
+    use tokio::sync::{mpsc::Receiver, oneshot};
+    use tokio::time::{sleep, timeout};
+    use tokio_util::sync::CancellationToken;
+    use uuid::Uuid;
+
+    use super::{EncryptedFrame, UdpSender, now_micros};
 
     fn make_sender(
         socket: Arc<UdpSocket>,
@@ -329,12 +341,12 @@ mod tests {
 
         let mut sender = make_sender(send_socket, ctrl_rx, frame_rx, retransmit_rx);
         let token2 = token.clone();
-        let handle = tokio::spawn(async move {
+        let handle = spawn(async move {
             drop(sender.frame_loop(token2).await);
         });
 
         let mut buf = vec![0u8; 65535];
-        drop(tokio::time::timeout(Duration::from_millis(500), server.recv(&mut buf)).await);
+        drop(timeout(Duration::from_millis(500), server.recv(&mut buf)).await);
 
         token.cancel();
         drop(handle.await);
@@ -387,16 +399,14 @@ mod tests {
 
         let mut sender = make_sender(send_socket, ctrl_rx, frame_rx, retransmit_rx);
         let token2 = token.clone();
-        let handle = tokio::spawn(async move {
+        let handle = spawn(async move {
             drop(sender.frame_loop(token2).await);
         });
 
         // The sender should drain both frames and exit cleanly (data channel closed).
         let mut count = 0usize;
         let mut buf = vec![0u8; 65535];
-        while let Ok(Ok(_)) =
-            tokio::time::timeout(Duration::from_millis(200), server.recv(&mut buf)).await
-        {
+        while let Ok(Ok(_)) = timeout(Duration::from_millis(200), server.recv(&mut buf)).await {
             count += 1;
         }
         token.cancel();
@@ -444,7 +454,7 @@ mod tests {
         peer_disc_tx.send(old_addr).expect("test oneshot send");
 
         let token2 = token.clone();
-        let handle = tokio::spawn(async move {
+        let handle = spawn(async move {
             drop(sender.frame_loop(token2).await);
         });
 
@@ -454,7 +464,7 @@ mod tests {
             .await
             .expect("test channel send");
         let mut buf = vec![0u8; 65535];
-        let got_old = tokio::time::timeout(Duration::from_millis(500), old_peer.recv(&mut buf))
+        let got_old = timeout(Duration::from_millis(500), old_peer.recv(&mut buf))
             .await
             .is_ok();
 
@@ -472,7 +482,7 @@ mod tests {
             .send(EncryptedFrame::Keepalive(0))
             .await
             .expect("test channel send");
-        let got_new = tokio::time::timeout(Duration::from_millis(500), new_peer.recv(&mut buf))
+        let got_new = timeout(Duration::from_millis(500), new_peer.recv(&mut buf))
             .await
             .is_ok();
 
@@ -501,7 +511,7 @@ mod tests {
 
         let mut sender = make_sender(send_socket, ctrl_rx, frame_rx, retransmit_rx);
         let token2 = token.clone();
-        let handle = tokio::spawn(async move { drop(sender.frame_loop(token2).await) });
+        let handle = spawn(async move { drop(sender.frame_loop(token2).await) });
 
         // Send a data frame: populates retransmit_buffer[seq=0] and sends a wire packet.
         frame_tx
@@ -509,7 +519,7 @@ mod tests {
             .await
             .expect("test channel send");
         let mut buf = vec![0u8; 65535];
-        let got_original = tokio::time::timeout(Duration::from_millis(200), server.recv(&mut buf))
+        let got_original = timeout(Duration::from_millis(200), server.recv(&mut buf))
             .await
             .is_ok();
 
@@ -520,10 +530,9 @@ mod tests {
             .expect("test channel send");
 
         // Deadline fires after ~20ms and re-sends the stored wire bytes.
-        let got_retransmit =
-            tokio::time::timeout(Duration::from_millis(100), server.recv(&mut buf))
-                .await
-                .is_ok();
+        let got_retransmit = timeout(Duration::from_millis(100), server.recv(&mut buf))
+            .await
+            .is_ok();
 
         token.cancel();
         drop(handle.await);

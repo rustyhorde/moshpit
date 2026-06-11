@@ -77,7 +77,7 @@ impl Emulator {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::Emulator;
 
     #[test]
     fn set_size_updates_screen_dimensions() {

@@ -6,7 +6,7 @@ members = ["agent", "keygen","libmoshpit", "moshpit", "moshpits", "xtask"]
 [workspace.dependencies]
 anyhow = "1.0.102"
 aws-lc-rs = "1.17.0"
-bon = "3.9.1"
+bon = "3.9.2"
 bytes = "1.11.1"
 clap = { version = "4.6.1", features = ["derive"] }
 config = { version = "0.15.23", features = ["toml"] }
@@ -29,7 +29,7 @@ tracing = { version = "0.1.44", features = [
   "release_max_level_trace",
 ] }
 tracing-subscriber-init = { version = "0.2.6", features = ["tstime"] }
-uuid = { version = "1.23.2", features = ["v4"] }
+uuid = { version = "1.23.3", features = ["v4"] }
 vergen-gix = { version = "10.0.0", features = [
   "build",
   "cargo",

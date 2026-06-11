@@ -14,12 +14,15 @@
 //! observable behaviour: add-key, list, lock, unlock, remove-all.
 
 use std::{
+    env::temp_dir,
+    fs::remove_file,
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
-    time::Duration,
+    process::{Child, Command, Stdio, id},
+    time::{Duration, Instant},
 };
 
 use libmoshpit::{AgentClient, AgentRequest, AgentResponse};
+use tokio::time::sleep;
 
 const TEST_KEY_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -36,19 +39,11 @@ fn agent_binary() -> PathBuf {
 }
 
 fn temp_socket(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "moshpit-agent-test-{}-{}.sock",
-        name,
-        std::process::id()
-    ))
+    temp_dir().join(format!("moshpit-agent-test-{}-{}.sock", name, id()))
 }
 
 fn temp_vault(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!(
-        "moshpit-agent-test-{}-{}.vault",
-        name,
-        std::process::id()
-    ))
+    temp_dir().join(format!("moshpit-agent-test-{}-{}.vault", name, id()))
 }
 
 /// Start the agent in foreground mode and return the child process.
@@ -80,23 +75,23 @@ fn start_agent(socket: &Path, vault: &Path) -> Child {
 }
 
 async fn wait_for_socket(socket: &Path, timeout: Duration) -> bool {
-    let deadline = std::time::Instant::now() + timeout;
-    while std::time::Instant::now() < deadline {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
         if socket.exists() {
             return true;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(50)).await;
     }
     false
 }
 
 async fn wait_for_lock(lock: &Path, timeout: Duration) -> bool {
-    let deadline = std::time::Instant::now() + timeout;
-    while std::time::Instant::now() < deadline {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
         if lock.exists() {
             return true;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(50)).await;
     }
     false
 }
@@ -189,8 +184,8 @@ async fn agent_lifecycle_add_list_lock_unlock() {
 
     child.kill().ok();
     child.wait().ok();
-    let _ = std::fs::remove_file(&socket);
-    let _ = std::fs::remove_file(&vault);
+    let _ = remove_file(&socket);
+    let _ = remove_file(&vault);
 }
 
 #[tokio::test]
@@ -248,9 +243,9 @@ async fn duplicate_start_is_rejected() {
 
     daemon.kill().ok();
     daemon.wait().ok();
-    let _ = std::fs::remove_file(&socket);
-    let _ = std::fs::remove_file(&lock);
-    let _ = std::fs::remove_file(&vault);
+    let _ = remove_file(&socket);
+    let _ = remove_file(&lock);
+    let _ = remove_file(&vault);
 }
 
 #[tokio::test]
@@ -299,6 +294,6 @@ async fn agent_add_encrypted_key() {
 
     child.kill().ok();
     child.wait().ok();
-    let _ = std::fs::remove_file(&socket);
-    let _ = std::fs::remove_file(&vault);
+    let _ = remove_file(&socket);
+    let _ = remove_file(&vault);
 }

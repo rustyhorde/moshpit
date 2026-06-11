@@ -194,7 +194,7 @@ mod tests {
     use std::io::Cursor;
 
     use aws_lc_rs::{
-        aead::{AES_256_GCM_SIV, Aad, LessSafeKey, NONCE_LEN, UnboundKey},
+        aead::{AES_256_GCM_SIV, Aad, Algorithm, LessSafeKey, NONCE_LEN, Nonce, UnboundKey},
         hmac::{HMAC_SHA512, Key, sign},
         rand,
     };
@@ -225,7 +225,7 @@ mod tests {
         encrypted_part.extend_from_slice(&data);
         let mut nonce_bytes = [0u8; NONCE_LEN];
         rand::fill(&mut nonce_bytes)?;
-        let nonce = aws_lc_rs::aead::Nonce::try_assume_unique_for_key(&nonce_bytes)?;
+        let nonce = Nonce::try_assume_unique_for_key(&nonce_bytes)?;
         rnk.seal_in_place_append_tag(nonce, aad, &mut encrypted_part)?;
         let seq_bytes = seq.to_be_bytes();
         let mut to_sign = seq_bytes.to_vec();
@@ -298,7 +298,7 @@ mod tests {
     fn parse_round_trip_all_aead_algorithms_separate_key_instances() {
         use aws_lc_rs::aead::{AES_128_GCM_SIV, AES_256_GCM, CHACHA20_POLY1305};
 
-        let algorithms: &[(&aws_lc_rs::aead::Algorithm, &[u8])] = &[
+        let algorithms: &[(&Algorithm, &[u8])] = &[
             (&AES_256_GCM_SIV, &[1u8; 32]),
             (&AES_256_GCM, &[2u8; 32]),
             (&CHACHA20_POLY1305, &[3u8; 32]),
@@ -382,7 +382,7 @@ mod tests {
         encrypted_part.extend_from_slice(&[0u8; 10]);
         let mut nonce_bytes = [0u8; NONCE_LEN];
         rand::fill(&mut nonce_bytes)?;
-        let nonce = aws_lc_rs::aead::Nonce::try_assume_unique_for_key(&nonce_bytes)?;
+        let nonce = Nonce::try_assume_unique_for_key(&nonce_bytes)?;
         rnk.seal_in_place_append_tag(nonce, aad, &mut encrypted_part)?;
 
         let seq_bytes = seq.to_be_bytes();

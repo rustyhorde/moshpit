@@ -9,7 +9,7 @@
 use std::{
     ffi::OsString,
     fs::{DirBuilder, OpenOptions},
-    io::BufRead as _,
+    io::{BufRead as _, stdin},
     path::{Path, PathBuf},
 };
 
@@ -104,7 +104,7 @@ fn prompt_for_overwrite() -> Result<bool> {
 
 fn read_passphrase_from_stdin() -> Result<Option<String>> {
     let mut line = String::new();
-    let _ = std::io::stdin().lock().read_line(&mut line)?;
+    let _ = stdin().lock().read_line(&mut line)?;
     let passphrase = line.trim_end_matches(['\n', '\r']).to_string();
     Ok(Some(passphrase))
 }
@@ -321,19 +321,29 @@ fn display_fingerprint(public_key_path: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::env::temp_dir;
     use std::fs;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use anyhow::Result;
+    use libmoshpit::{KEY_ALGORITHM_X25519, KexMode, KeyPair};
+
+    use super::{
+        check_paths_inner, display_fingerprint, generate_and_write_keys_inner, setup_paths_inner,
+        verify_key,
+    };
 
     static DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     fn get_temp_dir() -> PathBuf {
         let count = DIR_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
             .expect("system time is before UNIX epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!("moshpit_test_{time}_{count}"))
+        temp_dir().join(format!("moshpit_test_{time}_{count}"))
     }
 
     #[test]

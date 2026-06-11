@@ -176,7 +176,9 @@ fn default_backend() -> String {
 mod tests {
     use clap::CommandFactory;
 
-    use super::*;
+    use clap::Parser as _;
+
+    use super::{Cli, Commands, ShellKind};
 
     #[test]
     fn verify_cli() {

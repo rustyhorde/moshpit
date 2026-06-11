@@ -12,13 +12,14 @@ use std::{
     fs::File,
     io::{BufWriter, Read, Write},
     path::PathBuf,
+    str::from_utf8,
 };
 
 use anyhow::{Error, Result};
 use argon2::{Argon2, PasswordHasher, password_hash::phc::SaltString};
 use aws_lc_rs::{
     aead::{AES_256_GCM_SIV, Aad, Nonce, RandomizedNonceKey},
-    agreement::{ECDH_P256, ECDH_P384, PrivateKey, PublicKey, X25519},
+    agreement::{Algorithm, ECDH_P256, ECDH_P384, PrivateKey, PublicKey, X25519},
     cipher::AES_256_KEY_LEN,
     digest::SHA512_OUTPUT_LEN,
     encoding::{AsBigEndian as _, Curve25519SeedBin, EcPrivateKeyBin},
@@ -672,7 +673,7 @@ pub fn load_public_key(pub_key_path: &PathBuf) -> Result<(Vec<u8>, Vec<u8>)> {
     // Parse the public key file
     let mut public_key_bytes = BytesMut::from(&decoded[..]);
     let key_alg = get_val_by_len(&mut public_key_bytes)?;
-    let key_alg_str = std::str::from_utf8(&key_alg).map_err(|_| MoshpitError::InvalidKeyHeader)?;
+    let key_alg_str = from_utf8(&key_alg).map_err(|_| MoshpitError::InvalidKeyHeader)?;
     if !is_supported_key_algorithm(key_alg_str) {
         return Err(MoshpitError::InvalidKeyHeader.into());
     }
@@ -707,8 +708,8 @@ pub fn load_private_key(
     let cipher = get_val_by_len(&mut private_key_bytes)?;
     let kdf = get_val_by_len(&mut private_key_bytes)?;
     let key_alg = get_val_by_len(&mut private_key_bytes)?;
-    let key_alg_str = std::str::from_utf8(&key_alg).map_err(|_| MoshpitError::InvalidKeyHeader)?;
-    let agreement_alg: &aws_lc_rs::agreement::Algorithm = match key_alg_str {
+    let key_alg_str = from_utf8(&key_alg).map_err(|_| MoshpitError::InvalidKeyHeader)?;
+    let agreement_alg: &Algorithm = match key_alg_str {
         KEY_ALGORITHM_X25519 => &X25519,
         KEY_ALGORITHM_P384 => &ECDH_P384,
         KEY_ALGORITHM_P256 => &ECDH_P256,
@@ -770,7 +771,7 @@ pub fn load_identity_key(
     let cipher = get_val_by_len(&mut private_key_bytes)?;
     let kdf = get_val_by_len(&mut private_key_bytes)?;
     let key_alg = get_val_by_len(&mut private_key_bytes)?;
-    let key_alg_str = std::str::from_utf8(&key_alg).map_err(|_| MoshpitError::InvalidKeyHeader)?;
+    let key_alg_str = from_utf8(&key_alg).map_err(|_| MoshpitError::InvalidKeyHeader)?;
     if !is_supported_key_algorithm(key_alg_str) {
         return Err(MoshpitError::InvalidKeyHeader.into());
     }
@@ -808,7 +809,7 @@ pub fn validate_identity_key_pair(
     public_key: &[u8],
     private_key: &[u8],
 ) -> Result<()> {
-    let agreement_alg: Option<&aws_lc_rs::agreement::Algorithm> = match key_alg {
+    let agreement_alg: Option<&Algorithm> = match key_alg {
         KEY_ALGORITHM_X25519 => Some(&X25519),
         KEY_ALGORITHM_P384 => Some(&ECDH_P384),
         KEY_ALGORITHM_P256 => Some(&ECDH_P256),
@@ -843,6 +844,7 @@ fn get_val_by_len(bytes: &mut BytesMut) -> Result<BytesMut> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::{File, write};
     use std::path::PathBuf;
 
     use anyhow::Result;
@@ -970,7 +972,7 @@ mod tests {
             )?;
             let dir = tempfile::TempDir::new()?;
             let key_path = dir.path().join("id_mldsa");
-            let mut private_key = std::fs::File::create(&key_path)?;
+            let mut private_key = File::create(&key_path)?;
             key_pair.write_private_key(&mut private_key)?;
 
             let loaded = load_identity_key(&key_path, None)?;
@@ -1028,7 +1030,7 @@ mod tests {
         let path = dir.path().join("bad_key");
         let garbage =
             base64::engine::general_purpose::STANDARD.encode(b"wrong-header-for-testing-purposes");
-        std::fs::write(&path, garbage)?;
+        write(&path, garbage)?;
         assert!(load_identity_key(&path, None).is_err());
         Ok(())
     }
@@ -1057,7 +1059,7 @@ mod tests {
         )?;
         let dir = tempfile::TempDir::new()?;
         let path = dir.path().join("id_p384");
-        let mut f = std::fs::File::create(&path)?;
+        let mut f = File::create(&path)?;
         key_pair.write_private_key(&mut f)?;
         drop(f);
         let loaded = load_identity_key(&path, None)?;
@@ -1079,7 +1081,7 @@ mod tests {
         )?;
         let dir = tempfile::TempDir::new()?;
         let path = dir.path().join("id_p256");
-        let mut f = std::fs::File::create(&path)?;
+        let mut f = File::create(&path)?;
         key_pair.write_private_key(&mut f)?;
         drop(f);
         let loaded = load_identity_key(&path, None)?;
@@ -1126,7 +1128,7 @@ mod tests {
         )?;
         let dir = tempfile::TempDir::new()?;
         let path = dir.path().join("id_x25519_enc");
-        let mut f = std::fs::File::create(&path)?;
+        let mut f = File::create(&path)?;
         key_pair.write_private_key(&mut f)?;
         drop(f);
         let loaded = load_identity_key(&path, Some(&passphrase))?;
@@ -1151,7 +1153,7 @@ mod tests {
         )?;
         let dir = tempfile::TempDir::new()?;
         let path = dir.path().join("id_mldsa_enc");
-        let mut f = std::fs::File::create(&path)?;
+        let mut f = File::create(&path)?;
         key_pair.write_private_key(&mut f)?;
         drop(f);
         let loaded = load_identity_key(&path, Some(&passphrase))?;

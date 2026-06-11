@@ -654,7 +654,7 @@ impl PredictionEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{DisplayPreference, PredictionEngine};
 
     fn make_screen(rows: u16, cols: u16, content: &[u8]) -> vt100::Parser {
         let mut p = vt100::Parser::new(rows, cols, 0);

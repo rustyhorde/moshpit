@@ -19,6 +19,12 @@ server_destination = "192.168.1.10"
 # Clamped to the range [2, 86400].  Default: 3600 (1 hour).
 max_reconnect_backoff_secs = 3600
 
+# ── Force-quit key ────────────────────────────────────────────────────────────
+# Prefix key pressed (then followed by ".") to disconnect and quit.  Written as
+# "ctrl-<key>"; must resolve to a control key, e.g. "ctrl-^" (default), "ctrl-a",
+# or "ctrl-]".  The trailing "." confirm key is fixed.
+# escape_key = "ctrl-^"
+
 # ── Key files ─────────────────────────────────────────────────────────────────
 # Defaults to ~/.mp/id_x25519 and ~/.mp/id_x25519.pub when not set (for the
 # default x25519 key type). The filename reflects the --key-type used at

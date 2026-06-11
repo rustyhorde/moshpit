@@ -10,6 +10,7 @@ complete -c mp -l nat-warmup-count -d 'Number of NAT warmup keepalives to send (
 complete -c mp -l diff-mode -d 'UDP diff transport mode: reliable (default), datagram, or statesync' -r -f -a "reliable\t''
 datagram\t''
 statesync\t''"
+complete -c mp -l escape-key -d 'Force-quit prefix key, e.g. ctrl-^ (default), ctrl-a, ctrl-] — combined with . to quit' -r
 complete -c mp -l kex-algos -d 'Ordered KEX algorithms to offer, comma-separated [supported: x25519-sha256 (default), ml-kem-768-sha256, ml-kem-512-sha256, ml-kem-1024-sha256, p384-sha384, p256-sha256]' -r
 complete -c mp -l aead-algos -d 'Ordered AEAD algorithms to offer, comma-separated [supported: aes256-gcm-siv (default), aes256-gcm, chacha20-poly1305, aes128-gcm-siv]' -r
 complete -c mp -l mac-algos -d 'Ordered MAC algorithms to offer, comma-separated [supported: hmac-sha512 (default), hmac-sha256]' -r

@@ -8,10 +8,12 @@
 
 use std::{
     collections::HashMap,
+    env::{current_exe, var},
     ffi::OsString,
     fs,
-    io::BufRead as _,
+    io::{BufRead as _, stdin},
     path::{Path, PathBuf},
+    process::{Command, Stdio, exit},
     sync::Arc,
 };
 
@@ -28,6 +30,7 @@ use libmoshpit::{
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
     net::{UnixListener, UnixStream},
+    spawn,
     sync::Mutex,
 };
 use tracing::{error, info, warn};
@@ -130,9 +133,9 @@ async fn load_key_into_map(
     })
 }
 
-/// Handle a single client connection.
-async fn handle_connection(
-    mut stream: UnixStream,
+/// Shared daemon state handed to each connection handler.
+#[derive(Clone)]
+struct ConnectionState {
     identities: IdentityMap,
     vault: Arc<Mutex<Option<Vault>>>,
     vault_path: PathBuf,
@@ -140,7 +143,10 @@ async fn handle_connection(
     socket_path: PathBuf,
     lock_path: PathBuf,
     locked: Arc<Mutex<bool>>,
-) {
+}
+
+/// Handle a single client connection.
+async fn handle_connection(mut stream: UnixStream, state: ConnectionState) {
     while let Ok(raw_len) = stream.read_u32().await {
         let req_len = raw_len as usize;
         if req_len == 0 {
@@ -161,11 +167,11 @@ async fn handle_connection(
         let is_shutdown = matches!(request, AgentRequest::Shutdown);
         let response = dispatch_request(
             request,
-            &identities,
-            &vault,
-            &vault_path,
-            &master_passphrase,
-            &locked,
+            &state.identities,
+            &state.vault,
+            &state.vault_path,
+            &state.master_passphrase,
+            &state.locked,
         )
         .await;
 
@@ -186,9 +192,9 @@ async fn handle_connection(
             break;
         }
         if is_shutdown {
-            drop(fs::remove_file(&socket_path));
-            drop(fs::remove_file(&lock_path));
-            std::process::exit(0);
+            drop(fs::remove_file(&state.socket_path));
+            drop(fs::remove_file(&state.lock_path));
+            exit(0);
         }
     }
 }
@@ -448,7 +454,7 @@ async fn send_to_agent(socket_path: &Path, request: AgentRequest) -> Result<Agen
 #[cfg_attr(coverage_nightly, coverage(off))]
 fn read_passphrase_stdin() -> Result<String> {
     let mut line = String::new();
-    let _n = std::io::stdin().lock().read_line(&mut line)?;
+    let _n = stdin().lock().read_line(&mut line)?;
     Ok(line.trim_end_matches(['\n', '\r']).to_string())
 }
 
@@ -456,7 +462,7 @@ fn read_passphrase_stdin() -> Result<String> {
 fn read_key_passphrase(from_stdin: bool, key_path: &str) -> Result<Option<String>> {
     if from_stdin {
         let mut line = String::new();
-        let _n = std::io::stdin().lock().read_line(&mut line)?;
+        let _n = stdin().lock().read_line(&mut line)?;
         let trimmed = line.trim_end_matches(['\n', '\r']).to_string();
         Ok(if trimmed.is_empty() {
             None
@@ -636,9 +642,8 @@ where
             Ok(())
         }
         Commands::Status => {
-            let socket_path = std::env::var("MOSHPIT_AGENT_SOCK")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| crate::config::default_socket_path());
+            let socket_path = var("MOSHPIT_AGENT_SOCK")
+                .map_or_else(|_| crate::config::default_socket_path(), PathBuf::from);
             let client = libmoshpit::AgentClient::new(socket_path);
             match client.status().await {
                 Err(_) => println!("stopped"),
@@ -671,9 +676,13 @@ where
 }
 
 fn socket_from_env() -> Result<PathBuf> {
-    std::env::var("MOSHPIT_AGENT_SOCK")
+    socket_from_value(var("MOSHPIT_AGENT_SOCK").ok())
+}
+
+fn socket_from_value(value: Option<String>) -> Result<PathBuf> {
+    value
         .map(PathBuf::from)
-        .map_err(|_| anyhow!("MOSHPIT_AGENT_SOCK not set — is the agent running?"))
+        .ok_or_else(|| anyhow!("MOSHPIT_AGENT_SOCK not set — is the agent running?"))
 }
 
 fn unlock_backend(config: &AgentConfig) -> Box<dyn UnlockBackend> {
@@ -748,7 +757,7 @@ fn is_process_alive(pid: u32) -> bool {
     {
         use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
         matches!(
-            kill(Pid::from_raw(pid as i32), None),
+            kill(Pid::from_raw(pid.cast_signed()), None),
             Ok(()) | Err(Errno::EPERM)
         )
     }
@@ -763,13 +772,15 @@ async fn check_not_already_running(lock_path: &Path, socket_path: &Path) -> Resu
     if lock_path.exists() {
         let pid_str = fs::read_to_string(lock_path).unwrap_or_default();
         let pid: u32 = pid_str.trim().parse().unwrap_or(0);
-        if pid > 0 && is_process_alive(pid) {
-            if socket_path.exists() && UnixStream::connect(socket_path).await.is_ok() {
-                return Err(anyhow!(
-                    "agent is already running (pid {pid}, socket: {})\n  To stop it: mpa stop",
-                    socket_path.display()
-                ));
-            }
+        if pid > 0
+            && is_process_alive(pid)
+            && socket_path.exists()
+            && UnixStream::connect(socket_path).await.is_ok()
+        {
+            return Err(anyhow!(
+                "agent is already running (pid {pid}, socket: {})\n  To stop it: mpa stop",
+                socket_path.display()
+            ));
         }
         // Stale lock file — remove it and proceed.
         drop(fs::remove_file(lock_path));
@@ -790,12 +801,12 @@ fn spawn_daemon_child(
     shell: ShellKind,
     master_passphrase: &str,
 ) -> Result<()> {
-    let exe = std::env::current_exe()?;
+    let exe = current_exe()?;
     let shell_str = match shell {
         ShellKind::Fish => "fish",
         ShellKind::Bash => "bash",
     };
-    let mut cmd = std::process::Command::new(exe);
+    let mut cmd = Command::new(exe);
     let _ = cmd
         .arg("start")
         .arg("--foreground")
@@ -811,9 +822,9 @@ fn spawn_daemon_child(
         let _ = cmd.arg("--vault").arg(v);
     }
     let _ = cmd
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     #[cfg(target_family = "unix")]
     {
         use std::os::unix::process::CommandExt as _;
@@ -830,6 +841,22 @@ fn spawn_daemon_child(
 }
 
 #[cfg_attr(coverage_nightly, coverage(off))]
+/// Create the parent directories for the socket and vault files (mode 0700 on unix).
+fn create_runtime_dirs(config: &AgentConfig) -> Result<()> {
+    for path in [&config.socket_path, &config.vault_path] {
+        if let Some(parent) = path.parent() {
+            #[cfg(target_family = "unix")]
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .recursive(true)
+                .create(parent)?;
+            #[cfg(not(target_family = "unix"))]
+            fs::DirBuilder::new().recursive(true).create(parent)?;
+        }
+    }
+    Ok(())
+}
+
 async fn run_daemon(
     socket_override: Option<&str>,
     vault_override: Option<&str>,
@@ -841,25 +868,7 @@ async fn run_daemon(
 ) -> Result<()> {
     let config = AgentConfig::resolve(socket_override, vault_override, foreground, backend, shell);
 
-    // Create parent directories for socket and vault
-    if let Some(parent) = config.socket_path.parent() {
-        #[cfg(target_family = "unix")]
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .recursive(true)
-            .create(parent)?;
-        #[cfg(not(target_family = "unix"))]
-        fs::DirBuilder::new().recursive(true).create(parent)?;
-    }
-    if let Some(parent) = config.vault_path.parent() {
-        #[cfg(target_family = "unix")]
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .recursive(true)
-            .create(parent)?;
-        #[cfg(not(target_family = "unix"))]
-        fs::DirBuilder::new().recursive(true).create(parent)?;
-    }
+    create_runtime_dirs(&config)?;
 
     let backend = unlock_backend(&config);
     let vault_exists = config.vault_path.exists();
@@ -936,7 +945,7 @@ async fn run_daemon(
         let mut sighup = signal(SignalKind::hangup())?;
         let cleanup_path = socket_path_cleanup.clone();
         let cleanup_lock = lock_path_cleanup.clone();
-        drop(tokio::spawn(async move {
+        drop(spawn(async move {
             loop {
                 tokio::select! {
                     _ = sigterm.recv() => break,
@@ -946,22 +955,26 @@ async fn run_daemon(
             }
             drop(fs::remove_file(&cleanup_path));
             drop(fs::remove_file(&cleanup_lock));
-            std::process::exit(0);
+            exit(0);
         }));
     }
+
+    let state = ConnectionState {
+        identities,
+        vault,
+        vault_path: config.vault_path.clone(),
+        master_passphrase: master_passphrase_arc,
+        socket_path: config.socket_path.clone(),
+        lock_path: config.lock_path.clone(),
+        locked,
+    };
 
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
-                let ids = Arc::clone(&identities);
-                let v = Arc::clone(&vault);
-                let vp = config.vault_path.clone();
-                let mp = Arc::clone(&master_passphrase_arc);
-                let sp = config.socket_path.clone();
-                let lp = config.lock_path.clone();
-                let lk = Arc::clone(&locked);
-                drop(tokio::spawn(async move {
-                    handle_connection(stream, ids, v, vp, mp, sp, lp, lk).await;
+                let state = state.clone();
+                drop(spawn(async move {
+                    handle_connection(stream, state).await;
                 }));
             }
             Err(e) => error!("accept error: {e}"),
@@ -971,9 +984,26 @@ async fn run_daemon(
 
 #[cfg(test)]
 mod tests {
-    use tempfile::tempdir;
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        process::Command,
+        sync::Arc,
+    };
 
-    use super::*;
+    use bincode_next::{config::standard, decode_from_slice, encode_to_vec};
+    use tempfile::tempdir;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::net::{UnixListener, UnixStream};
+    use tokio::spawn;
+    use tokio::sync::Mutex;
+
+    use super::{
+        AgentConfig, AgentIdentityInfo, AgentRequest, AgentResponse, ConnectionState, Identity,
+        ShellKind, Vault, best_identity, check_not_already_running, dispatch_request,
+        format_socket_env, format_unset_socket_env, handle_connection, is_process_alive,
+        new_identity_map, reload_from_vault, sign_data, socket_from_value, unlock_backend,
+    };
 
     const TEST_KEY_PATH: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -1465,15 +1495,17 @@ mod tests {
 
         let (mut client, server) = UnixStream::pair().unwrap();
 
-        drop(tokio::spawn(handle_connection(
+        drop(spawn(handle_connection(
             server,
-            Arc::clone(&ids),
-            Arc::clone(&vault),
-            vault_path,
-            Arc::clone(&mp),
-            PathBuf::from("/tmp/nonexistent-socket-agent-test"),
-            PathBuf::from("/tmp/nonexistent-lock-agent-test"),
-            Arc::new(Mutex::new(false)),
+            ConnectionState {
+                identities: ids,
+                vault,
+                vault_path,
+                master_passphrase: mp,
+                socket_path: PathBuf::from("/tmp/nonexistent-socket-agent-test"),
+                lock_path: PathBuf::from("/tmp/nonexistent-lock-agent-test"),
+                locked: Arc::new(Mutex::new(false)),
+            },
         )));
 
         let req = AgentRequest::ListIdentities;
@@ -1501,15 +1533,17 @@ mod tests {
 
         let (mut client, server) = UnixStream::pair().unwrap();
 
-        let task = tokio::spawn(handle_connection(
+        let task = spawn(handle_connection(
             server,
-            ids,
-            vault,
-            vault_path,
-            mp,
-            PathBuf::from("/tmp/nonexistent-socket-agent-test"),
-            PathBuf::from("/tmp/nonexistent-lock-agent-test"),
-            Arc::new(Mutex::new(false)),
+            ConnectionState {
+                identities: ids,
+                vault,
+                vault_path,
+                master_passphrase: mp,
+                socket_path: PathBuf::from("/tmp/nonexistent-socket-agent-test"),
+                lock_path: PathBuf::from("/tmp/nonexistent-lock-agent-test"),
+                locked: Arc::new(Mutex::new(false)),
+            },
         ));
 
         client.write_all(&0u32.to_be_bytes()).await.unwrap();
@@ -1528,15 +1562,17 @@ mod tests {
 
         let (mut client, server) = UnixStream::pair().unwrap();
 
-        let task = tokio::spawn(handle_connection(
+        let task = spawn(handle_connection(
             server,
-            ids,
-            vault,
-            vault_path,
-            mp,
-            PathBuf::from("/tmp/nonexistent-socket-agent-test"),
-            PathBuf::from("/tmp/nonexistent-lock-agent-test"),
-            Arc::new(Mutex::new(false)),
+            ConnectionState {
+                identities: ids,
+                vault,
+                vault_path,
+                master_passphrase: mp,
+                socket_path: PathBuf::from("/tmp/nonexistent-socket-agent-test"),
+                lock_path: PathBuf::from("/tmp/nonexistent-lock-agent-test"),
+                locked: Arc::new(Mutex::new(false)),
+            },
         ));
 
         let garbage = vec![0xFF_u8, 0xFE, 0xFD, 0xFC];
@@ -1579,21 +1615,14 @@ mod tests {
     }
 
     #[test]
-    #[allow(unsafe_code)]
     fn socket_from_env_set() {
-        // Safety: nextest runs each test in its own process; no concurrent set_var calls.
-        unsafe { std::env::set_var("MOSHPIT_AGENT_SOCK", "/tmp/mpa-test-socket.sock") };
-        let result = socket_from_env();
-        unsafe { std::env::remove_var("MOSHPIT_AGENT_SOCK") };
+        let result = socket_from_value(Some("/tmp/mpa-test-socket.sock".to_string()));
         assert_eq!(result.unwrap(), PathBuf::from("/tmp/mpa-test-socket.sock"));
     }
 
     #[test]
-    #[allow(unsafe_code)]
     fn socket_from_env_not_set() {
-        // Safety: nextest runs each test in its own process; no concurrent env access.
-        unsafe { std::env::remove_var("MOSHPIT_AGENT_SOCK") };
-        assert!(socket_from_env().is_err());
+        assert!(socket_from_value(None).is_err());
     }
 
     #[test]
@@ -1657,7 +1686,7 @@ mod tests {
     #[test]
     fn is_process_alive_dead_pid() {
         // Spawn a trivial child, wait for it to exit, then check its PID is dead.
-        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let mut child = Command::new("true").spawn().unwrap();
         let pid = child.id();
         let _ = child.wait().unwrap();
         assert!(!is_process_alive(pid));
@@ -1679,7 +1708,7 @@ mod tests {
         let lock = dir.path().join("test.lock");
         let sock = dir.path().join("test.sock");
         // Write a guaranteed-dead PID to the lock file.
-        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let mut child = Command::new("true").spawn().unwrap();
         let pid = child.id();
         let _ = child.wait().unwrap();
         fs::write(&lock, format!("{pid}\n")).unwrap();
@@ -1693,7 +1722,7 @@ mod tests {
         let lock = dir.path().join("test.lock");
         let sock = dir.path().join("test.sock");
         let listener = UnixListener::bind(&sock).unwrap();
-        drop(tokio::spawn(async move { drop(listener.accept().await) }));
+        drop(spawn(async move { drop(listener.accept().await) }));
         fs::write(&lock, format!("{}\n", std::process::id())).unwrap();
         let err = check_not_already_running(&lock, &sock).await.unwrap_err();
         let msg = err.to_string();
@@ -1707,7 +1736,158 @@ mod tests {
         let lock = dir.path().join("test.lock");
         let sock = dir.path().join("test.sock");
         let listener = UnixListener::bind(&sock).unwrap();
-        drop(tokio::spawn(async move { drop(listener.accept().await) }));
+        drop(spawn(async move { drop(listener.accept().await) }));
         assert!(check_not_already_running(&lock, &sock).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn reload_from_vault_roundtrip() {
+        let dir = tempdir().unwrap();
+        let vault_path = dir.path().join("vault");
+
+        let mut v = Vault::new();
+        v.upsert(TEST_KEY_PATH.to_string(), String::new());
+        v.save_encrypted(&vault_path, "master").unwrap();
+
+        let ids = new_identity_map();
+        let vault = empty_vault();
+        let count = reload_from_vault(&ids, &vault, &vault_path, "master")
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "one identity should load from the vault");
+
+        let map = ids.lock().await;
+        assert_eq!(map.len(), 1);
+        let id = map.values().next().unwrap();
+        assert!(
+            id.fingerprint.starts_with("SHA256:"),
+            "fingerprint should have SHA256: prefix"
+        );
+        assert_eq!(id.algorithm, "X25519");
+        drop(map);
+
+        assert!(
+            vault.lock().await.is_some(),
+            "the loaded vault should be cached in the shared slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_from_vault_skips_missing_key() {
+        let dir = tempdir().unwrap();
+        let vault_path = dir.path().join("vault");
+
+        let mut v = Vault::new();
+        v.upsert("/nonexistent/key/path".to_string(), String::new());
+        v.save_encrypted(&vault_path, "master").unwrap();
+
+        let ids = new_identity_map();
+        let vault = empty_vault();
+        let count = reload_from_vault(&ids, &vault, &vault_path, "master")
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "a missing key should be skipped, not loaded");
+        assert!(ids.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reload_from_vault_wrong_passphrase() {
+        let dir = tempdir().unwrap();
+        let vault_path = dir.path().join("vault");
+
+        let mut v = Vault::new();
+        v.upsert(TEST_KEY_PATH.to_string(), String::new());
+        v.save_encrypted(&vault_path, "right").unwrap();
+
+        let ids = new_identity_map();
+        let vault = empty_vault();
+        let result = reload_from_vault(&ids, &vault, &vault_path, "wrong").await;
+        assert!(
+            result.is_err(),
+            "decrypting with the wrong passphrase should fail"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_from_vault_no_file_returns_zero() {
+        let dir = tempdir().unwrap();
+        let vault_path = dir.path().join("does-not-exist");
+
+        let ids = new_identity_map();
+        let vault = empty_vault();
+        let count = reload_from_vault(&ids, &vault, &vault_path, "master")
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        assert!(ids.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_add_identity_with_master_passphrase() {
+        let ids = new_identity_map();
+        let vault = empty_vault();
+        let dir = tempdir().unwrap();
+        let vault_path = dir.path().join("vault");
+        let mp = Arc::new(Mutex::new("master".to_string()));
+        let resp = dispatch_request(
+            AgentRequest::AddIdentity {
+                key_path: TEST_KEY_PATH.to_string(),
+                passphrase: None,
+            },
+            &ids,
+            &vault,
+            &vault_path,
+            &mp,
+            &unlocked_state(),
+        )
+        .await;
+        assert!(matches!(resp, AgentResponse::Ok));
+        assert_eq!(ids.lock().await.len(), 1);
+
+        // The vault must have been written encrypted (decodable only with the
+        // master passphrase) and contain the added key.
+        let loaded = Vault::load_encrypted(&vault_path, "master").unwrap();
+        assert_eq!(loaded.entries().len(), 1);
+        assert_eq!(loaded.entries()[0].key_path, TEST_KEY_PATH);
+    }
+
+    #[tokio::test]
+    async fn dispatch_remove_identity_with_master_passphrase() {
+        let ids = new_identity_map();
+        let vault = empty_vault();
+        let dir = tempdir().unwrap();
+        let vault_path = dir.path().join("vault");
+        let mp = Arc::new(Mutex::new("master".to_string()));
+
+        // Seed an encrypted vault + populated map via AddIdentity.
+        let add = dispatch_request(
+            AgentRequest::AddIdentity {
+                key_path: TEST_KEY_PATH.to_string(),
+                passphrase: None,
+            },
+            &ids,
+            &vault,
+            &vault_path,
+            &mp,
+            &unlocked_state(),
+        )
+        .await;
+        assert!(matches!(add, AgentResponse::Ok));
+        let fp = ids.lock().await.keys().next().unwrap().clone();
+
+        let resp = dispatch_request(
+            AgentRequest::RemoveIdentity(fp),
+            &ids,
+            &vault,
+            &vault_path,
+            &mp,
+            &unlocked_state(),
+        )
+        .await;
+        assert!(matches!(resp, AgentResponse::Ok));
+        assert!(ids.lock().await.is_empty());
+
+        // The encrypted re-save on removal must keep the vault decryptable.
+        assert!(Vault::load_encrypted(&vault_path, "master").is_ok());
     }
 }

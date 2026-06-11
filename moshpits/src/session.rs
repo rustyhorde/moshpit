@@ -93,7 +93,10 @@ mod test {
     };
 
     use libmoshpit::{EncryptedFrame, TerminalMessage};
-    use tokio::sync::{Mutex, mpsc::channel};
+    use tokio::sync::{
+        Mutex,
+        mpsc::{Sender, channel},
+    };
     use uuid::Uuid;
 
     use super::{SCROLLBACK_CAPACITY, SessionOutputHandle, SessionRecord, new_full_registry};
@@ -113,8 +116,8 @@ mod test {
     fn session_output_handle_debug() {
         let handle = SessionOutputHandle {
             kex_uuid: Uuid::nil(),
-            data_tx: None::<tokio::sync::mpsc::Sender<EncryptedFrame>>,
-            control_tx: None::<tokio::sync::mpsc::Sender<EncryptedFrame>>,
+            data_tx: None::<Sender<EncryptedFrame>>,
+            control_tx: None::<Sender<EncryptedFrame>>,
             conn_token: None,
             udp_port: None,
         };

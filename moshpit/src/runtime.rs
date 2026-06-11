@@ -7,13 +7,17 @@
 // modified, or distributed except according to those terms.
 
 use std::{
+    env::args_os,
+    error::Error,
     ffi::OsString,
-    fs::{DirBuilder, OpenOptions},
+    fmt::{Display, Formatter, Result as FmtResult},
+    fs::{DirBuilder, File, OpenOptions, create_dir_all},
     io::{Read as _, Write as _, stdin, stdout},
     net::SocketAddr,
     path::{Path, PathBuf},
+    process::exit,
     sync::{
-        Arc,
+        Arc, PoisonError,
         atomic::{AtomicBool, Ordering},
     },
     thread,
@@ -27,10 +31,10 @@ use anyhow::{Context as _, Result, bail};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use dialoguer::{Confirm, Password};
 use libmoshpit::{
-    DiffMode, DisplayPreference, Emulator, EncryptedFrame, FileLayer, KEY_ALGORITHM_X25519, Kex,
-    KexConfig as _, KexMode, KeyPair, MoshpitError, PredictionEngine, Renderer, UdpReader,
-    UdpSender, UuidWrapper, config_file_path, init_tracing, load, paint_overlays_to_ansi,
-    parse_server_destination, render_prediction_update, run_key_exchange,
+    ClientRenderCtx, DiffMode, DisplayPreference, Emulator, EncryptedFrame, FileLayer,
+    KEY_ALGORITHM_X25519, Kex, KexConfig as _, KexMode, KeyPair, MoshpitError, PredictionEngine,
+    Renderer, UdpReader, UdpSender, UuidWrapper, config_file_path, init_tracing, load,
+    paint_overlays_to_ansi, parse_server_destination, render_prediction_update, run_key_exchange,
 };
 use terminal_size::terminal_size;
 #[cfg(unix)]
@@ -41,7 +45,9 @@ use tokio::{
     sync::{
         Mutex,
         mpsc::{Receiver, Sender, channel},
+        oneshot,
     },
+    task::{block_in_place, yield_now},
     time,
 };
 use tokio_util::sync::CancellationToken;
@@ -64,7 +70,7 @@ where
     // recover the raw `ArgMatches` provenance inside `Cli::parse_argv`.
     let command_line: Vec<OsString> = match args {
         Some(args) => args.into_iter().map(Into::into).collect(),
-        None => std::env::args_os().collect(),
+        None => args_os().collect(),
     };
     let cli = Cli::parse_argv(command_line)?;
 
@@ -94,13 +100,17 @@ where
             "a server destination is required, e.g. `mp user@host` (run `mp ec` to inspect config)"
         );
     }
+    // Resolve and validate the force-quit prefix key up front so a bad value
+    // fails fast with a clear message instead of mid-session.
+    let escape_byte = parse_escape_key(config.escape_key())
+        .with_context(|| format!("invalid escape_key {:?}", config.escape_key()))?;
     let (user, socket_addr) =
         parse_server_destination(config.server_destination(), config.server_port())?;
     let server_ip = socket_addr.ip().to_string();
     let server_port = config.server_port();
     let _ = config.set_user(user);
 
-    run_session_loop(config, socket_addr, server_ip, server_port).await
+    run_session_loop(config, socket_addr, server_ip, server_port, escape_byte).await
 }
 
 /// Cached passphrase state, avoiding re-prompting across reconnects.
@@ -145,19 +155,88 @@ struct FatalKexError {
     key_path: PathBuf,
 }
 
-impl std::fmt::Display for FatalKexError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for FatalKexError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         write!(f, "{} (key: {})", self.inner, self.key_path.display())
     }
 }
 
-impl std::error::Error for FatalKexError {}
+impl Error for FatalKexError {}
 
 #[derive(Clone, Copy, Default)]
 enum EscapeState {
     #[default]
     Normal,
     PendingDot,
+}
+
+/// Map a key character to the control byte produced by pressing `Ctrl` with it.
+///
+/// Covers the canonical ASCII control mappings: `@` → `0x00`, `a`–`z`
+/// (case-insensitive) → `0x01`–`0x1A`, `\` → `0x1C`, `]` → `0x1D`, `^` → `0x1E`,
+/// `_` → `0x1F`.  `[` (which maps to `0x1B` / `ESC`) is intentionally excluded:
+/// using `ESC` as the escape prefix would swallow arrow keys and every other
+/// terminal escape sequence.  Returns `None` for any other character.
+fn ctrl_byte(c: char) -> Option<u8> {
+    match c.to_ascii_lowercase() {
+        '@' => Some(0x00),
+        c @ 'a'..='z' => Some(c as u8 - b'a' + 1),
+        '\\' => Some(0x1c),
+        ']' => Some(0x1d),
+        '^' => Some(0x1e),
+        '_' => Some(0x1f),
+        _ => None,
+    }
+}
+
+/// Parse a force-quit escape-prefix key (e.g. `"ctrl-^"`) into its control byte.
+///
+/// Accepts a leading `ctrl-` or `c-` prefix (case-insensitive) followed by a
+/// single key character resolved via [`ctrl_byte`].  The prefix must resolve to
+/// a control byte so it never collides with normal typed input.
+///
+/// # Errors
+/// Returns an error for an empty value, a missing/garbled `ctrl-` prefix, more
+/// than one key character, or a key that does not map to a control byte
+/// (including `ctrl-[`, which would be `ESC`).
+fn parse_escape_key(s: &str) -> Result<u8> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        bail!("escape_key is empty; expected something like \"ctrl-^\"");
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let key = lower
+        .strip_prefix("ctrl-")
+        .or_else(|| lower.strip_prefix("c-"))
+        .with_context(|| {
+            format!("escape_key {trimmed:?} must start with \"ctrl-\" (e.g. \"ctrl-^\")")
+        })?;
+    let mut chars = key.chars();
+    let (Some(c), None) = (chars.next(), chars.next()) else {
+        bail!("escape_key {trimmed:?} must name exactly one key after \"ctrl-\"");
+    };
+    ctrl_byte(c).with_context(|| {
+        if c == '[' {
+            "escape_key \"ctrl-[\" is ESC and cannot be used as the escape key".to_string()
+        } else {
+            format!("escape_key {trimmed:?} does not map to a control key")
+        }
+    })
+}
+
+/// Render a control byte as a human-readable `Ctrl-<key>` label for the
+/// reconnect banner hint.  Inverse of [`ctrl_byte`].
+fn ctrl_label(byte: u8) -> String {
+    let key = match byte {
+        0x00 => '@',
+        0x01..=0x1a => (b'A' + (byte - 1)) as char,
+        0x1c => '\\',
+        0x1d => ']',
+        0x1e => '^',
+        0x1f => '_',
+        _ => '?',
+    };
+    format!("Ctrl-{key}")
 }
 
 /// Show a mosh-style reconnecting banner at the top of the terminal.
@@ -191,11 +270,12 @@ async fn countdown_reconnect_banner(
     attempt: u32,
     max_backoff_secs: u64,
     exit_token: &CancellationToken,
+    escape_label: &str,
 ) -> bool {
     for remaining in (0..=total_secs).rev() {
         let msg = format!(
             "\x1b[s\x1b[1;1H\x1b[44;97;1m [moshpit] server unreachable, reconnecting \
-(attempt #{attempt}, {remaining}s, max {max_backoff_secs}s, Ctrl-^ . to quit)... \x1b[K\x1b[0m\x1b[u"
+(attempt #{attempt}, {remaining}s, max {max_backoff_secs}s, {escape_label} . to quit)... \x1b[K\x1b[0m\x1b[u"
         );
         drop(stdout_tx.send(msg.into_bytes()).await);
         if remaining > 0 {
@@ -215,7 +295,8 @@ async fn run_escape_listener(
     kb_rx: Arc<Mutex<Receiver<Vec<u8>>>>,
     exit_token: CancellationToken,
     done_token: CancellationToken,
-    ready_tx: tokio::sync::oneshot::Sender<()>,
+    ready_tx: oneshot::Sender<()>,
+    escape_byte: u8,
 ) {
     let mut state = EscapeState::Normal;
     // Acquire the lock interruptibly: if the countdown finishes before we can
@@ -236,13 +317,13 @@ async fn run_escape_listener(
                     for &byte in &data {
                         state = match state {
                             EscapeState::Normal => {
-                                if byte == 0x1E { EscapeState::PendingDot } else { EscapeState::Normal }
+                                if byte == escape_byte { EscapeState::PendingDot } else { EscapeState::Normal }
                             }
                             EscapeState::PendingDot => {
                                 if byte == 0x2E {
                                     exit_token.cancel();
                                     return;
-                                } else if byte == 0x1E {
+                                } else if byte == escape_byte {
                                     EscapeState::PendingDot
                                 } else {
                                     EscapeState::Normal
@@ -637,6 +718,7 @@ fn stdin_reader_loop(kb_tx: &Sender<Vec<u8>>, paused: &AtomicBool) {
 
 /// Runs the reconnect countdown alongside an escape-sequence listener.
 /// Returns `true` if the user pressed `Ctrl-^ .` to quit.
+#[cfg_attr(nightly, allow(clippy::too_many_arguments))]
 #[cfg_attr(coverage_nightly, coverage(off))]
 async fn countdown_with_escape(
     stdout_tx: &Sender<Vec<u8>>,
@@ -645,14 +727,17 @@ async fn countdown_with_escape(
     max_backoff_secs: u64,
     exit_token: &CancellationToken,
     kb_rx: Arc<Mutex<Receiver<Vec<u8>>>>,
+    escape_byte: u8,
+    escape_label: &str,
 ) -> bool {
     let escape_done = CancellationToken::new();
-    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (ready_tx, ready_rx) = oneshot::channel();
     let escape_handle = spawn(run_escape_listener(
         kb_rx,
         exit_token.clone(),
         escape_done.clone(),
         ready_tx,
+        escape_byte,
     ));
     // Wait for the listener to acquire kb_rx before showing the Ctrl-^. hint.
     // In practice nearly instant; 200ms guards against a slow forwarder cleanup.
@@ -663,6 +748,7 @@ async fn countdown_with_escape(
         attempt,
         max_backoff_secs,
         exit_token,
+        escape_label,
     )
     .await;
     escape_done.cancel();
@@ -695,7 +781,7 @@ fn restore_terminal_and_exit(exit_msg: Option<&[u8]>) -> ! {
     }
     drop(out.flush());
     drop(disable_raw_mode());
-    std::process::exit(0);
+    exit(0);
 }
 
 /// Persistent reconnect loop.  Runs until the shell exits (via `process::exit`).
@@ -706,9 +792,12 @@ async fn run_session_loop(
     socket_addr: SocketAddr,
     server_ip: String,
     server_port: u16,
+    escape_byte: u8,
 ) -> Result<()> {
     // Clamp to [2 s, 24 h].
     let max_backoff = Duration::from_secs(config.max_reconnect_backoff_secs().clamp(2, 86_400));
+    // Human-readable label (e.g. "Ctrl-^") for the reconnect-countdown hint.
+    let escape_label = ctrl_label(escape_byte);
 
     // Persistent stdout writer — survives reconnects.
     let (stdout_tx, mut stdout_rx) = channel::<Vec<u8>>(256);
@@ -776,6 +865,7 @@ async fn run_session_loop(
                     config.predict(),
                     config.diff_mode(),
                     config.legacy_passthrough(),
+                    escape_byte,
                     exit_token.clone(),
                     exit_msg.clone(),
                 )
@@ -787,9 +877,7 @@ async fn run_session_loop(
                 if exit_token.is_cancelled() {
                     // Let the stdout channel settle before the direct teardown write.
                     time::sleep(Duration::from_millis(100)).await;
-                    let msg = *exit_msg
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let msg = *exit_msg.lock().unwrap_or_else(PoisonError::into_inner);
                     restore_terminal_and_exit(msg);
                 }
                 // Session dropped — restore the terminal (the server-side app may
@@ -857,9 +945,8 @@ async fn run_session_loop(
                 // Reset passphrase cache on early failures so the user can
                 // re-enter it on the next attempt.
                 if !had_successful_kex {
-                    *pass_cache
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = PassCache::Uncached;
+                    *pass_cache.lock().unwrap_or_else(PoisonError::into_inner) =
+                        PassCache::Uncached;
                 }
                 if countdown_with_escape(
                     &stdout_tx,
@@ -868,6 +955,8 @@ async fn run_session_loop(
                     max_backoff.as_secs(),
                     &exit_token,
                     kb_rx_shared.clone(),
+                    escape_byte,
+                    &escape_label,
                 )
                 .await
                 {
@@ -903,9 +992,7 @@ async fn connect_and_kex(
     let cache = pass_cache.clone();
     let paused_pass = stdin_paused.clone();
     let pass_fn = move || -> Result<Option<String>> {
-        let guard = cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = cache.lock().unwrap_or_else(PoisonError::into_inner);
         if guard.is_cached() {
             info!(
                 "passphrase: returning cached value (has_passphrase={})",
@@ -915,17 +1002,14 @@ async fn connect_and_kex(
         }
         drop(guard);
         info!("passphrase: prompting user");
-        let result =
-            tokio::task::block_in_place(|| with_cooked_term(&paused_pass, read_passpharase));
+        let result = block_in_place(|| with_cooked_term(&paused_pass, read_passpharase));
         match &result {
             Ok(Some(_)) => info!("passphrase: prompt returned a passphrase"),
             Ok(None) => info!("passphrase: prompt returned None (key may be unencrypted)"),
             Err(e) => error!("passphrase: prompt failed: {e}"),
         }
         if let Ok(ref pass) = result {
-            *cache
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = match pass {
+            *cache.lock().unwrap_or_else(PoisonError::into_inner) = match pass {
                 Some(s) => PassCache::Passphrase(s.clone()),
                 None => PassCache::NoPassphrase,
             };
@@ -938,7 +1022,7 @@ async fn connect_and_kex(
     let paused_tofu = stdin_paused.clone();
     let tofu_fn: libmoshpit::TofuFn =
         Arc::new(move |host: &str, fingerprint: &str| -> Result<bool> {
-            tokio::task::block_in_place(|| {
+            block_in_place(|| {
                 with_cooked_term(&paused_tofu, || {
                     let prompt = format!(
                         "The authenticity of host '{host}' can't be established.\n\
@@ -956,7 +1040,7 @@ async fn connect_and_kex(
     let paused_mismatch = stdin_paused;
     let mismatch_fn: libmoshpit::HostKeyMismatchFn = Arc::new(
         move |host: &str, old_fingerprint: &str, new_fingerprint: &str| -> Result<bool> {
-            tokio::task::block_in_place(|| {
+            block_in_place(|| {
                 with_cooked_term(&paused_mismatch, || {
                     eprintln!("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@");
                     eprintln!("@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @");
@@ -1063,6 +1147,7 @@ async fn run_udp_session(
     display_preference: DisplayPreference,
     diff_mode: DiffMode,
     legacy_passthrough: bool,
+    escape_byte: u8,
     exit_token: CancellationToken,
     exit_msg: ExitMsg,
 ) -> Result<()> {
@@ -1157,11 +1242,13 @@ async fn run_udp_session(
                 reader_token,
                 exit_token_reader,
                 exit_msg_reader,
-                stdout_tx_reader,
-                emu_reader,
-                pred_reader,
-                rend_reader,
-                in_alt_screen_reader,
+                ClientRenderCtx::new(
+                    stdout_tx_reader,
+                    emu_reader,
+                    pred_reader,
+                    rend_reader,
+                    in_alt_screen_reader,
+                ),
             )
             .await;
     });
@@ -1198,7 +1285,7 @@ async fn run_udp_session(
                         for &byte in &data {
                             escape_state = match escape_state {
                                 EscapeState::Normal => {
-                                    if byte == 0x1E {
+                                    if byte == escape_byte {
                                         EscapeState::PendingDot
                                     } else {
                                         to_forward.push(byte);
@@ -1209,12 +1296,12 @@ async fn run_udp_session(
                                     if byte == 0x2E {
                                         exit_requested = true;
                                         break;
-                                    } else if byte == 0x1E {
+                                    } else if byte == escape_byte {
                                         // Repeated prefix: discard, stay pending
                                         EscapeState::PendingDot
                                     } else {
-                                        // Forward the held 0x1E and the current byte
-                                        to_forward.push(0x1E);
+                                        // Forward the held prefix byte and the current byte
+                                        to_forward.push(escape_byte);
                                         to_forward.push(byte);
                                         EscapeState::Normal
                                     }
@@ -1241,9 +1328,9 @@ async fn run_udp_session(
                                     // Legacy: paint the prediction out-of-band on top of
                                     // the raw bytes the renderer is not tracking.
                                     let (overlays, cursor) = {
-                                        let emu = emu_fwd.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                                        let emu = emu_fwd.lock().unwrap_or_else(PoisonError::into_inner);
                                         let screen = emu.screen();
-                                        let mut pred = pred_fwd.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                                        let mut pred = pred_fwd.lock().unwrap_or_else(PoisonError::into_inner);
                                         for byte in &to_forward {
                                             pred.new_user_byte(*byte, screen);
                                         }
@@ -1269,7 +1356,7 @@ async fn run_udp_session(
                         if exit_requested {
                             *exit_msg_fwd
                                 .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                .unwrap_or_else(PoisonError::into_inner) =
                                 Some(b"[moshpit] Disconnected.\r\n");
                             exit_token_fwd.cancel();
                             fwd_token.cancel();
@@ -1298,7 +1385,7 @@ async fn run_udp_session(
     {
         forwarder_abort.abort();
         // Yield so the executor can drop the aborted task and release the lock.
-        tokio::task::yield_now().await;
+        yield_now().await;
     }
     Ok(())
 }
@@ -1319,8 +1406,8 @@ fn spawn_resize_handler(
                     _ = sigwinch.recv() => {
                         let (columns, rows) = terminal_size()
                             .map_or((80, 24), |(width, height)| (width.0, height.0));
-                        emulator.lock().unwrap_or_else(std::sync::PoisonError::into_inner).set_size(rows, columns);
-                        renderer.lock().unwrap_or_else(std::sync::PoisonError::into_inner).set_size(rows, columns);
+                        emulator.lock().unwrap_or_else(PoisonError::into_inner).set_size(rows, columns);
+                        renderer.lock().unwrap_or_else(PoisonError::into_inner).set_size(rows, columns);
                         if let Err(e) =
                             resize_tx.send(EncryptedFrame::Resize((resize_uuid, columns, rows))).await
                         {
@@ -1360,11 +1447,11 @@ fn spawn_resize_handler(
                 let (columns, rows) = current_size;
                 emulator
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .unwrap_or_else(PoisonError::into_inner)
                     .set_size(rows, columns);
                 renderer
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .unwrap_or_else(PoisonError::into_inner)
                     .set_size(rows, columns);
                 if let Err(e) =
                     resize_tx.blocking_send(EncryptedFrame::Resize((resize_uuid, columns, rows)))
@@ -1571,7 +1658,7 @@ fn client_id() -> Option<Uuid> {
 #[allow(clippy::unnecessary_wraps)]
 fn client_id_in_home(home: &Path) -> Option<Uuid> {
     let path = client_id_path(home);
-    if let Ok(mut f) = std::fs::File::open(&path) {
+    if let Ok(mut f) = File::open(&path) {
         let mut buf = String::new();
         drop(f.read_to_string(&mut buf));
         if let Ok(uuid) = buf.trim().parse::<Uuid>() {
@@ -1581,9 +1668,9 @@ fn client_id_in_home(home: &Path) -> Option<Uuid> {
     // First run: generate a new client ID and persist it.
     let id = Uuid::new_v4();
     if let Some(parent) = path.parent() {
-        drop(std::fs::create_dir_all(parent));
+        drop(create_dir_all(parent));
     }
-    if let Ok(mut f) = std::fs::File::create(&path) {
+    if let Ok(mut f) = File::create(&path) {
         drop(write!(f, "{id}"));
     }
     Some(id)
@@ -1640,7 +1727,7 @@ fn session_file_path_in_home(home: &Path, host: &str, port: u16) -> Option<PathB
 }
 
 fn read_uuid_from_path(path: &Path) -> Option<Uuid> {
-    let mut file = std::fs::File::open(path).ok()?;
+    let mut file = File::open(path).ok()?;
     let mut buf = String::new();
     let _ = file.read_to_string(&mut buf).ok();
     buf.trim().parse::<Uuid>().ok()
@@ -1673,7 +1760,7 @@ fn write_uuid_to_path(path: &Path, uuid: Uuid) -> Result<()> {
         }
         #[cfg(not(unix))]
         {
-            std::fs::File::create(path)?
+            File::create(path)?
         }
     };
     write!(file, "{uuid}")?;
@@ -1693,7 +1780,27 @@ fn write_session_uuid(host: &str, port: u16, session_uuid: Uuid) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::{
+        env::{remove_var, set_var, temp_dir, var},
+        fs::{DirBuilder, File, create_dir_all, remove_dir_all, write},
+        io::{ErrorKind, Read as _},
+        path::{Path, PathBuf},
+        sync::{Arc, atomic::AtomicBool},
+    };
+
+    use anyhow::Result;
+    use tokio::{spawn, sync::mpsc::channel};
+    use tokio_util::sync::CancellationToken;
+    use uuid::Uuid;
+
+    #[cfg(not(unix))]
+    use super::key_event_to_bytes;
+    use super::{
+        Cli, Config, FatalKexError, PassCache, clear_reconnect_banner, client_id_in_home,
+        client_id_path, connect_and_kex, countdown_reconnect_banner, create_key_dir, load,
+        maybe_generate_keypair, read_uuid_from_path, session_file_path_in_home,
+        show_reconnect_banner, write_uuid_to_path,
+    };
 
     struct TestHome {
         path: PathBuf,
@@ -1701,8 +1808,8 @@ mod tests {
 
     impl TestHome {
         fn new() -> Self {
-            let path = std::env::temp_dir().join(Uuid::new_v4().to_string());
-            std::fs::create_dir_all(&path).expect("failed to create temp dir");
+            let path = temp_dir().join(Uuid::new_v4().to_string());
+            create_dir_all(&path).expect("failed to create temp dir");
             Self { path }
         }
 
@@ -1713,7 +1820,7 @@ mod tests {
 
     impl Drop for TestHome {
         fn drop(&mut self) {
-            drop(std::fs::remove_dir_all(&self.path));
+            drop(remove_dir_all(&self.path));
         }
     }
 
@@ -1727,12 +1834,12 @@ mod tests {
     impl EnvGuard {
         #[allow(unsafe_code)]
         fn new(key: &'static str, value: Option<&str>) -> Self {
-            let original = std::env::var(key).ok();
+            let original = var(key).ok();
             // SAFETY: test-only; nextest runs each test in its own process so
             // there is no concurrent env access from other threads.
             match value {
-                Some(v) => unsafe { std::env::set_var(key, v) },
-                None => unsafe { std::env::remove_var(key) },
+                Some(v) => unsafe { set_var(key, v) },
+                None => unsafe { remove_var(key) },
             }
             Self { key, original }
         }
@@ -1743,8 +1850,8 @@ mod tests {
         fn drop(&mut self) {
             // SAFETY: same as EnvGuard::new.
             match &self.original {
-                Some(v) => unsafe { std::env::set_var(self.key, v) },
-                None => unsafe { std::env::remove_var(self.key) },
+                Some(v) => unsafe { set_var(self.key, v) },
+                None => unsafe { remove_var(self.key) },
             }
         }
     }
@@ -1754,13 +1861,13 @@ mod tests {
     fn env_guard_restores_original_value() {
         // Safety: nextest runs each test in its own process; no concurrent env access.
         const KEY: &str = "MOSHPIT_TEST_ENV_GUARD_RESTORE";
-        unsafe { std::env::set_var(KEY, "original") };
+        unsafe { set_var(KEY, "original") };
         {
             let _guard = EnvGuard::new(KEY, Some("overridden"));
-            assert_eq!(std::env::var(KEY).ok().as_deref(), Some("overridden"));
+            assert_eq!(var(KEY).ok().as_deref(), Some("overridden"));
         }
-        assert_eq!(std::env::var(KEY).ok().as_deref(), Some("original"));
-        unsafe { std::env::remove_var(KEY) };
+        assert_eq!(var(KEY).ok().as_deref(), Some("original"));
+        unsafe { remove_var(KEY) };
     }
 
     #[test]
@@ -1804,12 +1911,13 @@ mod tests {
         assert!(String::from_utf8_lossy(&msg).ends_with("\x1b[0m\x1b[K\x1b[u"));
 
         let token = CancellationToken::new();
-        let _ = countdown_reconnect_banner(&tx, 0, 1, 10, &token).await;
+        let _ = countdown_reconnect_banner(&tx, 0, 1, 10, &token, "Ctrl-^").await;
         let msg = rx
             .recv()
             .await
             .ok_or_else(|| anyhow::anyhow!("channel closed"))?;
         assert!(String::from_utf8_lossy(&msg).contains("attempt #1"));
+        assert!(String::from_utf8_lossy(&msg).contains("Ctrl-^ . to quit"));
         Ok(())
     }
 
@@ -1818,29 +1926,29 @@ mod tests {
         let (tx, mut _rx) = channel(10);
         let token = CancellationToken::new();
         token.cancel();
-        let result = countdown_reconnect_banner(&tx, 0, 1, 10, &token).await;
+        let result = countdown_reconnect_banner(&tx, 0, 1, 10, &token, "Ctrl-^").await;
         assert!(result);
     }
 
     #[test]
     fn read_uuid_from_path_missing_file_returns_none() {
-        let dir = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        let dir = temp_dir().join(Uuid::new_v4().to_string());
         let path = dir.join("session");
         assert!(read_uuid_from_path(&path).is_none());
     }
 
     #[test]
     fn read_uuid_from_path_garbage_returns_none() {
-        let dir = std::env::temp_dir().join(Uuid::new_v4().to_string());
-        std::fs::create_dir_all(&dir).expect("failed to create temp dir");
+        let dir = temp_dir().join(Uuid::new_v4().to_string());
+        create_dir_all(&dir).expect("failed to create temp dir");
         let path = dir.join("session");
-        std::fs::write(&path, "not-a-uuid").expect("failed to write test file");
+        write(&path, "not-a-uuid").expect("failed to write test file");
         assert!(read_uuid_from_path(&path).is_none());
     }
 
     #[test]
     fn write_and_read_uuid_roundtrip() -> Result<()> {
-        let dir = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        let dir = temp_dir().join(Uuid::new_v4().to_string());
         let path = dir.join("sub").join("session");
         let uuid = Uuid::new_v4();
         write_uuid_to_path(&path, uuid)?;
@@ -1850,7 +1958,7 @@ mod tests {
 
     #[test]
     fn write_uuid_creates_parent_directories() -> Result<()> {
-        let dir = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        let dir = temp_dir().join(Uuid::new_v4().to_string());
         let nested = dir.join("a").join("b").join("c").join("session");
         let uuid = Uuid::new_v4();
         write_uuid_to_path(&nested, uuid)?;
@@ -1888,11 +1996,11 @@ mod tests {
         if let Some(parent) = path.parent() {
             DirBuilder::new().recursive(true).create(parent)?;
         }
-        std::fs::write(&path, uuid.to_string())?;
+        write(&path, uuid.to_string())?;
 
         // Read it back
         let read_uuid = {
-            let mut file = std::fs::File::open(&path)?;
+            let mut file = File::open(&path)?;
             let mut buf = String::new();
             let _ = file.read_to_string(&mut buf)?;
             buf.trim().parse::<Uuid>()?
@@ -1915,7 +2023,7 @@ mod tests {
 
     #[test]
     fn test_create_key_dir() -> Result<()> {
-        let dir = std::env::temp_dir().join(Uuid::new_v4().to_string());
+        let dir = temp_dir().join(Uuid::new_v4().to_string());
         let key_dir = dir.join("keys");
         create_key_dir(&key_dir)?;
         assert!(key_dir.exists());
@@ -1925,15 +2033,15 @@ mod tests {
 
     #[test]
     fn test_maybe_generate_keypair_existing() -> Result<()> {
-        let dir = std::env::temp_dir().join(Uuid::new_v4().to_string());
-        std::fs::create_dir_all(&dir)?;
+        let dir = temp_dir().join(Uuid::new_v4().to_string());
+        create_dir_all(&dir)?;
         let priv_path = dir.join("id_x25519");
         let pub_path = dir.join("id_x25519.pub");
         let config_path = dir.join("config.toml");
 
-        std::fs::write(&priv_path, "fake private key")?;
-        std::fs::write(&pub_path, "fake public key")?;
-        std::fs::write(
+        write(&priv_path, "fake private key")?;
+        write(&pub_path, "fake public key")?;
+        write(
             &config_path,
             "[tracing.stdout]\n\
              with_target = false\n\
@@ -2007,15 +2115,15 @@ mod tests {
     async fn test_connect_and_kex_kex_failure() -> Result<()> {
         // A live agent would supply an identity and bypass the empty-key-file path.
         let _agent_guard = EnvGuard::new("MOSHPIT_AGENT_SOCK", None);
-        let dir = std::env::temp_dir().join(Uuid::new_v4().to_string());
-        std::fs::create_dir_all(&dir)?;
+        let dir = temp_dir().join(Uuid::new_v4().to_string());
+        create_dir_all(&dir)?;
         let config_path = dir.join("config.toml");
         // Empty key files: /dev/null doesn't exist on Windows, so create real empty files.
         let empty_priv_key_path = dir.join("empty_priv_key");
         let empty_pub_key_path = dir.join("empty_pub_key");
-        std::fs::write(&empty_priv_key_path, b"")?;
-        std::fs::write(&empty_pub_key_path, b"")?;
-        std::fs::write(
+        write(&empty_priv_key_path, b"")?;
+        write(&empty_pub_key_path, b"")?;
+        write(
             &config_path,
             "[tracing.stdout]\n\
              with_target = false\n\
@@ -2054,7 +2162,7 @@ mod tests {
         // Bind a real listener
         let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
             Ok(listener) => listener,
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => return Ok(()),
+            Err(e) if e.kind() == ErrorKind::PermissionDenied => return Ok(()),
             Err(e) => return Err(e.into()),
         };
         let port = listener.local_addr()?.port();
@@ -2116,7 +2224,7 @@ mod tests {
         // Non-existent key paths
         let priv_path = home.path().join("nonexistent_id_x25519");
         let pub_path = home.path().join("nonexistent_id_x25519.pub");
-        std::fs::write(
+        write(
             &config_path,
             "[tracing.stdout]\n\
              with_target = false\n\
@@ -2199,8 +2307,8 @@ mod tests {
 
     mod escape_listener {
         use std::sync::Arc;
-        use tokio::sync::Mutex;
         use tokio::sync::mpsc::channel;
+        use tokio::sync::{Mutex, oneshot};
         use tokio_util::sync::CancellationToken;
 
         use super::super::run_escape_listener;
@@ -2216,7 +2324,8 @@ mod tests {
                 kb_rx,
                 exit_token.clone(),
                 done_token,
-                tokio::sync::oneshot::channel().0,
+                oneshot::channel().0,
+                0x1E,
             )
             .await;
             assert!(!exit_token.is_cancelled());
@@ -2234,7 +2343,8 @@ mod tests {
                 kb_rx,
                 exit_token.clone(),
                 done_token,
-                tokio::sync::oneshot::channel().0,
+                oneshot::channel().0,
+                0x1E,
             )
             .await;
             assert!(!exit_token.is_cancelled());
@@ -2252,7 +2362,8 @@ mod tests {
                 kb_rx,
                 exit_token.clone(),
                 done_token,
-                tokio::sync::oneshot::channel().0,
+                oneshot::channel().0,
+                0x1E,
             )
             .await;
             assert!(!exit_token.is_cancelled());
@@ -2272,7 +2383,8 @@ mod tests {
                 kb_rx,
                 exit_token.clone(),
                 done_token,
-                tokio::sync::oneshot::channel().0,
+                oneshot::channel().0,
+                0x1E,
             )
             .await;
             assert!(!exit_token.is_cancelled());
@@ -2293,7 +2405,8 @@ mod tests {
                 kb_rx,
                 exit_token.clone(),
                 done_token,
-                tokio::sync::oneshot::channel().0,
+                oneshot::channel().0,
+                0x1E,
             )
             .await;
             assert!(!exit_token.is_cancelled());
@@ -2311,7 +2424,8 @@ mod tests {
                 kb_rx,
                 exit_token.clone(),
                 done_token,
-                tokio::sync::oneshot::channel().0,
+                oneshot::channel().0,
+                0x1E,
             )
             .await;
             assert!(exit_token.is_cancelled());
@@ -2330,10 +2444,83 @@ mod tests {
                 kb_rx,
                 exit_token.clone(),
                 done_token,
-                tokio::sync::oneshot::channel().0,
+                oneshot::channel().0,
+                0x1E,
             )
             .await;
             assert!(exit_token.is_cancelled());
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn custom_escape_byte_triggers_and_default_does_not() -> anyhow::Result<()> {
+            // With a custom prefix (0x01 / Ctrl-a), the old default prefix (0x1E)
+            // must NOT trigger, and the custom prefix + '.' MUST trigger.
+            let (tx, rx) = channel::<Vec<u8>>(8);
+            let kb_rx = Arc::new(Mutex::new(rx));
+            let exit_token = CancellationToken::new();
+            let done_token = CancellationToken::new();
+            // Old default sequence under a custom binding: must be ignored.
+            tx.send(vec![0x1E, 0x2E]).await?;
+            // Custom sequence: must trigger exit.
+            tx.send(vec![0x01, 0x2E]).await?;
+            run_escape_listener(
+                kb_rx,
+                exit_token.clone(),
+                done_token,
+                oneshot::channel().0,
+                0x01,
+            )
+            .await;
+            assert!(exit_token.is_cancelled());
+            Ok(())
+        }
+    }
+
+    mod escape_key_parsing {
+        use super::super::{ctrl_byte, ctrl_label, parse_escape_key};
+
+        #[test]
+        fn parses_valid_escape_keys() -> anyhow::Result<()> {
+            assert_eq!(parse_escape_key("ctrl-^")?, 0x1E);
+            assert_eq!(parse_escape_key("ctrl-a")?, 0x01);
+            assert_eq!(parse_escape_key("CTRL-A")?, 0x01);
+            assert_eq!(parse_escape_key("C-]")?, 0x1D);
+            assert_eq!(parse_escape_key("  ctrl-@  ")?, 0x00);
+            assert_eq!(parse_escape_key("ctrl-_")?, 0x1F);
+            Ok(())
+        }
+
+        #[test]
+        fn rejects_invalid_escape_keys() {
+            assert!(parse_escape_key("").is_err());
+            assert!(parse_escape_key("   ").is_err());
+            assert!(parse_escape_key("^").is_err()); // missing ctrl- prefix
+            assert!(parse_escape_key("ctrl-").is_err()); // no key char
+            assert!(parse_escape_key("ctrl-ab").is_err()); // more than one key
+            assert!(parse_escape_key("ctrl-[").is_err()); // ESC is rejected
+            assert!(parse_escape_key("ctrl-1").is_err()); // not a control key
+            assert!(parse_escape_key("nope").is_err());
+        }
+
+        #[test]
+        fn ctrl_byte_excludes_esc() {
+            assert_eq!(ctrl_byte('['), None);
+            assert_eq!(ctrl_byte('^'), Some(0x1E));
+            assert_eq!(ctrl_byte('A'), Some(0x01));
+        }
+
+        #[test]
+        fn labels_round_trip_with_parse() -> anyhow::Result<()> {
+            assert_eq!(ctrl_label(0x1E), "Ctrl-^");
+            assert_eq!(ctrl_label(0x01), "Ctrl-A");
+            assert_eq!(ctrl_label(0x1D), "Ctrl-]");
+            assert_eq!(ctrl_label(0x00), "Ctrl-@");
+            assert_eq!(ctrl_label(0x1F), "Ctrl-_");
+            for key in ["ctrl-^", "ctrl-a", "ctrl-]", "ctrl-@", "ctrl-_"] {
+                let byte = parse_escape_key(key)?;
+                assert_eq!(parse_escape_key(&ctrl_label(byte))?, byte);
+            }
             Ok(())
         }
     }

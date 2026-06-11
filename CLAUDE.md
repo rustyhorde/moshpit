@@ -31,6 +31,9 @@ cargo clippy --all-targets -- -D warnings
 # Format check
 cargo fmt --check
 
+# Full local verification before pushing (fmt + clippy + tests, skipping fuzz + install)
+scripts/run_all.fish --no-install --unstable --no-fuzz
+
 # Generate docs
 cargo doc --no-deps --open
 
@@ -120,3 +123,9 @@ Tagging `v<semver>` triggers `release.yml`, which:
 - **`unstable` feature flag**: Exists in libmoshpit/moshpit/moshpits/keygen but is currently a no-op placeholder
 - **Config precedence** (both client and server): env vars > CLI flags > TOML config file. Implemented by `libmoshpit::load` (the `config` crate is last-source-wins, so sources are added file → CLI → env). Each binary's `Cli::collect` emits only values the user actually passed (tracked via `Cli::parse_argv`/`explicit_args`) so clap defaults don't clobber the file/env; fields needing a fallback carry `#[serde(default)]`. The client's config file is optional (`load(..., false)`); the server's is required (`load(..., true)`).
 - **Client env prefix**: `MOSHPIT_`; **Server env prefix**: `MOSHPITS_`. Env var names are `<PREFIX>_<FIELD>` with underscores preserved (e.g. `MOSHPIT_SERVER_PORT`, `MOSHPITS_TERM_TYPE`). Nested tables (e.g. `[preferred_algorithms]`) are **not** settable via a single env var — use the TOML table or the dedicated CLI flags.
+
+## Coding Conventions
+
+- **No glob imports**: Always use explicit named imports (`use foo::{Bar, Baz};`). Glob imports (`use foo::*`) hide dependencies and make refactoring harder. This applies everywhere — test modules, production code, and re-exports (`pub use`).
+- **Prefer leaf names over FQDNs**: Import a type or function and refer to it by its leaf name (`Bar`) rather than writing it fully qualified inline (`foo::bar::Bar`). Only use a fully-qualified path when a name collision would otherwise occur (e.g. two `Error` types in scope).
+- **Gate imports with the code that uses them**: When an import is only needed by code behind a `cfg` (e.g. `#[cfg(target_os = "linux")]`), put the same `cfg` on the `use` if the import isn't used elsewhere. An unconditional `use` for cfg-gated code triggers unused-import warnings on other platforms.
