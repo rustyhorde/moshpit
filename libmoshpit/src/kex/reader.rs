@@ -216,8 +216,18 @@ fn is_ml_dsa_algorithm(key_alg: &str) -> bool {
     )
 }
 
+/// Parse an SSH-format ML-DSA public key blob into `(algorithm, key_bytes)`.
+///
+/// Splits on whitespace, base64-decodes the key part, then walks two
+/// length-prefixed fields (algorithm name, public key). Exposed
+/// (`#[doc(hidden)]`) so the fuzz harness can drive the base64 + length-prefix
+/// parsing on arbitrary bytes; not part of the stable API.
+///
+/// # Errors
+/// If the blob is not a valid SSH-format public key.
 #[cfg(feature = "unstable")]
-fn parse_full_public_key(full_public_key: &[u8]) -> Result<(String, Vec<u8>)> {
+#[doc(hidden)]
+pub fn parse_full_public_key(full_public_key: &[u8]) -> Result<(String, Vec<u8>)> {
     let pub_key_str = String::from_utf8_lossy(full_public_key);
     let pub_key_parts: Vec<&str> = pub_key_str.split_whitespace().collect();
     if pub_key_parts.len() != 3 {

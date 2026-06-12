@@ -369,6 +369,8 @@ pub use self::kex::negotiate::negotiate;
 pub use self::kex::negotiate::negotiate_protocol_version;
 pub use self::kex::negotiate::supported_algorithms;
 pub use self::kex::reader::KexReader;
+#[cfg(feature = "unstable")]
+pub use self::kex::reader::parse_full_public_key;
 pub use self::kex::run_key_exchange;
 pub use self::kex::sender::KexSender;
 pub use self::keygen::AEADCipher;
@@ -389,6 +391,8 @@ pub use self::keygen::decrypt_private_key;
 pub use self::keygen::load_identity_key;
 pub use self::keygen::load_private_key;
 pub use self::keygen::load_public_key;
+pub use self::keygen::parse_private_key_bytes;
+pub use self::keygen::parse_public_key_bytes;
 pub use self::keygen::pk::extract_public_key_bytes;
 pub use self::keygen::pk::fingerprint;
 pub use self::keygen::pk::randomart;
@@ -406,7 +410,7 @@ pub use self::term::{
 pub use self::tracing::{TracingConfigExt, init_tracing};
 pub use self::udp::DiffMode;
 pub use self::udp::UdpClient;
-pub use self::udp::reader::{ClientRenderCtx, UdpReader};
+pub use self::udp::reader::{ClientRenderCtx, UdpReader, intercept_queries_core};
 pub use self::udp::sender::MAX_UDP_PAYLOAD;
 pub use self::udp::sender::UdpSender;
 pub use self::utils::is_exit_title;

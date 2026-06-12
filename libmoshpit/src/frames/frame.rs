@@ -13,12 +13,12 @@ use std::{
 };
 
 use anyhow::Result;
-use bincode_next::{Decode, Encode, config::standard, decode_from_slice};
+use bincode_next::{Decode, Encode};
 use bytes::Buf as _;
 
 use crate::{
     error::Error,
-    frames::{get_bytes, get_usize},
+    frames::{decode_frame, get_bytes, get_usize},
     kex::negotiate::{AlgorithmList, ProtocolSupport},
     uuid::UuidWrapper,
 };
@@ -121,8 +121,7 @@ impl Frame {
                         return Err(Error::FrameTooLarge.into());
                     }
                     if let Some(data) = get_bytes(src, length)? {
-                        let config = standard().with_limit::<65536>();
-                        let (frame, _): (Frame, _) = decode_from_slice(data, config)?;
+                        let frame: Frame = decode_frame(data)?;
                         return Ok(Some(frame));
                     }
                 }

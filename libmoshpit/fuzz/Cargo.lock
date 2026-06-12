@@ -2038,6 +2038,7 @@ version = "0.0.0"
 dependencies = [
  "arbitrary",
  "aws-lc-rs",
+ "base64",
  "libfuzzer-sys",
  "libmoshpit",
  "uuid",

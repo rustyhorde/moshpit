@@ -10,12 +10,18 @@ cargo-fuzz = true
 [dependencies]
 arbitrary = { version = "1.4.2", features = ["derive"] }
 aws-lc-rs = { version = "1.17.0", features = ["bindgen"] }
+base64 = "0.22.1"
 libfuzzer-sys = "0.4.13"
 libmoshpit = { path = ".." }
 uuid = "1.23.3"
 
 # Prevent the workspace from treating this crate as a member.
 [workspace]
+
+[features]
+# Forwards to libmoshpit's `unstable` (ML-DSA) feature. Required to actually
+# exercise `fuzz_pubkey_parse`; without it that target builds as a no-op.
+unstable = ["libmoshpit/unstable"]
 
 [[bin]]
 name = "fuzz_frame"
@@ -29,6 +35,36 @@ path = "fuzz_targets/fuzz_encframe.rs"
 test = false
 doc = false
 
+[[bin]]
+name = "fuzz_escape_intercept"
+path = "fuzz_targets/fuzz_escape_intercept.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_keyfile"
+path = "fuzz_targets/fuzz_keyfile.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_encframe_decrypt"
+path = "fuzz_targets/fuzz_encframe_decrypt.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_emulator"
+path = "fuzz_targets/fuzz_emulator.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_pubkey_parse"
+path = "fuzz_targets/fuzz_pubkey_parse.rs"
+test = false
+doc = false
+
 [[test]]
 name = "regression_encframe"
 path = "fuzz_targets/regression_encframe.rs"
@@ -36,3 +72,23 @@ path = "fuzz_targets/regression_encframe.rs"
 [[test]]
 name = "regression_frame"
 path = "fuzz_targets/regression_frame.rs"
+
+[[test]]
+name = "regression_escape_intercept"
+path = "fuzz_targets/regression_escape_intercept.rs"
+
+[[test]]
+name = "regression_keyfile"
+path = "fuzz_targets/regression_keyfile.rs"
+
+[[test]]
+name = "regression_encframe_decrypt"
+path = "fuzz_targets/regression_encframe_decrypt.rs"
+
+[[test]]
+name = "regression_emulator"
+path = "fuzz_targets/regression_emulator.rs"
+
+[[test]]
+name = "regression_pubkey_parse"
+path = "fuzz_targets/regression_pubkey_parse.rs"

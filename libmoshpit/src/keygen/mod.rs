@@ -659,6 +659,21 @@ pub fn load_public_key(pub_key_path: &PathBuf) -> Result<(Vec<u8>, Vec<u8>)> {
     let mut file_bytes = vec![];
     let _len = buffered_reader.read_to_end(&mut file_bytes)?;
 
+    parse_public_key_bytes(file_bytes)
+}
+
+/// Parse the bytes of a moshpit public key file (the `File::open` core of
+/// [`load_public_key`]).
+///
+/// Exposed (`#[doc(hidden)]`) so the fuzz harness can drive the SSH-format
+/// split + base64 + length-prefix parsing on arbitrary bytes without touching
+/// the filesystem; not part of the stable API.
+///
+/// # Errors
+///
+/// If the bytes are not a valid public key, an error is returned.
+#[doc(hidden)]
+pub fn parse_public_key_bytes(file_bytes: Vec<u8>) -> Result<(Vec<u8>, Vec<u8>)> {
     let pub_key_str = String::from_utf8_lossy(&file_bytes);
     let pub_key_parts: Vec<&str> = pub_key_str.split_whitespace().collect();
     if pub_key_parts.len() != 3 {
@@ -695,11 +710,31 @@ pub fn load_private_key(
     let mut file_bytes = vec![];
     let _len = buffered_reader.read_to_end(&mut file_bytes)?;
 
+    parse_private_key_bytes(&file_bytes)
+}
+
+/// Parse the bytes of a moshpit private key file (the `File::open` core of
+/// [`load_private_key`]).
+///
+/// Exposed (`#[doc(hidden)]`) so the fuzz harness can drive the base64 +
+/// length-prefixed parsing and key-material handling on arbitrary bytes without
+/// touching the filesystem; not part of the stable API.
+///
+/// # Errors
+///
+/// If the bytes are not a valid private key, an error is returned.
+#[doc(hidden)]
+pub fn parse_private_key_bytes(
+    file_bytes: &[u8],
+) -> Result<(Option<UnencryptedKeyPair>, Option<EncryptedKeyPair>)> {
     // Attempt the base64 decode the input
-    let decoded = STANDARD.decode(&file_bytes)?;
+    let decoded = STANDARD.decode(file_bytes)?;
 
     // Parse the private key file
     let mut private_key_bytes = BytesMut::from(&decoded[..]);
+    if private_key_bytes.remaining() < KEY_HEADER.len() {
+        return Err(MoshpitError::InvalidKeyHeader.into());
+    }
     let magic_key = private_key_bytes.split_to(KEY_HEADER.len());
     let magic_key_bytes = magic_key.freeze();
     if &magic_key_bytes[..] != KEY_HEADER {
@@ -763,6 +798,9 @@ pub fn load_identity_key(
     let decoded = STANDARD.decode(&file_bytes)?;
 
     let mut private_key_bytes = BytesMut::from(&decoded[..]);
+    if private_key_bytes.remaining() < KEY_HEADER.len() {
+        return Err(MoshpitError::InvalidKeyHeader.into());
+    }
     let magic_key = private_key_bytes.split_to(KEY_HEADER.len());
     let magic_key_bytes = magic_key.freeze();
     if &magic_key_bytes[..] != KEY_HEADER {
@@ -837,7 +875,18 @@ pub fn validate_identity_key_pair(
 }
 
 fn get_val_by_len(bytes: &mut BytesMut) -> Result<BytesMut> {
+    // Guard the 4-byte length prefix: `Buf::get_u32` panics when fewer than
+    // four bytes remain, so a truncated key file must error here rather than
+    // unwind.
+    if bytes.remaining() < 4 {
+        return Err(MoshpitError::InvalidKeyHeader.into());
+    }
     let len_bytes = usize::try_from(bytes.get_u32())?;
+    // Guard the payload: `BytesMut::split_to` panics when the requested length
+    // exceeds what remains, so a length that overruns the buffer must error too.
+    if bytes.remaining() < len_bytes {
+        return Err(MoshpitError::InvalidKeyHeader.into());
+    }
     let val_bytes = bytes.split_to(len_bytes);
     Ok(val_bytes)
 }
@@ -954,6 +1003,33 @@ mod tests {
         assert_eq!(&cipher[..], super::NONE_CIPHER.as_bytes());
         assert_eq!(&kdf[..], super::NONE_KDF.as_bytes());
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_val_by_len_rejects_short_length_prefix() {
+        // Fewer than four bytes remain: must error rather than panic in get_u32.
+        let mut buf = bytes::BytesMut::from(&[0x00, 0x00, 0x01][..]);
+        assert!(super::get_val_by_len(&mut buf).is_err());
+    }
+
+    #[test]
+    fn test_get_val_by_len_rejects_overrunning_length() {
+        // Length prefix claims 16 bytes but none follow: must error, not panic
+        // in split_to.
+        let mut buf = bytes::BytesMut::from(&[0x00, 0x00, 0x00, 0x10][..]);
+        assert!(super::get_val_by_len(&mut buf).is_err());
+    }
+
+    #[test]
+    fn test_load_private_key_rejects_short_magic_header() -> Result<()> {
+        // A base64 payload shorter than KEY_HEADER must error rather than panic
+        // in split_to(KEY_HEADER.len()).
+        let dir = tempfile::TempDir::new()?;
+        let key_path = dir.path().join("short_key");
+        let encoded = base64::engine::general_purpose::STANDARD.encode([0x00, 0x01, 0x02]);
+        write(&key_path, encoded)?;
+        assert!(load_private_key(&key_path).is_err());
         Ok(())
     }
 
