@@ -14,14 +14,14 @@ use aws_lc_rs::{
     error::Unspecified,
     hmac::{Key, verify},
 };
-use bincode_next::{Decode, Encode, config::standard, decode_from_slice};
+use bincode_next::{Decode, Encode};
 use tracing::error;
 use uuid::Uuid;
 
 use crate::{
     MoshpitError, UuidWrapper,
     error::Error,
-    frames::{get_bytes, get_nonce, get_usize},
+    frames::{decode_frame, get_bytes, get_nonce, get_usize},
 };
 
 const UUID_LEN: usize = 16;
@@ -177,9 +177,8 @@ impl EncryptedFrame {
                     message_with_tag.reverse();
                     let mut message = message_with_tag.split_off(AEAD_TAG_LEN);
                     message.reverse();
-                    let config = standard().with_limit::<65536>();
-                    let frame_data: (EncryptedFrame, _) = decode_from_slice(&message, config)?;
-                    return Ok(Some((frame_data.0, seq)));
+                    let frame: EncryptedFrame = decode_frame(&message)?;
+                    return Ok(Some((frame, seq)));
                 }
                 error!("HMAC verification failed");
                 return Err(Unspecified.into());

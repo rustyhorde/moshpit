@@ -5,11 +5,16 @@ members = ["agent", "keygen","libmoshpit", "moshpit", "moshpits", "xtask"]
 
 [workspace.dependencies]
 anyhow = "1.0.102"
+argon2 = { version = "0.6.0-rc.8", features = ["getrandom"] }
 aws-lc-rs = "1.17.0"
+base64 = "0.22.1"
+bincode-next = "3.0.0-rc.15"
 bon = "3.9.2"
 bytes = "1.11.1"
 clap = { version = "4.6.1", features = ["derive"] }
 config = { version = "0.15.23", features = ["toml"] }
+dialoguer = "0.12.0"
+dirs2 = "3.0.1"
 getset = "0.1.6"
 libc = "1.0.0-alpha.3"
 rustversion = "1.0.22"

@@ -38,7 +38,6 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
-use zstd::decode_all;
 
 use super::DiffMode;
 use crate::{
@@ -213,6 +212,38 @@ pub struct UdpReader {
     last_rx_us: Option<Arc<AtomicU64>>,
 }
 
+/// Hard cap on the size of any single decompressed server payload (16 MiB).
+///
+/// `vt100::Screen::contents_formatted()` for even a very large terminal is a few
+/// MB at most, so this is comfortable headroom for legitimate screen state while
+/// stopping a zstd decompression bomb — a tiny (≤64 KB) frame that expands to
+/// hundreds of MB or more and OOMs the client. A payload that exceeds the cap is
+/// treated as a corrupt frame and dropped.
+const MAX_DECOMPRESSED_LEN: usize = 16 * 1024 * 1024;
+
+/// Decompress a zstd stream, bounding the output to [`MAX_DECOMPRESSED_LEN`].
+///
+/// Returns `Err` (so the caller drops the frame, exactly as it does for a
+/// malformed stream) on invalid input or when the decompressed size would exceed
+/// the cap. [`Read::take`] bounds the allocation to `cap + 1` bytes, so an
+/// over-large payload never fully materialises in memory.
+fn decode_all_capped(input: &[u8]) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+    let decoder = zstd::Decoder::new(input)?;
+    let mut out = Vec::new();
+    // Read at most cap+1 bytes; getting cap+1 means the stream overran the cap.
+    let _ = decoder
+        .take(MAX_DECOMPRESSED_LEN as u64 + 1)
+        .read_to_end(&mut out)?;
+    if out.len() > MAX_DECOMPRESSED_LEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "decompressed payload exceeds MAX_DECOMPRESSED_LEN cap",
+        ));
+    }
+    Ok(out)
+}
+
 /// Current time as microseconds since the UNIX epoch, used for keepalive RTT timestamps.
 fn now_micros() -> u64 {
     u64::try_from(
@@ -222,6 +253,171 @@ fn now_micros() -> u64 {
             .as_micros(),
     )
     .unwrap_or(0)
+}
+
+/// Pure core of [`UdpReader::intercept_queries`]: scan server-supplied `bytes`,
+/// normalise VT/FF to CR+LF, strip intercepted CSI/OSC queries, and return the
+/// passthrough stream together with any query-response payloads that should be
+/// echoed back to the server.
+///
+/// This is the hand-rolled escape-sequence parser that runs client-side on the
+/// most attacker-controlled data in the system. It is exposed (`#[doc(hidden)]`)
+/// so the fuzz harness can exercise it without standing up channels or sockets;
+/// it is not part of the stable API.
+#[doc(hidden)]
+#[must_use]
+pub fn intercept_queries_core(
+    bytes: &[u8],
+    fg: &str,
+    bg: &str,
+    emulator: &Arc<Mutex<Emulator>>,
+) -> (Vec<u8>, Vec<Vec<u8>>) {
+    let mut responses = Vec::new();
+    if !bytes.contains(&0x1b) && !bytes.contains(&0x0b) && !bytes.contains(&0x0c) {
+        return (bytes.to_vec(), responses);
+    }
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x0b || bytes[i] == 0x0c {
+            out.push(b'\r');
+            out.push(b'\n');
+            i += 1;
+            continue;
+        }
+        if bytes[i] != 0x1b || i + 1 >= bytes.len() {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        match bytes[i + 1] {
+            b'[' => handle_csi(bytes, &mut i, &mut out, &mut responses, emulator),
+            b']' => handle_osc(bytes, &mut i, &mut out, &mut responses, fg, bg),
+            _ => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    (out, responses)
+}
+
+/// Handle one CSI sequence starting at `bytes[*i]` (`ESC [`).
+/// Advances `*i` past the sequence; appends passthrough bytes to `out`;
+/// pushes any recognised query response onto `responses`.
+fn handle_csi(
+    bytes: &[u8],
+    i: &mut usize,
+    out: &mut Vec<u8>,
+    responses: &mut Vec<Vec<u8>>,
+    emulator: &Arc<Mutex<Emulator>>,
+) {
+    let seq_start = *i;
+    *i += 2; // consume ESC [
+    let marker = if *i < bytes.len() && matches!(bytes[*i], b'?' | b'>' | b'=') {
+        let m = bytes[*i];
+        *i += 1;
+        Some(m)
+    } else {
+        None
+    };
+    let param_start = *i;
+    while *i < bytes.len() && (bytes[*i].is_ascii_digit() || bytes[*i] == b';') {
+        *i += 1;
+    }
+    let params = &bytes[param_start..*i];
+    if *i >= bytes.len() {
+        out.extend_from_slice(&bytes[seq_start..*i]);
+        return;
+    }
+    let terminator = bytes[*i];
+    *i += 1;
+    let response: Option<Vec<u8>> = match (marker, params, terminator) {
+        (None | Some(b'?'), b"6", b'n') => {
+            let (row, col) = emulator
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .screen()
+                .cursor_position();
+            Some(format!("\x1b[{};{}R", row + 1, col + 1).into_bytes())
+        }
+        (None, b"" | b"0", b'c') => Some(b"\x1b[?62c".to_vec()),
+        (Some(b'>'), b"" | b"0", b'c') => Some(b"\x1b[>1;10;0c".to_vec()),
+        (Some(b'='), b"" | b"0", b'c') => Some(b"\x1bP!|00000000\x1b\\".to_vec()),
+        // DSR — device status (vi, htop, etc. probe this at startup)
+        (None, b"5", b'n') => Some(b"\x1b[0n".to_vec()),
+        // XTVERSION — terminal identity (vim, neovim)
+        (Some(b'>'), _, b'q') => Some(b"\x1bP>|moshpit\x1b\\".to_vec()),
+        // XTWINOPS — terminal size in characters
+        (None, b"18", b't') => {
+            let (rows, cols) = emulator
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .screen()
+                .size();
+            Some(format!("\x1b[8;{rows};{cols}t").into_bytes())
+        }
+        // XTWINOPS — window/cell pixel sizes (unknown to the proxy → 0)
+        (None, b"14", b't') => Some(b"\x1b[4;0;0t".to_vec()),
+        (None, b"16", b't') => Some(b"\x1b[6;0;0t".to_vec()),
+        _ => {
+            out.extend_from_slice(&bytes[seq_start..*i]);
+            None
+        }
+    };
+    if let Some(resp) = response {
+        responses.push(resp);
+    }
+}
+
+/// Handle one OSC sequence starting at `bytes[*i]` (`ESC ]`).
+/// Intercepts OSC 10/11/12 color queries and pushes BEL-terminated canned color
+/// strings onto `responses`.  All other OSC sequences pass through unchanged.
+///
+/// **BEL termination** (`\x07`) is used deliberately instead of ST (`\e\\`).
+/// When the response is forwarded to the remote shell's stdin, fish's readline
+/// would otherwise consume the `\e` of `\e\\` as the start of an escape
+/// sequence and leave the trailing `\` as a literal character in the input
+/// buffer — causing it to appear before the next key typed (e.g. `\p`).
+fn handle_osc(
+    bytes: &[u8],
+    i: &mut usize,
+    out: &mut Vec<u8>,
+    responses: &mut Vec<Vec<u8>>,
+    fg: &str,
+    bg: &str,
+) {
+    let seq_start = *i;
+    *i += 2; // consume ESC ]
+    let param_start = *i;
+    let mut osc_params: Option<&[u8]> = None;
+    while *i < bytes.len() {
+        if bytes[*i] == 0x07 {
+            osc_params = Some(&bytes[param_start..*i]);
+            *i += 1;
+            break;
+        }
+        if bytes[*i] == 0x1b && *i + 1 < bytes.len() && bytes[*i + 1] == b'\\' {
+            osc_params = Some(&bytes[param_start..*i]);
+            *i += 2;
+            break;
+        }
+        *i += 1;
+    }
+    let Some(params) = osc_params else {
+        out.extend_from_slice(&bytes[seq_start..*i]);
+        return;
+    };
+    let response: Option<Vec<u8>> = params.strip_suffix(b";?").and_then(|cmd| match cmd {
+        b"10" => Some(format!("\x1b]10;{fg}\x07").into_bytes()),
+        b"11" => Some(format!("\x1b]11;{bg}\x07").into_bytes()),
+        b"12" => Some(format!("\x1b]12;{fg}\x07").into_bytes()),
+        _ => None,
+    });
+    match response {
+        Some(resp) => responses.push(resp),
+        None => out.extend_from_slice(&bytes[seq_start..*i]),
+    }
 }
 
 impl UdpReader {
@@ -321,9 +517,6 @@ impl UdpReader {
     ///
     /// Also normalises VT (0x0B) and FF (0x0C) to CR+LF.
     fn intercept_queries(&self, bytes: &[u8], emulator: &Arc<Mutex<Emulator>>) -> Vec<u8> {
-        if !bytes.contains(&0x1b) && !bytes.contains(&0x0b) && !bytes.contains(&0x0c) {
-            return bytes.to_vec();
-        }
         let fg = self
             .terminal_fg_color
             .as_deref()
@@ -332,153 +525,16 @@ impl UdpReader {
             .terminal_bg_color
             .as_deref()
             .unwrap_or("rgb:1c1c/1c1c/1c1c");
-        let mut out = Vec::with_capacity(bytes.len());
-        let mut i = 0;
-        while i < bytes.len() {
-            if bytes[i] == 0x0b || bytes[i] == 0x0c {
-                out.push(b'\r');
-                out.push(b'\n');
-                i += 1;
-                continue;
-            }
-            if bytes[i] != 0x1b || i + 1 >= bytes.len() {
-                out.push(bytes[i]);
-                i += 1;
-                continue;
-            }
-            match bytes[i + 1] {
-                b'[' => self.handle_csi(bytes, &mut i, &mut out, emulator),
-                b']' => self.handle_osc(bytes, &mut i, &mut out, fg, bg),
-                _ => {
-                    out.push(bytes[i]);
-                    i += 1;
+        let (out, responses) = intercept_queries_core(bytes, fg, bg, emulator);
+        if let Some(ref tx) = self.query_response_tx {
+            for resp in responses {
+                let frame = EncryptedFrame::Bytes((UuidWrapper::new(self.id), resp));
+                if let Err(e) = tx.try_send(frame) {
+                    warn!("Failed to send query response: {e}");
                 }
             }
         }
         out
-    }
-
-    /// Handle one CSI sequence starting at `bytes[*i]` (`ESC [`).
-    /// Advances `*i` past the sequence; appends passthrough bytes to `out`;
-    /// sends recognised query responses via `query_response_tx`.
-    fn handle_csi(
-        &self,
-        bytes: &[u8],
-        i: &mut usize,
-        out: &mut Vec<u8>,
-        emulator: &Arc<Mutex<Emulator>>,
-    ) {
-        let seq_start = *i;
-        *i += 2; // consume ESC [
-        let marker = if *i < bytes.len() && matches!(bytes[*i], b'?' | b'>' | b'=') {
-            let m = bytes[*i];
-            *i += 1;
-            Some(m)
-        } else {
-            None
-        };
-        let param_start = *i;
-        while *i < bytes.len() && (bytes[*i].is_ascii_digit() || bytes[*i] == b';') {
-            *i += 1;
-        }
-        let params = &bytes[param_start..*i];
-        if *i >= bytes.len() {
-            out.extend_from_slice(&bytes[seq_start..*i]);
-            return;
-        }
-        let terminator = bytes[*i];
-        *i += 1;
-        let response: Option<Vec<u8>> = match (marker, params, terminator) {
-            (None | Some(b'?'), b"6", b'n') => {
-                let (row, col) = emulator
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .screen()
-                    .cursor_position();
-                Some(format!("\x1b[{};{}R", row + 1, col + 1).into_bytes())
-            }
-            (None, b"" | b"0", b'c') => Some(b"\x1b[?62c".to_vec()),
-            (Some(b'>'), b"" | b"0", b'c') => Some(b"\x1b[>1;10;0c".to_vec()),
-            (Some(b'='), b"" | b"0", b'c') => Some(b"\x1bP!|00000000\x1b\\".to_vec()),
-            // DSR — device status (vi, htop, etc. probe this at startup)
-            (None, b"5", b'n') => Some(b"\x1b[0n".to_vec()),
-            // XTVERSION — terminal identity (vim, neovim)
-            (Some(b'>'), _, b'q') => Some(b"\x1bP>|moshpit\x1b\\".to_vec()),
-            // XTWINOPS — terminal size in characters
-            (None, b"18", b't') => {
-                let (rows, cols) = emulator
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .screen()
-                    .size();
-                Some(format!("\x1b[8;{rows};{cols}t").into_bytes())
-            }
-            // XTWINOPS — window/cell pixel sizes (unknown to the proxy → 0)
-            (None, b"14", b't') => Some(b"\x1b[4;0;0t".to_vec()),
-            (None, b"16", b't') => Some(b"\x1b[6;0;0t".to_vec()),
-            _ => {
-                out.extend_from_slice(&bytes[seq_start..*i]);
-                None
-            }
-        };
-        if let Some(resp) = response
-            && let Some(ref tx) = self.query_response_tx
-        {
-            let frame = EncryptedFrame::Bytes((UuidWrapper::new(self.id), resp));
-            if let Err(e) = tx.try_send(frame) {
-                warn!("Failed to send CSI query response: {e}");
-            }
-        }
-    }
-
-    /// Handle one OSC sequence starting at `bytes[*i]` (`ESC ]`).
-    /// Intercepts OSC 10/11/12 color queries and responds with BEL-terminated
-    /// canned color strings.  All other OSC sequences pass through unchanged.
-    ///
-    /// **BEL termination** (`\x07`) is used deliberately instead of ST (`\e\\`).
-    /// When the response is forwarded to the remote shell's stdin, fish's readline
-    /// would otherwise consume the `\e` of `\e\\` as the start of an escape
-    /// sequence and leave the trailing `\` as a literal character in the input
-    /// buffer — causing it to appear before the next key typed (e.g. `\p`).
-    fn handle_osc(&self, bytes: &[u8], i: &mut usize, out: &mut Vec<u8>, fg: &str, bg: &str) {
-        let seq_start = *i;
-        *i += 2; // consume ESC ]
-        let param_start = *i;
-        let mut osc_params: Option<&[u8]> = None;
-        while *i < bytes.len() {
-            if bytes[*i] == 0x07 {
-                osc_params = Some(&bytes[param_start..*i]);
-                *i += 1;
-                break;
-            }
-            if bytes[*i] == 0x1b && *i + 1 < bytes.len() && bytes[*i + 1] == b'\\' {
-                osc_params = Some(&bytes[param_start..*i]);
-                *i += 2;
-                break;
-            }
-            *i += 1;
-        }
-        let Some(params) = osc_params else {
-            out.extend_from_slice(&bytes[seq_start..*i]);
-            return;
-        };
-        let response: Option<Vec<u8>> = params.strip_suffix(b";?").and_then(|cmd| match cmd {
-            b"10" => Some(format!("\x1b]10;{fg}\x07").into_bytes()),
-            b"11" => Some(format!("\x1b]11;{bg}\x07").into_bytes()),
-            b"12" => Some(format!("\x1b]12;{fg}\x07").into_bytes()),
-            _ => None,
-        });
-        match response {
-            Some(resp) => {
-                if let Some(ref tx) = self.query_response_tx {
-                    let frame = EncryptedFrame::Bytes((UuidWrapper::new(self.id), resp));
-                    if let Err(e) = tx.try_send(frame) {
-                        warn!("Failed to send OSC query response: {e}");
-                    }
-                }
-            }
-            None => out.extend_from_slice(&bytes[seq_start..*i]),
-        }
     }
 
     /// Buffer an arrived `(frame, seq)` pair and return any frames now ready to deliver
@@ -1072,7 +1128,7 @@ impl UdpReader {
             let payload_compressed = take(&mut self.pending_chunk_data);
             self.pending_chunk_seq = 0;
             self.pending_chunk_total = 0;
-            match decode_all(payload_compressed.as_slice()) {
+            match decode_all_capped(payload_compressed.as_slice()) {
                 Ok(payload) => {
                     let repaint = self.apply_full_state(
                         &payload,
@@ -1220,7 +1276,7 @@ impl UdpReader {
                                 }
                             }
                             EncryptedFrame::ScreenStateCompressed(compressed) => {
-                                match decode_all(compressed.as_slice()) {
+                                match decode_all_capped(compressed.as_slice()) {
                                     Ok(payload) => {
                                         let repaint = self.apply_full_state(
                                             &payload,
@@ -1253,7 +1309,7 @@ impl UdpReader {
                                     .await;
                             }
                             EncryptedFrame::CompressedBytes((_id, compressed)) => {
-                                match decode_all(compressed.as_slice()) {
+                                match decode_all_capped(compressed.as_slice()) {
                                     Ok(decompressed) => {
                                         let message =
                                             self.intercept_queries(&decompressed, &emulator);
@@ -1357,7 +1413,7 @@ impl UdpReader {
                                         }
                                     }
                                     EncryptedFrame::ScreenStateCompressed(compressed) => {
-                                        match decode_all(compressed.as_slice()) {
+                                        match decode_all_capped(compressed.as_slice()) {
                                             Ok(payload) => {
                                                 let repaint = self.apply_full_state(
                                                     &payload,
@@ -1378,7 +1434,7 @@ impl UdpReader {
                                         }
                                     }
                                     EncryptedFrame::CompressedBytes((_id, compressed)) => {
-                                        match decode_all(compressed.as_slice()) {
+                                        match decode_all_capped(compressed.as_slice()) {
                                             Ok(decompressed) => {
                                                 let message = self
                                                     .intercept_queries(&decompressed, &emulator);
@@ -1420,7 +1476,7 @@ impl UdpReader {
                                             }
                                         } else if base_id == self.ack_state_seq {
                                             self.statesync_mismatch_count = 0;
-                                            match decode_all(compressed.as_slice()) {
+                                            match decode_all_capped(compressed.as_slice()) {
                                                 Ok(diff_bytes) => {
                                                     let (rows, cols) = {
                                                         let emu = emulator.lock().unwrap_or_else(PoisonError::into_inner);
@@ -3217,6 +3273,47 @@ mod tests {
             MAX_NAK_TIMEOUT,
             "sample equal to ceiling should not be clamped and should raise nak_timeout"
         );
+    }
+
+    // ── decode_all_capped ─────────────────────────────────────────────────────
+
+    #[test]
+    fn decode_all_capped_round_trips_small_payload() -> Result<()> {
+        use zstd::encode_all;
+        let raw = b"hello, moshpit";
+        let compressed = encode_all(raw.as_slice(), 0)?;
+        let decompressed = super::decode_all_capped(&compressed)?;
+        assert_eq!(decompressed, raw);
+        Ok(())
+    }
+
+    #[test]
+    fn decode_all_capped_rejects_over_cap_bomb() -> Result<()> {
+        use zstd::encode_all;
+        // Highly compressible buffer one byte over the cap: tiny compressed, but
+        // its decompressed size exceeds MAX_DECOMPRESSED_LEN and must be rejected
+        // instead of allocating the whole thing.
+        let bomb = vec![0u8; super::MAX_DECOMPRESSED_LEN + 1];
+        let compressed = encode_all(bomb.as_slice(), 0)?;
+        assert!(compressed.len() < super::MAX_DECOMPRESSED_LEN);
+        assert!(super::decode_all_capped(&compressed).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn decode_all_capped_allows_exactly_cap() -> Result<()> {
+        use zstd::encode_all;
+        let payload = vec![7u8; super::MAX_DECOMPRESSED_LEN];
+        let compressed = encode_all(payload.as_slice(), 0)?;
+        let decompressed = super::decode_all_capped(&compressed)?;
+        assert_eq!(decompressed.len(), super::MAX_DECOMPRESSED_LEN);
+        Ok(())
+    }
+
+    #[test]
+    fn decode_all_capped_rejects_non_zstd_garbage() {
+        assert!(super::decode_all_capped(b"not a zstd stream at all").is_err());
+        assert!(super::decode_all_capped(&[]).is_err());
     }
 
     // ── handle_state_chunk ────────────────────────────────────────────────────

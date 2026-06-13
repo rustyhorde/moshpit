@@ -84,7 +84,11 @@ run_step cargo matrix build
 
 if test $run_tests = true
     run_step cargo nextest run -p libmoshpit -p moshpits -p moshpit -p moshpit-keygen -p moshpit-agent
-    run_step cargo test --manifest-path libmoshpit/fuzz/Cargo.toml
+    if test $musl_unstable = true
+        run_step cargo test --manifest-path libmoshpit/fuzz/Cargo.toml --features unstable
+    else
+        run_step cargo test --manifest-path libmoshpit/fuzz/Cargo.toml
+    end
 end
 
 if test $run_docs = true
@@ -100,6 +104,11 @@ end
 if test $run_fuzz = true
     run_step cargo fuzz run --fuzz-dir libmoshpit/fuzz fuzz_frame -- -max_total_time=30
     run_step cargo fuzz run --fuzz-dir libmoshpit/fuzz fuzz_encframe -- -max_total_time=30
+    run_step cargo fuzz run --fuzz-dir libmoshpit/fuzz fuzz_encframe_decrypt -- -max_total_time=30
+    run_step cargo fuzz run --fuzz-dir libmoshpit/fuzz fuzz_escape_intercept -- -max_total_time=30
+    run_step cargo fuzz run --fuzz-dir libmoshpit/fuzz fuzz_keyfile -- -max_total_time=30
+    run_step cargo fuzz run --fuzz-dir libmoshpit/fuzz fuzz_emulator -- -max_total_time=30
+    run_step cargo fuzz run --fuzz-dir libmoshpit/fuzz --features unstable fuzz_pubkey_parse -- -max_total_time=30
 end
 
 if test $run_install = true

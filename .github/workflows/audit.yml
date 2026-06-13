@@ -74,6 +74,26 @@ jobs:
         working-directory: libmoshpit
         run: cargo +nightly fuzz run fuzz_encframe -- -max_total_time=30
 
+      - name: 🧪 Fuzz fuzz_encframe_decrypt (30 s) 🧪
+        working-directory: libmoshpit
+        run: cargo +nightly fuzz run fuzz_encframe_decrypt -- -max_total_time=30
+
+      - name: 🧪 Fuzz fuzz_escape_intercept (30 s) 🧪
+        working-directory: libmoshpit
+        run: cargo +nightly fuzz run fuzz_escape_intercept -- -max_total_time=30
+
+      - name: 🧪 Fuzz fuzz_keyfile (30 s) 🧪
+        working-directory: libmoshpit
+        run: cargo +nightly fuzz run fuzz_keyfile -- -max_total_time=30
+
+      - name: 🧪 Fuzz fuzz_emulator (30 s) 🧪
+        working-directory: libmoshpit
+        run: cargo +nightly fuzz run fuzz_emulator -- -max_total_time=30
+
+      - name: 🧪 Fuzz fuzz_pubkey_parse (30 s) 🧪
+        working-directory: libmoshpit
+        run: cargo +nightly fuzz run --features unstable fuzz_pubkey_parse -- -max_total_time=30
+
       - name: 💾 Upload crash artifacts (if any) 💾
         if: failure()
         # v7.0.1
@@ -83,4 +103,9 @@ jobs:
           path: |
             libmoshpit/fuzz/artifacts/fuzz_frame/
             libmoshpit/fuzz/artifacts/fuzz_encframe/
+            libmoshpit/fuzz/artifacts/fuzz_encframe_decrypt/
+            libmoshpit/fuzz/artifacts/fuzz_escape_intercept/
+            libmoshpit/fuzz/artifacts/fuzz_keyfile/
+            libmoshpit/fuzz/artifacts/fuzz_emulator/
+            libmoshpit/fuzz/artifacts/fuzz_pubkey_parse/
           if-no-files-found: ignore
