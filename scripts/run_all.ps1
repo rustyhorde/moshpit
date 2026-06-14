@@ -105,7 +105,7 @@ if ($runDocs) {
 }
 
 if ($runCoverage) {
-    Invoke-Step 'cargo matrix llvm-cov nextest -F unstable --no-report'
+    Invoke-Step 'cargo matrix -F unstable llvm-cov nextest --no-report'
     Invoke-Step 'cargo llvm-cov report --lcov --output-path lcov.info'
     Invoke-Step 'cargo llvm-cov report --html'
 }

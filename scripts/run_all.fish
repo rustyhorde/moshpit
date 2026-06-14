@@ -97,7 +97,7 @@ if test $run_docs = true
 end
 
 if test $run_coverage = true
-    run_step cargo matrix llvm-cov nextest -F unstable --no-report
+    run_step cargo matrix -F unstable llvm-cov nextest --no-report
     run_step cargo llvm-cov report --lcov --output-path lcov.info
     run_step cargo llvm-cov report --html
 end
