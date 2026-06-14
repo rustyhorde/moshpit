@@ -15,3 +15,6 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 clap_complete = "4.6.5"
 clap_mangen = "0.3.0"
+
+[package.metadata.cargo-matrix]
+skip-package = true

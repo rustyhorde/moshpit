@@ -83,7 +83,8 @@ run_step cargo matrix clippy --all-targets -- -D warnings
 run_step cargo matrix build
 
 if test $run_tests = true
-    run_step cargo nextest run -p libmoshpit -p moshpits -p moshpit -p moshpit-keygen -p moshpit-agent
+    run_step cargo matrix nextest run
+    run_step cargo matrix test --doc -p libmoshpit
     if test $musl_unstable = true
         run_step cargo test --manifest-path libmoshpit/fuzz/Cargo.toml --features unstable
     else
@@ -96,7 +97,7 @@ if test $run_docs = true
 end
 
 if test $run_coverage = true
-    run_step cargo llvm-cov nextest -F unstable --exclude xtask --no-report --workspace
+    run_step cargo matrix llvm-cov nextest -F unstable --no-report
     run_step cargo llvm-cov report --lcov --output-path lcov.info
     run_step cargo llvm-cov report --html
 end

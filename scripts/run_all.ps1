@@ -91,8 +91,13 @@ Invoke-Step 'cargo matrix clippy --all-targets -- -D warnings'
 Invoke-Step 'cargo matrix build'
 
 if ($runTests) {
-    Invoke-Step 'cargo nextest run -p libmoshpit -p moshpits -p moshpit -p moshpit-keygen -p moshpit-agent'
-    Invoke-Step 'cargo test --manifest-path libmoshpit/fuzz/Cargo.toml'
+    Invoke-Step 'cargo matrix nextest run'
+    Invoke-Step 'cargo matrix test --doc -p libmoshpit'
+    if ($muslUnstable) {
+        Invoke-Step 'cargo test --manifest-path libmoshpit/fuzz/Cargo.toml --features unstable'
+    } else {
+        Invoke-Step 'cargo test --manifest-path libmoshpit/fuzz/Cargo.toml'
+    }
 }
 
 if ($runDocs) {
@@ -100,7 +105,7 @@ if ($runDocs) {
 }
 
 if ($runCoverage) {
-    Invoke-Step 'cargo llvm-cov nextest -F unstable --exclude xtask --no-report --workspace'
+    Invoke-Step 'cargo matrix llvm-cov nextest -F unstable --no-report'
     Invoke-Step 'cargo llvm-cov report --lcov --output-path lcov.info'
     Invoke-Step 'cargo llvm-cov report --html'
 }
@@ -108,6 +113,13 @@ if ($runCoverage) {
 if ($runFuzz) {
     Invoke-Step 'cargo fuzz run --fuzz-dir libmoshpit/fuzz fuzz_frame -- -max_total_time=30'
     Invoke-Step 'cargo fuzz run --fuzz-dir libmoshpit/fuzz fuzz_encframe -- -max_total_time=30'
+    Invoke-Step 'cargo fuzz run --fuzz-dir libmoshpit/fuzz fuzz_encframe_decrypt -- -max_total_time=30'
+    Invoke-Step 'cargo fuzz run --fuzz-dir libmoshpit/fuzz fuzz_escape_intercept -- -max_total_time=30'
+    Invoke-Step 'cargo fuzz run --fuzz-dir libmoshpit/fuzz fuzz_keyfile -- -max_total_time=30'
+    Invoke-Step 'cargo fuzz run --fuzz-dir libmoshpit/fuzz fuzz_emulator -- -max_total_time=30'
+    if ($muslUnstable) {
+        Invoke-Step 'cargo fuzz run --fuzz-dir libmoshpit/fuzz --features unstable fuzz_pubkey_parse -- -max_total_time=30'
+    }
 }
 
 if ($runInstall) {
