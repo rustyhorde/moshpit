@@ -100,6 +100,12 @@ pub(crate) struct Config {
     #[serde(default)]
     #[getset(get_copy = "pub(crate)")]
     diff_mode: DiffMode,
+    /// Data-channel transport mode.  `udp` (default) uses encrypted UDP;
+    /// `tcp` uses the server's TCP data port (fallback for UDP-blocking firewalls).
+    /// Set via `--transport tcp` / `MOSHPIT_TRANSPORT=tcp`.
+    #[serde(default)]
+    #[getset(get_copy = "pub(crate)")]
+    transport: libmoshpit::TransportMode,
     /// Legacy escape hatch: drive the terminal by forwarding raw server PTY
     /// bytes straight to stdout instead of rendering exclusively through the
     /// differential renderer.  Defaults to `false` (the artifact-free rendered
@@ -181,6 +187,7 @@ impl Default for Config {
             nat_warmup: false,
             nat_warmup_count: Self::default_nat_warmup_count(),
             diff_mode: DiffMode::default(),
+            transport: libmoshpit::TransportMode::default(),
             legacy_passthrough: false,
             preferred_algorithms: AlgorithmPreferences::default(),
             send_env: Self::default_send_env(),
@@ -217,6 +224,10 @@ impl KexConfig for Config {
 
     fn diff_mode(&self) -> DiffMode {
         self.diff_mode
+    }
+
+    fn transport_preference(&self) -> libmoshpit::TransportMode {
+        self.transport
     }
 
     fn preferred_algorithms(&self) -> AlgorithmList {

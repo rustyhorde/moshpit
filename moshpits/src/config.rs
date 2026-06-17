@@ -140,6 +140,15 @@ pub(crate) struct Config {
     #[serde(default = "default_true")]
     #[getset(get_copy = "pub(crate)")]
     use_utmp: bool,
+    /// Allow clients to request a TCP data channel instead of UDP.
+    ///
+    /// When `true`, clients that negotiate protocol v2 and send
+    /// `TransportPreference(1)` (TCP) will have all terminal I/O delivered over
+    /// the kept-open TCP connection on a dedicated data port.  Useful for networks
+    /// where UDP is blocked by firewalls.  Default: `false` (opt-in).
+    #[serde(default)]
+    #[getset(get_copy = "pub(crate)")]
+    allow_tcp_transport: bool,
 }
 
 fn default_term_type() -> String {
@@ -174,6 +183,7 @@ impl Default for Config {
             namespace_escape: true,
             use_logind: true,
             use_utmp: true,
+            allow_tcp_transport: false,
         }
     }
 }
@@ -239,6 +249,10 @@ impl KexConfig for Config {
         // clamps the result to the implementable range.
         self.min_protocol_version
             .unwrap_or(libmoshpit::MIN_PROTOCOL_VERSION)
+    }
+
+    fn allow_tcp_transport(&self) -> bool {
+        self.allow_tcp_transport()
     }
 }
 

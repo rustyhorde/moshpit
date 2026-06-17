@@ -227,7 +227,7 @@ const MAX_DECOMPRESSED_LEN: usize = 16 * 1024 * 1024;
 /// malformed stream) on invalid input or when the decompressed size would exceed
 /// the cap. [`Read::take`] bounds the allocation to `cap + 1` bytes, so an
 /// over-large payload never fully materialises in memory.
-fn decode_all_capped(input: &[u8]) -> std::io::Result<Vec<u8>> {
+pub(crate) fn decode_all_capped(input: &[u8]) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
     let decoder = zstd::Decoder::new(input)?;
     let mut out = Vec::new();
@@ -418,6 +418,37 @@ fn handle_osc(
         Some(resp) => responses.push(resp),
         None => out.extend_from_slice(&bytes[seq_start..*i]),
     }
+}
+
+/// Apply a full screen-state snapshot to the emulator and render it.
+///
+/// Used by both `UdpReader` (in Reliable/Datagram mode) and `TcpTransportReader`.
+/// Does not update any `StateSync` tracking fields — callers that need those
+/// (i.e. `UdpReader` in `StateSync` mode) update them separately.
+pub(crate) fn apply_full_state_rendering(
+    payload: &[u8],
+    emulator: &Arc<Mutex<Emulator>>,
+    prediction: &Arc<Mutex<PredictionEngine>>,
+    renderer: &Arc<Mutex<Renderer>>,
+    in_alt_screen: &Arc<AtomicBool>,
+) -> Vec<u8> {
+    let (rows, cols) = {
+        let emu = emulator.lock().unwrap_or_else(PoisonError::into_inner);
+        emu.screen().size()
+    };
+    let was_alt = in_alt_screen.load(Ordering::Relaxed);
+    let mut tmp = vt100::Parser::new(rows, cols, 0);
+    if was_alt {
+        tmp.process(b"\x1b[?1049h");
+    }
+    tmp.process(payload);
+    let is_alt = tmp.screen().alternate_screen();
+    in_alt_screen.store(is_alt, Ordering::Relaxed);
+    {
+        let mut emu = emulator.lock().unwrap_or_else(PoisonError::into_inner);
+        emu.replace_parser(tmp);
+    }
+    render_server_update(emulator, prediction, renderer, !is_alt)
 }
 
 impl UdpReader {
@@ -1616,6 +1647,31 @@ impl ClientRenderCtx {
             in_alt_screen,
         }
     }
+
+    /// The stdout sender channel.
+    pub(crate) fn stdout_tx(&self) -> &Sender<Vec<u8>> {
+        &self.stdout_tx
+    }
+
+    /// The shared terminal emulator.
+    pub(crate) fn emulator(&self) -> &Arc<Mutex<Emulator>> {
+        &self.emulator
+    }
+
+    /// The shared prediction engine.
+    pub(crate) fn prediction(&self) -> &Arc<Mutex<PredictionEngine>> {
+        &self.prediction
+    }
+
+    /// The shared renderer.
+    pub(crate) fn renderer(&self) -> &Arc<Mutex<Renderer>> {
+        &self.renderer
+    }
+
+    /// Whether the terminal is currently in alternate-screen mode.
+    pub(crate) fn in_alt_screen(&self) -> &Arc<AtomicBool> {
+        &self.in_alt_screen
+    }
 }
 
 /// Feed server bytes through the emulator and render a single clean update.
@@ -1629,7 +1685,7 @@ impl ClientRenderCtx {
 /// When `passthrough` is `true` the legacy behavior is used instead: raw bytes
 /// are written straight to the terminal and prediction overlays are painted on
 /// top out-of-band.  This is an escape hatch and is off by default.
-async fn process_bytes_with_prediction(
+pub(crate) async fn process_bytes_with_prediction(
     raw: Vec<u8>,
     prev_bytes: &mut BytesMut,
     osc_started: &mut bool,

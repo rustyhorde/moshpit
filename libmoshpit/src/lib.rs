@@ -9,8 +9,9 @@
 //! Core library powering the moshpit suite of tools ([`mp`], [`mps`], [`mpa`]).
 //!
 //! moshpit provides encrypted, resilient remote terminal sessions.  A client (`mp`) authenticates
-//! to a server (`mps`) over TCP, then switches to an encrypted UDP channel for low-latency
-//! terminal I/O that survives IP roaming, NAT rebinding, and short network outages.
+//! to a server (`mps`) over TCP, then carries terminal I/O over an encrypted UDP channel
+//! (low-latency, survives IP roaming and NAT rebinding) or over a TCP data channel when UDP is
+//! unavailable (see [`TransportMode`]).
 //!
 //! [`mp`]: https://github.com/rustyhorde/moshpit#moshpit-client-mp
 //! [`mps`]: https://github.com/rustyhorde/moshpit#moshpits-server-mps
@@ -19,12 +20,18 @@
 //! # Connection model
 //!
 //! **Phase 1 — TCP key exchange**: the client opens a TCP connection and performs mutual
-//! asymmetric-key authentication.  A per-session AEAD key is derived via KDF and the TCP
-//! connection is closed.  See [`run_key_exchange`], [`Kex`], [`KexStateMachine`].
+//! asymmetric-key authentication.  A per-session AEAD key is derived via KDF.
+//! See [`run_key_exchange`], [`Kex`], [`KexStateMachine`].
 //!
-//! **Phase 2 — UDP session**: all terminal I/O is encrypted with the negotiated AEAD cipher and
-//! delivered over UDP.  The server maintains a full VT100 emulator state and sends a clean screen
-//! snapshot on reconnect.  See [`UdpClient`], [`UdpSender`], [`UdpReader`], [`DiffMode`].
+//! **Phase 2 — Data session**: all terminal I/O is encrypted with the negotiated AEAD cipher.
+//! Two transports are supported, negotiated during Phase 1 via [`TransportMode`]:
+//!
+//! - **UDP** (default): the TCP connection is closed after key exchange and terminal I/O runs
+//!   over UDP (server ports 50000–59999).  See [`UdpSender`], [`UdpReader`], [`DiffMode`].
+//! - **TCP fallback**: when `TransportMode::Tcp` is negotiated (client uses `--transport tcp`,
+//!   server has `allow_tcp_transport = true`), the TCP connection is kept open and a dedicated
+//!   TCP data port carries terminal I/O.  Useful when UDP is blocked by firewalls.
+//!   See [`TcpTransportSender`], [`TcpTransportReader`].
 //!
 //! # Cryptography
 //!
@@ -43,10 +50,12 @@
 //!
 //! Two bincode-serialized frame enums carry everything on the wire. [`Frame`]
 //! (`frames/frame.rs`) is the TCP key-exchange message; [`EncryptedFrame`]
-//! (`frames/encframe.rs`) is the payload of every encrypted UDP datagram. Each UDP
-//! packet is laid out as `[nonce (12)] [seq (8)] [hmac tag] [length (8)]
-//! [ciphertext]`; the sequence number is authenticated by the HMAC and reused as
-//! the AEAD AAD, so a frame can be retransmitted verbatim without re-encryption.
+//! (`frames/encframe.rs`) is the data-channel payload for both UDP and TCP transport.
+//! The wire format is identical for both: `[nonce (12)] [seq (8)] [hmac tag] [length (8)]
+//! [ciphertext]`.  The sequence number is authenticated by the HMAC and reused as the AEAD AAD,
+//! so a frame can be retransmitted verbatim without re-encryption.  Over UDP each frame is a
+//! datagram; over TCP it is wrapped in a length-prefixed blob via
+//! `ConnectionWriter::write_data` / `ConnectionReader::read_data`.
 //! See [`EncryptedFrame::parse`].
 //!
 //! Both peers advertise a [`ProtocolSupport`] range (min/max) in their
@@ -310,6 +319,7 @@ mod kex;
 mod keygen;
 mod session;
 mod tcp;
+mod tcp_transport;
 mod term;
 mod tracing;
 mod udp;
@@ -338,8 +348,10 @@ pub use self::kex::HostKeyMismatchFn;
 pub use self::kex::Kex;
 pub use self::kex::KexEvent;
 pub use self::kex::KexMode;
+pub use self::kex::KexOutcome;
 pub use self::kex::KexState;
 pub use self::kex::KexStateMachine;
+pub use self::kex::NegotiatedTransport;
 pub use self::kex::ServerKex;
 pub use self::kex::TofuFn;
 pub use self::kex::env_var_matches;
@@ -401,6 +413,8 @@ pub use self::session::SessionRegistry;
 pub use self::session::new_session_registry;
 pub use self::tcp::reader::ConnectionReader;
 pub use self::tcp::writer::ConnectionWriter;
+pub use self::tcp_transport::TcpTransportReader;
+pub use self::tcp_transport::TcpTransportSender;
 pub use self::term::TerminalMessage;
 pub use self::term::{
     DisplayPreference, Emulator, OverlayCell, OverlayCursor, PredictionEngine, Renderer,
@@ -408,6 +422,7 @@ pub use self::term::{
 };
 pub use self::tracing::{TracingConfigExt, init_tracing};
 pub use self::udp::DiffMode;
+pub use self::udp::TransportMode;
 pub use self::udp::UdpClient;
 pub use self::udp::reader::{ClientRenderCtx, UdpReader, intercept_queries_core};
 pub use self::udp::sender::MAX_UDP_PAYLOAD;

@@ -151,6 +151,17 @@ pub(crate) struct Cli {
     )]
     #[getset(get_copy = "pub(crate)")]
     legacy_passthrough: bool,
+    /// Data-channel transport mode.  `udp` (default) uses encrypted UDP datagrams;
+    /// `tcp` connects to the server's TCP data port (fallback for UDP-blocking firewalls).
+    /// Requires the server to have `allow_tcp_transport = true` in its config.
+    #[clap(
+        long,
+        value_name = "MODE",
+        default_value = "udp",
+        help = "Data-channel transport: udp (default) or tcp"
+    )]
+    #[getset(get = "pub(crate)")]
+    transport: String,
     /// Ordered KEX algorithms to offer (comma-separated).
     /// Example: `--kex-algos ml-kem-768-sha256,x25519-sha256`
     #[clap(
@@ -352,6 +363,12 @@ impl Source for Cli {
             let _old = map.insert(
                 "diff_mode".to_string(),
                 Value::new(Some(&origin), ValueKind::String(self.diff_mode.clone())),
+            );
+        }
+        if on("transport") {
+            let _old = map.insert(
+                "transport".to_string(),
+                Value::new(Some(&origin), ValueKind::String(self.transport.clone())),
             );
         }
         if on("legacy_passthrough") {

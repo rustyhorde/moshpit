@@ -57,6 +57,21 @@ impl ConnectionWriter {
         self.writer.write_all(bytes).await?;
         self.writer.flush().await.map_err(Into::into)
     }
+
+    /// Write a length-prefixed data blob to the stream.
+    ///
+    /// Writes an 8-byte big-endian length followed by the payload.  Used by the
+    /// TCP data channel to frame [`EncryptedFrame`](crate::EncryptedFrame) wire
+    /// bytes independently of the KEX [`Frame`] framing.
+    ///
+    /// # Errors
+    /// * I/O error.
+    ///
+    pub async fn write_data(&mut self, bytes: &[u8]) -> Result<()> {
+        self.writer.write_u64(u64::try_from(bytes.len())?).await?;
+        self.writer.write_all(bytes).await?;
+        self.writer.flush().await.map_err(Into::into)
+    }
 }
 
 #[cfg(test)]
@@ -78,6 +93,34 @@ mod tests {
         let (_, client_w) = client?.into_split();
         let mut writer = ConnectionWriter::builder().writer(client_w).build();
         writer.write_frame(&Frame::KexFailure).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_data_round_trips() -> Result<()> {
+        use tokio::{
+            io::AsyncReadExt as _,
+            net::{TcpListener, TcpStream},
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let (server, client) = tokio::join!(
+            async { listener.accept().await.map(|(s, _)| s) },
+            TcpStream::connect(addr),
+        );
+        let (server_r, _) = server?.into_split();
+        let (_, client_w) = client?.into_split();
+        let mut writer = ConnectionWriter::builder().writer(client_w).build();
+        let payload = b"hello data channel";
+        writer.write_data(payload).await?;
+        drop(writer);
+        let mut reader_raw = server_r;
+        let mut len_buf = [0u8; 8];
+        let _ = reader_raw.read_exact(&mut len_buf).await?;
+        let len = usize::try_from(u64::from_be_bytes(len_buf))?;
+        let mut data = vec![0u8; len];
+        let _ = reader_raw.read_exact(&mut data).await?;
+        assert_eq!(data, payload);
         Ok(())
     }
 

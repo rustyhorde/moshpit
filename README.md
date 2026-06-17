@@ -39,7 +39,7 @@ moshpit is a suite of tools for establishing encrypted, resilient remote termina
 | `mp-keygen` | moshpit-keygen | Key management — generates and inspects asymmetric key pairs (X25519, P-384, or P-256) |
 | `mpa` | moshpit-agent | Agent daemon — holds decrypted identity keys in memory, serves them over a Unix socket so `mp` never prompts for passphrases after first unlock |
 
-Sessions are authenticated with asymmetric key pairs (X25519 by default; P-384 and P-256 are also supported).  TCP is used only for the initial key exchange; once the exchange completes the connection switches to UDP exclusively (ports 50000–59999) for all terminal I/O.  The server tracks full terminal screen state with a server-side vt100 emulator; on reconnect the client receives a single clean screen snapshot and repaints instantly rather than replaying raw scrollback history.
+Sessions are authenticated with asymmetric key pairs (X25519 by default; P-384 and P-256 are also supported).  By default, TCP is used only for the initial key exchange; once the exchange completes the connection switches to UDP (ports 50000–59999) for all terminal I/O.  On networks where UDP is blocked by firewalls, the client can request a **TCP data channel** (`--transport tcp`) and the server will keep the TCP connection open for all terminal I/O instead — see [TCP transport fallback](#tcp-transport-fallback).  The server tracks full terminal screen state with a server-side vt100 emulator; on reconnect the client receives a single clean screen snapshot and repaints instantly rather than replaying raw scrollback history.
 
 ---
 
@@ -62,7 +62,7 @@ moshpit draws its core motivation from [Mosh (Mobile Shell)](https://mosh.org/),
 |---------|------|---------|
 | **Language** | C++ | Rust |
 | **Authentication** | Delegated to SSH for the initial handshake; a one-time secret is passed back over SSH | Standalone asymmetric key-pair authentication (X25519, P-384, or P-256) — no SSH dependency |
-| **Transport model** | Pure UDP after setup; Mosh's *State Synchronization Protocol* (SSP) keeps a diff of the full terminal screen state and sends only the latest snapshot | TCP is used solely for the asymmetric key exchange; all terminal I/O runs over UDP after the exchange completes.  Three selectable diff transport modes: `reliable` (default, NAK-based retransmission with adaptive RTT), `datagram` (fire-and-forget with periodic full-screen recovery), and `statesync` (Mosh-inspired ack-based diffs, no NAKs); see [UDP diff transport modes](#udp-diff-transport-modes) |
+| **Transport model** | Pure UDP after setup; Mosh's *State Synchronization Protocol* (SSP) keeps a diff of the full terminal screen state and sends only the latest snapshot | TCP is used for the asymmetric key exchange; terminal I/O then runs over UDP by default, or over the same TCP connection when `--transport tcp` is requested and the server has `allow_tcp_transport = true` (useful when UDP is blocked by firewalls).  Three selectable diff transport modes: `reliable` (default, NAK-based retransmission with adaptive RTT), `datagram` (fire-and-forget with periodic full-screen recovery), and `statesync` (Mosh-inspired ack-based diffs, no NAKs); see [UDP diff transport modes](#udp-diff-transport-modes) |
 | **Reconnect display sync** | SSP sends the latest screen snapshot; client repaints from the diff immediately | Server maintains a `vt100::Parser` tracking the live PTY screen; on reconnect a single `ScreenState` frame delivers `contents_formatted()` bytes for an instant clean repaint.  A 50 ms periodic task also sends `ScreenState` diffs during normal use so the client stays in sync even across network hiccups. |
 | **Client-side prediction** | Mosh echoes keystrokes locally and predicts cursor movement to hide latency, underlining characters that have not yet been confirmed by the server | Same — keystrokes are echoed locally, cursor movement is predicted, and unconfirmed characters are underlined until the server output arrives |
 | **Encryption** | AES-128-OCB authenticated encryption using a symmetric session key | Key exchange via an asymmetric key-pair handshake (default: X25519); negotiated symmetric encryption on the UDP channel (default: AES-256-GCM-SIV with per-packet HMAC-SHA-512; see [Algorithm negotiation](#algorithm-negotiation)) |
@@ -81,9 +81,11 @@ moshpit draws its core motivation from [Mosh (Mobile Shell)](https://mosh.org/),
 
 The client opens a TCP connection to the server's configured port (default 40404).  The two sides run a mutual asymmetric key-pair authentication and key-exchange protocol over this connection.  Once the handshake completes both halves of the TCP socket are released and the TCP connection is **closed immediately** — it is not kept alive, and is not used for anything after the key exchange.
 
-### Phase 2 — UDP session
+### Phase 2 — Data session (UDP or TCP)
 
-All subsequent communication happens exclusively over UDP (server-side port range 50000–59999).  Every frame is encrypted and authenticated using the algorithms negotiated during Phase 1 (default: AES-256-GCM-SIV with per-packet HMAC-SHA-512; see [Algorithm negotiation](#algorithm-negotiation) for the full list of supported ciphers and how to select them).
+By default, all subsequent communication happens over UDP (server-side port range 50000–59999).  Every frame is encrypted and authenticated using the algorithms negotiated during Phase 1 (default: AES-256-GCM-SIV with per-packet HMAC-SHA-512; see [Algorithm negotiation](#algorithm-negotiation) for the full list of supported ciphers and how to select them).
+
+When UDP is unavailable (blocked by a corporate firewall, VPN, or restrictive NAT), the client can request a **TCP data channel** during key exchange.  If the server has `allow_tcp_transport = true` and both sides negotiate protocol version 2, the TCP connection used for key exchange is kept open and used for all terminal I/O instead.  See [TCP transport fallback](#tcp-transport-fallback).
 
 The client selects a **diff transport mode** during key exchange (via `--diff-mode`; see [UDP diff transport modes](#udp-diff-transport-modes) below).  The mode determines how the server delivers PTY screen diffs and how lost packets are recovered.  All three modes use the same encryption and frame format; only the delivery and recovery strategy differ.
 
@@ -184,6 +186,53 @@ If the UDP path is interrupted the client automatically reconnects — performin
 ### NAT roaming
 
 If the client's IP address or UDP port changes mid-session (e.g. a mobile device switching networks), the server detects the new source address on the first authenticated packet it receives from that address and immediately redirects all subsequent outbound traffic there.  No reconnect or re-authentication is required; the session continues without interruption.
+
+---
+
+## TCP transport fallback
+
+On most networks moshpit uses UDP (ports 50000–59999) for terminal I/O.  Some corporate firewalls, VPNs, and cloud networks block outbound UDP entirely.  The TCP transport fallback lets moshpit run over the same TCP connection that was used for key exchange, avoiding the need for any UDP at all.
+
+### How it works
+
+1. During key exchange (protocol version 2), the client sends a `TransportPreference` frame advertising that it wants TCP.
+2. If the server has `allow_tcp_transport = true`, it echoes back its agreement and keeps the TCP connection open instead of closing it.
+3. The server binds a TCP data listener on an ephemeral port (from the same 50000–59999 range as UDP) and tells the client the address via a `MoshpitsAddr` frame.
+4. The client opens a new TCP connection to that port.  All terminal I/O then flows over this connection using the same encrypted wire format as UDP — no reduction in security.
+
+Features that rely on UDP characteristics (NAK retransmission, out-of-order reorder buffer, NAT roaming) are disabled in TCP mode; TCP's own ordered, reliable delivery takes their place.  Keepalives still fire every 3 seconds so the application layer detects dead peers before the OS would.
+
+### Server setup
+
+```toml
+# ~/.config/moshpits/moshpits.toml
+allow_tcp_transport = true
+```
+
+Or via CLI:
+
+```bash
+mps --allow-tcp-transport
+```
+
+### Client usage
+
+```bash
+# Force TCP transport (server must have allow_tcp_transport = true)
+mp --transport tcp user@remote-server.com
+
+# Config file
+# transport = "tcp"
+
+# Environment variable
+MOSHPIT_TRANSPORT=tcp mp user@remote-server.com
+```
+
+### Limitations
+
+- `StateSync` diff mode is not supported over TCP in this release; use `reliable` (default) or `datagram`.
+- TCP transport does not support NAT roaming (the connection is pinned to both endpoint addresses).
+- Latency is generally slightly higher than UDP on healthy networks because TCP's congestion control and retransmission interact with the terminal protocol.  Use UDP when available.
 
 ---
 
@@ -622,6 +671,9 @@ Options:
                                        [default: 1000]
       --term-type <TERM>               TERM environment variable for spawned shells
                                        [default: xterm-256color]
+      --allow-tcp-transport             Allow clients to request a TCP data channel
+                                       instead of UDP (opt-in; see
+                                       TCP transport fallback)
       --kex-algos <ALGOS>              Ordered KEX algorithms to prefer, comma-separated
                                        [supported: x25519-sha256 (default),
                                        ml-kem-768-sha256, ml-kem-512-sha256,
@@ -693,6 +745,13 @@ port = 40404       # TCP port to listen on for client connections
 # Matches the VT100/VT220 emulation used by libmoshpit. Required when running
 # as a systemd service to prevent ncurses application failures.
 term_type = "xterm-256color"
+
+# ── TCP transport fallback (optional) ────────────────────────────────────────
+# Allow clients to request a TCP data channel instead of UDP.  Useful for
+# networks where UDP port range 50000–59999 is blocked by a firewall.
+# Requires protocol version 2 on both sides (default for this build).
+# Default: false (opt-in).
+# allow_tcp_transport = true
 
 # ── NAT device tuning (optional) ──────────────────────────────────────────────
 # Extra delay (ms) after peer discovery before sending bulk terminal data.
@@ -845,6 +904,9 @@ Options:
                                        [default: 3]
       --diff-mode <MODE>               UDP diff transport mode: reliable (default),
                                        datagram, or statesync
+      --transport <MODE>               Data-channel transport: udp (default) or tcp
+                                       (use tcp when UDP is blocked by a firewall;
+                                       requires allow_tcp_transport on the server)
       --escape-key <KEY>               Force-quit prefix key, e.g. ctrl-^ (default),
                                        ctrl-a, ctrl-] — combined with . to quit
       --kex-algos <ALGOS>              Ordered KEX algorithms to offer, comma-separated
@@ -900,6 +962,9 @@ mp --diff-mode datagram user@remote-server.com
 
 # Use statesync mode on a satellite / metered link
 mp --diff-mode statesync user@remote-server.com
+
+# Use TCP transport when UDP is blocked by a firewall (server must have allow_tcp_transport = true)
+mp --transport tcp user@remote-server.com
 ```
 ### moshpit configuration
 
@@ -956,6 +1021,14 @@ nat_warmup_count = 3  # Number of keepalive frames to send (default: 3)
 #   datagram             Fire-and-forget + 150 ms full-screen push; best on high-loss links
 #   statesync            Ack-based diffs (Mosh-style); best on moderate-loss, low-bandwidth links
 # diff_mode = "reliable"
+
+# ── Data-channel transport ────────────────────────────────────────────────────
+# Controls whether terminal I/O is carried over UDP (default) or TCP.
+# Use "tcp" when UDP port range 50000–59999 is blocked by a firewall.
+# The server must have allow_tcp_transport = true in its config.
+#   udp  (default) Encrypted UDP datagrams; lowest latency
+#   tcp             All terminal I/O over the kept-open TCP connection
+# transport = "udp"
 
 # ── Environment & PATH forwarding ────────────────────────────────────────────
 # Environment variables whose names match at least one glob pattern in send_env
@@ -1296,6 +1369,31 @@ For stateful NAT devices that drop bursty packets, enable packet pacing:
 mps --pacing-delay-us 2000
 ```
 
+### UDP blocked by firewall — session hangs after key exchange
+
+**Symptom**: The TCP key exchange succeeds (you see the passphrase prompt or host-key confirmation), but the terminal never appears and `mp` eventually times out or reconnects.  The UDP port range 50000–59999 may be blocked by a corporate firewall, VPN policy, or cloud security group.
+
+**Solution**: Enable TCP transport on the server and use `--transport tcp` on the client.
+
+```toml
+# Server: ~/.config/moshpits/moshpits.toml
+allow_tcp_transport = true
+```
+
+```bash
+# Client: force TCP data channel
+mp --transport tcp user@remote-server.com
+```
+
+To verify UDP is the problem, test reachability from the client:
+
+```bash
+# Attempt a UDP probe on the server's data port range (requires netcat on server)
+nc -u -v -z remote-server.com 50000-50010
+```
+
+If all probes fail, TCP transport is the right fix.  If some ports are reachable, try `--nat-warmup` first (some NAT devices need a warmup burst to open the binding).
+
 ### High packet loss on poor networks
 
 **Symptom**: Terminal updates are sluggish or incomplete, especially during full-screen redraws (e.g. `htop`, `vim`).
@@ -1331,8 +1429,11 @@ mps --pacing-delay-us 2000
 
 | Port range | Protocol | Direction | Purpose |
 |-----------|----------|-----------|---------|
-| `mps.port` (e.g. 40404) | TCP | Inbound to server | Key exchange only — connection switches to UDP after handshake |
-| 50000–59999 | UDP | Inbound to server | Encrypted terminal data |
+| `mps.port` (e.g. 40404) | TCP | Inbound to server | Key exchange — and data channel too when `allow_tcp_transport = true` |
+| 50000–59999 | UDP | Inbound to server | Encrypted terminal data (default transport) |
+| 50000–59999 | TCP | Inbound to server | Encrypted terminal data when TCP transport is negotiated |
+
+> **Firewall note**: When UDP is unavailable, enable TCP transport on the server (`allow_tcp_transport = true`) and have clients connect with `--transport tcp`.  The TCP data channel uses the same ephemeral port range (50000–59999) as UDP, so only the protocol changes — the port allowlist stays the same.  Alternatively, if even UDP-range TCP is blocked, configure `mps.port` to a permissive port (e.g. 443) and open that range on TCP.
 
 ---
 

@@ -49,7 +49,7 @@ use bytes::Buf as _;
 use bytes::BytesMut;
 use socket2::SockRef;
 use tokio::{
-    net::UdpSocket,
+    net::{TcpListener, UdpSocket},
     process::Command,
     sync::{Mutex, mpsc::UnboundedSender},
 };
@@ -58,7 +58,8 @@ use uuid::Uuid;
 
 use crate::kex::HostKeyMismatchFn;
 use crate::{
-    ConnectionReader, Frame, KexEvent, MoshpitError, ServerKex, UuidWrapper,
+    ConnectionReader, ConnectionWriter, Frame, KexEvent, MoshpitError, NegotiatedTransport,
+    ServerKex, UuidWrapper,
     kex::TofuFn,
     kex::negotiate::{
         AEAD_AES128_GCM_SIV, AEAD_AES256_GCM, AEAD_AES256_GCM_SIV, AEAD_CHACHA20_POLY1305,
@@ -69,7 +70,7 @@ use crate::{
     },
     load_public_key,
     session::SessionRegistry,
-    udp::DiffMode,
+    udp::{DiffMode, TransportMode},
 };
 #[cfg(feature = "unstable")]
 use crate::{KEY_ALGORITHM_ML_DSA_44, KEY_ALGORITHM_ML_DSA_65, KEY_ALGORITHM_ML_DSA_87};
@@ -358,6 +359,16 @@ pub struct KexReader {
     agent_socket: Option<PathBuf>,
     /// Fingerprint of the agent identity to use for signing.
     agent_fingerprint: Option<String>,
+    /// Data-channel transport mode this client endpoint prefers (client mode only).
+    /// Sent to the server as `Frame::TransportPreference` when protocol version ≥ 2.
+    /// Defaults to `Udp` (current behavior, no change).
+    #[builder(default)]
+    transport_preference: TransportMode,
+    /// Whether this server is willing to serve data over TCP (server mode only).
+    /// When `true` and the client requests TCP, the server binds a TCP data port instead
+    /// of a UDP port.  Defaults to `false`.
+    #[builder(default)]
+    allow_tcp_transport: bool,
 }
 
 impl Debug for KexReader {
@@ -402,7 +413,9 @@ impl Debug for KexReader {
             .field("client_identity_private_key", &"<redacted>");
         let _ = debug
             .field("agent_socket", &self.agent_socket)
-            .field("agent_fingerprint", &self.agent_fingerprint);
+            .field("agent_fingerprint", &self.agent_fingerprint)
+            .field("transport_preference", &self.transport_preference)
+            .field("allow_tcp_transport", &self.allow_tcp_transport);
         debug.finish()
     }
 }
@@ -505,6 +518,50 @@ impl KexReader {
         drop(
             self.tx_event
                 .send(KexEvent::NegotiatedAlgorithms(negotiated.clone())),
+        );
+
+        // Protocol v2+: exchange transport preference before Initialize so both sides
+        // know whether to use TCP or UDP for the data channel.
+        let negotiated_transport = if negotiated.protocol_version >= 2 {
+            let pref_byte = match self.transport_preference {
+                TransportMode::Tcp => 1u8,
+                TransportMode::Udp => 0u8,
+            };
+            self.tx.send(Frame::TransportPreference(pref_byte))?;
+            trace!("client_kex: sent TransportPreference({pref_byte}), awaiting server echo");
+            match self.reader.read_frame().await? {
+                Some(Frame::TransportPreference(1))
+                    if self.transport_preference == TransportMode::Tcp =>
+                {
+                    trace!("client_kex: server agreed to TCP transport");
+                    TransportMode::Tcp
+                }
+                Some(Frame::TransportPreference(_)) => {
+                    trace!("client_kex: server responded UDP (or declined TCP)");
+                    TransportMode::Udp
+                }
+                None => {
+                    error!("client_kex: server closed connection during transport negotiation");
+                    drop(self.tx_event.send(KexEvent::Failure));
+                    return Err(anyhow::anyhow!(
+                        "Server closed connection during transport negotiation"
+                    ));
+                }
+                Some(other) => {
+                    error!(
+                        "client_kex: expected TransportPreference but got frame id={}",
+                        other.id()
+                    );
+                    drop(self.tx_event.send(KexEvent::Failure));
+                    return Err(MoshpitError::KeyNotEstablished.into());
+                }
+            }
+        } else {
+            TransportMode::Udp
+        };
+        drop(
+            self.tx_event
+                .send(KexEvent::TransportMode(negotiated_transport)),
         );
 
         let (client_ephemeral, epk_pub_bytes) = match kex_alg {
@@ -801,7 +858,8 @@ impl KexReader {
         port_pool: Arc<Mutex<BTreeSet<u16>>>,
         public_key_path: &PathBuf,
         session_registry: Option<SessionRegistry>,
-    ) -> Result<(ServerKex, Arc<UdpSocket>)> {
+        allow_tcp: bool,
+    ) -> Result<(ServerKex, NegotiatedTransport)> {
         trace!("server_kex: waiting for KexInit from client");
         let negotiated = match self.reader.read_frame().await? {
             Some(Frame::KexInit(client_algos, client_proto)) => {
@@ -880,6 +938,35 @@ impl KexReader {
                 );
                 return Err(MoshpitError::InvalidFrame.into());
             }
+        };
+
+        // Protocol v2+: exchange transport preference before Initialize.
+        let negotiated_transport_mode = if negotiated.protocol_version >= 2 {
+            match self.reader.read_frame().await? {
+                Some(Frame::TransportPreference(1)) if allow_tcp => {
+                    trace!("server_kex: client requested TCP transport, server agrees");
+                    self.tx.send(Frame::TransportPreference(1))?;
+                    TransportMode::Tcp
+                }
+                Some(Frame::TransportPreference(b)) => {
+                    trace!("server_kex: client requested transport byte={b}, server responds UDP");
+                    self.tx.send(Frame::TransportPreference(0))?;
+                    TransportMode::Udp
+                }
+                None => {
+                    error!("server_kex: client closed connection during transport negotiation");
+                    return Err(MoshpitError::InvalidFrame.into());
+                }
+                Some(other) => {
+                    error!(
+                        "server_kex: expected TransportPreference but got frame id={}",
+                        other.id()
+                    );
+                    return Err(MoshpitError::InvalidFrame.into());
+                }
+            }
+        } else {
+            TransportMode::Udp
         };
 
         trace!("server_kex: waiting for Initialize/ResumeRequest from client");
@@ -1114,7 +1201,13 @@ impl KexReader {
         self.tx
             .send(Frame::SessionToken(UuidWrapper::new(session_uuid)))?;
 
-        let udp_arc = self.handle_udp_setup(socket_addr, port_pool).await?;
+        let transport = match negotiated_transport_mode {
+            TransportMode::Tcp => self.handle_tcp_setup(socket_addr, port_pool).await?,
+            TransportMode::Udp => {
+                let udp_arc = self.handle_udp_setup(socket_addr, port_pool).await?;
+                NegotiatedTransport::Udp(udp_arc)
+            }
+        };
 
         let skex = ServerKex::builder()
             .user(user_str)
@@ -1127,7 +1220,7 @@ impl KexReader {
             .client_extra_path(client_extra_path)
             .build();
 
-        Ok((skex, udp_arc))
+        Ok((skex, transport))
     }
 
     #[cfg(feature = "unstable")]
@@ -1333,6 +1426,62 @@ impl KexReader {
             drop(sock.set_tclass_v6(0xB8));
         }
         Ok(Arc::new(udp_listener))
+    }
+
+    /// Bind a TCP data-channel listener on an ephemeral port from the pool,
+    /// advertise it to the client via `Frame::MoshpitsAddr`, accept one connection,
+    /// and return the framed reader/writer for that connection.
+    async fn handle_tcp_setup(
+        &mut self,
+        socket_addr: SocketAddr,
+        port_pool: Arc<Mutex<BTreeSet<u16>>>,
+    ) -> Result<NegotiatedTransport> {
+        let unspecified = match socket_addr {
+            SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        };
+
+        let candidates: Vec<u16> = {
+            let port_p = port_pool.lock().await;
+            port_p.iter().copied().collect()
+        };
+
+        let mut bound: Option<(u16, TcpListener)> = None;
+        for port in candidates {
+            let bind_addr = SocketAddr::new(unspecified, port);
+            trace!("trying moshpits TCP data-channel bind at {bind_addr}");
+            match TcpListener::bind(bind_addr).await {
+                Ok(listener) => {
+                    bound = Some((port, listener));
+                    break;
+                }
+                Err(e) => {
+                    trace!("port {port} unavailable for TCP: {e}");
+                }
+            }
+        }
+
+        let (next_port, listener) = bound.ok_or_else(|| {
+            anyhow::anyhow!("no available TCP data-channel port in pool (50000–59999 exhausted)")
+        })?;
+
+        {
+            let mut port_p = port_pool.lock().await;
+            let _ = port_p.remove(&next_port);
+        }
+
+        let tcp_addr_for_client = SocketAddr::new(socket_addr.ip(), next_port);
+        trace!("advertising moshpits TCP data-channel socket at {tcp_addr_for_client}");
+        self.tx.send(Frame::MoshpitsAddr(tcp_addr_for_client))?;
+
+        // Accept the single client connection.
+        let (stream, peer_addr) = listener.accept().await?;
+        trace!("moshpits TCP data-channel: accepted connection from {peer_addr}");
+        let (r, w) = stream.into_split();
+        Ok(NegotiatedTransport::Tcp {
+            reader: ConnectionReader::builder().reader(r).build(),
+            writer: ConnectionWriter::builder().writer(w).build(),
+        })
     }
 
     #[cfg(target_os = "linux")]
@@ -2568,12 +2717,12 @@ mod tests {
         let (mut kex_reader, _rx_frames, mut rx_events) = make_test_kex_reader(client_reader);
 
         // Server advertises a protocol range that does not overlap the client's
-        // default support (`{min:1, max:1}`), so version negotiation must fail
+        // support (min:1, max:2 after the v2 bump), so version negotiation must fail
         // even though the algorithm lists agree.
         server_writer
             .write_frame(&Frame::KexInit(
                 supported_algorithms(),
-                ProtocolSupport { min: 2, max: 2 },
+                ProtocolSupport { min: 3, max: 3 },
             ))
             .await
             .expect("write KexInit frame");
@@ -2607,11 +2756,11 @@ mod tests {
         // first, masking the version error we are testing for.
         let (mut kex_reader, _rx_frames, _rx_events) = make_test_kex_reader(server_reader);
 
-        // Client advertises a protocol range disjoint from the server's default.
+        // Client advertises a protocol range disjoint from the server's default (min:1, max:2).
         client_writer
             .write_frame(&Frame::KexInit(
                 supported_algorithms(),
-                ProtocolSupport { min: 2, max: 2 },
+                ProtocolSupport { min: 3, max: 3 },
             ))
             .await
             .expect("write KexInit frame");
@@ -2626,7 +2775,7 @@ mod tests {
         let dummy_pubkey = PathBuf::from("/nonexistent/pubkey");
 
         let result = kex_reader
-            .server_kex(socket_addr, port_pool, &dummy_pubkey, None)
+            .server_kex(socket_addr, port_pool, &dummy_pubkey, None, false)
             .await;
         assert!(
             result
@@ -2671,6 +2820,13 @@ mod tests {
                 ))
                 .await
                 .expect("write KexInit frame");
+            // 1b. Drain the TransportPreference frame the client sends after NegotiatedAlgorithms
+            //     (protocol v2+) and echo back our capability (UDP = 0).
+            drop(rx_out.recv().await);
+            server_writer
+                .write_frame(&Frame::TransportPreference(0))
+                .await
+                .expect("write TransportPreference echo");
             // 2. Drain the Initialize frame that client_kex sends after negotiation.
             drop(rx_out.recv().await);
             // 3. Send PeerInitialize with the server's identity key, ephemeral key, and salt.
@@ -2712,14 +2868,16 @@ mod tests {
             events.push(e);
         }
 
-        // Should have: NegotiatedAlgorithms, KeyMaterial, HMACKeyMaterial, Uuid, SessionInfo, MoshpitsAddr
-        assert_eq!(events.len(), 6, "expected 6 kex events, got: {events:?}");
+        // Protocol v2 emits 7 events:
+        // NegotiatedAlgorithms, TransportMode, KeyMaterial, HMACKeyMaterial, Uuid, SessionInfo, MoshpitsAddr
+        assert_eq!(events.len(), 7, "expected 7 kex events, got: {events:?}");
         assert!(matches!(events[0], KexEvent::NegotiatedAlgorithms(_)));
-        assert!(matches!(events[1], KexEvent::KeyMaterial(_)));
-        assert!(matches!(events[2], KexEvent::HMACKeyMaterial(_)));
-        assert!(matches!(events[3], KexEvent::Uuid(_)));
-        assert!(matches!(events[4], KexEvent::SessionInfo(_, false)));
-        assert!(matches!(events[5], KexEvent::MoshpitsAddr(_)));
+        assert!(matches!(events[1], KexEvent::TransportMode(_)));
+        assert!(matches!(events[2], KexEvent::KeyMaterial(_)));
+        assert!(matches!(events[3], KexEvent::HMACKeyMaterial(_)));
+        assert!(matches!(events[4], KexEvent::Uuid(_)));
+        assert!(matches!(events[5], KexEvent::SessionInfo(_, false)));
+        assert!(matches!(events[6], KexEvent::MoshpitsAddr(_)));
     }
 
     #[tokio::test]

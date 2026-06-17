@@ -32,9 +32,10 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use dialoguer::{Confirm, Password};
 use libmoshpit::{
     ClientRenderCtx, DiffMode, DisplayPreference, Emulator, EncryptedFrame, FileLayer,
-    KEY_ALGORITHM_X25519, Kex, KexConfig as _, KexMode, KeyPair, MoshpitError, PredictionEngine,
-    Renderer, UdpReader, UdpSender, UuidWrapper, config_file_path, init_tracing, load,
-    paint_overlays_to_ansi, parse_server_destination, render_prediction_update, run_key_exchange,
+    KEY_ALGORITHM_X25519, Kex, KexConfig as _, KexMode, KeyPair, MoshpitError, NegotiatedTransport,
+    PredictionEngine, Renderer, TcpTransportReader, TcpTransportSender, UdpReader, UdpSender,
+    UuidWrapper, config_file_path, init_tracing, load, paint_overlays_to_ansi,
+    parse_server_destination, render_prediction_update, run_key_exchange,
 };
 use terminal_size::terminal_size;
 #[cfg(unix)]
@@ -846,7 +847,7 @@ async fn run_session_loop(
         )
         .await
         {
-            Ok((kex, udp_arc, nak_timeout)) => {
+            Ok((kex, transport, nak_timeout)) => {
                 backoff = Duration::from_secs(2);
                 clear_reconnect_banner(&stdout_tx).await;
                 had_successful_kex = true;
@@ -854,22 +855,42 @@ async fn run_session_loop(
                 // Future wire-format changes should branch on kex.protocol_version().
                 info!("negotiated wire protocol v{}", kex.protocol_version());
 
-                let session_result = run_udp_session(
-                    kex,
-                    udp_arc,
-                    nak_timeout,
-                    kb_rx_shared.clone(),
-                    config.nat_warmup(),
-                    config.nat_warmup_count(),
-                    stdout_tx.clone(),
-                    config.predict(),
-                    config.diff_mode(),
-                    config.legacy_passthrough(),
-                    escape_byte,
-                    exit_token.clone(),
-                    exit_msg.clone(),
-                )
-                .await;
+                let session_result = match transport {
+                    NegotiatedTransport::Udp(udp_arc) => {
+                        run_udp_session(
+                            kex,
+                            udp_arc,
+                            nak_timeout,
+                            kb_rx_shared.clone(),
+                            config.nat_warmup(),
+                            config.nat_warmup_count(),
+                            stdout_tx.clone(),
+                            config.predict(),
+                            config.diff_mode(),
+                            config.legacy_passthrough(),
+                            escape_byte,
+                            exit_token.clone(),
+                            exit_msg.clone(),
+                        )
+                        .await
+                    }
+                    NegotiatedTransport::Tcp { reader, writer } => {
+                        run_tcp_session(
+                            kex,
+                            reader,
+                            writer,
+                            kb_rx_shared.clone(),
+                            stdout_tx.clone(),
+                            config.predict(),
+                            config.diff_mode(),
+                            config.legacy_passthrough(),
+                            escape_byte,
+                            exit_token.clone(),
+                            exit_msg.clone(),
+                        )
+                        .await
+                    }
+                };
                 if let Err(e) = session_result {
                     drop(disable_raw_mode());
                     return Err(e);
@@ -980,7 +1001,7 @@ async fn connect_and_kex(
     server_port: u16,
     pass_cache: &Arc<std::sync::Mutex<PassCache>>,
     stdin_paused: Arc<AtomicBool>,
-) -> Result<(Kex, Arc<UdpSocket>, Duration)> {
+) -> Result<(Kex, NegotiatedTransport, Duration)> {
     // Refresh resume UUID from disk (may have been updated by previous connection).
     let _ = config.set_resume_session_uuid(read_session_uuid(server_ip, server_port));
 
@@ -1076,7 +1097,11 @@ async fn connect_and_kex(
         ),
     )
     .await;
-    let (kex, udp_arc, _) = match kex_result {
+    let libmoshpit::KexOutcome {
+        kex,
+        transport,
+        server_kex: _,
+    } = match kex_result {
         Err(_elapsed) => {
             return Err(anyhow::anyhow!(
                 "key exchange timed out after {KEX_TIMEOUT:?} — \
@@ -1129,7 +1154,7 @@ async fn connect_and_kex(
         .elapsed()
         .clamp(Duration::from_millis(20), Duration::from_millis(500));
     info!("nak_timeout set to {:?} from kex elapsed time", nak_timeout);
-    Ok((kex, udp_arc, nak_timeout))
+    Ok((kex, transport, nak_timeout))
 }
 
 /// Set up UDP tasks for one session and wait until the server disconnects.
@@ -1385,6 +1410,212 @@ async fn run_udp_session(
     {
         forwarder_abort.abort();
         // Yield so the executor can drop the aborted task and release the lock.
+        yield_now().await;
+    }
+    Ok(())
+}
+
+/// Set up TCP data-channel tasks for one session and wait until the server disconnects.
+#[cfg_attr(nightly, allow(clippy::too_many_lines))]
+#[cfg_attr(nightly, allow(clippy::too_many_arguments))]
+#[cfg_attr(coverage_nightly, coverage(off))]
+async fn run_tcp_session(
+    kex: Kex,
+    tcp_reader: libmoshpit::ConnectionReader,
+    tcp_writer: libmoshpit::ConnectionWriter,
+    kb_rx: Arc<Mutex<Receiver<Vec<u8>>>>,
+    stdout_tx: Sender<Vec<u8>>,
+    display_preference: DisplayPreference,
+    _diff_mode: DiffMode,
+    legacy_passthrough: bool,
+    escape_byte: u8,
+    exit_token: CancellationToken,
+    exit_msg: ExitMsg,
+) -> Result<()> {
+    let (reconnect_tx, mut reconnect_rx) = channel::<()>(1);
+    let token = CancellationToken::new();
+    let (tx, rx) = channel::<EncryptedFrame>(256);
+    let (_control_tx, control_rx) = channel::<EncryptedFrame>(16);
+
+    // TCP transport uses a flat silence timeout (30 s); TCP OS-level detection
+    // can be slow, so keepalives are still needed for application-level dead-peer detection.
+    let silence_timeout = Duration::from_secs(30);
+    let mac_tag_len = kex.mac_tag_len();
+    let mut tcp_transport_reader = TcpTransportReader::builder()
+        .id(kex.uuid())
+        .hmac(kex.build_hmac())
+        .rnk(kex.build_aead_key()?)
+        .mac_tag_len(mac_tag_len)
+        .reader(tcp_reader)
+        .nak_out_tx(tx.clone())
+        .silence_timeout(silence_timeout)
+        .reconnect_tx(reconnect_tx)
+        .passthrough(legacy_passthrough)
+        .build();
+
+    let mut tcp_transport_sender = TcpTransportSender::builder()
+        .id(kex.uuid())
+        .hmac(kex.build_hmac())
+        .rnk(kex.build_aead_key()?)
+        .writer(tcp_writer)
+        .control_rx(control_rx)
+        .rx(rx)
+        .build();
+
+    let sender_token = token.clone();
+    let _sender = spawn(async move { tcp_transport_sender.frame_loop(sender_token).await });
+
+    let (cols, rows) = terminal_size().map_or((80, 24), |(w, h)| (w.0, h.0));
+    tx.send(EncryptedFrame::Resize((kex.uuid_wrapper(), cols, rows)))
+        .await?;
+
+    // ── Prediction / emulator shared state ──────────────────────────────────
+    let emulator = Arc::new(std::sync::Mutex::new(Emulator::new(rows, cols)));
+    let prediction = Arc::new(std::sync::Mutex::new(PredictionEngine::new(
+        display_preference,
+    )));
+    let renderer = Arc::new(std::sync::Mutex::new(Renderer::new(rows, cols)));
+    let in_alt_screen = Arc::new(AtomicBool::new(false));
+
+    let reader_token = token.clone();
+    let emu_reader = emulator.clone();
+    let pred_reader = prediction.clone();
+    let rend_reader = renderer.clone();
+    let stdout_tx_reader = stdout_tx.clone();
+    let exit_token_reader = exit_token.clone();
+    let exit_msg_reader = exit_msg.clone();
+    let in_alt_screen_reader = Arc::clone(&in_alt_screen);
+    let _reader = spawn(async move {
+        tcp_transport_reader
+            .client_frame_loop(
+                reader_token,
+                exit_token_reader,
+                exit_msg_reader,
+                ClientRenderCtx::new(
+                    stdout_tx_reader,
+                    emu_reader,
+                    pred_reader,
+                    rend_reader,
+                    in_alt_screen_reader,
+                ),
+            )
+            .await;
+    });
+
+    spawn_resize_handler(
+        tx.clone(),
+        kex.uuid_wrapper(),
+        token.clone(),
+        emulator.clone(),
+        renderer.clone(),
+    );
+
+    // Stdin forwarder (identical to run_udp_session).
+    let fwd_token = token.clone();
+    let exit_token_fwd = exit_token.clone();
+    let exit_msg_fwd = exit_msg.clone();
+    let session_tx = tx;
+    let uuid_wrapper = kex.uuid_wrapper();
+    let emu_fwd = emulator.clone();
+    let pred_fwd = prediction.clone();
+    let renderer_fwd = renderer.clone();
+    let stdout_tx_fwd = stdout_tx;
+    let in_alt_screen_fwd = Arc::clone(&in_alt_screen);
+    let forwarder = spawn(async move {
+        let mut rx = kb_rx.lock().await;
+        let mut escape_state = EscapeState::Normal;
+        loop {
+            select! {
+                () = fwd_token.cancelled() => break,
+                data = rx.recv() => match data {
+                    Some(data) => {
+                        let mut to_forward: Vec<u8> = Vec::new();
+                        let mut exit_requested = false;
+                        for &byte in &data {
+                            escape_state = match escape_state {
+                                EscapeState::Normal => {
+                                    if byte == escape_byte {
+                                        EscapeState::PendingDot
+                                    } else {
+                                        to_forward.push(byte);
+                                        EscapeState::Normal
+                                    }
+                                }
+                                EscapeState::PendingDot => {
+                                    if byte == 0x2E {
+                                        exit_requested = true;
+                                        break;
+                                    } else if byte == escape_byte {
+                                        EscapeState::PendingDot
+                                    } else {
+                                        to_forward.push(escape_byte);
+                                        to_forward.push(byte);
+                                        EscapeState::Normal
+                                    }
+                                }
+                            };
+                        }
+                        if !to_forward.is_empty() {
+                            if session_tx
+                                .send(EncryptedFrame::Bytes((uuid_wrapper, to_forward.clone())))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                            let in_alt = in_alt_screen_fwd.load(Ordering::Relaxed);
+                            if !in_alt {
+                                let preview = if legacy_passthrough {
+                                    let (overlays, cursor) = {
+                                        let emu = emu_fwd.lock().unwrap_or_else(PoisonError::into_inner);
+                                        let screen = emu.screen();
+                                        let mut pred = pred_fwd.lock().unwrap_or_else(PoisonError::into_inner);
+                                        for byte in &to_forward {
+                                            pred.new_user_byte(*byte, screen);
+                                        }
+                                        pred.apply(screen)
+                                    };
+                                    paint_overlays_to_ansi(&overlays, cursor)
+                                } else {
+                                    render_prediction_update(
+                                        &emu_fwd,
+                                        &pred_fwd,
+                                        &renderer_fwd,
+                                        &to_forward,
+                                    )
+                                };
+                                if !preview.is_empty() {
+                                    drop(stdout_tx_fwd.send(preview).await);
+                                }
+                            }
+                        }
+                        if exit_requested {
+                            *exit_msg_fwd
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner) =
+                                Some(b"[moshpit] Disconnected.\r\n");
+                            exit_token_fwd.cancel();
+                            fwd_token.cancel();
+                            break;
+                        }
+                    }
+                    None => break,
+                },
+            }
+        }
+    });
+    let forwarder_abort = forwarder.abort_handle();
+
+    select! {
+        _ = reconnect_rx.recv() => {}
+        () = exit_token.cancelled() => {}
+    }
+    token.cancel();
+    if time::timeout(Duration::from_millis(500), forwarder)
+        .await
+        .is_err()
+    {
+        forwarder_abort.abort();
         yield_now().await;
     }
     Ok(())

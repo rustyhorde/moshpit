@@ -137,6 +137,23 @@ pub trait KexConfig {
     fn agent_socket(&self) -> Option<PathBuf> {
         None
     }
+    /// Whether this server endpoint is willing to accept TCP data-channel
+    /// connections.  Returns `false` by default (opt-in); server implementations
+    /// override this from the `allow_tcp_transport` config field.
+    fn allow_tcp_transport(&self) -> bool {
+        false
+    }
+    /// The data-channel transport mode this client endpoint prefers.
+    ///
+    /// `Udp` (default): connect to the server's UDP data port after KEX.
+    /// `Tcp`: connect to the server's TCP data port after KEX; only honoured
+    ///   when the server also has `allow_tcp_transport = true`.
+    ///
+    /// Client implementations override this from the `--transport` flag or
+    /// the `transport` config field.  Server implementations ignore this method.
+    fn transport_preference(&self) -> crate::TransportMode {
+        crate::TransportMode::Udp
+    }
 }
 
 /// Load the configuration.

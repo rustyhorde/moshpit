@@ -36,9 +36,10 @@ use std::fs::{File, metadata};
 use anyhow::{Context as _, Result};
 use bytes::{Buf as _, BytesMut};
 use libmoshpit::{
-    DiffMode, EncryptedFrame, KexMode, MAX_UDP_PAYLOAD, MoshpitError, SessionRegistry,
-    TerminalMessage, UdpReader, UdpSender, UuidWrapper, env_var_matches, init_tracing,
-    is_exit_title, load, new_session_registry, run_key_exchange,
+    DiffMode, EncryptedFrame, KexMode, MAX_UDP_PAYLOAD, MoshpitError, NegotiatedTransport,
+    SessionRegistry, TcpTransportReader, TcpTransportSender, TerminalMessage, UdpReader, UdpSender,
+    UuidWrapper, env_var_matches, init_tracing, is_exit_title, load, new_session_registry,
+    run_key_exchange,
 };
 #[cfg(windows)]
 use portable_pty::CommandBuilder;
@@ -410,9 +411,13 @@ async fn handle_connection(
     let namespace_escape = config.namespace_escape();
     let use_logind = config.use_logind();
     let use_utmp = config.use_utmp();
-    let (kex, udp_arc, skex_opt) =
-        run_key_exchange(config, sock_read, sock_write, || Ok(None), None, None).await?;
+    let outcome = run_key_exchange(config, sock_read, sock_write, || Ok(None), None, None).await?;
     info!("Key exchange completed with moshpit");
+    let libmoshpit::KexOutcome {
+        kex,
+        transport,
+        server_kex: skex_opt,
+    } = outcome;
 
     let skex = skex_opt.ok_or_else(|| anyhow::anyhow!("missing server kex info"))?;
     // Informational: the wire protocol version negotiated with this client.
@@ -434,20 +439,21 @@ async fn handle_connection(
         format!("{}:{server_base}", skex.client_extra_path().join(":"))
     };
 
-    let udp_port = udp_arc.local_addr()?.port();
+    let data_port = match &transport {
+        NegotiatedTransport::Udp(udp_arc) => udp_arc.local_addr()?.port(),
+        NegotiatedTransport::Tcp {
+            reader: _,
+            writer: _,
+        } => {
+            // TCP transport — port not needed for session tracking beyond cleanup
+            0
+        }
+    };
 
     let (data_tx, data_rx) = channel::<EncryptedFrame>(256);
     let (control_tx, control_rx) = channel::<EncryptedFrame>(16);
-    let (retransmit_tx, retransmit_rx) = channel::<Vec<u64>>(512);
-    let udp_recv = udp_arc.clone();
-    let udp_send = udp_arc.clone();
 
     let conn_token = CancellationToken::new();
-
-    // Oneshot carries the initial peer SocketAddr from UdpReader to UdpSender.
-    let (peer_discovered_tx, peer_discovered_rx) = oneshot::channel::<SocketAddr>();
-    // mpsc carries mid-session NAT roam updates from UdpReader to UdpSender.
-    let (peer_addr_tx, peer_addr_rx) = channel::<SocketAddr>(4);
 
     // Resolve channels and decide whether to spawn a new PTY.
     let (
@@ -463,7 +469,7 @@ async fn handle_connection(
         &kex,
         &skex,
         &conn_token,
-        udp_port,
+        data_port,
         data_tx.clone(),
         control_tx.clone(),
         &full_registry,
@@ -475,46 +481,87 @@ async fn handle_connection(
     let nak_received_count = Arc::new(AtomicU64::new(0));
     let last_rx_us = Arc::new(AtomicU64::new(now_micros()));
     let mac_tag_len = kex.mac_tag_len();
-    let mut udp_reader = UdpReader::builder()
-        .socket(udp_recv)
-        .id(kex.uuid())
-        .hmac(kex.build_hmac())
-        .rnk(kex.build_aead_key()?)
-        .mac_tag_len(mac_tag_len)
-        .nak_out_tx(data_tx.clone())
-        .retransmit_tx(retransmit_tx)
-        .peer_discovered_tx(peer_discovered_tx)
-        .peer_addr_tx(peer_addr_tx)
-        .repaint_tx(repaint_tx)
-        .nak_received_count(nak_received_count.clone())
-        .diff_mode(diff_mode)
-        .client_ack_tx(client_ack_tx)
-        .last_rx_us(last_rx_us.clone())
-        .build();
-    let mut udp_sender = UdpSender::builder()
-        .socket(udp_send)
-        .control_rx(control_rx)
-        .rx(data_rx)
-        .retransmit_rx(retransmit_rx)
-        .id(kex.uuid())
-        .hmac(kex.build_hmac())
-        .rnk(kex.build_aead_key()?)
-        .peer_discovered_rx(peer_discovered_rx)
-        .peer_addr_rx(peer_addr_rx)
-        .maybe_warmup_delay(warmup_delay)
-        .diff_mode(diff_mode)
-        .build();
 
-    let reader_token = conn_token.clone();
-    let term_tx_c = term_tx.clone();
-    let _udp_reader_handle = spawn(async move {
-        if let Err(e) = udp_reader.server_frame_loop(reader_token, term_tx_c).await {
-            error!("{e}");
+    // Set up the data-channel reader and sender based on the negotiated transport.
+    match transport {
+        NegotiatedTransport::Udp(udp_arc) => {
+            let (retransmit_tx, retransmit_rx) = channel::<Vec<u64>>(512);
+            let udp_recv = udp_arc.clone();
+            let udp_send = udp_arc.clone();
+            // Oneshot carries the initial peer SocketAddr from UdpReader to UdpSender.
+            let (peer_discovered_tx, peer_discovered_rx) = oneshot::channel::<SocketAddr>();
+            // mpsc carries mid-session NAT roam updates from UdpReader to UdpSender.
+            let (peer_addr_tx, peer_addr_rx) = channel::<SocketAddr>(4);
+            let mut udp_reader = UdpReader::builder()
+                .socket(udp_recv)
+                .id(kex.uuid())
+                .hmac(kex.build_hmac())
+                .rnk(kex.build_aead_key()?)
+                .mac_tag_len(mac_tag_len)
+                .nak_out_tx(data_tx.clone())
+                .retransmit_tx(retransmit_tx)
+                .peer_discovered_tx(peer_discovered_tx)
+                .peer_addr_tx(peer_addr_tx)
+                .repaint_tx(repaint_tx)
+                .nak_received_count(nak_received_count.clone())
+                .diff_mode(diff_mode)
+                .client_ack_tx(client_ack_tx)
+                .last_rx_us(last_rx_us.clone())
+                .build();
+            let mut udp_sender = UdpSender::builder()
+                .socket(udp_send)
+                .control_rx(control_rx)
+                .rx(data_rx)
+                .retransmit_rx(retransmit_rx)
+                .id(kex.uuid())
+                .hmac(kex.build_hmac())
+                .rnk(kex.build_aead_key()?)
+                .peer_discovered_rx(peer_discovered_rx)
+                .peer_addr_rx(peer_addr_rx)
+                .maybe_warmup_delay(warmup_delay)
+                .diff_mode(diff_mode)
+                .build();
+            let reader_token = conn_token.clone();
+            let term_tx_c = term_tx.clone();
+            let _udp_reader_handle = spawn(async move {
+                if let Err(e) = udp_reader.server_frame_loop(reader_token, term_tx_c).await {
+                    error!("{e}");
+                }
+            });
+            let sender_token = conn_token.clone();
+            let _udp_handle = spawn(async move { udp_sender.frame_loop(sender_token).await });
         }
-    });
-
-    let sender_token = conn_token.clone();
-    let _udp_handle = spawn(async move { udp_sender.frame_loop(sender_token).await });
+        NegotiatedTransport::Tcp { reader, writer } => {
+            let mut tcp_reader = TcpTransportReader::builder()
+                .id(kex.uuid())
+                .hmac(kex.build_hmac())
+                .rnk(kex.build_aead_key()?)
+                .mac_tag_len(mac_tag_len)
+                .reader(reader)
+                .nak_out_tx(data_tx.clone())
+                .repaint_tx(repaint_tx)
+                .client_ack_tx(client_ack_tx)
+                .last_rx_us(last_rx_us.clone())
+                .build();
+            let mut tcp_sender = TcpTransportSender::builder()
+                .id(kex.uuid())
+                .hmac(kex.build_hmac())
+                .rnk(kex.build_aead_key()?)
+                .writer(writer)
+                .control_rx(control_rx)
+                .rx(data_rx)
+                .build();
+            let reader_token = conn_token.clone();
+            let term_tx_c = term_tx.clone();
+            let _tcp_reader_handle = spawn(async move {
+                if let Err(e) = tcp_reader.server_frame_loop(reader_token, term_tx_c).await {
+                    error!("{e}");
+                }
+            });
+            let sender_token = conn_token.clone();
+            let _tcp_handle = spawn(async move { tcp_sender.frame_loop(sender_token).await });
+        }
+    }
 
     spawn_connection_watchdogs(control_tx.clone(), conn_token.clone(), server_token);
     spawn_silence_watchdog(conn_token.clone(), last_rx_us);

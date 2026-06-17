@@ -52,6 +52,25 @@ pub enum DiffMode {
     StateSync,
 }
 
+/// The data-channel transport negotiated during key exchange.
+///
+/// `Udp` (default): all terminal I/O over encrypted UDP datagrams on ports
+/// 50000–59999.  Provides the lowest latency and best NAT-traversal behaviour.
+///
+/// `Tcp`: all terminal I/O over the kept-open TCP connection established during
+/// key exchange.  Used as a fallback when UDP is blocked by firewalls or other
+/// network restrictions.  Only available when both peers negotiate protocol
+/// version ≥ 2 and the server has `allow_tcp_transport` enabled.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TransportMode {
+    /// Encrypted UDP datagrams (default).
+    #[default]
+    Udp,
+    /// Terminal I/O over the kept-open TCP connection.
+    Tcp,
+}
+
 /// UDP client data
 #[derive(Builder, Debug, Getters)]
 #[getset(get = "pub")]
