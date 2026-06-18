@@ -157,6 +157,14 @@ pub(crate) struct Cli {
     )]
     #[getset(get = "pub(crate)")]
     kdf_algos: Option<String>,
+    /// Allow clients to negotiate a TCP data channel instead of UDP (opt-in).
+    /// Useful on networks where UDP is blocked by firewalls.  Default: off.
+    #[clap(
+        long,
+        help = "Allow clients to negotiate the TCP data transport (UDP-blocked networks)"
+    )]
+    #[getset(get_copy = "pub(crate)")]
+    allow_tcp_transport: bool,
     /// Set of clap argument ids the user actually supplied on the command line
     /// (`ValueSource::CommandLine`), populated by [`Cli::parse_argv`].  This lets
     /// [`Source::collect`] emit only user-provided values so clap defaults no
@@ -229,6 +237,7 @@ impl Source for Cli {
         Box::new((*self).clone())
     }
 
+    #[cfg_attr(nightly, allow(clippy::too_many_lines))]
     fn collect(&self) -> Result<Map<String, Value>, ConfigError> {
         let mut map = Map::new();
         let origin = String::from("command line");
@@ -318,6 +327,12 @@ impl Source for Cli {
             let _old = map.insert(
                 "term_type".to_string(),
                 Value::new(Some(&origin), ValueKind::String(self.term_type.clone())),
+            );
+        }
+        if on("allow_tcp_transport") {
+            let _old = map.insert(
+                "allow_tcp_transport".to_string(),
+                Value::new(Some(&origin), ValueKind::Boolean(self.allow_tcp_transport)),
             );
         }
         if let Some(table) = build_algo_table(
@@ -521,6 +536,25 @@ mod test {
             .get("pacing_delay_us")
             .expect("pacing_delay_us should be in map");
         assert_eq!(pacing.clone().into_uint().ok(), Some(250));
+    }
+
+    #[test]
+    fn cli_allow_tcp_transport_absent_by_default() {
+        let cli = parse(&["mps"]);
+        assert!(!cli.allow_tcp_transport());
+        let map = cli.collect().expect("collect should succeed");
+        assert!(!map.contains_key("allow_tcp_transport"));
+    }
+
+    #[test]
+    fn cli_allow_tcp_transport_collected() {
+        let cli = parse(&["mps", "--allow-tcp-transport"]);
+        assert!(cli.allow_tcp_transport());
+        let map = cli.collect().expect("collect should succeed");
+        let value = map
+            .get("allow_tcp_transport")
+            .expect("allow_tcp_transport should be in map");
+        assert_eq!(value.clone().into_bool().ok(), Some(true));
     }
 
     #[test]

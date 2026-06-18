@@ -51,7 +51,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::{
-    ConnectionReader, ConnectionWriter, Emulator, EncryptedFrame, TerminalMessage,
+    ConnectionReader, ConnectionWriter, Emulator, EncryptedFrame, TerminalMessage, UuidWrapper,
     udp::reader::{
         ClientRenderCtx, apply_full_state_rendering, decode_all_capped, intercept_queries_core,
         process_bytes_with_prediction,
@@ -236,7 +236,7 @@ impl TcpTransportReader {
                         Ok(Some(frame)) => {
                             match frame {
                                 EncryptedFrame::Bytes((_id, message)) => {
-                                    let message = intercept_queries_simple(&message, &emulator);
+                                    let message = self.intercept_queries(&message, &emulator);
                                     process_bytes_with_prediction(
                                         message,
                                         &mut prev_bytes,
@@ -251,7 +251,7 @@ impl TcpTransportReader {
                                 EncryptedFrame::CompressedBytes((_id, compressed)) => {
                                     match decode_all_capped(compressed.as_slice()) {
                                         Ok(decompressed) => {
-                                            let message = intercept_queries_simple(&decompressed, &emulator);
+                                            let message = self.intercept_queries(&decompressed, &emulator);
                                             process_bytes_with_prediction(
                                                 message,
                                                 &mut prev_bytes,
@@ -359,6 +359,26 @@ impl TcpTransportReader {
                 },
             }
         }
+    }
+
+    /// Intercept CSI/OSC terminal queries (DA1/DA2/DA3, DSR, color, etc.) in the
+    /// server's output, strip them from what is rendered, and send the synthetic
+    /// responses back to the server's PTY via `nak_out_tx` so the remote program
+    /// (e.g. fish's Primary Device Attribute probe) does not block waiting for a
+    /// reply.  Mirrors `UdpReader::intercept_queries`; without sending the
+    /// responses the shell stalls until its query timeout (~10 s).
+    fn intercept_queries(&self, bytes: &[u8], emulator: &Arc<Mutex<Emulator>>) -> Vec<u8> {
+        let (out, responses) =
+            intercept_queries_core(bytes, "rgb:d0d0/d0d0/d0d0", "rgb:1c1c/1c1c/1c1c", emulator);
+        if let Some(ref tx) = self.nak_out_tx {
+            for resp in responses {
+                let frame = EncryptedFrame::Bytes((UuidWrapper::new(self.id), resp));
+                if let Err(e) = tx.try_send(frame) {
+                    warn!("TCP transport: failed to send query response: {e}");
+                }
+            }
+        }
+        out
     }
 
     /// Server-side frame loop.
@@ -470,17 +490,92 @@ impl TcpTransportReader {
     }
 }
 
-/// Intercept CSI/OSC terminal queries and substitute local responses.
-/// Delegates to [`intercept_queries_core`] with default color strings.
-fn intercept_queries_simple(bytes: &[u8], emulator: &Arc<Mutex<Emulator>>) -> Vec<u8> {
-    let (out, _responses) =
-        intercept_queries_core(bytes, "rgb:d0d0/d0d0/d0d0", "rgb:1c1c/1c1c/1c1c", emulator);
-    out
-}
-
 fn now_micros() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use aws_lc_rs::{
+        aead::{AES_256_GCM_SIV, LessSafeKey, UnboundKey},
+        hmac::{HMAC_SHA512, Key},
+    };
+    use tokio::{
+        net::{TcpListener, TcpStream},
+        sync::mpsc::{Receiver, channel},
+    };
+    use uuid::Uuid;
+
+    use super::TcpTransportReader;
+    use crate::{ConnectionReader, Emulator, EncryptedFrame};
+
+    /// Build a `TcpTransportReader` whose `nak_out_tx` (the path back to the
+    /// server's PTY) is captured so tests can observe query responses.  The
+    /// `reader` half is a throwaway loopback socket — `intercept_queries` never
+    /// reads from it.
+    async fn make_reader_with_response_rx() -> (TcpTransportReader, Receiver<EncryptedFrame>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("local addr");
+        let (server, _client) = tokio::join!(
+            async { listener.accept().await.map(|(s, _)| s).expect("accept") },
+            async { TcpStream::connect(addr).await.expect("connect") },
+        );
+        let (server_r, _) = server.into_split();
+        let reader = ConnectionReader::builder().reader(server_r).build();
+        let (tx, rx) = channel::<EncryptedFrame>(16);
+        let transport_reader = TcpTransportReader::builder()
+            .id(Uuid::new_v4())
+            .rnk(LessSafeKey::new(
+                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).expect("test AEAD key"),
+            ))
+            .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
+            .mac_tag_len(16)
+            .reader(reader)
+            .nak_out_tx(tx)
+            .passthrough(false)
+            .build();
+        (transport_reader, rx)
+    }
+
+    fn make_emulator() -> Arc<Mutex<Emulator>> {
+        Arc::new(Mutex::new(Emulator::new(24, 80)))
+    }
+
+    #[tokio::test]
+    async fn intercept_queries_da1_sends_response_to_server() {
+        let (reader, mut rx) = make_reader_with_response_rx().await;
+        let emu = make_emulator();
+        // Primary Device Attribute query (the one fish sends on startup).
+        let out = reader.intercept_queries(b"\x1b[c", &emu);
+        assert!(out.is_empty(), "DA1 query must be stripped from stdout");
+        let frame = rx
+            .try_recv()
+            .expect("a DA1 response frame must be sent back");
+        let EncryptedFrame::Bytes((_id, resp)) = frame else {
+            panic!("expected Bytes frame, got {frame:?}");
+        };
+        assert_eq!(resp, b"\x1b[?62c", "DA1 response payload");
+    }
+
+    #[tokio::test]
+    async fn intercept_queries_plain_bytes_pass_through_without_response() {
+        let (reader, mut rx) = make_reader_with_response_rx().await;
+        let emu = make_emulator();
+        let out = reader.intercept_queries(b"hello world", &emu);
+        assert_eq!(
+            out, b"hello world",
+            "non-query bytes pass through unchanged"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no response should be sent for plain output"
+        );
+    }
 }

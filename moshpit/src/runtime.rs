@@ -263,6 +263,58 @@ async fn clear_reconnect_banner(stdout_tx: &Sender<Vec<u8>>) {
     drop(stdout_tx.send(msg.to_vec()).await);
 }
 
+/// Show a warning banner indicating the session is running over the TCP
+/// fallback transport (UDP was unavailable).  Same first-row envelope as
+/// [`show_reconnect_banner`] but styled yellow-on-black to read as a caution
+/// distinct from the blue reconnect banner.
+async fn show_tcp_warning_banner(stdout_tx: &Sender<Vec<u8>>) {
+    // ESC[43;30;1m — yellow background, black bold text (warning styling).
+    let msg = b"\x1b[s\x1b[1;1H\x1b[43;30;1m [moshpit] TCP fallback transport \xe2\x80\x94 UDP unavailable; expect higher latency \x1b[K\x1b[0m\x1b[u";
+    drop(stdout_tx.send(msg.to_vec()).await);
+}
+
+/// How long the TCP-fallback warning banner stays overlaid on the live screen.
+const TCP_BANNER_DURATION: Duration = Duration::from_secs(2);
+
+/// Overlay the TCP-fallback warning on row 1 of the live session for
+/// [`TCP_BANNER_DURATION`], redrawing periodically so it survives the server's
+/// repaints, then restore the real screen from the local emulator.  Runs
+/// concurrently with the session (no reader hold).  If `token` is cancelled
+/// (the session ended), returns without restoring — the session-drop path
+/// repaints row 1 itself.
+async fn run_tcp_warning_overlay(
+    stdout_tx: Sender<Vec<u8>>,
+    token: CancellationToken,
+    emulator: Arc<std::sync::Mutex<Emulator>>,
+    renderer: Arc<std::sync::Mutex<Renderer>>,
+) {
+    let deadline = Instant::now() + TCP_BANNER_DURATION;
+    loop {
+        show_tcp_warning_banner(&stdout_tx).await;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        select! {
+            () = token.cancelled() => return,
+            () = time::sleep(remaining.min(Duration::from_millis(300))) => {}
+        }
+    }
+    // Restore the screen (erasing the banner from row 1) by repainting from the
+    // local emulator — same pattern as the ScrollbackEnd handler in
+    // libmoshpit's tcp_transport frame loop.
+    let repaint = {
+        let emu = emulator.lock().unwrap_or_else(PoisonError::into_inner);
+        let screen = emu.screen();
+        let mut rend = renderer.lock().unwrap_or_else(PoisonError::into_inner);
+        rend.invalidate();
+        rend.render(screen, &[], None)
+    };
+    if !repaint.is_empty() {
+        drop(stdout_tx.send(repaint).await);
+    }
+}
+
 /// Redraw the banner once per second, counting down from `total_secs` to 0.
 /// Returns `true` if the user pressed the escape sequence (`Ctrl-^ .`) to quit.
 async fn countdown_reconnect_banner(
@@ -857,6 +909,7 @@ async fn run_session_loop(
 
                 let session_result = match transport {
                     NegotiatedTransport::Udp(udp_arc) => {
+                        info!("terminal transport: UDP");
                         run_udp_session(
                             kex,
                             udp_arc,
@@ -875,6 +928,7 @@ async fn run_session_loop(
                         .await
                     }
                     NegotiatedTransport::Tcp { reader, writer } => {
+                        info!("terminal transport: TCP");
                         run_tcp_session(
                             kex,
                             reader,
@@ -1501,6 +1555,16 @@ async fn run_tcp_session(
             )
             .await;
     });
+
+    // Warn the user they fell back to the TCP transport.  The session renders
+    // normally; this overlays a yellow banner on row 1 for a couple seconds
+    // (concurrently, no reader hold) then restores the screen.
+    let _banner = spawn(run_tcp_warning_overlay(
+        stdout_tx.clone(),
+        token.clone(),
+        emulator.clone(),
+        renderer.clone(),
+    ));
 
     spawn_resize_handler(
         tx.clone(),
