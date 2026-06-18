@@ -31,8 +31,9 @@ cargo clippy --all-targets -- -D warnings
 # Format check
 cargo fmt --check
 
-# Full local verification before pushing (fmt + clippy + tests, skipping fuzz + install)
-scripts/run_all.fish --no-install --unstable --no-fuzz
+# Full local verification before pushing (fmt + clippy + tests + docs + coverage).
+# Heavy stages are opt-in: --fuzz, --install, --musl/--unstable (MUSL Docker build).
+scripts/run_all.fish
 
 # Generate docs
 cargo doc --no-deps --open
