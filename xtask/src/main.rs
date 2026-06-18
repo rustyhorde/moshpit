@@ -200,9 +200,11 @@ fn mp_command() -> Command {
             Arg::new("diff-mode")
                 .long("diff-mode")
                 .value_name("MODE")
-                .value_parser(["reliable", "datagram", "statesync"])
-                .default_value("reliable")
-                .help("UDP diff transport mode: reliable (default), datagram, or statesync"),
+                .value_parser(["auto", "reliable", "datagram", "statesync"])
+                .default_value("auto")
+                .help(
+                    "Diff mode: auto (statesync over TCP, reliable over UDP), reliable, datagram, or statesync",
+                ),
         )
         .arg(
             Arg::new("escape-key")
