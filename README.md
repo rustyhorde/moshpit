@@ -87,7 +87,7 @@ By default, all subsequent communication happens over UDP (server-side port rang
 
 When UDP is unavailable (blocked by a corporate firewall, VPN, or restrictive NAT), the client can request a **TCP data channel** during key exchange.  If the server has `allow_tcp_transport = true` and both sides negotiate protocol version 2, the TCP connection used for key exchange is kept open and used for all terminal I/O instead.  See [TCP transport fallback](#tcp-transport-fallback).
 
-The client selects a **diff transport mode** during key exchange (via `--diff-mode`; see [UDP diff transport modes](#udp-diff-transport-modes) below).  The mode determines how the server delivers PTY screen diffs and how lost packets are recovered.  All three modes use the same encryption and frame format; only the delivery and recovery strategy differ.
+The client selects a **diff transport mode** during key exchange (via `--diff-mode`; see [UDP diff transport modes](#udp-diff-transport-modes) below).  The mode determines how the server delivers PTY screen diffs and how lost packets are recovered.  All three modes use the same encryption and frame format; only the delivery and recovery strategy differ.  The default is `auto`, which resolves to `statesync` over the TCP transport and `reliable` over UDP.
 
 ### UDP diff transport modes
 
@@ -202,6 +202,8 @@ On most networks moshpit uses UDP (ports 50000–59999) for terminal I/O.  Some 
 
 Features that rely on UDP characteristics (NAK retransmission, out-of-order reorder buffer, NAT roaming) are disabled in TCP mode; TCP's own ordered, reliable delivery takes their place.  Keepalives still fire every 3 seconds so the application layer detects dead peers before the OS would.
 
+Over TCP the diff mode defaults to **`statesync`** (incremental ack-based diffs), since TCP already guarantees the ordered, reliable delivery `statesync` assumes — this keeps server CPU low for full-screen apps like `htop`.  Pass `--diff-mode reliable` or `--diff-mode datagram` to override.  Over UDP the default remains `reliable`.
+
 ### Server setup
 
 ```toml
@@ -230,7 +232,6 @@ MOSHPIT_TRANSPORT=tcp mp user@remote-server.com
 
 ### Limitations
 
-- `StateSync` diff mode is not supported over TCP in this release; use `reliable` (default) or `datagram`.
 - TCP transport does not support NAT roaming (the connection is pinned to both endpoint addresses).
 - Latency is generally slightly higher than UDP on healthy networks because TCP's congestion control and retransmission interact with the terminal protocol.  Use UDP when available.
 
@@ -937,8 +938,9 @@ Options:
       --nat-warmup                     Send NAT warmup keepalives at UDP session start
       --nat-warmup-count <N>           Number of NAT warmup keepalives to send
                                        [default: 3]
-      --diff-mode <MODE>               UDP diff transport mode: reliable (default),
-                                       datagram, or statesync
+      --diff-mode <MODE>               Diff mode: auto (statesync over TCP,
+                                       reliable over UDP), reliable, datagram, or
+                                       statesync
       --transport <MODE>               Data-channel transport: udp (default) or tcp
                                        (use tcp when UDP is blocked by a firewall;
                                        requires allow_tcp_transport on the server)
@@ -1050,12 +1052,13 @@ predict = "adaptive"
 nat_warmup = false
 nat_warmup_count = 3  # Number of keepalive frames to send (default: 3)
 
-# ── UDP diff transport mode ───────────────────────────────────────────────────
+# ── Diff transport mode ───────────────────────────────────────────────────────
 # Controls how the server delivers PTY screen diffs and recovers from packet loss.
-#   reliable   (default) NAK-based retransmission; lowest bandwidth; best on low-loss links
+#   auto       (default) statesync over TCP, reliable over UDP
+#   reliable             NAK-based retransmission; lowest bandwidth; best on low-loss links
 #   datagram             Fire-and-forget + 150 ms full-screen push; best on high-loss links
 #   statesync            Ack-based diffs (Mosh-style); best on moderate-loss, low-bandwidth links
-# diff_mode = "reliable"
+# diff_mode = "auto"
 
 # ── Data-channel transport ────────────────────────────────────────────────────
 # Controls whether terminal I/O is carried over UDP (default) or TCP.

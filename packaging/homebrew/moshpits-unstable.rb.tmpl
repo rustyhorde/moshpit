@@ -14,12 +14,12 @@ class MoshpitsUnstable < Formula
   conflicts_with "moshpits", because: "both install the mps binary"
 
   def install
-    bin.install "mps/mps"
-    bash_completion.install "mps/mps.bash" => "mps"
-    zsh_completion.install "mps/_mps"
-    fish_completion.install "mps/mps.fish"
-    man1.install "mps/mps.1"
-    (etc/"moshpits").install "mps/moshpits.toml.example" if File.exist?("mps/moshpits.toml.example")
+    bin.install "mps"
+    bash_completion.install "mps.bash" => "mps"
+    zsh_completion.install "_mps"
+    fish_completion.install "mps.fish"
+    man1.install "mps.1"
+    (etc/"moshpits").install "moshpits.toml.example" if File.exist?("moshpits.toml.example")
   end
 
   def caveats

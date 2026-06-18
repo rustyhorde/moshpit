@@ -15,6 +15,10 @@ libfuzzer-sys = "0.4.13"
 libmoshpit = { path = ".." }
 uuid = "1.23.3"
 
+[dev-dependencies]
+# Used only by `regression_zstd_decompress` to build a high-ratio test stream.
+zstd = "0.13.3"
+
 # Prevent the workspace from treating this crate as a member.
 [workspace]
 
@@ -65,6 +69,18 @@ path = "fuzz_targets/fuzz_pubkey_parse.rs"
 test = false
 doc = false
 
+[[bin]]
+name = "fuzz_statesync"
+path = "fuzz_targets/fuzz_statesync.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_zstd_decompress"
+path = "fuzz_targets/fuzz_zstd_decompress.rs"
+test = false
+doc = false
+
 [[test]]
 name = "regression_encframe"
 path = "fuzz_targets/regression_encframe.rs"
@@ -92,3 +108,11 @@ path = "fuzz_targets/regression_emulator.rs"
 [[test]]
 name = "regression_pubkey_parse"
 path = "fuzz_targets/regression_pubkey_parse.rs"
+
+[[test]]
+name = "regression_statesync"
+path = "fuzz_targets/regression_statesync.rs"
+
+[[test]]
+name = "regression_zstd_decompress"
+path = "fuzz_targets/regression_zstd_decompress.rs"

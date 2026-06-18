@@ -122,10 +122,13 @@ pub(crate) struct Cli {
     )]
     #[getset(get_copy = "pub(crate)")]
     nat_warmup_count: u32,
-    /// UDP diff transport mode.
+    /// Diff transport mode.
     ///
-    /// `reliable` (default): NAK-based selective retransmission — best for
-    /// low-loss networks where retransmit rarely fires.
+    /// `auto` (default): pick the best mode for the transport — `statesync` over
+    /// TCP (incremental diffs keep server CPU low) and `reliable` over UDP.
+    ///
+    /// `reliable`: NAK-based selective retransmission — best for low-loss
+    /// networks where retransmit rarely fires.
     ///
     /// `datagram`: fire-and-forget diffs with no retransmission; the server
     /// sends a periodic full-screen snapshot for recovery instead.  Eliminates
@@ -137,8 +140,8 @@ pub(crate) struct Cli {
     #[clap(
         long,
         value_name = "MODE",
-        default_value = "reliable",
-        help = "UDP diff transport mode: reliable (default), datagram, or statesync"
+        default_value = "auto",
+        help = "Diff mode: auto (statesync over TCP, reliable over UDP), reliable, datagram, or statesync"
     )]
     #[getset(get = "pub(crate)")]
     diff_mode: String,

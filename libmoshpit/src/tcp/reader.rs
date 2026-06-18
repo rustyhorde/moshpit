@@ -25,6 +25,20 @@ pub struct ConnectionReader {
     buffer: BytesMut,
 }
 
+/// Decode and validate the 8-byte big-endian length prefix of a data blob.
+///
+/// Pure helper extracted from [`ConnectionReader::read_data`] so the length
+/// bound — the only untrusted parsing on the data-channel framing path — can be
+/// unit-tested without standing up a socket. Rejects any length above
+/// [`MAX_ENCFRAME_LENGTH`] (and, on 32-bit targets, any value above `usize::MAX`).
+fn decode_data_length(len_buf: [u8; 8]) -> Result<usize> {
+    let length = usize::try_from(u64::from_be_bytes(len_buf))?;
+    if length > MAX_ENCFRAME_LENGTH {
+        return Err(Error::FrameTooLarge.into());
+    }
+    Ok(length)
+}
+
 impl ConnectionReader {
     /// Read a length-prefixed data blob written by `ConnectionWriter::write_data`.
     ///
@@ -42,10 +56,7 @@ impl ConnectionReader {
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
             Err(e) => return Err(e.into()),
         }
-        let length = usize::try_from(u64::from_be_bytes(len_buf))?;
-        if length > MAX_ENCFRAME_LENGTH {
-            return Err(Error::FrameTooLarge.into());
-        }
+        let length = decode_data_length(len_buf)?;
         let mut buf = vec![0u8; length];
         let _ = self
             .reader
@@ -56,6 +67,12 @@ impl ConnectionReader {
     }
 
     /// Read a single `Frame` value from the underlying stream.
+    //
+    // Note: the data-channel length prefix is handled by the pure
+    // [`decode_data_length`] helper below (unit-tested for its boundary cases).
+    // It is deliberately *not* a fuzz target: the only untrusted parsing is
+    // `u64::from_be_bytes` + a cap check, while the `EncryptedFrame` payload it
+    // frames is already covered by `fuzz_encframe`/`fuzz_encframe_decrypt`.
     ///
     /// The function waits until it has retrieved enough data to parse a frame.
     /// Any data remaining in the read buffer after the frame has been parsed is
@@ -155,9 +172,29 @@ impl ConnectionReader {
 mod tests {
     use tokio::net::{TcpListener, TcpStream};
 
-    use super::{ConnectionReader, Frame};
+    use super::{ConnectionReader, Frame, decode_data_length};
     use crate::ConnectionWriter;
+    use crate::frames::encframe::MAX_ENCFRAME_LENGTH;
     use anyhow::Result;
+
+    #[test]
+    fn decode_data_length_accepts_up_to_cap() {
+        assert_eq!(decode_data_length(0u64.to_be_bytes()).unwrap(), 0);
+        let cap = u64::try_from(MAX_ENCFRAME_LENGTH).unwrap();
+        assert_eq!(
+            decode_data_length(cap.to_be_bytes()).unwrap(),
+            MAX_ENCFRAME_LENGTH
+        );
+    }
+
+    #[test]
+    fn decode_data_length_rejects_over_cap() {
+        let over = u64::try_from(MAX_ENCFRAME_LENGTH).unwrap() + 1;
+        assert!(decode_data_length(over.to_be_bytes()).is_err());
+        // A maximal length prefix must error (FrameTooLarge on 64-bit, or a
+        // TryFromInt error on 32-bit), never allocate ~16 EiB.
+        assert!(decode_data_length(u64::MAX.to_be_bytes()).is_err());
+    }
 
     async fn make_loopback() -> Result<(ConnectionReader, ConnectionWriter)> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;

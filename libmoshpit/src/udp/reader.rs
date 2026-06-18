@@ -227,7 +227,12 @@ const MAX_DECOMPRESSED_LEN: usize = 16 * 1024 * 1024;
 /// malformed stream) on invalid input or when the decompressed size would exceed
 /// the cap. [`Read::take`] bounds the allocation to `cap + 1` bytes, so an
 /// over-large payload never fully materialises in memory.
-pub(crate) fn decode_all_capped(input: &[u8]) -> std::io::Result<Vec<u8>> {
+///
+/// Exposed (`#[doc(hidden)]`) so the `fuzz_zstd_decompress` harness can stress the
+/// decompression-bomb guard directly with arbitrary bytes; it is not part of the
+/// stable API.
+#[doc(hidden)]
+pub fn decode_all_capped(input: &[u8]) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
     let decoder = zstd::Decoder::new(input)?;
     let mut out = Vec::new();

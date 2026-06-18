@@ -44,6 +44,24 @@ impl AlgorithmPreferences {
     }
 }
 
+/// Client diff-mode preference parsed from `--diff-mode` / `MOSHPIT_DIFF_MODE` /
+/// TOML.  `Auto` (the default) resolves to a concrete [`DiffMode`] based on the
+/// negotiated transport: `StateSync` over TCP, `Reliable` over UDP.  An explicit
+/// mode is always honored regardless of transport.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum DiffModePref {
+    /// Transport-dependent default: `StateSync` over TCP, `Reliable` over UDP.
+    #[default]
+    Auto,
+    /// NAK-based selective retransmission.
+    Reliable,
+    /// Fire-and-forget diffs with periodic full-screen snapshots.
+    Datagram,
+    /// Mosh-style ack-based incremental diffs.
+    Statesync,
+}
+
 /// Client-side tracing configuration — file layer only.
 /// The mp client never writes to stdout, so there is no stdout layer.
 #[derive(Clone, Debug, Default, Deserialize, Eq, Getters, PartialEq, Serialize)]
@@ -95,11 +113,11 @@ pub(crate) struct Config {
     #[serde(default = "Config::default_nat_warmup_count")]
     #[getset(get_copy = "pub(crate)")]
     nat_warmup_count: u32,
-    /// UDP diff transport mode.  Defaults to `Reliable`; set to `Datagram`
-    /// via `--diff-mode datagram` / `MOSHPIT_DIFF_MODE=datagram`.
+    /// Diff transport mode preference.  Defaults to `Auto`, which resolves to
+    /// `StateSync` over TCP and `Reliable` over UDP (see [`Config::diff_mode`]).
+    /// Set explicitly via `--diff-mode <mode>` / `MOSHPIT_DIFF_MODE=<mode>`.
     #[serde(default)]
-    #[getset(get_copy = "pub(crate)")]
-    diff_mode: DiffMode,
+    diff_mode: DiffModePref,
     /// Data-channel transport mode.  `udp` (default) uses encrypted UDP;
     /// `tcp` uses the server's TCP data port (fallback for UDP-blocking firewalls).
     /// Set via `--transport tcp` / `MOSHPIT_TRANSPORT=tcp`.
@@ -156,6 +174,23 @@ impl Config {
         "ctrl-^".to_string()
     }
 
+    /// Resolve the configured [`DiffModePref`] to a concrete [`DiffMode`].
+    ///
+    /// `Auto` picks `StateSync` over the TCP transport (incremental diffs keep
+    /// server CPU low) and `Reliable` over UDP (the historical default).  An
+    /// explicit preference is returned unchanged.
+    pub(crate) fn diff_mode(&self) -> DiffMode {
+        match self.diff_mode {
+            DiffModePref::Reliable => DiffMode::Reliable,
+            DiffModePref::Datagram => DiffMode::Datagram,
+            DiffModePref::Statesync => DiffMode::StateSync,
+            DiffModePref::Auto => match self.transport {
+                libmoshpit::TransportMode::Tcp => DiffMode::StateSync,
+                libmoshpit::TransportMode::Udp => DiffMode::Reliable,
+            },
+        }
+    }
+
     fn load_key_paths(&self) -> Result<(PathBuf, PathBuf)> {
         let (default_private_key_path, default_pub_key_ext) =
             KeyPair::default_key_path_ext(self.mode, KEY_ALGORITHM_X25519)?;
@@ -186,7 +221,7 @@ impl Default for Config {
             predict: DisplayPreference::default(),
             nat_warmup: false,
             nat_warmup_count: Self::default_nat_warmup_count(),
-            diff_mode: DiffMode::default(),
+            diff_mode: DiffModePref::default(),
             transport: libmoshpit::TransportMode::default(),
             legacy_passthrough: false,
             preferred_algorithms: AlgorithmPreferences::default(),
@@ -223,7 +258,8 @@ impl KexConfig for Config {
     }
 
     fn diff_mode(&self) -> DiffMode {
-        self.diff_mode
+        // Delegate to the inherent resolver (handles the `Auto` default).
+        Config::diff_mode(self)
     }
 
     fn transport_preference(&self) -> libmoshpit::TransportMode {
@@ -254,7 +290,7 @@ mod tests {
     use anyhow::Result;
     use uuid::Uuid;
 
-    use libmoshpit::TransportMode;
+    use libmoshpit::{DiffMode, TransportMode};
 
     use super::{Config, DisplayPreference, KexConfig, KexMode};
 
@@ -286,6 +322,65 @@ mod tests {
         "#;
         let config: Config = toml::from_str(toml)?;
         assert_eq!(config.transport_preference(), TransportMode::Udp);
+        Ok(())
+    }
+
+    #[test]
+    fn auto_diff_mode_resolves_reliable_over_udp() {
+        // Default config (UDP transport, Auto diff mode) keeps the historical
+        // UDP default of Reliable.
+        let config = Config::default();
+        assert_eq!(config.diff_mode(), DiffMode::Reliable);
+    }
+
+    #[test]
+    fn auto_diff_mode_resolves_statesync_over_tcp() -> Result<()> {
+        let toml = r#"
+            private_key_path = "/tmp/priv"
+            public_key_path = "/tmp/pub"
+            transport = "tcp"
+        "#;
+        let config: Config = toml::from_str(toml)?;
+        assert_eq!(config.diff_mode(), DiffMode::StateSync);
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_diff_mode_overrides_tcp_statesync_default() -> Result<()> {
+        let toml = r#"
+            private_key_path = "/tmp/priv"
+            public_key_path = "/tmp/pub"
+            transport = "tcp"
+            diff_mode = "reliable"
+        "#;
+        let config: Config = toml::from_str(toml)?;
+        assert_eq!(config.diff_mode(), DiffMode::Reliable);
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_statesync_honored_over_udp() -> Result<()> {
+        let toml = r#"
+            private_key_path = "/tmp/priv"
+            public_key_path = "/tmp/pub"
+            diff_mode = "statesync"
+        "#;
+        let config: Config = toml::from_str(toml)?;
+        assert_eq!(config.transport_preference(), TransportMode::Udp);
+        assert_eq!(config.diff_mode(), DiffMode::StateSync);
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_datagram_honored_over_tcp() -> Result<()> {
+        let toml = r#"
+            private_key_path = "/tmp/priv"
+            public_key_path = "/tmp/pub"
+            transport = "tcp"
+            diff_mode = "datagram"
+        "#;
+        let config: Config = toml::from_str(toml)?;
+        assert_eq!(config.diff_mode(), DiffMode::Datagram);
         Ok(())
     }
 

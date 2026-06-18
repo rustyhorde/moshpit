@@ -18,8 +18,11 @@
 //! RTT estimation, NAT roam detection.  TCP handles ordering and retransmission
 //! at the OS level; keepalives are still useful for silence detection.
 //!
-//! `StateSync` diff mode is not supported over TCP in this release; use
-//! `Reliable` or `Datagram`.
+//! All three diff modes work over TCP.  `StateSync` (the default for the TCP
+//! transport) is in fact a natural fit: TCP already guarantees the in-order
+//! reliable delivery its ack model assumes, so incoming `StateSyncDiff` /
+//! `StateChunk` frames are applied via the shared
+//! [`StateSyncClient`](crate::udp::statesync::StateSyncClient).
 
 use std::{
     future::pending,
@@ -52,9 +55,12 @@ use uuid::Uuid;
 
 use crate::{
     ConnectionReader, ConnectionWriter, Emulator, EncryptedFrame, TerminalMessage, UuidWrapper,
-    udp::reader::{
-        ClientRenderCtx, apply_full_state_rendering, decode_all_capped, intercept_queries_core,
-        process_bytes_with_prediction,
+    udp::{
+        reader::{
+            ClientRenderCtx, decode_all_capped, intercept_queries_core,
+            process_bytes_with_prediction,
+        },
+        statesync::StateSyncClient,
     },
 };
 
@@ -184,6 +190,11 @@ pub struct TcpTransportReader {
     /// Whether to use legacy raw-passthrough rendering (client mode).
     #[builder(default)]
     passthrough: bool,
+    /// Client-side `StateSync` state: ack baseline + `StateChunk` reassembly.
+    /// Unused in server mode and in non-`StateSync` sessions.  Never set by the
+    /// builder — it always starts from [`StateSyncClient::default`].
+    #[builder(skip)]
+    statesync: StateSyncClient,
 }
 
 impl TcpTransportReader {
@@ -202,9 +213,11 @@ impl TcpTransportReader {
     ) {
         let stdout_tx = ctx.stdout_tx().clone();
         let emulator = ctx.emulator().clone();
-        let prediction = ctx.prediction().clone();
         let renderer = ctx.renderer().clone();
-        let in_alt_screen = ctx.in_alt_screen().clone();
+        // Cheap (Arc-backed) clone so the `StateSync` helpers can send ClientAck /
+        // RepaintRequest frames without an immutable borrow of `self` colliding
+        // with the mutable borrow of `self.statesync`.
+        let nak_out_tx = self.nak_out_tx.clone();
 
         let mut prev_bytes = BytesMut::with_capacity(1024);
         let mut osc_started = false;
@@ -269,9 +282,7 @@ impl TcpTransportReader {
                                     }
                                 }
                                 EncryptedFrame::ScreenState(payload) => {
-                                    let repaint = apply_full_state_rendering(
-                                        &payload, &emulator, &prediction, &renderer, &in_alt_screen,
-                                    );
+                                    let repaint = self.statesync.apply_full_state(&payload, &ctx);
                                     if !repaint.is_empty()
                                         && let Err(e) = stdout_tx.send(repaint).await
                                     {
@@ -281,9 +292,7 @@ impl TcpTransportReader {
                                 EncryptedFrame::ScreenStateCompressed(compressed) => {
                                     match decode_all_capped(compressed.as_slice()) {
                                         Ok(payload) => {
-                                            let repaint = apply_full_state_rendering(
-                                                &payload, &emulator, &prediction, &renderer, &in_alt_screen,
-                                            );
+                                            let repaint = self.statesync.apply_full_state(&payload, &ctx);
                                             if !repaint.is_empty()
                                                 && let Err(e) = stdout_tx.send(repaint).await
                                             {
@@ -333,11 +342,15 @@ impl TcpTransportReader {
                                         error!("TCP transport: error sending scrollback repaint: {e}");
                                     }
                                 }
-                                EncryptedFrame::StateSyncDiff(_) => {
-                                    warn!("TCP transport: StateSyncDiff not supported, ignoring");
+                                EncryptedFrame::StateSyncDiff((base_id, diff_id, compressed)) => {
+                                    self.statesync
+                                        .apply_diff(base_id, diff_id, &compressed, &ctx, nak_out_tx.as_ref())
+                                        .await;
                                 }
-                                EncryptedFrame::StateChunk(_) => {
-                                    warn!("TCP transport: StateChunk not supported, ignoring");
+                                EncryptedFrame::StateChunk((seq, total, data)) => {
+                                    self.statesync
+                                        .apply_chunk(seq, total, data, &ctx, nak_out_tx.as_ref())
+                                        .await;
                                 }
                                 EncryptedFrame::Resize(_)
                                 | EncryptedFrame::Nak(_)
@@ -945,6 +958,183 @@ mod tests {
             .expect("stdout timeout")
             .expect("stdout frame");
         assert!(!out.is_empty(), "rendered output must reach stdout");
+
+        token.cancel();
+        sender_token.cancel();
+        let _joined = timeout(Duration::from_secs(2), client_handle).await;
+        let _joined = sender_handle.await;
+    }
+
+    /// zstd-compress `bytes` at the given level for building test wire payloads.
+    fn zstd(bytes: &[u8], level: i32) -> Vec<u8> {
+        zstd::encode_all(bytes, level).expect("zstd encode")
+    }
+
+    /// `contents_formatted()` of a fresh 24×80 screen after processing `raw`.
+    fn formatted(raw: &[u8]) -> Vec<u8> {
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        parser.process(raw);
+        parser.screen().contents_formatted()
+    }
+
+    #[tokio::test]
+    async fn client_frame_loop_statesync_diff_acks_and_renders() {
+        let (writer, reader) = make_link().await;
+        let id = Uuid::new_v4();
+        let (mut sender, _control_tx, data_tx) = make_sender(writer, id);
+        let sender_token = CancellationToken::new();
+        let st = sender_token.clone();
+        let sender_handle = tokio::spawn(async move { sender.frame_loop(st).await });
+
+        let (mut client, _reconnect_rx, mut nak_rx) = make_client_reader(reader, id);
+        let (ctx, mut stdout_rx) = make_render_ctx();
+        let token = CancellationToken::new();
+        let exit_token = CancellationToken::new();
+        let exit_msg = Arc::new(Mutex::new(None));
+        let ct = token.clone();
+        let et = exit_token.clone();
+        let em = Arc::clone(&exit_msg);
+        let client_handle =
+            tokio::spawn(async move { client.client_frame_loop(ct, et, em, ctx).await });
+
+        // 1. Seed the ack baseline with a full-state push.
+        let base = formatted(b"hello");
+        data_tx
+            .send(EncryptedFrame::ScreenStateCompressed(zstd(&base, 3)))
+            .await
+            .expect("send full state");
+
+        // 2. Build a diff against that baseline the way the server does:
+        //    contents_diff(target, ack), where `ack` mirrors the client's
+        //    reconstruction (a parser seeded with the baseline bytes).
+        let mut ack_parser = vt100::Parser::new(24, 80, 0);
+        ack_parser.process(&base);
+        let mut target_parser = vt100::Parser::new(24, 80, 0);
+        target_parser.process(&base);
+        target_parser.process(b" world");
+        let diff = target_parser.screen().contents_diff(ack_parser.screen());
+        data_tx
+            .send(EncryptedFrame::StateSyncDiff((0, 1, zstd(&diff, 1))))
+            .await
+            .expect("send diff");
+
+        // The full-state push renders to stdout first.
+        let _full = timeout(Duration::from_secs(2), stdout_rx.recv())
+            .await
+            .expect("full-state stdout timeout")
+            .expect("full-state stdout frame");
+
+        // The diff must produce a ClientAck for its diff_id.
+        let ack = timeout(Duration::from_secs(2), nak_rx.recv())
+            .await
+            .expect("ack timeout")
+            .expect("ack frame");
+        assert_eq!(
+            ack,
+            EncryptedFrame::ClientAck(1),
+            "applied StateSyncDiff must be acked with its diff_id"
+        );
+
+        token.cancel();
+        sender_token.cancel();
+        let _joined = timeout(Duration::from_secs(2), client_handle).await;
+        let _joined = sender_handle.await;
+    }
+
+    #[tokio::test]
+    async fn client_frame_loop_statesync_diff_before_full_state_requests_repaint() {
+        let (writer, reader) = make_link().await;
+        let id = Uuid::new_v4();
+        let (mut sender, _control_tx, data_tx) = make_sender(writer, id);
+        let sender_token = CancellationToken::new();
+        let st = sender_token.clone();
+        let sender_handle = tokio::spawn(async move { sender.frame_loop(st).await });
+
+        let (mut client, _reconnect_rx, mut nak_rx) = make_client_reader(reader, id);
+        let (ctx, _stdout_rx) = make_render_ctx();
+        let token = CancellationToken::new();
+        let exit_token = CancellationToken::new();
+        let exit_msg = Arc::new(Mutex::new(None));
+        let ct = token.clone();
+        let et = exit_token.clone();
+        let em = Arc::clone(&exit_msg);
+        let client_handle =
+            tokio::spawn(async move { client.client_frame_loop(ct, et, em, ctx).await });
+
+        // A diff arriving before any full-state push must trigger a RepaintRequest
+        // and must NOT be acked.
+        data_tx
+            .send(EncryptedFrame::StateSyncDiff((0, 1, zstd(b"x", 1))))
+            .await
+            .expect("send diff");
+
+        let frame = timeout(Duration::from_secs(2), nak_rx.recv())
+            .await
+            .expect("repaint timeout")
+            .expect("repaint frame");
+        assert_eq!(
+            frame,
+            EncryptedFrame::RepaintRequest,
+            "diff before full state must request a repaint, not ack"
+        );
+
+        token.cancel();
+        sender_token.cancel();
+        let _joined = timeout(Duration::from_secs(2), client_handle).await;
+        let _joined = sender_handle.await;
+    }
+
+    #[tokio::test]
+    async fn client_frame_loop_state_chunk_reassembles_full_state() {
+        let (writer, reader) = make_link().await;
+        let id = Uuid::new_v4();
+        let (mut sender, _control_tx, data_tx) = make_sender(writer, id);
+        let sender_token = CancellationToken::new();
+        let st = sender_token.clone();
+        let sender_handle = tokio::spawn(async move { sender.frame_loop(st).await });
+
+        let (mut client, _reconnect_rx, mut nak_rx) = make_client_reader(reader, id);
+        let (ctx, mut stdout_rx) = make_render_ctx();
+        let token = CancellationToken::new();
+        let exit_token = CancellationToken::new();
+        let exit_msg = Arc::new(Mutex::new(None));
+        let ct = token.clone();
+        let et = exit_token.clone();
+        let em = Arc::clone(&exit_msg);
+        let client_handle =
+            tokio::spawn(async move { client.client_frame_loop(ct, et, em, ctx).await });
+
+        // Split a compressed full-state push into two ordered chunks.
+        let compressed = zstd(&formatted(b"chunked screen"), 3);
+        let mid = compressed.len() / 2;
+        let (first, second) = compressed.split_at(mid);
+        data_tx
+            .send(EncryptedFrame::StateChunk((0, 2, first.to_vec())))
+            .await
+            .expect("send chunk 0");
+        data_tx
+            .send(EncryptedFrame::StateChunk((1, 2, second.to_vec())))
+            .await
+            .expect("send chunk 1");
+
+        // Reassembly completes and renders the screen to stdout.
+        let out = timeout(Duration::from_secs(2), stdout_rx.recv())
+            .await
+            .expect("stdout timeout")
+            .expect("stdout frame");
+        assert!(!out.is_empty(), "reassembled full state must render");
+
+        // A following diff (base_id 0) applies cleanly, proving the chunk
+        // assembly seeded the ack baseline.
+        data_tx
+            .send(EncryptedFrame::StateSyncDiff((0, 1, zstd(b"", 1))))
+            .await
+            .expect("send diff");
+        let ack = timeout(Duration::from_secs(2), nak_rx.recv())
+            .await
+            .expect("ack timeout")
+            .expect("ack frame");
+        assert_eq!(ack, EncryptedFrame::ClientAck(1));
 
         token.cancel();
         sender_token.cancel();

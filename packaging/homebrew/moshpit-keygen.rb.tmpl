@@ -12,11 +12,11 @@ class MoshpitKeygen < Formula
   end
 
   def install
-    bin.install "mp-keygen/mp-keygen"
-    bash_completion.install "mp-keygen/mp-keygen.bash" => "mp-keygen"
-    zsh_completion.install "mp-keygen/_mp-keygen"
-    fish_completion.install "mp-keygen/mp-keygen.fish"
-    man1.install "mp-keygen/mp-keygen.1"
+    bin.install "mp-keygen"
+    bash_completion.install "mp-keygen.bash" => "mp-keygen"
+    zsh_completion.install "_mp-keygen"
+    fish_completion.install "mp-keygen.fish"
+    man1.install "mp-keygen.1"
   end
 
   test do

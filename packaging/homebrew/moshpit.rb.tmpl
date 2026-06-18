@@ -12,12 +12,12 @@ class Moshpit < Formula
   end
 
   def install
-    bin.install "mp/mp"
-    bash_completion.install "mp/mp.bash" => "mp"
-    zsh_completion.install "mp/_mp"
-    fish_completion.install "mp/mp.fish"
-    man1.install "mp/mp.1"
-    (etc/"moshpit").install "mp/moshpit.toml.example" if File.exist?("mp/moshpit.toml.example")
+    bin.install "mp"
+    bash_completion.install "mp.bash" => "mp"
+    zsh_completion.install "_mp"
+    fish_completion.install "mp.fish"
+    man1.install "mp.1"
+    (etc/"moshpit").install "moshpit.toml.example" if File.exist?("moshpit.toml.example")
   end
 
   def caveats

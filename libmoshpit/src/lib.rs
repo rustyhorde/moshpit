@@ -424,9 +424,12 @@ pub use self::tracing::{TracingConfigExt, init_tracing};
 pub use self::udp::DiffMode;
 pub use self::udp::TransportMode;
 pub use self::udp::UdpClient;
-pub use self::udp::reader::{ClientRenderCtx, UdpReader, intercept_queries_core};
+pub use self::udp::reader::{
+    ClientRenderCtx, UdpReader, decode_all_capped, intercept_queries_core,
+};
 pub use self::udp::sender::MAX_UDP_PAYLOAD;
 pub use self::udp::sender::UdpSender;
+pub use self::udp::statesync::fuzz_statesync_drive;
 pub use self::utils::is_exit_title;
 pub use self::utils::parse_server_destination;
 pub use self::utils::to_path_buf;

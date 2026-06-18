@@ -619,11 +619,7 @@ async fn handle_connection(
                     }
                     diff_id = client_ack_rx.recv() => {
                         let Some(diff_id) = diff_id else { break; };
-                        if let Some(pos) = sent_states.iter().position(|(id, _)| *id == diff_id) {
-                            let snapshot = sent_states[pos].1.clone();
-                            ack_state = snapshot;
-                            ack_diff_id = diff_id;
-                            drop(sent_states.drain(..=pos));
+                        if apply_client_ack(&mut sent_states, &mut ack_state, &mut ack_diff_id, diff_id) {
                             ack_dirty = true;
                         }
                     }
@@ -901,6 +897,29 @@ fn spawn_connection_watchdogs(
             }
         }
     });
+}
+
+/// Apply a client `ClientAck(diff_id)` against the server's sent-states ring buffer.
+///
+/// `diff_id` is attacker-controlled (it arrives over the network). On a hit, the
+/// ack baseline advances to that snapshot and every entry up to and including it
+/// is drained; the caller marks the baseline dirty. An unknown/stale/zero
+/// `diff_id` not present in the ring is a no-op returning `false`. Because the
+/// lookup is by value via [`Iterator::position`], the subsequent index and
+/// `drain(..=pos)` can never panic or fall out of bounds for any `diff_id`.
+fn apply_client_ack(
+    sent_states: &mut VecDeque<(u64, Vec<u8>)>,
+    ack_state: &mut Vec<u8>,
+    ack_diff_id: &mut u64,
+    diff_id: u64,
+) -> bool {
+    let Some(pos) = sent_states.iter().position(|(id, _)| *id == diff_id) else {
+        return false;
+    };
+    ack_state.clone_from(&sent_states[pos].1);
+    *ack_diff_id = diff_id;
+    drop(sent_states.drain(..=pos));
+    true
 }
 
 /// Cancel the connection token if no UDP frame has been received from the client within
@@ -1941,10 +1960,12 @@ mod test {
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
+    use super::apply_client_ack;
     #[cfg(unix)]
     use super::{
         current_daemon_user, parse_environment_file, parse_etc_environment, resolve_user_account,
     };
+    use std::collections::VecDeque;
     use std::{
         sync::{
             Arc,
@@ -1952,6 +1973,79 @@ mod test {
         },
         time::Duration,
     };
+
+    fn ring(ids: &[u64]) -> VecDeque<(u64, Vec<u8>)> {
+        ids.iter()
+            .map(|&id| (id, id.to_be_bytes().to_vec()))
+            .collect()
+    }
+
+    #[test]
+    fn client_ack_unknown_id_is_noop() {
+        let mut sent = ring(&[1, 2, 3]);
+        let mut ack_state = vec![9u8];
+        let mut ack_diff_id = 0u64;
+        // A diff_id never sent (stale/forged) leaves everything untouched.
+        assert!(!apply_client_ack(
+            &mut sent,
+            &mut ack_state,
+            &mut ack_diff_id,
+            99
+        ));
+        assert_eq!(sent.len(), 3);
+        assert_eq!(ack_state, vec![9u8]);
+        assert_eq!(ack_diff_id, 0u64);
+    }
+
+    #[test]
+    fn client_ack_empty_ring_is_noop() {
+        let mut sent: VecDeque<(u64, Vec<u8>)> = VecDeque::new();
+        let mut ack_state = Vec::new();
+        let mut ack_diff_id = 0u64;
+        // diff_id 0 against an empty ring must not panic or index out of bounds.
+        assert!(!apply_client_ack(
+            &mut sent,
+            &mut ack_state,
+            &mut ack_diff_id,
+            0
+        ));
+        assert!(sent.is_empty());
+    }
+
+    #[test]
+    fn client_ack_match_advances_and_drains_prefix() {
+        let mut sent = ring(&[1, 2, 3, 4]);
+        let mut ack_state = Vec::new();
+        let mut ack_diff_id = 0u64;
+        // Acking id 3 advances the baseline and drops 1, 2, 3 — leaving only 4.
+        assert!(apply_client_ack(
+            &mut sent,
+            &mut ack_state,
+            &mut ack_diff_id,
+            3
+        ));
+        assert_eq!(ack_diff_id, 3u64);
+        assert_eq!(ack_state, 3u64.to_be_bytes().to_vec());
+        assert_eq!(
+            sent.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![4u64]
+        );
+    }
+
+    #[test]
+    fn client_ack_future_id_beyond_ring_is_noop() {
+        // A diff_id larger than anything sent yet (forged "ahead" ack) is ignored.
+        let mut sent = ring(&[1, 2]);
+        let mut ack_state = Vec::new();
+        let mut ack_diff_id = 0u64;
+        assert!(!apply_client_ack(
+            &mut sent,
+            &mut ack_state,
+            &mut ack_diff_id,
+            u64::MAX
+        ));
+        assert_eq!(sent.len(), 2);
+    }
 
     use super::{
         MAX_STATESYNC_DIFF_BYTES, MTU_PROBE_FAIL_THRESHOLD, MTU_PROBE_QUIET_TICKS,

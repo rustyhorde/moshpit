@@ -2,10 +2,10 @@
 
 $runTests    = $true
 $runCoverage = $true
-$runFuzz     = $true
+$runFuzz     = $false
 $runDocs     = $true
-$runInstall  = $true
-$runMusl     = $true
+$runInstall  = $false
+$runMusl     = $false
 $muslUnstable = $false
 $runClean    = $false
 
@@ -19,11 +19,11 @@ foreach ($arg in $args) {
             Write-Host "Options:"
             Write-Host "  --no-test      Skip nextest and all coverage steps"
             Write-Host "  --no-coverage  Skip coverage steps only (lcov + html reports)"
-            Write-Host "  --no-fuzz      Skip the cargo fuzz steps"
             Write-Host "  --no-docs      Skip the documentation step"
-            Write-Host "  --no-install   Skip the cargo install step"
-            Write-Host "  --no-musl      Skip the MUSL Docker build step"
-            Write-Host "  --unstable     Pass --unstable to run_musl.ps1 (builds unstable instead of stable)"
+            Write-Host "  --fuzz         Run the cargo fuzz steps"
+            Write-Host "  --install      Run the cargo install step"
+            Write-Host "  --musl         Run the MUSL Docker build step (stable)"
+            Write-Host "  --unstable     Run the MUSL Docker build step with the unstable feature"
             Write-Host "  --clean        Run cargo clean after all steps complete"
             Write-Host "  --help, -h     Show this help message"
             Write-Host ""
@@ -32,15 +32,15 @@ foreach ($arg in $args) {
             Write-Host "  2.  cargo fmt --all -- --check"
             Write-Host "  3.  cargo matrix clippy --all-targets -- -D warnings"
             Write-Host "  4.  cargo matrix build"
-            Write-Host "  5.  cargo nextest run ...              (skipped with --no-test)"
-            Write-Host "  6.  cargo test (libmoshpit-fuzz)       (skipped with --no-test)"
+            Write-Host "  5.  cargo matrix nextest run ...       (skipped with --no-test)"
+            Write-Host "  6.  cargo matrix nextest run (libmoshpit-fuzz: stable + unstable) (skipped with --no-test)"
             Write-Host "  7.  cargo doc -p libmoshpit            (skipped with --no-docs)"
             Write-Host "  8.  cargo llvm-cov nextest ...         (skipped with --no-test or --no-coverage)"
             Write-Host "  9.  cargo llvm-cov report --lcov ...   (skipped with --no-test or --no-coverage)"
             Write-Host "  10. cargo llvm-cov report --html       (skipped with --no-test or --no-coverage)"
-            Write-Host "  11. cargo fuzz run (30s each target)   (skipped with --no-fuzz)"
-            Write-Host "  12. run_install.ps1                    (skipped with --no-install)"
-            Write-Host "  13. run_musl.ps1                       (skipped with --no-musl; --unstable passed through)"
+            Write-Host "  11. cargo fuzz run (30s each target)   (only with --fuzz)"
+            Write-Host "  12. run_install.ps1                    (only with --install)"
+            Write-Host "  13. run_musl.ps1                       (only with --musl or --unstable; --unstable builds unstable)"
             Write-Host "  14. cargo clean                        (only with --clean)"
             exit 0
         }
@@ -49,11 +49,11 @@ foreach ($arg in $args) {
             $runCoverage = $false
         }
         '--no-coverage' { $runCoverage  = $false }
-        '--no-fuzz'     { $runFuzz      = $false }
         '--no-docs'     { $runDocs      = $false }
-        '--no-install'  { $runInstall   = $false }
-        '--no-musl'     { $runMusl      = $false }
-        '--unstable'    { $muslUnstable = $true  }
+        '--fuzz'        { $runFuzz      = $true  }
+        '--install'     { $runInstall   = $true  }
+        '--musl'        { $runMusl      = $true  }
+        '--unstable'    { $runMusl = $true; $muslUnstable = $true }
         '--clean'       { $runClean     = $true  }
         default {
             Write-Host "Unknown argument: $arg"
@@ -93,11 +93,9 @@ Invoke-Step 'cargo matrix build'
 if ($runTests) {
     Invoke-Step 'cargo matrix nextest run'
     Invoke-Step 'cargo matrix test --doc -p libmoshpit'
-    if ($muslUnstable) {
-        Invoke-Step 'cargo test --manifest-path libmoshpit/fuzz/Cargo.toml --features unstable'
-    } else {
-        Invoke-Step 'cargo test --manifest-path libmoshpit/fuzz/Cargo.toml'
-    }
+    Push-Location libmoshpit/fuzz
+    Invoke-Step 'cargo matrix nextest run'
+    Pop-Location
 }
 
 if ($runDocs) {
@@ -117,9 +115,7 @@ if ($runFuzz) {
     Invoke-Step 'cargo fuzz run --fuzz-dir libmoshpit/fuzz fuzz_escape_intercept -- -max_total_time=30'
     Invoke-Step 'cargo fuzz run --fuzz-dir libmoshpit/fuzz fuzz_keyfile -- -max_total_time=30'
     Invoke-Step 'cargo fuzz run --fuzz-dir libmoshpit/fuzz fuzz_emulator -- -max_total_time=30'
-    if ($muslUnstable) {
-        Invoke-Step 'cargo fuzz run --fuzz-dir libmoshpit/fuzz --features unstable fuzz_pubkey_parse -- -max_total_time=30'
-    }
+    Invoke-Step 'cargo fuzz run --fuzz-dir libmoshpit/fuzz --features unstable fuzz_pubkey_parse -- -max_total_time=30'
 }
 
 if ($runInstall) {

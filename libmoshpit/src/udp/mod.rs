@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 pub(crate) mod reader;
 pub(crate) mod sender;
+pub(crate) mod statesync;
 
 /// Controls the UDP transport delivery strategy for diff packets.
 ///
