@@ -15,6 +15,7 @@
 //! carries equivalent inline logic in its receive loop.
 
 use std::{
+    io::Cursor,
     mem::take,
     sync::{PoisonError, atomic::Ordering},
 };
@@ -224,4 +225,150 @@ impl StateSyncClient {
             }
         }
     }
+}
+
+/// Fuzz harness driver for the client-side `StateSync` application pipeline.
+///
+/// Parses `data` into a sequence of operations and replays them against a single
+/// freshly-built [`StateSyncClient`] + [`ClientRenderCtx`], so the hand-rolled
+/// `StateChunk` reassembly bookkeeping and `apply_diff` baseline logic are
+/// exercised across calls (out-of-order chunks, mismatched `total`, diffs before
+/// any full state, decompression bombs, etc.). All channel sends use `try_send`
+/// or complete immediately against a live receiver, so no real I/O is involved.
+///
+/// Exposed (`#[doc(hidden)]`) for the `fuzz_statesync` target only; not part of
+/// the stable API. The internal op encoding is intentionally simple so random
+/// fuzzer bytes reach interesting states:
+/// - `0x00` `<u16 len> <len bytes>`            → full-state push (raw payload)
+/// - `0x01` `<u64 base> <u64 diff> <u16 len> <len bytes>` → `StateSyncDiff`
+/// - `0x02` `<u16 seq> <u16 total> <u16 len> <len bytes>` → `StateChunk`
+///
+/// Any other selector byte, or a truncated field, ends parsing.
+#[doc(hidden)]
+pub fn fuzz_statesync_drive(data: &[u8]) {
+    use std::sync::{Arc, Mutex, atomic::AtomicBool};
+
+    use tokio::{runtime::Builder, sync::mpsc::channel};
+
+    use crate::{DisplayPreference, Emulator, PredictionEngine, Renderer};
+
+    const ROWS: u16 = 24;
+    const COLS: u16 = 80;
+
+    let Ok(rt) = Builder::new_current_thread().build() else {
+        return;
+    };
+
+    // Keep the receivers alive for the lifetime of the run so `stdout_tx.send`
+    // and `nak_out_tx.try_send` always have a live endpoint (no spurious Err).
+    let (stdout_tx, _stdout_rx) = channel::<Vec<u8>>(64);
+    let (nak_tx, _nak_rx) = channel::<EncryptedFrame>(64);
+    let ctx = ClientRenderCtx::new(
+        stdout_tx,
+        Arc::new(Mutex::new(Emulator::new(ROWS, COLS))),
+        Arc::new(Mutex::new(PredictionEngine::new(
+            DisplayPreference::Adaptive,
+        ))),
+        Arc::new(Mutex::new(Renderer::new(ROWS, COLS))),
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    let mut client = StateSyncClient::default();
+    let mut cur = Cursor::new(data);
+
+    rt.block_on(async {
+        while let Some(op) = next_op(&mut cur) {
+            match op {
+                FuzzOp::FullState(payload) => {
+                    let _repaint = client.apply_full_state(&payload, &ctx);
+                }
+                FuzzOp::Diff {
+                    base_id,
+                    diff_id,
+                    compressed,
+                } => {
+                    client
+                        .apply_diff(base_id, diff_id, &compressed, &ctx, Some(&nak_tx))
+                        .await;
+                }
+                FuzzOp::Chunk { seq, total, data } => {
+                    client
+                        .apply_chunk(seq, total, data, &ctx, Some(&nak_tx))
+                        .await;
+                }
+            }
+        }
+    });
+}
+
+/// One decoded operation for [`fuzz_statesync_drive`].
+enum FuzzOp {
+    FullState(Vec<u8>),
+    Diff {
+        base_id: u64,
+        diff_id: u64,
+        compressed: Vec<u8>,
+    },
+    Chunk {
+        seq: u16,
+        total: u16,
+        data: Vec<u8>,
+    },
+}
+
+/// Read one [`FuzzOp`] from `cur`, or `None` once input is exhausted/truncated.
+fn next_op(cur: &mut Cursor<&[u8]>) -> Option<FuzzOp> {
+    let selector = read_u8(cur)?;
+    match selector {
+        0x00 => Some(FuzzOp::FullState(read_blob(cur)?)),
+        0x01 => {
+            let base_id = read_u64(cur)?;
+            let diff_id = read_u64(cur)?;
+            let compressed = read_blob(cur)?;
+            Some(FuzzOp::Diff {
+                base_id,
+                diff_id,
+                compressed,
+            })
+        }
+        0x02 => {
+            let seq = read_u16(cur)?;
+            let total = read_u16(cur)?;
+            let data = read_blob(cur)?;
+            Some(FuzzOp::Chunk { seq, total, data })
+        }
+        _ => None,
+    }
+}
+
+fn read_u8(cur: &mut Cursor<&[u8]>) -> Option<u8> {
+    let mut b = [0u8; 1];
+    take_exact(cur, &mut b)?;
+    Some(b[0])
+}
+
+fn read_u16(cur: &mut Cursor<&[u8]>) -> Option<u16> {
+    let mut b = [0u8; 2];
+    take_exact(cur, &mut b)?;
+    Some(u16::from_be_bytes(b))
+}
+
+fn read_u64(cur: &mut Cursor<&[u8]>) -> Option<u64> {
+    let mut b = [0u8; 8];
+    take_exact(cur, &mut b)?;
+    Some(u64::from_be_bytes(b))
+}
+
+/// Read a `u16`-length-prefixed byte blob.
+fn read_blob(cur: &mut Cursor<&[u8]>) -> Option<Vec<u8>> {
+    let len = usize::from(read_u16(cur)?);
+    let mut buf = vec![0u8; len];
+    take_exact(cur, &mut buf)?;
+    Some(buf)
+}
+
+/// Fill `dst` from `cur`, or return `None` if fewer than `dst.len()` bytes remain.
+fn take_exact(cur: &mut Cursor<&[u8]>, dst: &mut [u8]) -> Option<()> {
+    use std::io::Read as _;
+    cur.read_exact(dst).ok()
 }

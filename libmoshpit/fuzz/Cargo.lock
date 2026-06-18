@@ -1998,6 +1998,7 @@ dependencies = [
  "libfuzzer-sys",
  "libmoshpit",
  "uuid",
+ "zstd",
 ]
 
 [[package]]
