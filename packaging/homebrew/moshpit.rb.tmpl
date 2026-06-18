@@ -1,0 +1,38 @@
+class Moshpit < Formula
+  desc "Moshpit client — mosh-like encrypted remote terminal"
+  homepage "https://github.com/rustyhorde/moshpit"
+  license any_of: ["MIT", "Apache-2.0"]
+  version "PKGVER"
+
+  on_macos do
+    if Hardware::CPU.arm?
+      url "https://github.com/rustyhorde/moshpit/releases/download/vPKGVER/mp-aarch64-apple-darwin.tar.gz"
+      sha256 "MP_MACOS_SHA256"
+    end
+  end
+
+  def install
+    bin.install "mp/mp"
+    bash_completion.install "mp/mp.bash" => "mp"
+    zsh_completion.install "mp/_mp"
+    fish_completion.install "mp/mp.fish"
+    man1.install "mp/mp.1"
+    (etc/"moshpit").install "mp/moshpit.toml.example" if File.exist?("mp/moshpit.toml.example")
+  end
+
+  def caveats
+    <<~EOS
+      Generate or verify keys with mp-keygen:
+        brew install rustyhorde/moshpit/moshpit-keygen
+
+      Copy the example config to get started:
+        mkdir -p "$HOME/Library/Application Support/moshpit"
+        cp #{etc}/moshpit/moshpit.toml.example \\
+          "$HOME/Library/Application Support/moshpit/moshpit.toml"
+    EOS
+  end
+
+  test do
+    system bin/"mp", "--version"
+  end
+end

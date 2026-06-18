@@ -517,6 +517,41 @@ sudo dnf remove moshpit moshpits moshpit-keygen
 
 ---
 
+## Installation (Homebrew / macOS)
+
+Pre-compiled binaries for **Apple Silicon (aarch64)** are published to the
+[`rustyhorde/moshpit`](https://github.com/rustyhorde/homebrew-moshpit) tap. Intel Macs are
+not currently supported, and the `mpa` agent is Linux-only so it is not distributed here.
+
+```bash
+brew tap rustyhorde/moshpit
+
+# Client + key tooling (the typical macOS setup — connect to a remote server)
+brew install moshpit moshpit-keygen
+
+# Server (optional — host terminals from your Mac)
+brew install moshpits
+```
+
+### Unstable formulae (includes post-quantum ML-DSA support)
+
+The `-unstable` formulae ship the same binaries built with the `unstable` feature. They
+**conflict** with their standard counterparts — install one or the other, not both:
+
+```bash
+brew install moshpit-unstable moshpit-keygen-unstable
+brew install moshpits-unstable
+```
+
+### Removing formulae
+
+```bash
+brew uninstall moshpit moshpits moshpit-keygen
+brew untap rustyhorde/moshpit
+```
+
+---
+
 ## Installation (cargo)
 
 Requires a Rust toolchain (stable, 1.95.0 or later).  Install all three binaries directly from [crates.io](https://crates.io):
