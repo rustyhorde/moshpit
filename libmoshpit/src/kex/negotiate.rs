@@ -80,7 +80,7 @@ pub const KDF_HKDF_SHA512: &str = "hkdf-sha512";
 /// format of **UDP** frames it must additionally be threaded into the UDP
 /// transport (`UdpSender` / `UdpReader`), which does not receive it today; the
 /// `Kex` value at session setup is the single source to pass down.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// Lowest wire protocol version this build can implement.
 ///

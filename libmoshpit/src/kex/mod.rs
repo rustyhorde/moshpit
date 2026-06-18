@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use socket2::SockRef;
 use tokio::{
     net::{
-        UdpSocket,
+        TcpStream, UdpSocket,
         tcp::{OwnedReadHalf, OwnedWriteHalf},
     },
     spawn,
@@ -49,8 +49,10 @@ use crate::AgentClient;
 use crate::keygen::{SUPPORTED_IDENTITY_ALGORITHMS, algorithm_strength_rank};
 use crate::{
     ConnectionReader, ConnectionWriter, Frame, KexConfig, KexReader, KexSender, MoshpitError,
-    UuidWrapper, kex::negotiate::NegotiatedAlgorithms, load_identity_key, load_public_key,
-    udp::DiffMode,
+    UuidWrapper,
+    kex::negotiate::NegotiatedAlgorithms,
+    load_identity_key, load_public_key,
+    udp::{DiffMode, TransportMode},
 };
 
 fn fmt_hex(bytes: &[u8]) -> String {
@@ -109,7 +111,7 @@ pub enum KexEvent {
     HMACKeyMaterial(Vec<u8>),
     /// moshpit client UUID
     Uuid(Uuid),
-    /// moshpits socket address
+    /// moshpits socket address (also used for TCP data port when transport = Tcp)
     MoshpitsAddr(SocketAddr),
     /// Session information: (stable session UUID, `is_resume` flag)
     SessionInfo(Uuid, bool),
@@ -118,6 +120,10 @@ pub enum KexEvent {
     /// No algorithm in common between client and server — client should exit,
     /// not retry.
     NoCommonAlgorithm,
+    /// Negotiated data-channel transport mode — emitted in client mode after
+    /// `NegotiatedAlgorithms` and before `KeyMaterial`.  Server mode always
+    /// defaults to `TransportMode::Udp` and never emits this event.
+    TransportMode(TransportMode),
 }
 
 /// The moshpit key exchange state
@@ -126,6 +132,9 @@ pub enum KexState {
     /// Awaiting the negotiated-algorithm event (arrives before key material)
     #[default]
     AwaitingNegotiatedAlgorithms,
+    /// Awaiting the negotiated data-channel transport mode (client mode only,
+    /// immediately after `NegotiatedAlgorithms` when protocol version ≥ 2)
+    AwaitingTransportMode,
     /// Awaiting key material for encrypting/decrypting UDP packets
     AwaitingKeyMaterial,
     /// Awaiting HMAC key for signing UDP packets
@@ -163,6 +172,8 @@ pub struct Kex {
     #[getset(get_copy = "pub")]
     uuid: Uuid,
     /// An optional moshpits socket address used by moshpit.
+    /// For `TransportMode::Udp` this is the UDP data port; for `TransportMode::Tcp`
+    /// it is the TCP data port the client must connect to.
     #[getset(get_copy = "pub")]
     moshpits_addr: Option<SocketAddr>,
     /// Stable session UUID, set for client mode after `SessionToken` received.
@@ -174,6 +185,10 @@ pub struct Kex {
     /// Algorithms negotiated during key exchange.
     #[getset(get = "pub")]
     negotiated_algorithms: NegotiatedAlgorithms,
+    /// Negotiated data-channel transport mode.  Set from `KexEvent::TransportMode`
+    /// in client mode; defaults to `Udp` for server mode.
+    #[getset(get_copy = "pub")]
+    transport_mode: TransportMode,
 }
 
 impl Kex {
@@ -257,6 +272,7 @@ impl Default for Kex {
             session_uuid: None,
             is_resume: false,
             negotiated_algorithms: NegotiatedAlgorithms::default(),
+            transport_mode: TransportMode::Udp,
         }
     }
 }
@@ -324,6 +340,14 @@ impl KexStateMachine {
             match (self.state, event) {
                 (KexState::AwaitingNegotiatedAlgorithms, KexEvent::NegotiatedAlgorithms(algos)) => {
                     kex.negotiated_algorithms = algos;
+                    if client_mode {
+                        self.state = KexState::AwaitingTransportMode;
+                    } else {
+                        self.state = KexState::AwaitingKeyMaterial;
+                    }
+                }
+                (KexState::AwaitingTransportMode, KexEvent::TransportMode(mode)) => {
+                    kex.transport_mode = mode;
                     self.state = KexState::AwaitingKeyMaterial;
                 }
                 (KexState::AwaitingKeyMaterial, KexEvent::KeyMaterial(key_material)) => {
@@ -394,6 +418,34 @@ impl Display for KexMode {
     }
 }
 
+/// The negotiated data-channel transport after a completed key exchange.
+#[derive(Debug)]
+pub enum NegotiatedTransport {
+    /// All terminal I/O over UDP.  The `Arc<UdpSocket>` is bound and connected
+    /// to the server's data port; pass it to `UdpSender` / `UdpReader`.
+    Udp(Arc<UdpSocket>),
+    /// All terminal I/O over the TCP data connection.  The server bound a
+    /// dedicated TCP data port and the client connected to it.  Pass
+    /// `reader`/`writer` to `TcpTransportSender` / `TcpTransportReader`.
+    Tcp {
+        /// Framed TCP reader for the data channel.
+        reader: ConnectionReader,
+        /// Framed TCP writer for the data channel.
+        writer: ConnectionWriter,
+    },
+}
+
+/// The outcome of a completed key exchange.
+#[derive(Debug)]
+pub struct KexOutcome {
+    /// Session key material and negotiated parameters.
+    pub kex: Kex,
+    /// The negotiated data-channel transport (UDP socket or TCP connection).
+    pub transport: NegotiatedTransport,
+    /// Server-side key exchange result (only `Some` in server mode).
+    pub server_kex: Option<ServerKex>,
+}
+
 /// Run the client side of the key exchange
 ///
 /// # Errors
@@ -405,7 +457,7 @@ pub async fn run_key_exchange<T: KexConfig>(
     passphrase_fn: impl Fn() -> Result<Option<String>>,
     tofu_fn: Option<TofuFn>,
     host_key_mismatch_fn: Option<HostKeyMismatchFn>,
-) -> Result<(Kex, Arc<UdpSocket>, Option<ServerKex>)> {
+) -> Result<KexOutcome> {
     // Setup the TCP connection to the server for key exchange
     let mode = config.mode();
     let reader = ConnectionReader::builder().reader(sock_read).build();
@@ -423,7 +475,7 @@ pub async fn run_key_exchange<T: KexConfig>(
         }
     });
 
-    Ok(match mode {
+    match mode {
         KexMode::Client => {
             run_client_kex(
                 config,
@@ -437,19 +489,19 @@ pub async fn run_key_exchange<T: KexConfig>(
                     host_key_mismatch_fn,
                 },
             )
-            .await?
+            .await
         }
         KexMode::Server(socket_addr) => {
             let tx_c = tx.clone();
             match run_server_kex(config, socket_addr, tx, tx_event, reader, kex_handle).await {
-                Ok(result) => result,
+                Ok(result) => Ok(result),
                 Err(e) => {
                     let _blah = tx_c.send(Frame::KexFailure);
-                    Err(e)?
+                    Err(e)
                 }
             }
         }
-    })
+    }
 }
 
 #[cfg_attr(nightly, allow(clippy::too_many_lines))]
@@ -462,7 +514,7 @@ async fn run_client_kex<T: KexConfig>(
     kex_handle: JoinHandle<Result<Kex>>,
     passphrase_fn: impl Fn() -> Result<Option<String>>,
     callbacks: HostKeyCallbacks,
-) -> Result<(Kex, Arc<UdpSocket>, Option<ServerKex>)> {
+) -> Result<KexOutcome> {
     let agent_socket = config.agent_socket();
 
     // Resolve identity: try agent first, fall back to key files if agent is
@@ -608,6 +660,7 @@ async fn run_client_kex<T: KexConfig>(
     } = callbacks;
 
     let diff_mode = config.diff_mode();
+    let transport_preference = config.transport_preference();
     let client_algos = config.preferred_algorithms();
     let client_protocol_support = config.protocol_support();
     let user = config.user().unwrap_or_default();
@@ -627,6 +680,7 @@ async fn run_client_kex<T: KexConfig>(
             .maybe_tofu_fn(tofu_fn)
             .maybe_host_key_mismatch_fn(host_key_mismatch_fn)
             .diff_mode(diff_mode)
+            .transport_preference(transport_preference)
             .client_algos(client_algos)
             .protocol_support(client_protocol_support)
             .user(user)
@@ -648,6 +702,7 @@ async fn run_client_kex<T: KexConfig>(
             .maybe_tofu_fn(tofu_fn)
             .maybe_host_key_mismatch_fn(host_key_mismatch_fn)
             .diff_mode(diff_mode)
+            .transport_preference(transport_preference)
             .client_algos(client_algos)
             .protocol_support(client_protocol_support)
             .user(user)
@@ -672,29 +727,47 @@ async fn run_client_kex<T: KexConfig>(
     let kex = kex_handle.await??;
 
     if let Some(moshpits_addr) = kex.moshpits_addr() {
-        trace!("Connecting to moshpits at {moshpits_addr}");
-        // Bind to the unspecified address on port 0 so the OS assigns both the
-        // outbound interface and an ephemeral port automatically.
-        let bind_addr = if moshpits_addr.is_ipv6() {
-            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
-        } else {
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+        let transport = match kex.transport_mode() {
+            TransportMode::Tcp => {
+                trace!("Connecting TCP data channel to {moshpits_addr}");
+                let stream = TcpStream::connect(moshpits_addr).await?;
+                let (r, w) = stream.into_split();
+                NegotiatedTransport::Tcp {
+                    reader: ConnectionReader::builder().reader(r).build(),
+                    writer: ConnectionWriter::builder().writer(w).build(),
+                }
+            }
+            TransportMode::Udp => {
+                trace!("Connecting UDP data channel to {moshpits_addr}");
+                // Bind to the unspecified address on port 0 so the OS assigns both the
+                // outbound interface and an ephemeral port automatically.
+                let bind_addr = if moshpits_addr.is_ipv6() {
+                    SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
+                } else {
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+                };
+                let udp_listener = UdpSocket::bind(bind_addr).await?;
+                let sock = SockRef::from(&udp_listener);
+                drop(sock.set_recv_buffer_size(4 * 1024 * 1024));
+                drop(sock.set_send_buffer_size(4 * 1024 * 1024));
+                // DSCP Expedited Forwarding (EF, DSCP 46 = TOS byte 0xB8): give terminal
+                // traffic priority on QoS-aware networks.  Silently ignored on platforms
+                // where the socket option is unavailable.
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
+                if bind_addr.is_ipv4() {
+                    drop(sock.set_tos_v4(0xB8));
+                } else {
+                    drop(sock.set_tclass_v6(0xB8));
+                }
+                udp_listener.connect(moshpits_addr).await?;
+                NegotiatedTransport::Udp(Arc::new(udp_listener))
+            }
         };
-        let udp_listener = UdpSocket::bind(bind_addr).await?;
-        let sock = SockRef::from(&udp_listener);
-        drop(sock.set_recv_buffer_size(4 * 1024 * 1024));
-        drop(sock.set_send_buffer_size(4 * 1024 * 1024));
-        // DSCP Expedited Forwarding (EF, DSCP 46 = TOS byte 0xB8): give terminal
-        // traffic priority on QoS-aware networks.  Silently ignored on platforms
-        // where the socket option is unavailable.
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        if bind_addr.is_ipv4() {
-            drop(sock.set_tos_v4(0xB8));
-        } else {
-            drop(sock.set_tclass_v6(0xB8));
-        }
-        udp_listener.connect(moshpits_addr).await?;
-        Ok((kex, Arc::new(udp_listener), None))
+        Ok(KexOutcome {
+            kex,
+            transport,
+            server_kex: None,
+        })
     } else {
         Err(MoshpitError::InvalidMoshpitsAddress.into())
     }
@@ -708,8 +781,9 @@ async fn run_server_kex<T: KexConfig>(
     tx_event: UnboundedSender<KexEvent>,
     reader: ConnectionReader,
     kex_handle: JoinHandle<Result<Kex>>,
-) -> Result<(Kex, Arc<UdpSocket>, Option<ServerKex>)> {
+) -> Result<KexOutcome> {
     let port_pool_opt = config.port_pool();
+    let allow_tcp = config.allow_tcp_transport();
     let (_private_key_path, public_key_path) = config.key_pair_paths()?;
     let session_registry = config.session_registry();
     trace!(
@@ -730,10 +804,20 @@ async fn run_server_kex<T: KexConfig>(
         .protocol_support(server_protocol_support)
         .build();
     if let Some(port_pool) = port_pool_opt {
-        let (skex, udp_arc) = frame_reader
-            .server_kex(socket_addr, port_pool, &public_key_path, session_registry)
+        let (skex, transport) = frame_reader
+            .server_kex(
+                socket_addr,
+                port_pool,
+                &public_key_path,
+                session_registry,
+                allow_tcp,
+            )
             .await?;
-        Ok((kex_handle.await??, udp_arc, Some(skex)))
+        Ok(KexOutcome {
+            kex: kex_handle.await??,
+            transport,
+            server_kex: Some(skex),
+        })
     } else {
         Err(anyhow::anyhow!(
             "Port pool is required for server key exchange"
@@ -752,6 +836,7 @@ mod tests {
     use super::{
         Kex, KexEvent, KexMode, KexStateMachine, MoshpitError, ServerKex, env_var_matches,
     };
+    use crate::TransportMode;
 
     #[tokio::test]
     async fn kex_state_machine_server_mode_completes_after_uuid() -> Result<()> {
@@ -783,7 +868,7 @@ mod tests {
 
     #[tokio::test]
     async fn kex_state_machine_client_mode_full_sequence() -> Result<()> {
-        use crate::kex::negotiate::NegotiatedAlgorithms;
+        use crate::{TransportMode, kex::negotiate::NegotiatedAlgorithms};
 
         let (tx, rx) = unbounded_channel();
         let mut sm = KexStateMachine::builder().rx_event(rx).build();
@@ -796,6 +881,9 @@ mod tests {
             NegotiatedAlgorithms::default(),
         ))
         .expect("test channel send");
+        // Client mode now expects a TransportMode event before KeyMaterial.
+        tx.send(KexEvent::TransportMode(TransportMode::Udp))
+            .expect("test channel send");
         tx.send(KexEvent::KeyMaterial(key.clone()))
             .expect("test channel send");
         tx.send(KexEvent::HMACKeyMaterial(hmac_key.clone()))
@@ -812,6 +900,36 @@ mod tests {
         assert_eq!(kex.session_uuid(), Some(session_uuid));
         assert_eq!(kex.moshpits_addr(), Some(addr));
         assert!(!kex.is_resume());
+        assert_eq!(kex.transport_mode(), TransportMode::Udp);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn kex_state_machine_client_mode_tcp_transport() -> Result<()> {
+        use crate::{TransportMode, kex::negotiate::NegotiatedAlgorithms};
+
+        let (tx, rx) = unbounded_channel();
+        let mut sm = KexStateMachine::builder().rx_event(rx).build();
+        let addr: SocketAddr = "127.0.0.1:51000".parse().expect("hardcoded test address");
+        tx.send(KexEvent::NegotiatedAlgorithms(
+            NegotiatedAlgorithms::default(),
+        ))
+        .expect("test channel send");
+        tx.send(KexEvent::TransportMode(TransportMode::Tcp))
+            .expect("test channel send");
+        tx.send(KexEvent::KeyMaterial(vec![0u8; 32]))
+            .expect("test channel send");
+        tx.send(KexEvent::HMACKeyMaterial(vec![0u8; 64]))
+            .expect("test channel send");
+        tx.send(KexEvent::Uuid(Uuid::new_v4()))
+            .expect("test channel send");
+        tx.send(KexEvent::SessionInfo(Uuid::new_v4(), false))
+            .expect("test channel send");
+        tx.send(KexEvent::MoshpitsAddr(addr))
+            .expect("test channel send");
+        let kex = sm.handle_events(true).await?;
+        assert_eq!(kex.transport_mode(), TransportMode::Tcp);
+        assert_eq!(kex.moshpits_addr(), Some(addr));
         Ok(())
     }
 
@@ -908,6 +1026,7 @@ mod tests {
                 protocol_version: 42,
                 ..NegotiatedAlgorithms::default()
             },
+            transport_mode: TransportMode::Udp,
         };
         assert_eq!(kex.protocol_version(), 42);
     }
@@ -941,6 +1060,7 @@ mod tests {
                 aead: AEAD_AES256_GCM_SIV.to_string(),
                 ..NegotiatedAlgorithms::default()
             },
+            transport_mode: TransportMode::Udp,
         };
         assert!(kex.build_aead_key().is_ok());
     }
@@ -959,6 +1079,7 @@ mod tests {
                 aead: AEAD_AES256_GCM.to_string(),
                 ..NegotiatedAlgorithms::default()
             },
+            transport_mode: TransportMode::Udp,
         };
         assert!(kex.build_aead_key().is_ok());
     }
@@ -977,6 +1098,7 @@ mod tests {
                 aead: AEAD_CHACHA20_POLY1305.to_string(),
                 ..NegotiatedAlgorithms::default()
             },
+            transport_mode: TransportMode::Udp,
         };
         assert!(kex.build_aead_key().is_ok());
     }
@@ -995,6 +1117,7 @@ mod tests {
                 aead: AEAD_AES128_GCM_SIV.to_string(),
                 ..NegotiatedAlgorithms::default()
             },
+            transport_mode: TransportMode::Udp,
         };
         assert!(kex.build_aead_key().is_ok());
     }
@@ -1013,6 +1136,7 @@ mod tests {
                 aead: "unknown-cipher".to_string(),
                 ..NegotiatedAlgorithms::default()
             },
+            transport_mode: TransportMode::Udp,
         };
         assert!(kex.build_aead_key().is_err());
     }
@@ -1031,6 +1155,7 @@ mod tests {
                 mac: MAC_HMAC_SHA256.to_string(),
                 ..NegotiatedAlgorithms::default()
             },
+            transport_mode: TransportMode::Udp,
         };
         assert_eq!(kex.mac_tag_len(), 32);
     }
@@ -1049,6 +1174,7 @@ mod tests {
                 mac: MAC_HMAC_SHA512.to_string(),
                 ..NegotiatedAlgorithms::default()
             },
+            transport_mode: TransportMode::Udp,
         };
         assert_eq!(kex.mac_tag_len(), 64);
     }
@@ -1067,6 +1193,7 @@ mod tests {
                 mac: MAC_HMAC_SHA256.to_string(),
                 ..NegotiatedAlgorithms::default()
             },
+            transport_mode: TransportMode::Udp,
         };
         let _key = kex.build_hmac(); // verify it doesn't panic
         assert_eq!(kex.mac_tag_len(), 32);
@@ -1086,6 +1213,7 @@ mod tests {
                 mac: MAC_HMAC_SHA512.to_string(),
                 ..NegotiatedAlgorithms::default()
             },
+            transport_mode: TransportMode::Udp,
         };
         let _key = kex.build_hmac(); // verify it doesn't panic
         assert_eq!(kex.mac_tag_len(), 64);

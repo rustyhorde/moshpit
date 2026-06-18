@@ -151,6 +151,17 @@ pub(crate) struct Cli {
     )]
     #[getset(get_copy = "pub(crate)")]
     legacy_passthrough: bool,
+    /// Data-channel transport mode.  `udp` (default) uses encrypted UDP datagrams;
+    /// `tcp` connects to the server's TCP data port (fallback for UDP-blocking firewalls).
+    /// Requires the server to have `allow_tcp_transport = true` in its config.
+    #[clap(
+        long,
+        value_name = "MODE",
+        default_value = "udp",
+        help = "Data-channel transport: udp (default) or tcp"
+    )]
+    #[getset(get = "pub(crate)")]
+    transport: String,
     /// Ordered KEX algorithms to offer (comma-separated).
     /// Example: `--kex-algos ml-kem-768-sha256,x25519-sha256`
     #[clap(
@@ -352,6 +363,12 @@ impl Source for Cli {
             let _old = map.insert(
                 "diff_mode".to_string(),
                 Value::new(Some(&origin), ValueKind::String(self.diff_mode.clone())),
+            );
+        }
+        if on("transport") {
+            let _old = map.insert(
+                "transport".to_string(),
+                Value::new(Some(&origin), ValueKind::String(self.transport.clone())),
             );
         }
         if on("legacy_passthrough") {
@@ -556,6 +573,31 @@ mod tests {
         assert!(!map.contains_key("server_port"));
         assert!(!map.contains_key("predict"));
         assert!(!map.contains_key("diff_mode"));
+        assert!(!map.contains_key("transport"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_transport_defaults_to_udp() -> anyhow::Result<()> {
+        let cli = Cli::parse_argv(["moshpit", "host"])?;
+        assert_eq!(cli.transport(), "udp");
+        Ok(())
+    }
+
+    #[test]
+    fn test_transport_tcp_flag_parses_and_collects() -> anyhow::Result<()> {
+        let cli = Cli::parse_argv(["moshpit", "--transport", "tcp", "host"])?;
+        assert_eq!(cli.transport(), "tcp");
+        let map = cli.collect()?;
+        if let ValueKind::String(ref s) = map
+            .get("transport")
+            .ok_or_else(|| anyhow::anyhow!("\"transport\" not found in map"))?
+            .kind
+        {
+            assert_eq!(s, "tcp");
+        } else {
+            panic!("Expected String");
+        }
         Ok(())
     }
 

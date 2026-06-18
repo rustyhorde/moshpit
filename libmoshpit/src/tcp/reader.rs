@@ -13,7 +13,7 @@ use bon::Builder;
 use bytes::{Buf as _, BytesMut};
 use tokio::{io::AsyncReadExt as _, net::tcp::OwnedReadHalf};
 
-use crate::{Frame, error::Error};
+use crate::{Frame, error::Error, frames::encframe::MAX_ENCFRAME_LENGTH};
 
 /// A reader over a `ReadHalf` and `BytesMut` buffer.
 #[derive(Builder, Debug)]
@@ -26,6 +26,35 @@ pub struct ConnectionReader {
 }
 
 impl ConnectionReader {
+    /// Read a length-prefixed data blob written by `ConnectionWriter::write_data`.
+    ///
+    /// Returns `None` when the stream closes cleanly between blobs.
+    ///
+    /// # Errors
+    /// * Data payload exceeds the maximum frame length (64 KiB).
+    /// * I/O error or mid-blob EOF.
+    ///
+    pub async fn read_data(&mut self) -> Result<Option<Vec<u8>>> {
+        // Read the 8-byte big-endian length.  A clean EOF before any bytes is Ok(None).
+        let mut len_buf = [0u8; 8];
+        match self.reader.read_exact(&mut len_buf).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(e.into()),
+        }
+        let length = usize::try_from(u64::from_be_bytes(len_buf))?;
+        if length > MAX_ENCFRAME_LENGTH {
+            return Err(Error::FrameTooLarge.into());
+        }
+        let mut buf = vec![0u8; length];
+        let _ = self
+            .reader
+            .read_exact(&mut buf)
+            .await
+            .map_err(|_| Error::ConnectionResetByPeer)?;
+        Ok(Some(buf))
+    }
+
     /// Read a single `Frame` value from the underlying stream.
     ///
     /// The function waits until it has retrieved enough data to parse a frame.
@@ -142,6 +171,26 @@ mod tests {
         let reader = ConnectionReader::builder().reader(server_r).build();
         let writer = ConnectionWriter::builder().writer(client_w).build();
         Ok((reader, writer))
+    }
+
+    #[tokio::test]
+    async fn read_data_round_trips() -> Result<()> {
+        let (mut reader, mut writer) = make_loopback().await?;
+        let payload = b"hello data channel";
+        writer.write_data(payload).await?;
+        drop(writer);
+        let received = reader.read_data().await?.expect("expected Some");
+        assert_eq!(received, payload);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_data_eof_returns_none() -> Result<()> {
+        let (mut reader, writer) = make_loopback().await?;
+        drop(writer);
+        let result = reader.read_data().await?;
+        assert!(result.is_none());
+        Ok(())
     }
 
     #[tokio::test]

@@ -100,6 +100,12 @@ pub(crate) struct Config {
     #[serde(default)]
     #[getset(get_copy = "pub(crate)")]
     diff_mode: DiffMode,
+    /// Data-channel transport mode.  `udp` (default) uses encrypted UDP;
+    /// `tcp` uses the server's TCP data port (fallback for UDP-blocking firewalls).
+    /// Set via `--transport tcp` / `MOSHPIT_TRANSPORT=tcp`.
+    #[serde(default)]
+    #[getset(get_copy = "pub(crate)")]
+    transport: libmoshpit::TransportMode,
     /// Legacy escape hatch: drive the terminal by forwarding raw server PTY
     /// bytes straight to stdout instead of rendering exclusively through the
     /// differential renderer.  Defaults to `false` (the artifact-free rendered
@@ -181,6 +187,7 @@ impl Default for Config {
             nat_warmup: false,
             nat_warmup_count: Self::default_nat_warmup_count(),
             diff_mode: DiffMode::default(),
+            transport: libmoshpit::TransportMode::default(),
             legacy_passthrough: false,
             preferred_algorithms: AlgorithmPreferences::default(),
             send_env: Self::default_send_env(),
@@ -219,6 +226,10 @@ impl KexConfig for Config {
         self.diff_mode
     }
 
+    fn transport_preference(&self) -> libmoshpit::TransportMode {
+        self.transport
+    }
+
     fn preferred_algorithms(&self) -> AlgorithmList {
         self.preferred_algorithms.clone().into_algorithm_list()
     }
@@ -243,7 +254,40 @@ mod tests {
     use anyhow::Result;
     use uuid::Uuid;
 
+    use libmoshpit::TransportMode;
+
     use super::{Config, DisplayPreference, KexConfig, KexMode};
+
+    #[test]
+    fn test_transport_defaults_to_udp() {
+        let config = Config::default();
+        assert_eq!(config.transport(), TransportMode::Udp);
+        assert_eq!(config.transport_preference(), TransportMode::Udp);
+    }
+
+    #[test]
+    fn test_transport_tcp_from_toml() -> Result<()> {
+        let toml = r#"
+            private_key_path = "/tmp/priv"
+            public_key_path = "/tmp/pub"
+            transport = "tcp"
+        "#;
+        let config: Config = toml::from_str(toml)?;
+        assert_eq!(config.transport(), TransportMode::Tcp);
+        assert_eq!(config.transport_preference(), TransportMode::Tcp);
+        Ok(())
+    }
+
+    #[test]
+    fn test_transport_absent_in_toml_defaults_udp() -> Result<()> {
+        let toml = r#"
+            private_key_path = "/tmp/priv"
+            public_key_path = "/tmp/pub"
+        "#;
+        let config: Config = toml::from_str(toml)?;
+        assert_eq!(config.transport_preference(), TransportMode::Udp);
+        Ok(())
+    }
 
     #[test]
     fn test_default_config() {

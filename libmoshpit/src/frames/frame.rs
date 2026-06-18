@@ -85,6 +85,18 @@ pub enum Frame {
     /// - `extra_path`: directories to prepend to the server's base `server_path`;
     ///   ignored when the server has `path_locked = true`.
     ClientEnv(Vec<(String, String)>, Vec<String>),
+    /// Data-channel transport preference sent by the client after [`KexInit`](Frame::KexInit)
+    /// and echoed back by the server with its own capability byte.
+    ///
+    /// Client payload: `0` = UDP (default), `1` = TCP.
+    /// Server echo:    `0` = UDP only (client must use UDP), `1` = TCP supported.
+    ///
+    /// When the server echoes `1`, the existing TCP connection is kept open and used
+    /// for all terminal I/O instead of opening a UDP data channel.  Servers that do
+    /// not recognise ID 12 return `Ok(None)` from [`Frame::parse`] and the client
+    /// falls back to UDP.  Only sent when both peers negotiate
+    /// [`PROTOCOL_VERSION`](crate::PROTOCOL_VERSION) ≥ 2.
+    TransportPreference(u8),
 }
 
 impl Frame {
@@ -104,6 +116,7 @@ impl Frame {
             Frame::KexInit(_, _) => 9,
             Frame::IdentityProof(_) => 10,
             Frame::ClientEnv(_, _) => 11,
+            Frame::TransportPreference(_) => 12,
         }
     }
 
@@ -114,7 +127,7 @@ impl Frame {
     ///
     pub fn parse(src: &mut Cursor<&[u8]>) -> Result<Option<Self>> {
         match get_u8(src) {
-            Some(0..=11) => {
+            Some(0..=12) => {
                 if let Some(length_slice) = get_usize(src)? {
                     let length = usize::from_be_bytes(length_slice.try_into()?);
                     if length > MAX_FRAME_LENGTH {
@@ -188,6 +201,7 @@ impl Display for Frame {
                 env_vars.len(),
                 extra_path.len()
             ),
+            Frame::TransportPreference(pref) => write!(f, "TransportPreference({pref})"),
         }
     }
 }
@@ -396,12 +410,49 @@ mod tests {
 
     #[test]
     fn test_parse_unknown_frame_id_returns_none() -> Result<()> {
-        // Frame IDs 0-11 are known; anything above 11 must be silently ignored (Ok(None)).
-        let all_data = [12u8, 0, 0, 0, 0, 0, 0, 0, 0]; // id=12, length=0, no payload
+        // Frame IDs 0-12 are known; anything above 12 must be silently ignored (Ok(None)).
+        let all_data = [13u8, 0, 0, 0, 0, 0, 0, 0, 0]; // id=13, length=0, no payload
         let mut cursor = Cursor::new(&all_data[..]);
         let result = Frame::parse(&mut cursor)?;
         assert!(result.is_none(), "unknown frame id must return Ok(None)");
         Ok(())
+    }
+
+    #[test]
+    fn test_transport_preference_round_trips() -> Result<()> {
+        use bincode_next::{config::standard, encode_to_vec};
+
+        for pref in [0u8, 1u8] {
+            let frame = Frame::TransportPreference(pref);
+            let encoded_frame = encode_to_vec(&frame, standard())?;
+            let length = encoded_frame.len();
+            let length_bytes = length.to_be_bytes();
+
+            let mut all_data = vec![12u8]; // TransportPreference id=12
+            all_data.extend_from_slice(&length_bytes);
+            all_data.extend_from_slice(&encoded_frame);
+
+            let mut cursor = Cursor::new(&all_data[..]);
+            let Frame::TransportPreference(parsed_pref) = Frame::parse(&mut cursor)?
+                .ok_or_else(|| anyhow::anyhow!("expected TransportPreference frame"))?
+            else {
+                panic!("expected TransportPreference");
+            };
+            assert_eq!(parsed_pref, pref);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_transport_preference_display() {
+        assert_eq!(
+            format!("{}", Frame::TransportPreference(0)),
+            "TransportPreference(0)"
+        );
+        assert_eq!(
+            format!("{}", Frame::TransportPreference(1)),
+            "TransportPreference(1)"
+        );
     }
 
     #[test]
