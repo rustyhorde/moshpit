@@ -1927,7 +1927,8 @@ mod tests {
     use super::{
         ClientRenderCtx, DiffMode, EncryptedFrame, MAX_NAK_RETRIES, MAX_NAK_TIMEOUT, MAX_SEQ_JUMP,
         MIN_NAK_CHECK_INTERVAL, MIN_NAK_TIMEOUT, RECV_BUFFER_REPAINT_THRESHOLD,
-        REPAINT_REQUEST_THRESHOLD, UdpReader, process_bytes_with_prediction,
+        REPAINT_REQUEST_THRESHOLD, UdpReader, intercept_queries_core,
+        process_bytes_with_prediction,
     };
     use crate::udp::sender::RETRANSMIT_WINDOW;
     use crate::{Emulator, PredictionEngine, Renderer, TerminalMessage};
@@ -2119,6 +2120,134 @@ mod tests {
 
     fn make_emulator() -> Arc<Mutex<Emulator>> {
         Arc::new(Mutex::new(Emulator::new(24, 80)))
+    }
+
+    // --- intercept_queries_core (pure escape-sequence parser) ---
+
+    /// Default foreground/background color reply strings used by the reader.
+    const TEST_FG: &str = "rgb:d0d0/d0d0/d0d0";
+    const TEST_BG: &str = "rgb:1c1c/1c1c/1c1c";
+
+    /// Run the pure query interceptor with a fresh 24×80 emulator.
+    fn intercept(bytes: &[u8]) -> (Vec<u8>, Vec<Vec<u8>>) {
+        let emu = make_emulator();
+        intercept_queries_core(bytes, TEST_FG, TEST_BG, &emu)
+    }
+
+    #[test]
+    fn intercept_core_plain_bytes_fast_path() {
+        // No ESC/VT/FF → returned verbatim with no responses.
+        let (out, responses) = intercept(b"plain output");
+        assert_eq!(out, b"plain output");
+        assert!(responses.is_empty());
+    }
+
+    #[test]
+    fn intercept_core_normalizes_vt_and_ff() {
+        // Vertical tab (0x0b) and form feed (0x0c) become CR+LF.
+        let (out, responses) = intercept(b"a\x0bb\x0cc");
+        assert_eq!(out, b"a\r\nb\r\nc");
+        assert!(responses.is_empty());
+    }
+
+    #[test]
+    fn intercept_core_dsr_cursor_position() {
+        // DSR 6n at the home position of a fresh emulator → row 1, col 1.
+        let (out, responses) = intercept(b"\x1b[6n");
+        assert!(out.is_empty(), "query stripped from passthrough");
+        assert_eq!(responses, vec![b"\x1b[1;1R".to_vec()]);
+    }
+
+    #[test]
+    fn intercept_core_dsr_device_status() {
+        let (out, responses) = intercept(b"\x1b[5n");
+        assert!(out.is_empty());
+        assert_eq!(responses, vec![b"\x1b[0n".to_vec()]);
+    }
+
+    #[test]
+    fn intercept_core_da1_da2_da3() {
+        let (out1, r1) = intercept(b"\x1b[c");
+        assert!(out1.is_empty());
+        assert_eq!(r1, vec![b"\x1b[?62c".to_vec()]);
+
+        let (out2, r2) = intercept(b"\x1b[>c");
+        assert!(out2.is_empty());
+        assert_eq!(r2, vec![b"\x1b[>1;10;0c".to_vec()]);
+
+        let (out3, r3) = intercept(b"\x1b[=c");
+        assert!(out3.is_empty());
+        assert_eq!(r3, vec![b"\x1bP!|00000000\x1b\\".to_vec()]);
+    }
+
+    #[test]
+    fn intercept_core_xtversion() {
+        let (out, responses) = intercept(b"\x1b[>q");
+        assert!(out.is_empty());
+        assert_eq!(responses, vec![b"\x1bP>|moshpit\x1b\\".to_vec()]);
+    }
+
+    #[test]
+    fn intercept_core_xtwinops_text_area_size() {
+        // 18t → text-area size in characters → 24 rows, 80 cols.
+        let (out, responses) = intercept(b"\x1b[18t");
+        assert!(out.is_empty());
+        assert_eq!(responses, vec![b"\x1b[8;24;80t".to_vec()]);
+    }
+
+    #[test]
+    fn intercept_core_xtwinops_pixel_sizes() {
+        let (out14, r14) = intercept(b"\x1b[14t");
+        assert!(out14.is_empty());
+        assert_eq!(r14, vec![b"\x1b[4;0;0t".to_vec()]);
+
+        let (out16, r16) = intercept(b"\x1b[16t");
+        assert!(out16.is_empty());
+        assert_eq!(r16, vec![b"\x1b[6;0;0t".to_vec()]);
+    }
+
+    #[test]
+    fn intercept_core_osc_color_queries_bel_terminated() {
+        // OSC 10/11/12 color queries with BEL terminator → canned replies.
+        let (out10, r10) = intercept(b"\x1b]10;?\x07");
+        assert!(out10.is_empty());
+        assert_eq!(r10, vec![format!("\x1b]10;{TEST_FG}\x07").into_bytes()]);
+
+        let (out11, r11) = intercept(b"\x1b]11;?\x07");
+        assert!(out11.is_empty());
+        assert_eq!(r11, vec![format!("\x1b]11;{TEST_BG}\x07").into_bytes()]);
+
+        let (out12, r12) = intercept(b"\x1b]12;?\x07");
+        assert!(out12.is_empty());
+        assert_eq!(r12, vec![format!("\x1b]12;{TEST_FG}\x07").into_bytes()]);
+    }
+
+    #[test]
+    fn intercept_core_osc_color_query_st_terminated() {
+        // ST terminator (ESC \) is also accepted; the reply still uses BEL.
+        let (out, responses) = intercept(b"\x1b]11;?\x1b\\");
+        assert!(out.is_empty());
+        assert_eq!(
+            responses,
+            vec![format!("\x1b]11;{TEST_BG}\x07").into_bytes()]
+        );
+    }
+
+    #[test]
+    fn intercept_core_unknown_osc_passes_through() {
+        // An OSC title set (not a color query) is left untouched.
+        let title = b"\x1b]0;my title\x07";
+        let (out, responses) = intercept(title);
+        assert_eq!(out, title);
+        assert!(responses.is_empty());
+    }
+
+    #[test]
+    fn intercept_core_strips_query_but_keeps_surrounding_text() {
+        // Surrounding plain text is preserved; only the query is removed.
+        let (out, responses) = intercept(b"before\x1b[cafter");
+        assert_eq!(out, b"beforeafter");
+        assert_eq!(responses, vec![b"\x1b[?62c".to_vec()]);
     }
 
     // --- plain bytes passthrough ---

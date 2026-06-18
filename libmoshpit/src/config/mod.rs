@@ -313,6 +313,18 @@ mod tests {
     }
 
     #[test]
+    fn kex_config_allow_tcp_transport_default_is_false() {
+        let cfg = TestKexConfig::default();
+        assert!(!cfg.allow_tcp_transport());
+    }
+
+    #[test]
+    fn kex_config_transport_preference_default_is_udp() {
+        let cfg = TestKexConfig::default();
+        assert_eq!(cfg.transport_preference(), crate::TransportMode::Udp);
+    }
+
+    #[test]
     fn kex_config_resume_session_uuid_default_is_none() {
         let cfg = TestKexConfig::default();
         let uuid: Option<Uuid> = cfg.resume_session_uuid();

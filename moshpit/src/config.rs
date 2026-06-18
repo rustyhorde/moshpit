@@ -254,7 +254,40 @@ mod tests {
     use anyhow::Result;
     use uuid::Uuid;
 
+    use libmoshpit::TransportMode;
+
     use super::{Config, DisplayPreference, KexConfig, KexMode};
+
+    #[test]
+    fn test_transport_defaults_to_udp() {
+        let config = Config::default();
+        assert_eq!(config.transport(), TransportMode::Udp);
+        assert_eq!(config.transport_preference(), TransportMode::Udp);
+    }
+
+    #[test]
+    fn test_transport_tcp_from_toml() -> Result<()> {
+        let toml = r#"
+            private_key_path = "/tmp/priv"
+            public_key_path = "/tmp/pub"
+            transport = "tcp"
+        "#;
+        let config: Config = toml::from_str(toml)?;
+        assert_eq!(config.transport(), TransportMode::Tcp);
+        assert_eq!(config.transport_preference(), TransportMode::Tcp);
+        Ok(())
+    }
+
+    #[test]
+    fn test_transport_absent_in_toml_defaults_udp() -> Result<()> {
+        let toml = r#"
+            private_key_path = "/tmp/priv"
+            public_key_path = "/tmp/pub"
+        "#;
+        let config: Config = toml::from_str(toml)?;
+        assert_eq!(config.transport_preference(), TransportMode::Udp);
+        Ok(())
+    }
 
     #[test]
     fn test_default_config() {

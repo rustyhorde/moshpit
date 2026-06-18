@@ -573,6 +573,31 @@ mod tests {
         assert!(!map.contains_key("server_port"));
         assert!(!map.contains_key("predict"));
         assert!(!map.contains_key("diff_mode"));
+        assert!(!map.contains_key("transport"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_transport_defaults_to_udp() -> anyhow::Result<()> {
+        let cli = Cli::parse_argv(["moshpit", "host"])?;
+        assert_eq!(cli.transport(), "udp");
+        Ok(())
+    }
+
+    #[test]
+    fn test_transport_tcp_flag_parses_and_collects() -> anyhow::Result<()> {
+        let cli = Cli::parse_argv(["moshpit", "--transport", "tcp", "host"])?;
+        assert_eq!(cli.transport(), "tcp");
+        let map = cli.collect()?;
+        if let ValueKind::String(ref s) = map
+            .get("transport")
+            .ok_or_else(|| anyhow::anyhow!("\"transport\" not found in map"))?
+            .kind
+        {
+            assert_eq!(s, "tcp");
+        } else {
+            panic!("Expected String");
+        }
         Ok(())
     }
 

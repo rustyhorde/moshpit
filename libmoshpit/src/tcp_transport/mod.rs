@@ -499,7 +499,13 @@ fn now_micros() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, AtomicU64, Ordering},
+        },
+        time::Duration,
+    };
 
     use aws_lc_rs::{
         aead::{AES_256_GCM_SIV, LessSafeKey, UnboundKey},
@@ -507,36 +513,89 @@ mod tests {
     };
     use tokio::{
         net::{TcpListener, TcpStream},
-        sync::mpsc::{Receiver, channel},
+        sync::mpsc::{Receiver, Sender, channel},
+        time::timeout,
     };
+    use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
 
-    use super::TcpTransportReader;
-    use crate::{ConnectionReader, Emulator, EncryptedFrame};
+    use super::{TcpTransportReader, TcpTransportSender};
+    use crate::{
+        ClientRenderCtx, ConnectionReader, ConnectionWriter, DisplayPreference, Emulator,
+        EncryptedFrame, PredictionEngine, Renderer, TerminalMessage, UuidWrapper,
+    };
+
+    /// Wire-format HMAC tag length for HMAC-SHA512 (64 bytes).  The TCP transport
+    /// always signs with SHA-512, so the reader must parse a 64-byte tag.
+    const MAC_TAG_LEN: usize = 64;
+
+    /// Shared AEAD key bytes so a sender and reader built independently agree.
+    const AEAD_BYTES: [u8; 32] = [7u8; 32];
+    /// Shared HMAC key bytes so a sender and reader built independently agree.
+    const HMAC_BYTES: [u8; 64] = [9u8; 64];
+
+    fn aead() -> LessSafeKey {
+        LessSafeKey::new(UnboundKey::new(&AES_256_GCM_SIV, &AEAD_BYTES).expect("test AEAD key"))
+    }
+
+    fn hmac() -> Key {
+        Key::new(HMAC_SHA512, &HMAC_BYTES)
+    }
+
+    /// Build a single TCP loopback link, returning a `ConnectionWriter` on the
+    /// client end and a `ConnectionReader` on the server end.  Bytes written to
+    /// the writer arrive on the reader (client → server direction).
+    async fn make_link() -> (ConnectionWriter, ConnectionReader) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("local addr");
+        let (server, client) = tokio::join!(
+            async { listener.accept().await.map(|(s, _)| s).expect("accept") },
+            async { TcpStream::connect(addr).await.expect("connect") },
+        );
+        let (_, client_w) = client.into_split();
+        let (server_r, _) = server.into_split();
+        let writer = ConnectionWriter::builder().writer(client_w).build();
+        let reader = ConnectionReader::builder().reader(server_r).build();
+        (writer, reader)
+    }
+
+    /// Build a `TcpTransportSender` over `writer`, returning the control-channel
+    /// and data-channel `Sender`s so the test can feed it frames.
+    fn make_sender(
+        writer: ConnectionWriter,
+        id: Uuid,
+    ) -> (
+        TcpTransportSender,
+        Sender<EncryptedFrame>,
+        Sender<EncryptedFrame>,
+    ) {
+        let (control_tx, control_rx) = channel::<EncryptedFrame>(16);
+        let (data_tx, rx) = channel::<EncryptedFrame>(16);
+        let sender = TcpTransportSender::builder()
+            .id(id)
+            .rnk(aead())
+            .hmac(hmac())
+            .writer(writer)
+            .control_rx(control_rx)
+            .rx(rx)
+            .build();
+        (sender, control_tx, data_tx)
+    }
 
     /// Build a `TcpTransportReader` whose `nak_out_tx` (the path back to the
     /// server's PTY) is captured so tests can observe query responses.  The
     /// `reader` half is a throwaway loopback socket — `intercept_queries` never
     /// reads from it.
     async fn make_reader_with_response_rx() -> (TcpTransportReader, Receiver<EncryptedFrame>) {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind test listener");
-        let addr = listener.local_addr().expect("local addr");
-        let (server, _client) = tokio::join!(
-            async { listener.accept().await.map(|(s, _)| s).expect("accept") },
-            async { TcpStream::connect(addr).await.expect("connect") },
-        );
-        let (server_r, _) = server.into_split();
-        let reader = ConnectionReader::builder().reader(server_r).build();
+        let (_writer, reader) = make_link().await;
         let (tx, rx) = channel::<EncryptedFrame>(16);
         let transport_reader = TcpTransportReader::builder()
             .id(Uuid::new_v4())
-            .rnk(LessSafeKey::new(
-                UnboundKey::new(&AES_256_GCM_SIV, &[0u8; 32]).expect("test AEAD key"),
-            ))
-            .hmac(Key::new(HMAC_SHA512, &[0u8; 64]))
-            .mac_tag_len(16)
+            .rnk(aead())
+            .hmac(hmac())
+            .mac_tag_len(MAC_TAG_LEN)
             .reader(reader)
             .nak_out_tx(tx)
             .passthrough(false)
@@ -546,6 +605,18 @@ mod tests {
 
     fn make_emulator() -> Arc<Mutex<Emulator>> {
         Arc::new(Mutex::new(Emulator::new(24, 80)))
+    }
+
+    /// Build a `ClientRenderCtx` backed by real emulator/prediction/renderer
+    /// instances, returning the stdout receiver and a handle to the emulator.
+    fn make_render_ctx() -> (ClientRenderCtx, Receiver<Vec<u8>>) {
+        let (stdout_tx, stdout_rx) = channel::<Vec<u8>>(64);
+        let emulator = make_emulator();
+        let prediction = Arc::new(Mutex::new(PredictionEngine::new(DisplayPreference::Never)));
+        let renderer = Arc::new(Mutex::new(Renderer::new(24, 80)));
+        let in_alt_screen = Arc::new(AtomicBool::new(false));
+        let ctx = ClientRenderCtx::new(stdout_tx, emulator, prediction, renderer, in_alt_screen);
+        (ctx, stdout_rx)
     }
 
     #[tokio::test]
@@ -576,6 +647,433 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "no response should be sent for plain output"
+        );
+    }
+
+    /// Build a bare server-mode `TcpTransportReader` (no output channels) for
+    /// exercising `read_frame` directly against a sender.
+    fn make_plain_reader(reader: ConnectionReader, id: Uuid) -> TcpTransportReader {
+        TcpTransportReader::builder()
+            .id(id)
+            .rnk(aead())
+            .hmac(hmac())
+            .mac_tag_len(MAC_TAG_LEN)
+            .reader(reader)
+            .build()
+    }
+
+    /// Build a server-mode `TcpTransportReader` with every dispatch channel
+    /// captured, plus the `last_rx_us` watchdog counter.
+    fn make_server_reader(
+        reader: ConnectionReader,
+        id: Uuid,
+    ) -> (
+        TcpTransportReader,
+        Receiver<EncryptedFrame>,
+        Receiver<()>,
+        Receiver<u64>,
+        Arc<AtomicU64>,
+    ) {
+        let (nak_tx, nak_rx) = channel::<EncryptedFrame>(16);
+        let (repaint_tx, repaint_rx) = channel::<()>(4);
+        let (ack_tx, ack_rx) = channel::<u64>(4);
+        let last_rx_us = Arc::new(AtomicU64::new(0));
+        let r = TcpTransportReader::builder()
+            .id(id)
+            .rnk(aead())
+            .hmac(hmac())
+            .mac_tag_len(MAC_TAG_LEN)
+            .reader(reader)
+            .nak_out_tx(nak_tx)
+            .repaint_tx(repaint_tx)
+            .client_ack_tx(ack_tx)
+            .last_rx_us(Arc::clone(&last_rx_us))
+            .build();
+        (r, nak_rx, repaint_rx, ack_rx, last_rx_us)
+    }
+
+    /// Build a client-mode `TcpTransportReader` with `reconnect_tx` set (so the
+    /// silence / shutdown paths signal a reconnect instead of `process::exit`)
+    /// and `nak_out_tx` captured for keepalive echoes.
+    fn make_client_reader(
+        reader: ConnectionReader,
+        id: Uuid,
+    ) -> (TcpTransportReader, Receiver<()>, Receiver<EncryptedFrame>) {
+        let (reconnect_tx, reconnect_rx) = channel::<()>(4);
+        let (nak_tx, nak_rx) = channel::<EncryptedFrame>(16);
+        let r = TcpTransportReader::builder()
+            .id(id)
+            .rnk(aead())
+            .hmac(hmac())
+            .mac_tag_len(MAC_TAG_LEN)
+            .reader(reader)
+            .reconnect_tx(reconnect_tx)
+            .nak_out_tx(nak_tx)
+            .passthrough(false)
+            .build();
+        (r, reconnect_rx, nak_rx)
+    }
+
+    // ── Sender ────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn sender_frame_loop_delivers_data_frames_in_order() {
+        let (writer, reader) = make_link().await;
+        let id = Uuid::new_v4();
+        let (mut sender, _control_tx, data_tx) = make_sender(writer, id);
+        let token = CancellationToken::new();
+        let loop_token = token.clone();
+        let handle = tokio::spawn(async move { sender.frame_loop(loop_token).await });
+
+        data_tx
+            .send(EncryptedFrame::Bytes((
+                UuidWrapper::new(id),
+                b"one".to_vec(),
+            )))
+            .await
+            .expect("send one");
+        data_tx
+            .send(EncryptedFrame::Bytes((
+                UuidWrapper::new(id),
+                b"two".to_vec(),
+            )))
+            .await
+            .expect("send two");
+
+        let mut rdr = make_plain_reader(reader, id);
+        let f1 = rdr.read_frame().await.expect("read1").expect("some1");
+        let f2 = rdr.read_frame().await.expect("read2").expect("some2");
+        let EncryptedFrame::Bytes((_, b1)) = f1 else {
+            panic!("expected Bytes, got {f1:?}");
+        };
+        let EncryptedFrame::Bytes((_, b2)) = f2 else {
+            panic!("expected Bytes, got {f2:?}");
+        };
+        assert_eq!(b1, b"one");
+        assert_eq!(b2, b"two");
+
+        token.cancel();
+        drop(data_tx);
+        let _joined = handle.await;
+    }
+
+    #[tokio::test]
+    async fn sender_frame_loop_rewrites_keepalive_timestamp() {
+        let (writer, reader) = make_link().await;
+        let id = Uuid::new_v4();
+        let (mut sender, control_tx, _data_tx) = make_sender(writer, id);
+        let token = CancellationToken::new();
+        let loop_token = token.clone();
+        let handle = tokio::spawn(async move { sender.frame_loop(loop_token).await });
+
+        // A zero timestamp must be replaced with the current time before sending.
+        control_tx
+            .send(EncryptedFrame::Keepalive(0))
+            .await
+            .expect("send keepalive");
+
+        let mut rdr = make_plain_reader(reader, id);
+        let frame = rdr.read_frame().await.expect("read").expect("some");
+        let EncryptedFrame::Keepalive(ts) = frame else {
+            panic!("expected Keepalive, got {frame:?}");
+        };
+        assert!(ts > 0, "keepalive timestamp must be rewritten to now");
+
+        token.cancel();
+        drop(control_tx);
+        let _joined = handle.await;
+    }
+
+    // ── Server frame loop ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn server_frame_loop_forwards_input_and_resize() {
+        let (writer, reader) = make_link().await;
+        let id = Uuid::new_v4();
+        let (mut sender, _control_tx, data_tx) = make_sender(writer, id);
+        let sender_token = CancellationToken::new();
+        let st = sender_token.clone();
+        let sender_handle = tokio::spawn(async move { sender.frame_loop(st).await });
+
+        let (mut srv, _nak, _repaint, _ack, last_rx_us) = make_server_reader(reader, id);
+        let (term_tx, mut term_rx) = channel::<TerminalMessage>(16);
+        let srv_token = CancellationToken::new();
+        let srv_t = srv_token.clone();
+        let srv_handle = tokio::spawn(async move { srv.server_frame_loop(srv_t, term_tx).await });
+
+        data_tx
+            .send(EncryptedFrame::Bytes((
+                UuidWrapper::new(id),
+                b"abc".to_vec(),
+            )))
+            .await
+            .expect("send input");
+        data_tx
+            .send(EncryptedFrame::Resize((UuidWrapper::new(id), 100, 40)))
+            .await
+            .expect("send resize");
+
+        let input = timeout(Duration::from_secs(2), term_rx.recv())
+            .await
+            .expect("input timeout")
+            .expect("input frame");
+        assert_eq!(input, TerminalMessage::Input(b"abc".to_vec()));
+        let resize = timeout(Duration::from_secs(2), term_rx.recv())
+            .await
+            .expect("resize timeout")
+            .expect("resize frame");
+        assert_eq!(
+            resize,
+            TerminalMessage::Resize {
+                rows: 40,
+                columns: 100
+            }
+        );
+        assert!(
+            last_rx_us.load(Ordering::Relaxed) > 0,
+            "watchdog counter must advance on receipt"
+        );
+
+        srv_token.cancel();
+        sender_token.cancel();
+        srv_handle.await.expect("srv join").expect("srv loop");
+        let _joined = sender_handle.await;
+    }
+
+    #[tokio::test]
+    async fn server_frame_loop_echoes_keepalive_and_forwards_control() {
+        let (writer, reader) = make_link().await;
+        let id = Uuid::new_v4();
+        let (mut sender, _control_tx, data_tx) = make_sender(writer, id);
+        let sender_token = CancellationToken::new();
+        let st = sender_token.clone();
+        let sender_handle = tokio::spawn(async move { sender.frame_loop(st).await });
+
+        let (mut srv, mut nak_rx, mut repaint_rx, mut ack_rx, _last) =
+            make_server_reader(reader, id);
+        let (term_tx, _term_rx) = channel::<TerminalMessage>(16);
+        let srv_token = CancellationToken::new();
+        let srv_t = srv_token.clone();
+        let srv_handle = tokio::spawn(async move { srv.server_frame_loop(srv_t, term_tx).await });
+
+        data_tx
+            .send(EncryptedFrame::Keepalive(42))
+            .await
+            .expect("send keepalive");
+        data_tx
+            .send(EncryptedFrame::RepaintRequest)
+            .await
+            .expect("send repaint");
+        data_tx
+            .send(EncryptedFrame::ClientAck(7))
+            .await
+            .expect("send ack");
+
+        let echoed = timeout(Duration::from_secs(2), nak_rx.recv())
+            .await
+            .expect("keepalive echo timeout")
+            .expect("keepalive echo");
+        assert!(matches!(echoed, EncryptedFrame::Keepalive(42)));
+        timeout(Duration::from_secs(2), repaint_rx.recv())
+            .await
+            .expect("repaint timeout")
+            .expect("repaint signal");
+        let ack = timeout(Duration::from_secs(2), ack_rx.recv())
+            .await
+            .expect("ack timeout")
+            .expect("ack value");
+        assert_eq!(ack, 7);
+
+        srv_token.cancel();
+        sender_token.cancel();
+        srv_handle.await.expect("srv join").expect("srv loop");
+        let _joined = sender_handle.await;
+    }
+
+    #[tokio::test]
+    async fn server_frame_loop_returns_on_eof() {
+        let (writer, reader) = make_link().await;
+        let id = Uuid::new_v4();
+        let (sender, _control_tx, _data_tx) = make_sender(writer, id);
+        // Dropping the sender (and its writer half) closes the connection.
+        drop(sender);
+
+        let (mut srv, _nak, _repaint, _ack, _last) = make_server_reader(reader, id);
+        let (term_tx, _term_rx) = channel::<TerminalMessage>(16);
+        let token = CancellationToken::new();
+        let res = timeout(
+            Duration::from_secs(2),
+            srv.server_frame_loop(token, term_tx),
+        )
+        .await
+        .expect("loop should return promptly on EOF");
+        assert!(res.is_ok(), "clean EOF returns Ok(())");
+    }
+
+    // ── Client frame loop ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn client_frame_loop_renders_bytes_to_stdout() {
+        let (writer, reader) = make_link().await;
+        let id = Uuid::new_v4();
+        let (mut sender, _control_tx, data_tx) = make_sender(writer, id);
+        let sender_token = CancellationToken::new();
+        let st = sender_token.clone();
+        let sender_handle = tokio::spawn(async move { sender.frame_loop(st).await });
+
+        let (mut client, _reconnect_rx, _nak_rx) = make_client_reader(reader, id);
+        let (ctx, mut stdout_rx) = make_render_ctx();
+        let token = CancellationToken::new();
+        let exit_token = CancellationToken::new();
+        let exit_msg = Arc::new(Mutex::new(None));
+        let ct = token.clone();
+        let et = exit_token.clone();
+        let em = Arc::clone(&exit_msg);
+        let client_handle =
+            tokio::spawn(async move { client.client_frame_loop(ct, et, em, ctx).await });
+
+        data_tx
+            .send(EncryptedFrame::Bytes((
+                UuidWrapper::new(id),
+                b"hello".to_vec(),
+            )))
+            .await
+            .expect("send bytes");
+
+        let out = timeout(Duration::from_secs(2), stdout_rx.recv())
+            .await
+            .expect("stdout timeout")
+            .expect("stdout frame");
+        assert!(!out.is_empty(), "rendered output must reach stdout");
+
+        token.cancel();
+        sender_token.cancel();
+        let _joined = timeout(Duration::from_secs(2), client_handle).await;
+        let _joined = sender_handle.await;
+    }
+
+    #[tokio::test]
+    async fn client_frame_loop_pty_exit_sets_message_and_cancels() {
+        let (writer, reader) = make_link().await;
+        let id = Uuid::new_v4();
+        let (mut sender, _control_tx, data_tx) = make_sender(writer, id);
+        let sender_token = CancellationToken::new();
+        let st = sender_token.clone();
+        let sender_handle = tokio::spawn(async move { sender.frame_loop(st).await });
+
+        let (mut client, _reconnect_rx, _nak_rx) = make_client_reader(reader, id);
+        let (ctx, _stdout_rx) = make_render_ctx();
+        let token = CancellationToken::new();
+        let exit_token = CancellationToken::new();
+        let exit_msg: Arc<Mutex<Option<&'static [u8]>>> = Arc::new(Mutex::new(None));
+        let et = exit_token.clone();
+        let em = Arc::clone(&exit_msg);
+        let client_handle = tokio::spawn(async move {
+            client.client_frame_loop(token, et, em, ctx).await;
+        });
+
+        data_tx
+            .send(EncryptedFrame::PtyExit)
+            .await
+            .expect("send pty exit");
+
+        // The loop breaks after PtyExit, so the task completes.
+        timeout(Duration::from_secs(2), client_handle)
+            .await
+            .expect("client loop should finish")
+            .expect("client join");
+        assert!(exit_token.is_cancelled(), "PtyExit cancels the exit token");
+        assert!(
+            exit_msg.lock().unwrap().is_some(),
+            "PtyExit sets the exit message"
+        );
+
+        sender_token.cancel();
+        let _joined = sender_handle.await;
+    }
+
+    #[tokio::test]
+    async fn client_frame_loop_shutdown_signals_reconnect() {
+        let (writer, reader) = make_link().await;
+        let id = Uuid::new_v4();
+        let (mut sender, _control_tx, data_tx) = make_sender(writer, id);
+        let sender_token = CancellationToken::new();
+        let st = sender_token.clone();
+        let sender_handle = tokio::spawn(async move { sender.frame_loop(st).await });
+
+        let (mut client, mut reconnect_rx, _nak_rx) = make_client_reader(reader, id);
+        let (ctx, _stdout_rx) = make_render_ctx();
+        let token = CancellationToken::new();
+        let exit_token = CancellationToken::new();
+        let exit_msg = Arc::new(Mutex::new(None));
+        let client_handle = tokio::spawn(async move {
+            client
+                .client_frame_loop(token, exit_token, exit_msg, ctx)
+                .await;
+        });
+
+        data_tx
+            .send(EncryptedFrame::Shutdown)
+            .await
+            .expect("send shutdown");
+
+        timeout(Duration::from_secs(2), reconnect_rx.recv())
+            .await
+            .expect("reconnect timeout")
+            .expect("reconnect signal");
+
+        sender_token.cancel();
+        let _joined = timeout(Duration::from_secs(2), client_handle).await;
+        let _joined = sender_handle.await;
+    }
+
+    #[tokio::test]
+    async fn client_frame_loop_echoes_keepalive() {
+        let (writer, reader) = make_link().await;
+        let id = Uuid::new_v4();
+        let (mut sender, _control_tx, data_tx) = make_sender(writer, id);
+        let sender_token = CancellationToken::new();
+        let st = sender_token.clone();
+        let sender_handle = tokio::spawn(async move { sender.frame_loop(st).await });
+
+        let (mut client, _reconnect_rx, mut nak_rx) = make_client_reader(reader, id);
+        let (ctx, _stdout_rx) = make_render_ctx();
+        let token = CancellationToken::new();
+        let exit_token = CancellationToken::new();
+        let exit_msg = Arc::new(Mutex::new(None));
+        let ct = token.clone();
+        let client_handle = tokio::spawn(async move {
+            client
+                .client_frame_loop(ct, exit_token, exit_msg, ctx)
+                .await;
+        });
+
+        data_tx
+            .send(EncryptedFrame::Keepalive(99))
+            .await
+            .expect("send keepalive");
+
+        let echoed = timeout(Duration::from_secs(2), nak_rx.recv())
+            .await
+            .expect("keepalive echo timeout")
+            .expect("keepalive echo");
+        assert!(matches!(echoed, EncryptedFrame::Keepalive(99)));
+
+        token.cancel();
+        sender_token.cancel();
+        let _joined = timeout(Duration::from_secs(2), client_handle).await;
+        let _joined = sender_handle.await;
+    }
+
+    #[tokio::test]
+    async fn signal_reconnect_or_exit_sends_on_reconnect_tx() {
+        let (_writer, reader) = make_link().await;
+        let id = Uuid::new_v4();
+        let (client, mut reconnect_rx, _nak_rx) = make_client_reader(reader, id);
+        client.signal_reconnect_or_exit(0);
+        assert!(
+            reconnect_rx.try_recv().is_ok(),
+            "reconnect signal must be sent when reconnect_tx is set"
         );
     }
 }

@@ -325,6 +325,28 @@ mod test {
     }
 
     #[test]
+    fn config_allow_tcp_transport_defaults_false() {
+        use libmoshpit::KexConfig;
+        let config = Config::default();
+        assert!(!config.allow_tcp_transport(), "inherent getter default");
+        assert!(
+            !KexConfig::allow_tcp_transport(&config),
+            "trait method default"
+        );
+    }
+
+    #[test]
+    fn config_allow_tcp_transport_when_enabled() {
+        use libmoshpit::KexConfig;
+        let config = Config {
+            allow_tcp_transport: true,
+            ..Config::default()
+        };
+        assert!(config.allow_tcp_transport());
+        assert!(KexConfig::allow_tcp_transport(&config));
+    }
+
+    #[test]
     fn config_tracing_config_delegates() {
         let config = Config::default();
         assert_eq!(config.quiet(), 0);
