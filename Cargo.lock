@@ -2405,7 +2405,7 @@ checksum = "e136bfa874086c78f34d6eba98c423fefe464ce57f38164d16893ba8ed358e70"
 
 [[package]]
 name = "libmoshpit"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "ansi-control-codes",
  "anyhow",
@@ -2546,7 +2546,7 @@ dependencies = [
 
 [[package]]
 name = "moshpit"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -2573,7 +2573,7 @@ dependencies = [
 
 [[package]]
 name = "moshpit-agent"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "anyhow",
  "argon2",
@@ -2603,7 +2603,7 @@ dependencies = [
 
 [[package]]
 name = "moshpit-keygen"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -2617,7 +2617,7 @@ dependencies = [
 
 [[package]]
 name = "moshpits"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "anyhow",
  "bytes",
@@ -4657,7 +4657,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "xtask"
-version = "0.9.2"
+version = "0.9.3"
 dependencies = [
  "anyhow",
  "clap",
