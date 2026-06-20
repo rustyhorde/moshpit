@@ -432,13 +432,13 @@ impl TcpTransportReader {
                                         warn!("TCP transport: failed to signal repaint request: {e}");
                                     }
                                 }
-                                EncryptedFrame::Keepalive(ts) => {
-                                    // Echo the keepalive back so the client can measure RTT.
-                                    if let Some(ref tx) = self.nak_out_tx
-                                        && let Err(e) = tx.try_send(EncryptedFrame::Keepalive(ts))
-                                    {
-                                        warn!("TCP transport: failed to echo keepalive: {e}");
-                                    }
+                                EncryptedFrame::Keepalive(_ts) => {
+                                    // Consume — do NOT echo. The server originates
+                                    // keepalives (see the keepalive task in the runtime); the
+                                    // client echoes them back once so the server's silence
+                                    // watchdog stays satisfied for an idle session. Echoing
+                                    // here too would bounce the frame server<->client forever,
+                                    // burning CPU. Receipt already refreshed `last_rx_us` above.
                                 }
                                 EncryptedFrame::ClientAck(diff_id) => {
                                     if let Some(ref tx) = self.client_ack_tx
@@ -854,7 +854,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_frame_loop_echoes_keepalive_and_forwards_control() {
+    async fn server_frame_loop_consumes_keepalive_and_forwards_control() {
         let (writer, reader) = make_link().await;
         let id = Uuid::new_v4();
         let (mut sender, _control_tx, data_tx) = make_sender(writer, id);
@@ -882,11 +882,8 @@ mod tests {
             .await
             .expect("send ack");
 
-        let echoed = timeout(Duration::from_secs(2), nak_rx.recv())
-            .await
-            .expect("keepalive echo timeout")
-            .expect("keepalive echo");
-        assert!(matches!(echoed, EncryptedFrame::Keepalive(42)));
+        // Repaint and ack (both sent after the keepalive, processed in order) must
+        // be forwarded.  Observing the ack proves the keepalive was already handled.
         timeout(Duration::from_secs(2), repaint_rx.recv())
             .await
             .expect("repaint timeout")
@@ -896,6 +893,13 @@ mod tests {
             .expect("ack timeout")
             .expect("ack value");
         assert_eq!(ack, 7);
+
+        // The server must NOT echo the keepalive back — echoing on both ends would
+        // bounce it forever and burn CPU.  Nothing should have reached `nak_rx`.
+        assert!(
+            nak_rx.try_recv().is_err(),
+            "server must not echo keepalive back to the client"
+        );
 
         srv_token.cancel();
         sender_token.cancel();
