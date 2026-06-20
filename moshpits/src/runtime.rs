@@ -574,6 +574,7 @@ async fn handle_connection(
         let ss_emu = server_emulator.clone();
         let ss_tx = data_tx.clone();
         let ss_token = conn_token.clone();
+        let ss_dirty = dirty_counter.clone();
         let _state_sync = spawn(async move {
             let mut ticker = interval(STATESYNC_INTERVAL);
             ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -585,6 +586,11 @@ async fn handle_connection(
             // nor the ack baseline has changed since the last tick.
             let mut last_current: Vec<u8> = Vec::new();
             let mut ack_dirty = true;
+            // Cheaper guard than the `last_current` comparison: the PTY reader bumps
+            // `dirty_counter` on every chunk of output, so an unchanged counter means
+            // no new output to format this tick.  Mirrors the `screen_sync` loop and
+            // avoids the per-tick `contents_formatted()` while idle.
+            let mut last_dirty: u64 = 0;
             loop {
                 select! {
                     () = ss_token.cancelled() => break,
@@ -624,6 +630,14 @@ async fn handle_connection(
                         }
                     }
                     _ = ticker.tick() => {
+                        // Cheap short-circuit before locking the emulator and formatting
+                        // the whole screen: when the PTY produced no output since the last
+                        // tick, the client is fully caught up, and the ack baseline is
+                        // clean, there is nothing to do.
+                        let now_dirty = ss_dirty.load(Ordering::Relaxed);
+                        if now_dirty == last_dirty && !ack_dirty && ack_diff_id == diff_counter {
+                            continue;
+                        }
                         let (current, rows, cols, is_alt) = {
                             let emu = ss_emu.lock().await;
                             let screen = emu.screen();
@@ -657,6 +671,7 @@ async fn handle_connection(
                         let content_diff = cur_parser.screen().contents_diff(ack_parser.screen());
                         if content_diff.is_empty() && diff.is_empty() {
                             last_current = current_for_cache;
+                            last_dirty = now_dirty;
                             ack_dirty = false;
                             continue;
                         }
@@ -703,6 +718,7 @@ async fn handle_connection(
                             }
                         }
                         last_current = current_for_cache;
+                        last_dirty = now_dirty;
                         ack_dirty = false;
                     }
                 }
