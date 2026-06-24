@@ -10,7 +10,7 @@ license = "MIT OR Apache-2.0"
 name = "moshpit-keygen"
 readme = "../README.md"
 repository = "https://github.com/rustyhorde/moshpit"
-version = "0.9.3"
+version = "0.9.4"
 rust-version = "1.95.0"
 
 [[bin]]
@@ -25,7 +25,7 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 dialoguer = { workspace = true }
 getset = { workspace = true }
-libmoshpit = { version = "0.9.3", path = "../libmoshpit" }
+libmoshpit = { version = "0.9.4", path = "../libmoshpit" }
 vergen-pretty = { workspace = true }
 [build-dependencies]
 anyhow = { workspace = true }
