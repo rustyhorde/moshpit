@@ -1,0 +1,319 @@
+# =============================================================================
+# Rakefile.toml — moshpit build pipeline
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# tools
+# ---------------------------------------------------------------------------
+
+[tool.cargo.matrix]
+crate = "cargo-matrix"
+check = ["cargo", "matrix", "--version"]
+install = ["cargo", "install", "cargo-matrix", "--force", "--locked"]
+update = true
+
+[tool.cargo.nextest]
+crate = "cargo-nextest"
+check = ["cargo", "nextest", "--version"]
+install = ["cargo", "install", "cargo-nextest", "--force", "--locked"]
+update = true
+
+[tool.cargo.llvm-cov]
+crate = "cargo-llvm-cov"
+check = ["cargo", "llvm-cov", "--version"]
+install = ["cargo", "install", "cargo-llvm-cov", "--force", "--locked"]
+update = true
+
+[tool.cargo.fuzz]
+crate = "cargo-fuzz"
+check = ["cargo", "fuzz", "--version"]
+install = ["cargo", "install", "cargo-fuzz", "--force", "--locked"]
+update = true
+
+[tool.os.docker]
+check = ["docker", "--version"]
+hint = "install Docker: https://docs.docker.com/get-docker/"
+
+[tool.fish.puc]
+hint = "The 'puc' fish function is required to run this target"
+
+# ---------------------------------------------------------------------------
+# update
+# ---------------------------------------------------------------------------
+
+[target.puc]
+tools = ["puc"]
+[[target.puc.command]]
+name = "puc"
+platform = ["linux"]
+fish = "puc"
+
+# ---------------------------------------------------------------------------
+# fmt
+# ---------------------------------------------------------------------------
+
+[[target.fmt.command]]
+name = "fmt"
+cmd = ["cargo", "fmt"]
+
+[[target.fmt.command]]
+name = "fmt check"
+cmd = ["cargo", "fmt", "--all", "--", "--check"]
+
+# ---------------------------------------------------------------------------
+# clippy
+# ---------------------------------------------------------------------------
+
+[target.clippy]
+tools = ["matrix"]
+
+[[target.clippy.command]]
+name = "clippy"
+cmd = ["cargo", "matrix", "clippy", "--all-targets", "--", "-Dwarnings"]
+
+# ---------------------------------------------------------------------------
+# build
+# ---------------------------------------------------------------------------
+
+[target.build]
+tools = ["matrix"]
+
+[[target.build.command]]
+name = "build"
+cmd = ["cargo", "matrix", "build"]
+
+# ---------------------------------------------------------------------------
+# test
+# ---------------------------------------------------------------------------
+
+[target.test]
+depends_on = ["build"]
+tools = ["matrix", "nextest"]
+
+[[target.test.command]]
+name = "nextest"
+cmd = ["cargo", "matrix", "nextest", "run"]
+
+[[target.test.command]]
+name = "doc test"
+cmd = ["cargo", "matrix", "test", "--doc", "-p", "libmoshpit"]
+
+[[target.test.command]]
+name = "fuzz nextest"
+fish = "cd libmoshpit/fuzz; and cargo matrix nextest run"
+sh = "cd libmoshpit/fuzz && cargo matrix nextest run"
+
+# ---------------------------------------------------------------------------
+# docs
+# ---------------------------------------------------------------------------
+
+[[target.docs.command]]
+name = "docs"
+cmd = ["cargo", "doc", "-p", "libmoshpit"]
+
+# ---------------------------------------------------------------------------
+# coverage
+# ---------------------------------------------------------------------------
+
+[target.coverage]
+depends_on = ["test"]
+tools = ["llvm-cov", "matrix", "nextest"]
+
+[[target.coverage.command]]
+name = "coverage"
+cmd = ["cargo", "matrix", "-F", "unstable", "llvm-cov", "nextest", "--no-report"]
+
+[[target.coverage.command]]
+name = "lcov.info"
+cmd = ["cargo", "llvm-cov", "report", "--lcov", "--output-path", "lcov.info"]
+
+[[target.coverage.command]]
+name = "html"
+cmd = ["cargo", "llvm-cov", "report", "--html"]
+
+# ---------------------------------------------------------------------------
+# fuzz  (requires nightly; no +nightly prefix)
+# ---------------------------------------------------------------------------
+
+[target.fuzz]
+tools = ["fuzz"]
+
+[[target.fuzz.command]]
+name = "fuzz_frame"
+cmd = ["cargo", "fuzz", "run", "--fuzz-dir", "libmoshpit/fuzz", "fuzz_frame", "--", "-max_total_time=30"]
+
+[[target.fuzz.command]]
+name = "fuzz_encframe"
+cmd = ["cargo", "fuzz", "run", "--fuzz-dir", "libmoshpit/fuzz", "fuzz_encframe", "--", "-max_total_time=30"]
+
+[[target.fuzz.command]]
+name = "fuzz_encframe_decrypt"
+cmd = ["cargo", "fuzz", "run", "--fuzz-dir", "libmoshpit/fuzz", "fuzz_encframe_decrypt", "--", "-max_total_time=30"]
+
+[[target.fuzz.command]]
+name = "fuzz_escape_intercept"
+cmd = ["cargo", "fuzz", "run", "--fuzz-dir", "libmoshpit/fuzz", "fuzz_escape_intercept", "--", "-max_total_time=30"]
+
+[[target.fuzz.command]]
+name = "fuzz_keyfile"
+cmd = ["cargo", "fuzz", "run", "--fuzz-dir", "libmoshpit/fuzz", "fuzz_keyfile", "--", "-max_total_time=30"]
+
+[[target.fuzz.command]]
+name = "fuzz_emulator"
+cmd = ["cargo", "fuzz", "run", "--fuzz-dir", "libmoshpit/fuzz", "fuzz_emulator", "--", "-max_total_time=30"]
+
+[[target.fuzz.command]]
+name = "fuzz_statesync"
+cmd = ["cargo", "fuzz", "run", "--fuzz-dir", "libmoshpit/fuzz", "fuzz_statesync", "--", "-max_total_time=30"]
+
+[[target.fuzz.command]]
+name = "fuzz_zstd_decompress"
+cmd = ["cargo", "fuzz", "run", "--fuzz-dir", "libmoshpit/fuzz", "fuzz_zstd_decompress", "--", "-max_total_time=30"]
+
+# ---------------------------------------------------------------------------
+# fuzz-unstable  (adds fuzz_pubkey_parse on top of fuzz)
+# ---------------------------------------------------------------------------
+
+[target.fuzz-unstable]
+depends_on = ["fuzz"]
+tools = ["fuzz"]
+
+[[target.fuzz-unstable.command]]
+name = "fuzz_pubkey_parse"
+cmd = ["cargo", "fuzz", "run", "--fuzz-dir", "libmoshpit/fuzz", "fuzz_pubkey_parse", "--", "-max_total_time=30"]
+
+# ---------------------------------------------------------------------------
+# install
+# ---------------------------------------------------------------------------
+
+[[target.install.command]]
+name = "install moshpits"
+cmd = ["cargo", "install", "--path", "moshpits", "--force", "--locked"]
+
+[[target.install.command]]
+name = "install moshpit"
+cmd = ["cargo", "install", "--path", "moshpit", "--force", "--locked"]
+
+[[target.install.command]]
+name = "install keygen"
+cmd = ["cargo", "install", "--path", "keygen", "--force", "--locked"]
+
+[[target.install.command]]
+name = "install agent"
+cmd = ["cargo", "install", "--path", "agent", "--force", "--locked"]
+
+# ---------------------------------------------------------------------------
+# musl  (regular build)
+# ---------------------------------------------------------------------------
+
+[target.musl]
+tools = ["docker"]
+
+[[target.musl.command]]
+name = "docker build"
+platform = ["linux", "macos"]
+fish = "docker run -v cargo-cache:/root/.cargo/registry -v (pwd):/home/rust/src -v ~/.gitconfig:/root/.gitconfig:ro --rm -t blackdex/rust-musl:x86_64-musl-stable cargo build --release"
+sh = "docker run -v cargo-cache:/root/.cargo/registry -v \"$(pwd)\":/home/rust/src -v \"$HOME/.gitconfig\":/root/.gitconfig:ro --rm -t blackdex/rust-musl:x86_64-musl-stable cargo build --release"
+
+[[target.musl.command]]
+name = "chown"
+platform = ["linux", "macos"]
+fish = "sudo chown -R $USER:$USER target/"
+sh = "sudo chown -R $USER:$USER target/"
+
+[[target.musl.command]]
+name = "copy mp"
+platform = ["linux", "macos"]
+fish = "cp target/x86_64-unknown-linux-musl/release/mp ~/mp"
+sh = "cp target/x86_64-unknown-linux-musl/release/mp $HOME/mp"
+
+[[target.musl.command]]
+name = "copy mps"
+platform = ["linux", "macos"]
+fish = "cp target/x86_64-unknown-linux-musl/release/mps ~/mps"
+sh = "cp target/x86_64-unknown-linux-musl/release/mps $HOME/mps"
+
+[[target.musl.command]]
+name = "copy mp-keygen"
+platform = ["linux", "macos"]
+fish = "cp target/x86_64-unknown-linux-musl/release/mp-keygen ~/mp-keygen"
+sh = "cp target/x86_64-unknown-linux-musl/release/mp-keygen $HOME/mp-keygen"
+
+[[target.musl.command]]
+name = "copy mpa"
+platform = ["linux", "macos"]
+fish = "cp target/x86_64-unknown-linux-musl/release/mpa ~/mpa"
+sh = "cp target/x86_64-unknown-linux-musl/release/mpa $HOME/mpa"
+
+# ---------------------------------------------------------------------------
+# musl-unstable  (with --features unstable)
+# ---------------------------------------------------------------------------
+
+[target.musl-unstable]
+tools = ["docker"]
+
+[[target.musl-unstable.command]]
+name = "docker build"
+platform = ["linux", "macos"]
+fish = "docker run -v cargo-cache:/root/.cargo/registry -v (pwd):/home/rust/src -v ~/.gitconfig:/root/.gitconfig:ro --rm -t blackdex/rust-musl:x86_64-musl-stable cargo build --release --features unstable"
+sh = "docker run -v cargo-cache:/root/.cargo/registry -v \"$(pwd)\":/home/rust/src -v \"$HOME/.gitconfig\":/root/.gitconfig:ro --rm -t blackdex/rust-musl:x86_64-musl-stable cargo build --release --features unstable"
+
+[[target.musl-unstable.command]]
+name = "chown"
+platform = ["linux", "macos"]
+fish = "sudo chown -R $USER:$USER target/"
+sh = "sudo chown -R $USER:$USER target/"
+
+[[target.musl-unstable.command]]
+name = "copy mp"
+platform = ["linux", "macos"]
+fish = "cp target/x86_64-unknown-linux-musl/release/mp ~/mp"
+sh = "cp target/x86_64-unknown-linux-musl/release/mp $HOME/mp"
+
+[[target.musl-unstable.command]]
+name = "copy mps"
+platform = ["linux", "macos"]
+fish = "cp target/x86_64-unknown-linux-musl/release/mps ~/mps"
+sh = "cp target/x86_64-unknown-linux-musl/release/mps $HOME/mps"
+
+[[target.musl-unstable.command]]
+name = "copy mp-keygen"
+platform = ["linux", "macos"]
+fish = "cp target/x86_64-unknown-linux-musl/release/mp-keygen ~/mp-keygen"
+sh = "cp target/x86_64-unknown-linux-musl/release/mp-keygen $HOME/mp-keygen"
+
+[[target.musl-unstable.command]]
+name = "copy mpa"
+platform = ["linux", "macos"]
+fish = "cp target/x86_64-unknown-linux-musl/release/mpa ~/mpa"
+sh = "cp target/x86_64-unknown-linux-musl/release/mpa $HOME/mpa"
+
+# ---------------------------------------------------------------------------
+# clean
+# ---------------------------------------------------------------------------
+
+[[target.clean.command]]
+name = "clean"
+cmd = ["cargo", "clean"]
+
+[[target.clean.command]]
+name = "rm lcov.info"
+fish = "rm -f lcov.info"
+sh = "rm -f lcov.info"
+ps = "Remove-Item -Force lcov.info -ErrorAction Ignore"
+
+# ---------------------------------------------------------------------------
+# aggregates
+# ---------------------------------------------------------------------------
+
+[target.most]
+depends_on = ["fmt", "clippy", "build", "test", "docs", "coverage"]
+
+[target.daily]
+depends_on = ["all", "^fuzz", "^install"]
+
+[target.all]
+depends_on = ["puc", "fmt", "clippy", "build", "test", "docs", "coverage", "fuzz", "install", "musl", "clean"]
+
+[target.default]
+depends_on = ["most"]
