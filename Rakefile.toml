@@ -1,22 +1,5 @@
 # =============================================================================
 # Rakefile.toml — moshpit build pipeline
-#
-# Mirrors scripts/run_all.fish.  Leave the fish scripts in place until you
-# have verified that `cargo rake` produces equivalent results.
-#
-# Equivalences with fish flags:
-#
-#   scripts/run_all.fish                          cargo rake        (default → most)
-#   scripts/run_all.fish --no-test                cargo rake most ^test ^coverage
-#   scripts/run_all.fish --no-coverage            cargo rake most ^coverage
-#   scripts/run_all.fish --no-docs                cargo rake most ^docs
-#   scripts/run_all.fish --install                cargo rake install  (or most install)
-#   scripts/run_all.fish --fuzz                   cargo rake fuzz  (or most fuzz)
-#   scripts/run_all.fish --fuzz --unstable        cargo rake fuzz-unstable
-#   scripts/run_all.fish --musl                   cargo rake musl  (or most musl)
-#   scripts/run_all.fish --musl --unstable        cargo rake musl-unstable
-#   scripts/run_all.fish --clean                  cargo rake clean
-#   scripts/run_all.fish --install --musl --clean cargo rake all
 # =============================================================================
 
 # ---------------------------------------------------------------------------
@@ -149,7 +132,7 @@ name = "html"
 cmd = ["cargo", "llvm-cov", "report", "--html"]
 
 # ---------------------------------------------------------------------------
-# fuzz  (requires nightly — mirror run_all.fish; no +nightly prefix)
+# fuzz  (requires nightly; no +nightly prefix)
 # ---------------------------------------------------------------------------
 
 [target.fuzz]

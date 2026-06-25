@@ -33,7 +33,7 @@ cargo fmt --check
 
 # Full local verification before pushing (fmt + clippy + tests + docs + coverage).
 # Heavy stages are opt-in: --fuzz, --install, --musl/--unstable (MUSL Docker build).
-scripts/run_all.fish
+cargo rake
 
 # Generate docs
 cargo doc --no-deps --open
