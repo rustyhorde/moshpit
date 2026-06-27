@@ -194,6 +194,24 @@ cmd = ["cargo", "fuzz", "run", "--fuzz-dir", "libmoshpit/fuzz", "fuzz_pubkey_par
 # install
 # ---------------------------------------------------------------------------
 
+[target.install.windows]
+
+[[target.install.windows.command]]
+name = "rm moshp.exe"
+ps = "Remove-Item -Force 'C:\\Users\\jason\\.cargo\\bin\\moshp.exe' -ErrorAction Ignore"
+
+[[target.install.windows.command]]
+name = "install moshpit"
+cmd = ["cargo", "install", "--path", "moshpit", "-F", "unstable", "--force", "--locked", "--root", "./tmp"]
+
+[[target.install.windows.command]]
+name = "install keygen"
+cmd = ["cargo", "install", "--path", "keygen", "-F", "unstable", "--force", "--locked"]
+
+[[target.install.windows.command]]
+name = "mv moshp.exe"
+ps = "Move-Item -Force '.\\tmp\\bin\\mp.exe' 'C:\\Users\\jason\\.cargo\\bin\\moshp.exe'"
+
 [[target.install.command]]
 name = "install moshpits"
 cmd = ["cargo", "install", "--path", "moshpits", "--force", "--locked"]
@@ -321,7 +339,7 @@ depends_on = ["fmt", "clippy", "build", "test", "docs", "coverage"]
 depends_on = ["all", "^fuzz", "^install"]
 
 [target.daily.windows]
-depends_on = ["install"]
+depends_on = ["install", "clean"]
 
 [target.all]
 depends_on = ["puc", "fmt", "clippy", "build", "test", "docs", "coverage", "fuzz", "install", "musl", "clean"]
