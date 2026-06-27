@@ -10,7 +10,7 @@ license=('MIT' 'Apache-2.0')
 provides=('moshpits')
 conflicts=('moshpits' 'moshpits-bin')
 replaces=('moshpits-bin')
-depends=('moshpit-keygen')
+depends=('moshpit-keygen-unstable-bin')
 makedepends=()
 install=moshpits.install
 

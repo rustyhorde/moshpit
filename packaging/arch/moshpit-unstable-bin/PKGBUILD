@@ -10,7 +10,7 @@ license=('MIT' 'Apache-2.0')
 provides=('moshpit')
 conflicts=('moshpit' 'moshpit-bin')
 replaces=('moshpit-bin')
-depends=('moshpit-keygen')
+depends=('moshpit-keygen-unstable-bin')
 makedepends=()
 
 _base="https://github.com/rustyhorde/moshpit/releases/download/v${pkgver}"
