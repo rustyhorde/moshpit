@@ -342,6 +342,9 @@ depends_on = ["all", "^fuzz", "^install"]
 [target.daily.windows]
 depends_on = ["install", "clean"]
 
+[target.daily.macos]
+depends_on = ["all", "^fuzz", "^install", "^musl"]
+
 [target.all]
 depends_on = ["puc", "fmt", "clippy", "build", "test", "docs", "coverage", "fuzz", "install", "musl", "clean"]
 
