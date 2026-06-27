@@ -199,6 +199,7 @@ cmd = ["cargo", "fuzz", "run", "--fuzz-dir", "libmoshpit/fuzz", "fuzz_pubkey_par
 [[target.install.windows.command]]
 name = "rm moshp.exe"
 ps = "Remove-Item -Force 'C:\\Users\\jason\\.cargo\\bin\\moshp.exe' -ErrorAction Ignore"
+skip_on_error = true
 
 [[target.install.windows.command]]
 name = "install moshpit"
