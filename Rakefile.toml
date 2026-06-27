@@ -41,12 +41,20 @@ hint = "The 'puc' fish function is required to run this target"
 # update
 # ---------------------------------------------------------------------------
 
-[target.puc]
+[target.puc.linux]
 tools = ["puc"]
-[[target.puc.command]]
+
+[[target.puc.linux.command]]
 name = "puc"
-platform = ["linux"]
 fish = "puc"
+
+[[target.puc.command]]
+name = "pull"
+cmd = ["git", "pull"]
+
+[[target.puc.command]]
+name = "puc clean"
+cmd = ["cargo", "clean"]
 
 # ---------------------------------------------------------------------------
 # fmt
@@ -186,6 +194,25 @@ cmd = ["cargo", "fuzz", "run", "--fuzz-dir", "libmoshpit/fuzz", "fuzz_pubkey_par
 # install
 # ---------------------------------------------------------------------------
 
+[target.install.windows]
+
+[[target.install.windows.command]]
+name = "rm moshp.exe"
+ps = "Remove-Item -Force 'C:\\Users\\jason\\.cargo\\bin\\moshp.exe' -ErrorAction Ignore"
+skip_on_error = true
+
+[[target.install.windows.command]]
+name = "install moshpit"
+cmd = ["cargo", "install", "--path", "moshpit", "-F", "unstable", "--force", "--locked", "--root", "./tmp"]
+
+[[target.install.windows.command]]
+name = "install keygen"
+cmd = ["cargo", "install", "--path", "keygen", "-F", "unstable", "--force", "--locked"]
+
+[[target.install.windows.command]]
+name = "mv moshp.exe"
+ps = "Move-Item -Force '.\\tmp\\bin\\mp.exe' 'C:\\Users\\jason\\.cargo\\bin\\moshp.exe'"
+
 [[target.install.command]]
 name = "install moshpits"
 cmd = ["cargo", "install", "--path", "moshpits", "--force", "--locked"]
@@ -212,8 +239,8 @@ tools = ["docker"]
 [[target.musl.command]]
 name = "docker build"
 platform = ["linux", "macos"]
-fish = "docker run -v cargo-cache:/root/.cargo/registry -v (pwd):/home/rust/src -v ~/.gitconfig:/root/.gitconfig:ro --rm -t blackdex/rust-musl:x86_64-musl-stable cargo build --release"
-sh = "docker run -v cargo-cache:/root/.cargo/registry -v \"$(pwd)\":/home/rust/src -v \"$HOME/.gitconfig\":/root/.gitconfig:ro --rm -t blackdex/rust-musl:x86_64-musl-stable cargo build --release"
+fish = "docker run -v cargo-cache:/root/.cargo/registry -v (pwd):/home/rust/src -v ~/.gitconfig:/root/.gitconfig:ro --rm -t blackdex/rust-musl:x86_64-musl-nightly cargo build --release"
+sh = "docker run -v cargo-cache:/root/.cargo/registry -v \"$(pwd)\":/home/rust/src -v \"$HOME/.gitconfig\":/root/.gitconfig:ro --rm -t blackdex/rust-musl:x86_64-musl-nightly cargo build --release"
 
 [[target.musl.command]]
 name = "chown"
@@ -255,8 +282,8 @@ tools = ["docker"]
 [[target.musl-unstable.command]]
 name = "docker build"
 platform = ["linux", "macos"]
-fish = "docker run -v cargo-cache:/root/.cargo/registry -v (pwd):/home/rust/src -v ~/.gitconfig:/root/.gitconfig:ro --rm -t blackdex/rust-musl:x86_64-musl-stable cargo build --release --features unstable"
-sh = "docker run -v cargo-cache:/root/.cargo/registry -v \"$(pwd)\":/home/rust/src -v \"$HOME/.gitconfig\":/root/.gitconfig:ro --rm -t blackdex/rust-musl:x86_64-musl-stable cargo build --release --features unstable"
+fish = "docker run -v cargo-cache:/root/.cargo/registry -v (pwd):/home/rust/src -v ~/.gitconfig:/root/.gitconfig:ro --rm -t blackdex/rust-musl:x86_64-musl-nightly cargo build --release --features unstable"
+sh = "docker run -v cargo-cache:/root/.cargo/registry -v \"$(pwd)\":/home/rust/src -v \"$HOME/.gitconfig\":/root/.gitconfig:ro --rm -t blackdex/rust-musl:x86_64-musl-nightly cargo build --release --features unstable"
 
 [[target.musl-unstable.command]]
 name = "chown"
@@ -311,6 +338,9 @@ depends_on = ["fmt", "clippy", "build", "test", "docs", "coverage"]
 
 [target.daily]
 depends_on = ["all", "^fuzz", "^install"]
+
+[target.daily.windows]
+depends_on = ["install", "clean"]
 
 [target.all]
 depends_on = ["puc", "fmt", "clippy", "build", "test", "docs", "coverage", "fuzz", "install", "musl", "clean"]
