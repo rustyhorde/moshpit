@@ -4,18 +4,18 @@ resolver = "3"
 members = ["agent", "keygen","libmoshpit", "moshpit", "moshpits", "xtask"]
 
 [workspace.dependencies]
-anyhow = "1.0.102"
+anyhow = "1.0.103"
 argon2 = { version = "0.6.0-rc.8", features = ["getrandom"] }
 aws-lc-rs = "1.17.0"
 base64 = "0.22.1"
-bincode-next = "3.0.0-rc.15"
-bon = "3.9.2"
-bytes = "1.11.1"
+bincode-next = "3.1.1"
+bon = "3.9.3"
+bytes = "1.12.0"
 clap = { version = "4.6.1", features = ["derive"] }
-config = { version = "0.15.23", features = ["toml"] }
+config = { version = "0.15.25", features = ["toml"] }
 dialoguer = "0.12.0"
 dirs2 = "3.0.1"
-getset = "0.1.6"
+getset = "0.1.7"
 libc = "1.0.0-alpha.3"
 rustversion = "1.0.22"
 serde = { version = "1.0.228", features = ["derive"] }
@@ -34,15 +34,15 @@ tracing = { version = "0.1.44", features = [
   "release_max_level_trace",
 ] }
 tracing-subscriber-init = { version = "0.2.6", features = ["tstime"] }
-uuid = { version = "1.23.3", features = ["v4"] }
-vergen-gix = { version = "10.0.0", features = [
+uuid = { version = "1.23.4", features = ["v4"] }
+vergen-gix = { version = "10.0.1", features = [
   "build",
   "cargo",
   "rustc",
   "si",
 ] }
-vergen-pretty = { version = "10.0.0", features = ["color", "tracing", "rkyv", "serde"] }
+vergen-pretty = { version = "10.0.1", features = ["color", "tracing", "rkyv", "serde"] }
 vt100 = "0.16.2"
 zbus = "5.16.0"
-zeroize = { version = "1.8.2", features = ["zeroize_derive"] }
+zeroize = { version = "1.9.0", features = ["zeroize_derive"] }
 zstd = "0.13.3"
