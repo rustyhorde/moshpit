@@ -7,3 +7,4 @@ test_key
 scripts/logs/
 TODO.md
 /.rake
+/tmp
