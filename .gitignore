@@ -6,3 +6,4 @@ test_key
 *.bin
 scripts/logs/
 TODO.md
+/.rake
