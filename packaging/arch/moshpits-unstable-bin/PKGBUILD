@@ -14,7 +14,7 @@ depends=('moshpit-keygen-unstable-bin')
 makedepends=()
 install=moshpits.install
 
-_base="https://github.com/rustyhorde/moshpit/releases/download/v${pkgver}"
+_base="https://git.jasonozias.com/dl/moshpit/v${pkgver}"
 
 source=("${_base}/dist-mps.tar.gz" "mps.service")
 source_x86_64=("mps-unstable-x86_64::${_base}/mps-unstable-x86_64-unknown-linux-musl")

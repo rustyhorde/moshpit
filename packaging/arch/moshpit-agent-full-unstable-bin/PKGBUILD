@@ -15,7 +15,7 @@ conflicts=('moshpit-agent' 'moshpit-agent-bin' 'moshpit-agent-fido2-bin'
 depends=()
 makedepends=()
 
-_base="https://github.com/rustyhorde/moshpit/releases/download/v${pkgver}"
+_base="https://git.jasonozias.com/dl/moshpit/v${pkgver}"
 
 source=("${_base}/dist-mpa.tar.gz")
 source_x86_64=("mpa-full-unstable-x86_64::${_base}/mpa-full-unstable-x86_64-unknown-linux-musl")

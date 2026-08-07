@@ -1,0 +1,23 @@
+name = "audit"
+
+# [on.push.branches] is deliberately OMITTED here, not set to `names = []`.
+# Per librepomon's Push::ref_kind_matches, an ABSENT branches/branches_ignore
+# pair matches every branch push, while a PRESENT filter with an empty
+# `names` list matches NONE (RefFilter::matches is `.any()` over the list,
+# which is false when the list is empty). release.toml legitimately uses
+# `names = []` to mean "never fire on an ordinary branch push, tags only" —
+# copying that idiom here would make audit/fuzz never run on regular pushes,
+# which defeats the point. This runs on every branch push AND on release
+# tags (the [on.push.tags] filter below), so it also gates releases.
+[on.push.tags]
+names = ["v[0-9]+\\.[0-9]+\\.[0-9]+(-.*)?"]
+
+[jobs.audit]
+runs_on = ["linux"]
+
+[jobs.audit.steps.checkout]
+uses = "actions/checkout"
+
+[jobs.audit.steps.rake]
+name = "💣 Audit 💣"
+run = "cargo rake audit && cargo rake fuzz"

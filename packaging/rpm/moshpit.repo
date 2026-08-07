@@ -1,0 +1,6 @@
+[moshpit]
+name=moshpit Package Repository
+baseurl=https://git.jasonozias.com/dl/moshpit/rpm/$basearch
+enabled=1
+gpgcheck=1
+gpgkey=https://git.jasonozias.com/dl/moshpit/gpg.key

@@ -15,7 +15,7 @@ conflicts=('moshpit-agent' 'moshpit-agent-systemd-creds' 'moshpit-agent-bin' 'mo
 depends=()
 makedepends=()
 
-_base="https://github.com/rustyhorde/moshpit/releases/download/v${pkgver}"
+_base="https://git.jasonozias.com/dl/moshpit/v${pkgver}"
 
 source=("${_base}/dist-mpa.tar.gz")
 source_x86_64=("mpa-systemd-creds-unstable-x86_64::${_base}/mpa-systemd-creds-unstable-x86_64-unknown-linux-musl")
