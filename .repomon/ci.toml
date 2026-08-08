@@ -26,6 +26,11 @@ run = "cargo rake most"
 [jobs.rake-macos]
 runs_on = ["macos"]
 
+# See the matching note in test.toml: `cargo rake most` depends on `test`,
+# which hits the same fish-launch failure on this runner without this.
+[jobs.rake-macos.env]
+RAKE_SHELL = "sh"
+
 [jobs.rake-macos.steps.checkout]
 uses = "actions/checkout"
 

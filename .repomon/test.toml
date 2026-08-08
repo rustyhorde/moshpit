@@ -22,6 +22,15 @@ run = "cargo rake test"
 [jobs.test-macos]
 runs_on = ["macos"]
 
+# This runner's $SHELL/FISH_VERSION resolves librake's shell-family
+# detection to Fish even though the `fish` binary isn't actually reachable
+# there (likely a stale login-shell env var, not an installed fish) —
+# "fuzz nextest"'s fish variant then fails with "could not launch 'fish':
+# No such file or directory". Pin to the already-correct `sh` variant
+# instead of fixing the runner's shell config.
+[jobs.test-macos.env]
+RAKE_SHELL = "sh"
+
 [jobs.test-macos.steps.checkout]
 uses = "actions/checkout"
 

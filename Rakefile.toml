@@ -54,6 +54,10 @@ hint = "install createrepo_c: sudo pacman -S --needed createrepo_c"
 check = ["gpg", "--version"]
 hint = "install gnupg: sudo pacman -S --needed gnupg"
 
+[tool.os.libclang]
+check = ["clang", "--version"]
+hint = "libmoshpit/fuzz needs libclang for aws-lc-rs's bindgen feature: Linux: sudo pacman -S clang llvm (or your distro's clang/libclang-dev); Windows: choco install llvm -y; macOS: usually bundled with Xcode Command Line Tools (xcode-select --install)"
+
 [tool.fish.puc]
 hint = "The 'puc' fish function is required to run this target"
 
@@ -137,7 +141,7 @@ cmd = ["cargo", "matrix", "build"]
 
 [target.test]
 depends_on = ["build"]
-tools = ["matrix", "nextest"]
+tools = ["matrix", "nextest", "libclang"]
 
 [[target.test.command]]
 name = "nextest"
@@ -191,7 +195,7 @@ cmd = ["cargo", "llvm-cov", "report", "--html"]
 # ---------------------------------------------------------------------------
 
 [target.fuzz]
-tools = ["fuzz"]
+tools = ["fuzz", "libclang"]
 
 [[target.fuzz.command]]
 name = "fuzz_frame"
@@ -231,7 +235,7 @@ cmd = ["cargo", "fuzz", "run", "--fuzz-dir", "libmoshpit/fuzz", "fuzz_zstd_decom
 
 [target.fuzz-unstable]
 depends_on = ["fuzz"]
-tools = ["fuzz"]
+tools = ["fuzz", "libclang"]
 
 [[target.fuzz-unstable.command]]
 name = "fuzz_pubkey_parse"

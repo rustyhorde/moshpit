@@ -130,6 +130,15 @@ source-build PKGBUILDs, and the `tpm`/`ssh-agent-piggyback`/
    repomon-runner machines themselves — `.repomon/ci.toml`'s
    `rake-linux`/`rake-macos`/`rake-windows` jobs run `cargo rake most`
    directly, which depends on both.
+   - **`clang`/`llvm` (providing `libclang`)** is also required on every
+     Linux and Windows repomon-runner: `libmoshpit/fuzz/Cargo.toml` enables
+     `aws-lc-rs`'s `bindgen` feature, so building the fuzz crate (via
+     `cargo rake fuzz`/`fuzz-unstable`, or the `test` target's "fuzz
+     nextest" step) invokes `bindgen`, which needs `libclang` at build
+     time — checked by the `[tool.os.libclang]` Rakefile hook. Install with
+     `sudo pacman -S clang llvm` (Linux) or `choco install llvm -y`
+     (Windows); macOS normally already has it via Xcode Command Line Tools
+     (`xcode-select --install` if not).
 
 ## Cutting a release
 
