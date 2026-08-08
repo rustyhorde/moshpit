@@ -16,3 +16,6 @@ TODO.md
 /mpa-*-unknown-linux-musl
 /mps-*-unknown-linux-musl
 /mp-keygen-*-unknown-linux-musl
+
+# scripts/release/publish-arch.fish local makepkg scratch workspace
+/scripts/release/.work/

@@ -79,8 +79,16 @@ for arch in x86_64 aarch64
         rm -rf $pkgwork
         cp -r $repo_root/packaging/arch/$pkg $pkgwork
 
+        # --nodeps: moshpit-bin/moshpits-bin's depends=('moshpit-keygen-bin')
+        # (and the -unstable equivalents) can never resolve against this
+        # build host — that package doesn't exist in any pacman repo until
+        # this same loop (or a later iteration of it) builds and publishes
+        # it. package() only installs a prebuilt musl binary, so there's no
+        # real build-time need for the runtime dependency to be present;
+        # the depends= metadata still ends up embedded in the built
+        # package for pacman to enforce at end-user install time.
         pushd $pkgwork
-        makepkg --config $makepkg_conf -f --noconfirm --sign --key $gpg_user
+        makepkg --config $makepkg_conf -f --noconfirm --nodeps --sign --key $gpg_user
         or rel_die "makepkg failed for $pkg ($arch)"
         popd
 

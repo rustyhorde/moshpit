@@ -247,3 +247,14 @@ to validate the net-new WiX MSI authoring for `mp`/`mp-keygen`.
   `update-pkgbuilds.fish` and `publish-arch.fish` both depend on the
   binaries it just published being fetchable from
   `https://git.jasonozias.com/dl/moshpit/<tag>/`).
+- **`makepkg` in `publish-arch.fish` fails with "Missing dependencies: ->
+  moshpit-keygen-bin"** (or the `-unstable` equivalent) — expected and
+  already handled: `moshpit-bin`/`moshpits-bin` declare a real
+  `depends=('moshpit-keygen-bin')`, but that package only exists once this
+  same script builds and publishes it, so it can never resolve against
+  this build host's pacman. `publish-arch.fish` passes `makepkg --nodeps`
+  for exactly this reason — if you see this error, `--nodeps` got dropped
+  from that invocation; put it back rather than trying to pre-seed a local
+  pacman repo (the `depends=` metadata is still embedded in the built
+  package and enforced normally when end users install from the published
+  repo).
