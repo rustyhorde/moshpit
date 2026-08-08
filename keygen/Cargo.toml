@@ -1,17 +1,17 @@
 [package]
-authors = ["Jason Ozias <jason.g.ozias@gmail.com>"]
-categories = ["command-line-interface", "network-programming", "cryptography"]
+authors.workspace = true
+categories.workspace = true
 description = "Perform various key tasks for moshpit"
 documentation = "https://github.com/rustyhorde/moshpit#mp-keygen"
-edition = "2024"
-homepage = "https://github.com/rustyhorde/moshpit"
-keywords = ["ssh", "mosh"]
-license = "MIT OR Apache-2.0"
+edition.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+license.workspace = true
 name = "moshpit-keygen"
-readme = "../README.md"
-repository = "https://github.com/rustyhorde/moshpit"
-version = "0.9.4"
-rust-version = "1.95.0"
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
 
 [[bin]]
 name = "mp-keygen"
@@ -25,7 +25,7 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 dialoguer = { workspace = true }
 getset = { workspace = true }
-libmoshpit = { version = "0.9.4", path = "../libmoshpit" }
+libmoshpit = { workspace = true }
 vergen-pretty = { workspace = true }
 [build-dependencies]
 anyhow = { workspace = true }

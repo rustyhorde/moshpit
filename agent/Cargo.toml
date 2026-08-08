@@ -1,17 +1,17 @@
 [package]
-authors = ["Jason Ozias <jason.g.ozias@gmail.com>"]
-categories = ["command-line-interface", "network-programming", "cryptography"]
+authors.workspace = true
+categories.workspace = true
 description = "moshpit agent — holds identity keys in memory and serves them over a Unix socket"
 documentation = "https://github.com/rustyhorde/moshpit#moshpit-agent-mpa"
-edition = "2024"
-homepage = "https://github.com/rustyhorde/moshpit"
-keywords = ["ssh", "mosh"]
-license = "MIT OR Apache-2.0"
+edition.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+license.workspace = true
 name = "moshpit-agent"
-readme = "../README.md"
-repository = "https://github.com/rustyhorde/moshpit"
-version = "0.9.4"
-rust-version = "1.95.0"
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
 
 [[bin]]
 name = "mpa"
@@ -45,33 +45,25 @@ clap = { workspace = true }
 dialoguer = { workspace = true }
 dirs2 = { workspace = true }
 getset = { workspace = true }
-libmoshpit = { version = "0.9.4", path = "../libmoshpit" }
-nix = { version = "0.31.3", features = ["process", "signal", "socket", "user"] }
-tokio = { workspace = true, features = [
-  "io-util",
-  "macros",
-  "net",
-  "rt-multi-thread",
-  "signal",
-] }
+libmoshpit = { workspace = true }
+nix = { workspace = true }
+tokio = { workspace = true, features = ["signal"] }
 tracing = { workspace = true }
 vergen-pretty = { workspace = true }
 zeroize = { workspace = true }
 
 # Feature-gated optional deps
-secret-service = { version = "5.1.0", features = [
-  "rt-tokio-crypto-rust",
-], optional = true }
-security-framework = { version = "3.7.0", optional = true }
-tss-esapi = { version = "7.7.0", optional = true }
+secret-service = { workspace = true, optional = true }
+security-framework = { workspace = true, optional = true }
+tss-esapi = { workspace = true, optional = true }
 zbus = { workspace = true, optional = true }
 
 [dev-dependencies]
-tempfile = "3.27.0"
+tempfile = { workspace = true }
 
 [build-dependencies]
 anyhow = { workspace = true }
-pkg-config = "0.3.33"
+pkg-config = { workspace = true }
 rustversion = { workspace = true }
 vergen-gix = { workspace = true }
 
