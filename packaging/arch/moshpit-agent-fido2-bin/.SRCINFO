@@ -1,6 +1,6 @@
 pkgbase = moshpit-agent-fido2-bin
 	pkgdesc = Moshpit agent daemon — FIDO2/YubiKey unlock (pre-compiled MUSL static binary)
-	pkgver = 0.9.4
+	pkgver = 0.9.5
 	pkgrel = 1
 	url = https://github.com/rustyhorde/moshpit
 	arch = x86_64
@@ -17,11 +17,11 @@ pkgbase = moshpit-agent-fido2-bin
 	conflicts = moshpit-agent-fido2-unstable-bin
 	conflicts = moshpit-agent-systemd-creds-unstable-bin
 	conflicts = moshpit-agent-full-unstable-bin
-	source = https://git.jasonozias.com/dl/moshpit/v0.9.4/dist-mpa.tar.gz
-	sha256sums = da66d1096f1fda2a0246c342b89f905705099704aa98f095d624185b950e166c
-	source_x86_64 = mpa-fido2-x86_64::https://git.jasonozias.com/dl/moshpit/v0.9.4/mpa-fido2-x86_64-unknown-linux-musl
-	sha256sums_x86_64 = ff7589dd51930ca8239326e63c6a171a04efbcc7bc2711cabee391f941723961
-	source_aarch64 = mpa-fido2-aarch64::https://git.jasonozias.com/dl/moshpit/v0.9.4/mpa-fido2-aarch64-unknown-linux-musl
-	sha256sums_aarch64 = de520ec467197252a9cf59a3f398537b6a1f78ebdc727da97092e3b1c6c2164f
+	source = https://git.jasonozias.com/dl/moshpit/v0.9.5/dist-mpa.tar.gz
+	sha256sums = 59ec10e172c322e54e4179dcf19edb2e1facc6cb2ecfa007b0b382d4f5c81aa7
+	source_x86_64 = mpa-fido2-x86_64::https://git.jasonozias.com/dl/moshpit/v0.9.5/mpa-fido2-x86_64-unknown-linux-musl
+	sha256sums_x86_64 = 81a2da117e1a46db642572badc682830e2b110a1df4e6cd300a20c7ed1df9681
+	source_aarch64 = mpa-fido2-aarch64::https://git.jasonozias.com/dl/moshpit/v0.9.5/mpa-fido2-aarch64-unknown-linux-musl
+	sha256sums_aarch64 = e249ef0ff4ad69509ed38865c34f2ce587bcf3d6bded21d23c96d5f2e3f63a04
 
 pkgname = moshpit-agent-fido2-bin

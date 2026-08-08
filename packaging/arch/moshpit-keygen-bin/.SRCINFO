@@ -1,6 +1,6 @@
 pkgbase = moshpit-keygen-bin
 	pkgdesc = Asymmetric key generation and inspection tool for moshpit (pre-compiled binary)
-	pkgver = 0.9.4
+	pkgver = 0.9.5
 	pkgrel = 1
 	url = https://github.com/rustyhorde/moshpit
 	arch = x86_64
@@ -9,11 +9,11 @@ pkgbase = moshpit-keygen-bin
 	license = Apache-2.0
 	provides = moshpit-keygen
 	conflicts = moshpit-keygen
-	source = https://git.jasonozias.com/dl/moshpit/v0.9.4/dist-mp-keygen.tar.gz
-	sha256sums = 23d2598ed8cfeeebc1c18d84152fc32ccfcb2dfbaba8e6fdd1d30f75137feb4a
-	source_x86_64 = mp-keygen-x86_64::https://git.jasonozias.com/dl/moshpit/v0.9.4/mp-keygen-x86_64-unknown-linux-musl
-	sha256sums_x86_64 = fcd517b909e1bf2003e1eb91cadc7025b245bf4b370f39a88a4e081c2b4b584f
-	source_aarch64 = mp-keygen-aarch64::https://git.jasonozias.com/dl/moshpit/v0.9.4/mp-keygen-aarch64-unknown-linux-musl
-	sha256sums_aarch64 = 2b851925704b907104e5f501251167882b863b890b64f313fafd864d7c45156d
+	source = https://git.jasonozias.com/dl/moshpit/v0.9.5/dist-mp-keygen.tar.gz
+	sha256sums = 9c321a447ad918139ae689bdb8fbb1a459dd33b97be0648bbdbb50bcbb885228
+	source_x86_64 = mp-keygen-x86_64::https://git.jasonozias.com/dl/moshpit/v0.9.5/mp-keygen-x86_64-unknown-linux-musl
+	sha256sums_x86_64 = 851659b77cc7198c26995126cf65242c042fe80571c56f4c7b449905f00503bd
+	source_aarch64 = mp-keygen-aarch64::https://git.jasonozias.com/dl/moshpit/v0.9.5/mp-keygen-aarch64-unknown-linux-musl
+	sha256sums_aarch64 = 2476a1fd75e7e5c0c210943e5dcd35e979afbcfaf1fff769c1d53ceacaa9b29b
 
 pkgname = moshpit-keygen-bin

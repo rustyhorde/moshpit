@@ -1,6 +1,6 @@
 pkgbase = moshpit-unstable-bin
 	pkgdesc = moshpit client with post-quantum support — SSH and Mosh inspired remote terminal client (pre-compiled binary)
-	pkgver = 0.9.4
+	pkgver = 0.9.5
 	pkgrel = 1
 	url = https://github.com/rustyhorde/moshpit
 	arch = x86_64
@@ -12,11 +12,11 @@ pkgbase = moshpit-unstable-bin
 	conflicts = moshpit
 	conflicts = moshpit-bin
 	replaces = moshpit-bin
-	source = https://git.jasonozias.com/dl/moshpit/v0.9.4/dist-mp.tar.gz
-	sha256sums = 2835ea81a4926dfc2ff1df229ad46a9ed37ed32f2cf49bde22ebfa72abb37bcd
-	source_x86_64 = mp-unstable-x86_64::https://git.jasonozias.com/dl/moshpit/v0.9.4/mp-unstable-x86_64-unknown-linux-musl
-	sha256sums_x86_64 = 1412abb4c08b7a03cd3da1f6ad4f606717cc1c99e3594df9d696c74105e6b559
-	source_aarch64 = mp-unstable-aarch64::https://git.jasonozias.com/dl/moshpit/v0.9.4/mp-unstable-aarch64-unknown-linux-musl
-	sha256sums_aarch64 = fdd4a11ce9e72d195d3df31aaea95b5f48c0b63447306310378fb66c1dd84900
+	source = https://git.jasonozias.com/dl/moshpit/v0.9.5/dist-mp.tar.gz
+	sha256sums = 44c6f26ac8ff6ef5f9bb414b421239ed578221eaf6ce69381334a5a5cb770cbb
+	source_x86_64 = mp-unstable-x86_64::https://git.jasonozias.com/dl/moshpit/v0.9.5/mp-unstable-x86_64-unknown-linux-musl
+	sha256sums_x86_64 = 4b324895636a5d56218f349c34b1e9165e690f94814b6114336f36de8643e960
+	source_aarch64 = mp-unstable-aarch64::https://git.jasonozias.com/dl/moshpit/v0.9.5/mp-unstable-aarch64-unknown-linux-musl
+	sha256sums_aarch64 = e80968c97db276c6332b130c24c90204861f166fd9c4e06145326b5e02e52e71
 
 pkgname = moshpit-unstable-bin
