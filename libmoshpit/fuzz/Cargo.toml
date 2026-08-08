@@ -9,11 +9,11 @@ cargo-fuzz = true
 
 [dependencies]
 arbitrary = { version = "1.4.2", features = ["derive"] }
-aws-lc-rs = { version = "1.17.0", features = ["bindgen"] }
-base64 = "0.22.1"
+aws-lc-rs = { version = "1.18.0", features = ["bindgen"] }
+base64 = "0.23.1"
 libfuzzer-sys = "0.4.13"
 libmoshpit = { path = ".." }
-uuid = "1.23.3"
+uuid = "1.24.0"
 
 [dev-dependencies]
 # Used only by `regression_zstd_decompress` to build a high-ratio test stream.
