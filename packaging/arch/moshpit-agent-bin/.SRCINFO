@@ -1,6 +1,6 @@
 pkgbase = moshpit-agent-bin
 	pkgdesc = Moshpit agent daemon — passphrase unlock (pre-compiled MUSL static binary)
-	pkgver = 0.9.3
+	pkgver = 0.9.4
 	pkgrel = 1
 	url = https://github.com/rustyhorde/moshpit
 	arch = x86_64
@@ -13,11 +13,11 @@ pkgbase = moshpit-agent-bin
 	conflicts = moshpit-agent-systemd-creds-bin
 	conflicts = moshpit-agent-ssh-agent-piggyback-bin
 	conflicts = moshpit-agent-full-bin
-	source = https://github.com/rustyhorde/moshpit/releases/download/v0.9.3/dist-mpa.tar.gz
-	sha256sums = d5ed9b9d0a2df90fd23c946f9c1808e25adfaff73b6c909d6eaf975105124e64
-	source_x86_64 = mpa-x86_64::https://github.com/rustyhorde/moshpit/releases/download/v0.9.3/mpa-x86_64-unknown-linux-musl
-	sha256sums_x86_64 = b7ad3653c2c9f2c47ed0e85f36c1150f4c1764a182ad1eb88d22185fdf5ff254
-	source_aarch64 = mpa-aarch64::https://github.com/rustyhorde/moshpit/releases/download/v0.9.3/mpa-aarch64-unknown-linux-musl
-	sha256sums_aarch64 = 4b4f091d3d46cc42fb6d4012b17939f505200d25fd88f925f437cfd5f7292cbd
+	source = https://git.jasonozias.com/dl/moshpit/v0.9.4/dist-mpa.tar.gz
+	sha256sums = da66d1096f1fda2a0246c342b89f905705099704aa98f095d624185b950e166c
+	source_x86_64 = mpa-x86_64::https://git.jasonozias.com/dl/moshpit/v0.9.4/mpa-x86_64-unknown-linux-musl
+	sha256sums_x86_64 = 924820fe5dff92c55133d03b6cc018f26931292faf7d357f2d3107e455b96715
+	source_aarch64 = mpa-aarch64::https://git.jasonozias.com/dl/moshpit/v0.9.4/mpa-aarch64-unknown-linux-musl
+	sha256sums_aarch64 = 849d2630f598cbd7a9588f318f132ae1741a7b0d1e9ac98284519bc3350e3b79
 
 pkgname = moshpit-agent-bin

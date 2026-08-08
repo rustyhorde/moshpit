@@ -1,0 +1,26 @@
+pkgbase = moshpit-agent-systemd-creds-bin
+	pkgdesc = Moshpit agent daemon — systemd credentials unlock (pre-compiled MUSL static binary)
+	pkgver = 0.9.4
+	pkgrel = 1
+	url = https://github.com/rustyhorde/moshpit
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	license = Apache-2.0
+	provides = moshpit-agent
+	conflicts = moshpit-agent
+	conflicts = moshpit-agent-systemd-creds
+	conflicts = moshpit-agent-bin
+	conflicts = moshpit-agent-fido2-bin
+	conflicts = moshpit-agent-full-bin
+	conflicts = moshpit-agent-unstable-bin
+	conflicts = moshpit-agent-fido2-unstable-bin
+	conflicts = moshpit-agent-full-unstable-bin
+	source = https://git.jasonozias.com/dl/moshpit/v0.9.4/dist-mpa.tar.gz
+	sha256sums = da66d1096f1fda2a0246c342b89f905705099704aa98f095d624185b950e166c
+	source_x86_64 = mpa-systemd-creds-x86_64::https://git.jasonozias.com/dl/moshpit/v0.9.4/mpa-systemd-creds-x86_64-unknown-linux-musl
+	sha256sums_x86_64 = 722316050d57cda240f3d53bcd8b00ff17c6267e69ca1ce409fb6ab11eae9a0d
+	source_aarch64 = mpa-systemd-creds-aarch64::https://git.jasonozias.com/dl/moshpit/v0.9.4/mpa-systemd-creds-aarch64-unknown-linux-musl
+	sha256sums_aarch64 = f24deb3268da2b698dd149f80b0dcf210578afa817fbeb9de998fd01a0cd9ae3
+
+pkgname = moshpit-agent-systemd-creds-bin
