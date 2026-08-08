@@ -2855,8 +2855,14 @@ mod tests {
 
         #[test]
         fn release_events_produce_no_bytes() {
-            assert!(key_event_to_bytes(release(KeyCode::Char('a'))).is_empty());
-            assert!(key_event_to_bytes(release(KeyCode::Up)).is_empty());
+            assert_eq!(
+                key_event_to_bytes(release(KeyCode::Char('a'))).as_slice(),
+                Vec::<u8>::new()
+            );
+            assert_eq!(
+                key_event_to_bytes(release(KeyCode::Up)).as_slice(),
+                Vec::<u8>::new()
+            );
         }
 
         #[test]
@@ -2958,8 +2964,14 @@ mod tests {
 
         #[test]
         fn function_keys_out_of_range_produce_no_bytes() {
-            assert!(key_event_to_bytes(press(KeyCode::F(0))).is_empty());
-            assert!(key_event_to_bytes(press(KeyCode::F(13))).is_empty());
+            assert_eq!(
+                key_event_to_bytes(press(KeyCode::F(0))).as_slice(),
+                Vec::<u8>::new()
+            );
+            assert_eq!(
+                key_event_to_bytes(press(KeyCode::F(13))).as_slice(),
+                Vec::<u8>::new()
+            );
         }
 
         #[test]
