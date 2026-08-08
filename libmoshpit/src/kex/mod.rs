@@ -1003,8 +1003,8 @@ mod tests {
     fn kex_default_has_empty_keys_and_nil_uuid() {
         use crate::kex::negotiate::NegotiatedAlgorithms;
         let kex = Kex::default();
-        assert!(kex.key().is_empty());
-        assert!(kex.hmac_key().is_empty());
+        assert_eq!(kex.key().as_slice(), Vec::<u8>::new());
+        assert_eq!(kex.hmac_key().as_slice(), Vec::<u8>::new());
         assert_eq!(kex.uuid(), Uuid::nil());
         assert!(kex.moshpits_addr().is_none());
         assert!(kex.session_uuid().is_none());

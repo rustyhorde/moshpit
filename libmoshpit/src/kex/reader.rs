@@ -2131,7 +2131,7 @@ mod tests {
     #[test]
     fn key_fingerprint_from_b64_handles_invalid_input() {
         let fp = super::key_fingerprint_from_b64("not-base64-@@@");
-        assert!(!fp.is_empty());
+        assert_ne!(fp, "");
     }
 
     /// Unknown host + TOFU callback that returns `true` → accepted and saved.

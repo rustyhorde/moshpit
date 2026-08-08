@@ -584,7 +584,7 @@ mod tests {
         let parser = vt100::Parser::new(24, 80, 0);
         let out = r.render(parser.screen(), &[], None);
         assert!(r.initialized);
-        assert!(!out.is_empty());
+        assert_ne!(out, Vec::<u8>::new());
     }
 
     #[test]
@@ -600,7 +600,7 @@ mod tests {
     #[test]
     fn paint_overlays_to_ansi_empty_returns_empty() {
         let out = paint_overlays_to_ansi(&[], None);
-        assert!(out.is_empty());
+        assert_eq!(out, Vec::<u8>::new());
     }
 
     #[test]
@@ -628,7 +628,7 @@ mod tests {
         let mut parser = vt100::Parser::new(24, 80, 0);
         parser.process(b"hello");
         let out = r.render(parser.screen(), &[], None);
-        assert!(!out.is_empty());
+        assert_ne!(out, Vec::<u8>::new());
         let s = String::from_utf8_lossy(&out);
         assert!(s.contains("hello"));
     }
@@ -640,7 +640,7 @@ mod tests {
         parser.process(b"hello");
         // First render (full refresh)
         let first = r.render(parser.screen(), &[], None);
-        assert!(!first.is_empty());
+        assert_ne!(first, Vec::<u8>::new());
         // Second render without changes: only cursor positioning
         let second = r.render(parser.screen(), &[], None);
         // Should be much shorter than the first (just cursor move, no cell redraws)
@@ -830,7 +830,7 @@ mod tests {
         parser.process(b"hello");
         // First render to initialise
         let first = r.render(parser.screen(), &[], None);
-        assert!(!first.is_empty());
+        assert_ne!(first, Vec::<u8>::new());
         // Change size
         r.set_size(30, 100);
         assert!(!r.initialized);
@@ -839,7 +839,7 @@ mod tests {
         parser2.process(b"world");
         let after_resize = r.render(parser2.screen(), &[], None);
         assert!(r.initialized);
-        assert!(!after_resize.is_empty());
+        assert_ne!(after_resize, Vec::<u8>::new());
     }
 
     use super::super::prediction::DisplayPreference;

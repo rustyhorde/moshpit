@@ -2107,8 +2107,11 @@ mod test {
     #[cfg(unix)]
     #[test]
     fn parse_environment_file_empty() {
-        assert!(parse_environment_file("").is_empty());
-        assert!(parse_environment_file("# only a comment\n\n").is_empty());
+        assert_eq!(parse_environment_file(""), Vec::<(String, String)>::new());
+        assert_eq!(
+            parse_environment_file("# only a comment\n\n"),
+            Vec::<(String, String)>::new()
+        );
     }
 
     #[cfg(unix)]
@@ -2118,7 +2121,7 @@ mod test {
         // yields an empty Vec when the file is absent. Host-independent — every
         // entry is a non-empty key parsed from a `KEY=VALUE` line.
         for (key, _value) in parse_etc_environment() {
-            assert!(!key.is_empty());
+            assert_ne!(key, "");
         }
     }
 
@@ -2140,8 +2143,8 @@ mod test {
             resolve_user_account(&username, "/bin/sh").expect("current daemon user should resolve");
 
         assert_eq!(account.username, username);
-        assert!(!account.home.is_empty());
-        assert!(!account.shell.is_empty());
+        assert_ne!(account.home, "");
+        assert_ne!(account.shell, "");
     }
 
     // ── Phase 5: new_session ──────────────────────────────────────────────────
@@ -2726,7 +2729,7 @@ mod test {
 
     #[test]
     fn server_intercept_queries_no_escape_returns_empty() {
-        assert!(server_intercept_queries(b"hello world", 24, 80).is_empty());
+        assert_eq!(server_intercept_queries(b"hello world", 24, 80), b"");
     }
 
     #[test]
@@ -2791,9 +2794,9 @@ mod test {
     #[test]
     fn server_intercept_queries_unknown_sequence_returns_empty() {
         // Mode set — not a query
-        assert!(server_intercept_queries(b"\x1b[?25h", 24, 80).is_empty());
+        assert_eq!(server_intercept_queries(b"\x1b[?25h", 24, 80), b"");
         // Cursor position report — handled client-side, not server-side
-        assert!(server_intercept_queries(b"\x1b[6n", 24, 80).is_empty());
+        assert_eq!(server_intercept_queries(b"\x1b[6n", 24, 80), b"");
     }
 
     #[test]

@@ -1966,7 +1966,7 @@ mod tests {
         let ready2 = reader.handle_arrival(frame2, oversized_jump_seq);
 
         // Should drop the frame
-        assert!(ready2.is_empty());
+        assert_eq!(ready2, Vec::<EncryptedFrame>::new());
         assert_eq!(reader.next_seq, 1); // Unchanged
         assert!(reader.gap_first_seen.is_empty()); // No gaps recorded!
 
@@ -1975,7 +1975,7 @@ mod tests {
         let ready3 = reader.handle_arrival(frame3, 3);
 
         // Should buffer the frame and record gaps for 1 and 2
-        assert!(ready3.is_empty());
+        assert_eq!(ready3, Vec::<EncryptedFrame>::new());
         assert_eq!(reader.next_seq, 1);
         assert_eq!(reader.gap_first_seen.len(), 2);
         assert!(reader.gap_first_seen.contains_key(&1));
@@ -2144,7 +2144,7 @@ mod tests {
         // No ESC/VT/FF → returned verbatim with no responses.
         let (out, responses) = intercept(b"plain output");
         assert_eq!(out, b"plain output");
-        assert!(responses.is_empty());
+        assert_eq!(responses, Vec::<Vec<u8>>::new());
     }
 
     #[test]
@@ -2152,7 +2152,7 @@ mod tests {
         // Vertical tab (0x0b) and form feed (0x0c) become CR+LF.
         let (out, responses) = intercept(b"a\x0bb\x0cc");
         assert_eq!(out, b"a\r\nb\r\nc");
-        assert!(responses.is_empty());
+        assert_eq!(responses, Vec::<Vec<u8>>::new());
     }
 
     #[test]
@@ -2166,29 +2166,29 @@ mod tests {
     #[test]
     fn intercept_core_dsr_device_status() {
         let (out, responses) = intercept(b"\x1b[5n");
-        assert!(out.is_empty());
+        assert_eq!(out, Vec::<u8>::new());
         assert_eq!(responses, vec![b"\x1b[0n".to_vec()]);
     }
 
     #[test]
     fn intercept_core_da1_da2_da3() {
         let (out1, r1) = intercept(b"\x1b[c");
-        assert!(out1.is_empty());
+        assert_eq!(out1, Vec::<u8>::new());
         assert_eq!(r1, vec![b"\x1b[?62c".to_vec()]);
 
         let (out2, r2) = intercept(b"\x1b[>c");
-        assert!(out2.is_empty());
+        assert_eq!(out2, Vec::<u8>::new());
         assert_eq!(r2, vec![b"\x1b[>1;10;0c".to_vec()]);
 
         let (out3, r3) = intercept(b"\x1b[=c");
-        assert!(out3.is_empty());
+        assert_eq!(out3, Vec::<u8>::new());
         assert_eq!(r3, vec![b"\x1bP!|00000000\x1b\\".to_vec()]);
     }
 
     #[test]
     fn intercept_core_xtversion() {
         let (out, responses) = intercept(b"\x1b[>q");
-        assert!(out.is_empty());
+        assert_eq!(out, Vec::<u8>::new());
         assert_eq!(responses, vec![b"\x1bP>|moshpit\x1b\\".to_vec()]);
     }
 
@@ -2196,18 +2196,18 @@ mod tests {
     fn intercept_core_xtwinops_text_area_size() {
         // 18t → text-area size in characters → 24 rows, 80 cols.
         let (out, responses) = intercept(b"\x1b[18t");
-        assert!(out.is_empty());
+        assert_eq!(out, Vec::<u8>::new());
         assert_eq!(responses, vec![b"\x1b[8;24;80t".to_vec()]);
     }
 
     #[test]
     fn intercept_core_xtwinops_pixel_sizes() {
         let (out14, r14) = intercept(b"\x1b[14t");
-        assert!(out14.is_empty());
+        assert_eq!(out14, Vec::<u8>::new());
         assert_eq!(r14, vec![b"\x1b[4;0;0t".to_vec()]);
 
         let (out16, r16) = intercept(b"\x1b[16t");
-        assert!(out16.is_empty());
+        assert_eq!(out16, Vec::<u8>::new());
         assert_eq!(r16, vec![b"\x1b[6;0;0t".to_vec()]);
     }
 
@@ -2215,15 +2215,15 @@ mod tests {
     fn intercept_core_osc_color_queries_bel_terminated() {
         // OSC 10/11/12 color queries with BEL terminator → canned replies.
         let (out10, r10) = intercept(b"\x1b]10;?\x07");
-        assert!(out10.is_empty());
+        assert_eq!(out10, Vec::<u8>::new());
         assert_eq!(r10, vec![format!("\x1b]10;{TEST_FG}\x07").into_bytes()]);
 
         let (out11, r11) = intercept(b"\x1b]11;?\x07");
-        assert!(out11.is_empty());
+        assert_eq!(out11, Vec::<u8>::new());
         assert_eq!(r11, vec![format!("\x1b]11;{TEST_BG}\x07").into_bytes()]);
 
         let (out12, r12) = intercept(b"\x1b]12;?\x07");
-        assert!(out12.is_empty());
+        assert_eq!(out12, Vec::<u8>::new());
         assert_eq!(r12, vec![format!("\x1b]12;{TEST_FG}\x07").into_bytes()]);
     }
 
@@ -2231,7 +2231,7 @@ mod tests {
     fn intercept_core_osc_color_query_st_terminated() {
         // ST terminator (ESC \) is also accepted; the reply still uses BEL.
         let (out, responses) = intercept(b"\x1b]11;?\x1b\\");
-        assert!(out.is_empty());
+        assert_eq!(out, Vec::<u8>::new());
         assert_eq!(
             responses,
             vec![format!("\x1b]11;{TEST_BG}\x07").into_bytes()]
@@ -2244,7 +2244,7 @@ mod tests {
         let title = b"\x1b]0;my title\x07";
         let (out, responses) = intercept(title);
         assert_eq!(out, title);
-        assert!(responses.is_empty());
+        assert_eq!(responses, Vec::<Vec<u8>>::new());
     }
 
     #[test]
@@ -2271,7 +2271,7 @@ mod tests {
         let (reader, _rx) = make_reader_with_response_rx().await;
         let emu = make_emulator();
         let out = reader.intercept_queries(b"", &emu);
-        assert!(out.is_empty());
+        assert_eq!(out, Vec::<u8>::new());
     }
 
     // --- VT (0x0B) and FF (0x0C) normalisation to CR+LF ---
@@ -2783,7 +2783,7 @@ mod tests {
 
         // seq=4 arrives — gap 3 is new; gaps 0 and 1 are already tracked.
         let ready2 = reader.handle_arrival(EncryptedFrame::Keepalive(0), 4);
-        assert!(ready2.is_empty());
+        assert_eq!(ready2, Vec::<EncryptedFrame>::new());
         let frame2 = nak_rx
             .try_recv()
             .expect("expected NAK for newly-discovered gap 3");
@@ -3542,7 +3542,7 @@ mod tests {
         // After completion the assembly state must be reset
         assert_eq!(reader.pending_chunk_seq, 0);
         assert_eq!(reader.pending_chunk_total, 0);
-        assert!(reader.pending_chunk_data.is_empty());
+        assert_eq!(reader.pending_chunk_data, Vec::<u8>::new());
         Ok(())
     }
 

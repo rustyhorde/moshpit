@@ -1052,9 +1052,9 @@ mod tests {
 
             let loaded = load_identity_key(&key_path, None)?;
             assert_eq!(loaded.key_algorithm(), key_alg);
-            assert!(!key_pair.public_key_bytes().is_empty());
-            assert!(!loaded.public_key().is_empty());
-            assert!(!loaded.private_key().is_empty());
+            assert_ne!(key_pair.public_key_bytes().as_slice(), Vec::<u8>::new());
+            assert_ne!(loaded.public_key().as_slice(), Vec::<u8>::new());
+            assert_ne!(loaded.private_key().as_slice(), Vec::<u8>::new());
         }
         Ok(())
     }
@@ -1070,7 +1070,7 @@ mod tests {
             0x93, 0xD4, 0xF5, 0x5B,
         ];
         assert_eq!(key.public_key(), &expected);
-        assert!(!key.private_key().is_empty());
+        assert_ne!(key.private_key().as_slice(), Vec::<u8>::new());
     }
 
     #[test]
@@ -1084,7 +1084,7 @@ mod tests {
             0x4D, 0x54, 0x3F, 0x2F,
         ];
         assert_eq!(key.public_key(), &expected);
-        assert!(!key.private_key().is_empty());
+        assert_ne!(key.private_key().as_slice(), Vec::<u8>::new());
     }
 
     #[test]
@@ -1233,8 +1233,8 @@ mod tests {
         drop(f);
         let loaded = load_identity_key(&path, Some(&passphrase))?;
         assert_eq!(loaded.key_algorithm(), super::KEY_ALGORITHM_ML_DSA_44);
-        assert!(!loaded.public_key().is_empty());
-        assert!(!loaded.private_key().is_empty());
+        assert_ne!(loaded.public_key().as_slice(), Vec::<u8>::new());
+        assert_ne!(loaded.private_key().as_slice(), Vec::<u8>::new());
         Ok(())
     }
 
