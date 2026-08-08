@@ -4,7 +4,6 @@ categories.workspace = true
 description = "Perform various key tasks for moshpit"
 documentation = "https://github.com/rustyhorde/moshpit#mp-keygen"
 edition.workspace = true
-homepage.workspace = true
 keywords.workspace = true
 license.workspace = true
 name = "moshpit-keygen"

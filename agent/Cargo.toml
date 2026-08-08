@@ -4,7 +4,6 @@ categories.workspace = true
 description = "moshpit agent — holds identity keys in memory and serves them over a Unix socket"
 documentation = "https://github.com/rustyhorde/moshpit#moshpit-agent-mpa"
 edition.workspace = true
-homepage.workspace = true
 keywords.workspace = true
 license.workspace = true
 name = "moshpit-agent"

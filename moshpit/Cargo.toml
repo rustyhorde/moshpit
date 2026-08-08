@@ -4,7 +4,6 @@ categories.workspace = true
 description = "moshpit client (mp) — encrypted, resilient remote terminal session client"
 documentation = "https://github.com/rustyhorde/moshpit#moshpit-client-mp"
 edition.workspace = true
-homepage.workspace = true
 keywords.workspace = true
 license.workspace = true
 name = "moshpit"

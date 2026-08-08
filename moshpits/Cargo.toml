@@ -4,7 +4,6 @@ categories.workspace = true
 description = "moshpits server (mps) — server daemon for moshpit remote terminal sessions"
 documentation = "https://github.com/rustyhorde/moshpit#moshpits-server-mps"
 edition.workspace = true
-homepage.workspace = true
 keywords.workspace = true
 license.workspace = true
 name = "moshpits"

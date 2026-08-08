@@ -4,7 +4,6 @@ categories.workspace = true
 description = "A Rust implementation of in the same vein as Mosh, the mobile shell."
 documentation = "https://docs.rs/libmoshpit"
 edition.workspace = true
-homepage.workspace = true
 keywords.workspace = true
 license.workspace = true
 name = "libmoshpit"
