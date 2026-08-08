@@ -140,7 +140,6 @@ cmd = ["cargo", "matrix", "build"]
 # ---------------------------------------------------------------------------
 
 [target.test]
-depends_on = ["build"]
 tools = ["matrix", "nextest", "libclang"]
 
 [[target.test.command]]
