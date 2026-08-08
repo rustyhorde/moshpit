@@ -25,8 +25,6 @@ An SSH and Mosh inspired tool written in Rust.
 
 ### CI/CD
 [![docs.rs](https://docs.rs/libmoshpit/badge.svg)](https://docs.rs/libmoshpit)
-[![codecov](https://codecov.io/gh/rustyhorde/moshpit/branch/master/graph/badge.svg?token=cBXro7o2UN)](https://codecov.io/gh/rustyhorde/moshpit)
-[![CI](https://github.com/rustyhorde/moshpit/actions/workflows/moshpit.yml/badge.svg)](https://github.com/rustyhorde/moshpit/actions)
 
 ## Overview
 
@@ -327,89 +325,64 @@ Use this software at your own risk, especially in internet-facing, production, o
 
 ---
 
-## Installation (Arch Linux / AUR)
+## Installation (Arch Linux)
 
-All three binaries are available in three package variants on the AUR.  Install them with any AUR helper (e.g. `yay`, `paru`) or manually with `makepkg`.
-
-| Variant | Packages | Build | ML-DSA keys |
-|---------|----------|-------|:-----------:|
-| Source (compile locally) | `moshpit-keygen` `moshpit` `moshpits` | `cargo build` from source tarball | — |
-| Pre-compiled binary | `moshpit-keygen-bin` `moshpit-bin` `moshpits-bin` | MUSL static binary from GitHub release | — |
-| Pre-compiled binary + unstable | `moshpit-keygen-unstable-bin` `moshpit-unstable-bin` `moshpits-unstable-bin` | MUSL static binary built with `--features unstable` | ✓ |
-
-The `-unstable-bin` packages install the same binary names (`mp-keygen`, `mp`, `mps`) and conflict with the other variants — only one variant can be installed at a time.
-
-### Install with an AUR helper
+`moshpit`/`moshpits`/`moshpit-keygen`/`moshpit-agent` ship as a self-hosted, signed pacman repo with pre-compiled static MUSL binaries — no AUR helper or `makepkg` build step required:
 
 ```bash
-# Standard pre-compiled binaries (no Rust toolchain required)
-yay -S moshpits-bin moshpit-bin
+sudo curl -fsSL https://git.jasonozias.com/dl/moshpit/gpg.key \
+  -o /etc/pacman.d/moshpit.gpg
+sudo pacman-key --add /etc/pacman.d/moshpit.gpg
+sudo pacman-key --lsign-key jason.g.ozias@pm.me
+```
+
+Add to `/etc/pacman.conf`:
+
+```ini
+[moshpit]
+SigLevel = Required
+Server = https://git.jasonozias.com/dl/moshpit/arch/$arch
+```
+
+```bash
+# Key tooling first (provides mp-keygen, no dependencies)
+sudo pacman -Sy moshpit-keygen-bin
+
+# Client and/or server
+sudo pacman -S moshpit-bin moshpits-bin
+
+# Vault agent — pick one unlock-backend build
+sudo pacman -S moshpit-agent-bin                # base
+sudo pacman -S moshpit-agent-fido2-bin          # + FIDO2
+sudo pacman -S moshpit-agent-systemd-creds-bin  # + systemd-creds
+sudo pacman -S moshpit-agent-full-bin           # fido2 + systemd-creds
 
 # Pre-compiled binaries with post-quantum ML-DSA identity key support
-yay -S moshpits-unstable-bin moshpit-unstable-bin
-
-# Source packages (compiles locally; requires Rust, cmake, gcc)
-yay -S moshpits moshpit
+sudo pacman -S moshpit-keygen-unstable-bin moshpit-unstable-bin moshpits-unstable-bin
 ```
 
-### Install manually with makepkg
+The `-unstable-bin` packages install the same binary names (`mp-keygen`, `mp`, `mps`) and conflict with their standard counterparts — only one variant of a given binary can be installed at a time. The same applies across the four `moshpit-agent*-bin` variants.
 
-#### Pre-compiled binary packages (`-bin`)
+<details>
+<summary>Migrating from the AUR</summary>
+
+Earlier releases published a 24-package matrix (source + `-bin` + `-unstable-bin` builds of `moshpit-keygen`, `moshpit`, `moshpits`, plus the agent unlock-backend variants) to the AUR. All of those AUR packages are retired in favor of the self-hosted repo above. The `-bin`/`-unstable-bin` package names are unchanged but consolidated to 14 packages (the never-precompiled source-only builds and the still-stubbed agent unlock backends were dropped), so switching means adding the repo above and reinstalling:
 
 ```bash
-# 1. Install moshpit-keygen-bin first (provides mp-keygen, no dependencies)
-git clone https://aur.archlinux.org/moshpit-keygen-bin.git
-cd moshpit-keygen-bin && makepkg -si && cd ..
-
-# 2. Install the server binary
-git clone https://aur.archlinux.org/moshpits-bin.git
-cd moshpits-bin && makepkg -si && cd ..
-
-# 3. Install the client binary
-git clone https://aur.archlinux.org/moshpit-bin.git
-cd moshpit-bin && makepkg -si && cd ..
+sudo pacman -R moshpits moshpit moshpit-keygen   # or whichever -bin/-unstable-bin variants you had
+sudo pacman -Sy moshpits-bin moshpit-bin moshpit-keygen-bin  # reinstall from the new repo above
 ```
 
-#### Unstable binary packages (`-unstable-bin`, includes ML-DSA support)
-
-```bash
-# 1. Install moshpit-keygen-unstable-bin first
-git clone https://aur.archlinux.org/moshpit-keygen-unstable-bin.git
-cd moshpit-keygen-unstable-bin && makepkg -si && cd ..
-
-# 2. Install the server binary with unstable support
-git clone https://aur.archlinux.org/moshpits-unstable-bin.git
-cd moshpits-unstable-bin && makepkg -si && cd ..
-
-# 3. Install the client binary with unstable support
-git clone https://aur.archlinux.org/moshpit-unstable-bin.git
-cd moshpit-unstable-bin && makepkg -si && cd ..
-```
-
-#### Source packages (compile locally)
-
-```bash
-# 1. Clone and build moshpit-keygen first (shared dependency)
-git clone https://aur.archlinux.org/moshpit-keygen.git
-cd moshpit-keygen && makepkg -si && cd ..
-
-# 2. Clone and build the server
-git clone https://aur.archlinux.org/moshpits.git
-cd moshpits && makepkg -si && cd ..
-
-# 3. Clone and build the client
-git clone https://aur.archlinux.org/moshpit.git
-cd moshpit && makepkg -si && cd ..
-```
+</details>
 
 ### Removing packages
 
 ```bash
 # Remove server and client (keep keygen)
-sudo pacman -R moshpits moshpit       # or moshpits-bin / moshpits-unstable-bin etc.
+sudo pacman -R moshpits-bin moshpit-bin       # or the -unstable-bin variants
 
-# Remove everything including keygen
-sudo pacman -Rs moshpits moshpit moshpit-keygen
+# Remove everything including keygen and the agent
+sudo pacman -Rs moshpits-bin moshpit-bin moshpit-keygen-bin moshpit-agent-bin
 ```
 
 ---
@@ -418,18 +391,18 @@ sudo pacman -Rs moshpits moshpit moshpit-keygen
 
 ### Install from the apt repository (recommended)
 
-The signed apt repository at <https://rustyhorde.github.io/moshpit-packages/> tracks every release, so `apt upgrade` keeps moshpit current.  Packages are available for `amd64` and `arm64`:
+The signed apt repository at <https://git.jasonozias.com/dl/moshpit/> tracks every release, so `apt upgrade` keeps moshpit current.  Packages are available for `amd64` and `arm64`:
 
 ```bash
-# Add the repository signing key
+# Add the repository signing key (dearmored — apt/gpgv can't read the
+# armored block directly)
 sudo install -d /etc/apt/keyrings
-curl -fsSL https://rustyhorde.github.io/moshpit-packages/gpg.key \
+curl -fsSL https://git.jasonozias.com/dl/moshpit/gpg.key \
     | sudo gpg --dearmor -o /etc/apt/keyrings/moshpit.gpg
 
 # Add the apt source
-echo "deb [arch=amd64,arm64 signed-by=/etc/apt/keyrings/moshpit.gpg] \
-  https://rustyhorde.github.io/moshpit-packages/apt stable main" \
-    | sudo tee /etc/apt/sources.list.d/moshpit.list
+sudo curl -fsSL https://git.jasonozias.com/dl/moshpit/apt/moshpit.sources \
+    -o /etc/apt/sources.list.d/moshpit.sources
 
 # Install
 sudo apt update
@@ -438,9 +411,20 @@ sudo apt install moshpit-keygen moshpits moshpit moshpit-agent
 
 The same repository also carries the `-unstable` builds (ML-DSA support) and the per-feature agent builds — install them by name, e.g. `moshpit-unstable`, `moshpit-agent-fido2`, or `moshpit-agent-full`.  Each binary's variants conflict with one another, so only one variant of a given binary can be installed at a time.
 
+<details>
+<summary>Migrating from the old apt repository</summary>
+
+The apt repo used to be hosted on GitHub Pages (`rustyhorde.github.io/moshpit-packages`). Remove the old source and key before adding the new ones above:
+
+```bash
+sudo rm -f /etc/apt/sources.list.d/moshpit.list /etc/apt/keyrings/moshpit.gpg
+```
+
+</details>
+
 ### Install a downloaded `.deb` directly
 
-Pre-built `.deb` packages are also attached to each [GitHub release](https://github.com/rustyhorde/moshpit/releases) if you prefer not to add the repository.
+Pre-built `.deb` packages for each release are also available directly at <https://git.jasonozias.com/dl/moshpit/vX.Y.Z/> if you prefer not to add the repository.
 
 > **Note**: Place `.deb` files in `/tmp/` before installing with `apt`.  When accessing a local file `apt` drops privileges to the `_apt` system user, which cannot read files under `/home/`.  Using `/tmp/` (world-readable by default) avoids the resulting permission warning entirely.  Alternatively, use `dpkg -i` — it runs as root and has no sandboxing step.
 
@@ -448,11 +432,11 @@ Pre-built `.deb` packages are also attached to each [GitHub release](https://git
 
 ```bash
 # Download the packages to /tmp (substitute the desired version)
-VERSION=0.8.0
+VERSION=0.9.5
 wget -P /tmp \
-    https://github.com/rustyhorde/moshpit/releases/download/v${VERSION}/moshpit-keygen_${VERSION}_amd64.deb \
-    https://github.com/rustyhorde/moshpit/releases/download/v${VERSION}/moshpits_${VERSION}_amd64.deb \
-    https://github.com/rustyhorde/moshpit/releases/download/v${VERSION}/moshpit_${VERSION}_amd64.deb
+    https://git.jasonozias.com/dl/moshpit/v${VERSION}/moshpit-keygen_${VERSION}_amd64.deb \
+    https://git.jasonozias.com/dl/moshpit/v${VERSION}/moshpits_${VERSION}_amd64.deb \
+    https://git.jasonozias.com/dl/moshpit/v${VERSION}/moshpit_${VERSION}_amd64.deb
 
 # Install in dependency order — keygen first, then server, then client
 sudo apt install \
@@ -466,7 +450,7 @@ sudo apt install \
 `dpkg -i` runs entirely as root and works with `.deb` files in any location:
 
 ```bash
-VERSION=0.8.0
+VERSION=0.9.5
 sudo dpkg -i \
     ~/moshpit-keygen_${VERSION}_amd64.deb \
     ~/moshpits_${VERSION}_amd64.deb \
@@ -493,12 +477,12 @@ sudo apt purge moshpit moshpits moshpit-keygen
 
 ## Installation (Fedora / RHEL)
 
-Pre-built `.rpm` packages for `x86_64` and `aarch64` are served from the signed dnf repository at <https://rustyhorde.github.io/moshpit-packages/>, so `dnf upgrade` keeps moshpit current.
+Pre-built `.rpm` packages for `x86_64` and `aarch64` are served from the signed dnf repository at <https://git.jasonozias.com/dl/moshpit/>, so `dnf upgrade` keeps moshpit current.
 
 ```bash
 # Add the repository (imports the signing key on first install)
 sudo dnf config-manager \
-    --add-repo https://rustyhorde.github.io/moshpit-packages/rpm/moshpit.repo
+    --add-repo https://git.jasonozias.com/dl/moshpit/rpm/moshpit.repo
 
 # Install
 sudo dnf install moshpit-keygen moshpits moshpit moshpit-agent
@@ -508,7 +492,29 @@ sudo dnf install moshpit-keygen moshpits moshpit moshpit-agent
 
 The `-unstable` builds and per-feature agent builds (`moshpit-agent-fido2`, `moshpit-agent-full`, …) are available from the same repository by name.  Variants of a given binary conflict, so only one can be installed at a time.
 
-`.rpm` files are also attached to each [GitHub release](https://github.com/rustyhorde/moshpit/releases) for direct `sudo dnf install ./<pkg>.rpm` use.
+<details>
+<summary>Migrating from the old dnf repository</summary>
+
+The dnf repo used to be hosted on GitHub Pages (`rustyhorde.github.io/moshpit-packages`). Remove the old repo file first:
+
+```bash
+sudo rm -f /etc/yum.repos.d/moshpit.repo
+```
+
+</details>
+
+### From a downloaded `.rpm`
+
+Pre-built `.rpm` packages for each release are also available directly at <https://git.jasonozias.com/dl/moshpit/vX.Y.Z/>:
+
+```bash
+VERSION=0.9.5
+ARCH=x86_64
+curl -LO "https://git.jasonozias.com/dl/moshpit/v${VERSION}/moshpit-keygen-${VERSION}-1.${ARCH}.rpm"
+curl -LO "https://git.jasonozias.com/dl/moshpit/v${VERSION}/moshpits-${VERSION}-1.${ARCH}.rpm"
+curl -LO "https://git.jasonozias.com/dl/moshpit/v${VERSION}/moshpit-${VERSION}-1.${ARCH}.rpm"
+sudo dnf install ./moshpit-keygen-${VERSION}-1.${ARCH}.rpm ./moshpits-${VERSION}-1.${ARCH}.rpm ./moshpit-${VERSION}-1.${ARCH}.rpm
+```
 
 ### Removing packages
 
@@ -520,18 +526,15 @@ sudo dnf remove moshpit moshpits moshpit-keygen
 
 ## Installation (Homebrew / macOS)
 
-Pre-compiled binaries for **Apple Silicon (aarch64)** are published to the
-[`rustyhorde/moshpit`](https://github.com/rustyhorde/homebrew-moshpit) tap. Intel Macs are
-not currently supported, and the `mpa` agent is Linux-only so it is not distributed here.
+Pre-compiled binaries for **Apple Silicon (aarch64)** are published to a self-hosted
+Homebrew tap. Intel Macs are not currently supported. `mps` (the server) and `mpa` (the
+agent) are Linux-only, so neither is distributed here — only the client and key tooling:
 
 ```bash
-brew tap rustyhorde/moshpit
+brew tap jozias/moshpit https://git.jasonozias.com/homebrew-moshpit.git
 
 # Client + key tooling (the typical macOS setup — connect to a remote server)
 brew install moshpit moshpit-keygen
-
-# Server (optional — host terminals from your Mac)
-brew install moshpits
 ```
 
 ### Unstable formulae (includes post-quantum ML-DSA support)
@@ -541,14 +544,38 @@ The `-unstable` formulae ship the same binaries built with the `unstable` featur
 
 ```bash
 brew install moshpit-unstable moshpit-keygen-unstable
-brew install moshpits-unstable
 ```
+
+<details>
+<summary>Migrating from the old Homebrew tap</summary>
+
+The tap used to be hosted on GitHub (`rustyhorde/homebrew-moshpit`). Untap it before adding the new one above:
+
+```bash
+brew untap rustyhorde/moshpit
+```
+
+</details>
 
 ### Removing formulae
 
 ```bash
-brew uninstall moshpit moshpits moshpit-keygen
-brew untap rustyhorde/moshpit
+brew uninstall moshpit moshpit-keygen
+brew untap jozias/moshpit
+```
+
+---
+
+## Installation (Windows)
+
+Pre-built MSI installers for `mp` and `mp-keygen` are published for each release directly at <https://git.jasonozias.com/dl/moshpit/vX.Y.Z/>. `mps` (the server) and `mpa` (the agent) are Linux-only and are not built for Windows.
+
+```powershell
+curl.exe -fsSLO https://git.jasonozias.com/dl/moshpit/vX.Y.Z/mp-x86_64-pc-windows-msvc.msi
+msiexec /i mp-x86_64-pc-windows-msvc.msi /l*v mp-install.log
+
+curl.exe -fsSLO https://git.jasonozias.com/dl/moshpit/vX.Y.Z/mp-keygen-x86_64-pc-windows-msvc.msi
+msiexec /i mp-keygen-x86_64-pc-windows-msvc.msi /l*v mp-keygen-install.log
 ```
 
 ---
