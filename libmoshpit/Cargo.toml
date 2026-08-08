@@ -1,61 +1,53 @@
 [package]
-authors = ["Jason Ozias <jason.g.ozias@gmail.com>"]
-categories = ["command-line-interface", "network-programming", "cryptography"]
+authors.workspace = true
+categories.workspace = true
 description = "A Rust implementation of in the same vein as Mosh, the mobile shell."
 documentation = "https://docs.rs/libmoshpit"
-edition = "2024"
-homepage = "https://github.com/rustyhorde/moshpit"
-keywords = ["ssh", "mosh"]
-license = "MIT OR Apache-2.0"
+edition.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+license.workspace = true
 name = "libmoshpit"
-readme = "../README.md"
-repository = "https://github.com/rustyhorde/moshpit"
-version = "0.9.4"
-rust-version = "1.95.0"
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
 
 [features]
 unstable = ["aws-lc-rs/unstable"]
 
 [dependencies]
-ansi-control-codes = { version = "1.0.1", features = ["parser", "explain"] }
+ansi-control-codes = { workspace = true }
 anyhow = { workspace = true }
 argon2 = { workspace = true }
 aws-lc-rs = { workspace = true }
 base64 = { workspace = true }
 bincode-next = { workspace = true }
-bishop = "1.0.0"
+bishop = { workspace = true }
 bon = { workspace = true }
 bytes = { workspace = true }
 clap = { workspace = true }
 config = { workspace = true }
 dirs2 = { workspace = true }
 getset = { workspace = true }
-regex = "1.12.4"
+regex = { workspace = true }
 serde = { workspace = true }
 socket2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["process", "sync", "time"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
-tracing-appender = "0.2.5"
-tracing-subscriber = { version = "0.3.23", features = [
-    "env-filter",
-    "fmt",
-    "time",
-] }
+tracing-appender = { workspace = true }
+tracing-subscriber = { workspace = true }
 tracing-subscriber-init = { workspace = true }
 uuid = { workspace = true }
 vt100 = { workspace = true }
-whoami = "2.1.2"
+whoami = { workspace = true }
 zeroize = { workspace = true }
 zstd = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.62.2", features = [
-    "Win32_Foundation",
-    "Win32_Security",
-    "Win32_Security_Authorization",
-] }
+windows = { workspace = true }
 
 [build-dependencies]
 anyhow = { workspace = true }
@@ -64,7 +56,7 @@ vergen-gix = { workspace = true }
 
 [dev-dependencies]
 bincode-next = { workspace = true }
-proptest = "1.11.0"
+proptest = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = [
     "macros",

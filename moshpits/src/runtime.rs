@@ -997,8 +997,8 @@ fn spawn_silence_watchdog(token: CancellationToken, last_rx_us: Arc<AtomicU64>) 
 /// Single tick of the MTU probe state machine.
 ///
 /// Returns `Some(new_mtu)` if the effective MTU tier changed this tick; `None` otherwise.
-/// Extracted from [`spawn_mtu_probe_task`] so the state-transition logic can be tested
-/// without async machinery.
+/// Extracted from [`spawn_connection_health_task`] so the state-transition logic can be
+/// tested without async machinery.
 fn mtu_probe_step(
     current_nak: u64,
     last_nak: &mut u64,

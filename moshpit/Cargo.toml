@@ -1,17 +1,17 @@
 [package]
-authors = ["Jason Ozias <jason.g.ozias@gmail.com>"]
-categories = ["command-line-interface", "network-programming", "cryptography"]
+authors.workspace = true
+categories.workspace = true
 description = "moshpit client (mp) — encrypted, resilient remote terminal session client"
 documentation = "https://github.com/rustyhorde/moshpit#moshpit-client-mp"
-edition = "2024"
-homepage = "https://github.com/rustyhorde/moshpit"
-keywords = ["ssh", "mosh"]
-license = "MIT OR Apache-2.0"
+edition.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+license.workspace = true
 name = "moshpit"
-readme = "../README.md"
-repository = "https://github.com/rustyhorde/moshpit"
-version = "0.9.4"
-rust-version = "1.95.0"
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
 
 [[bin]]
 name = "mp"
@@ -24,17 +24,17 @@ unstable = ["libmoshpit/unstable"]
 anyhow = { workspace = true }
 clap = { workspace = true }
 config = { workspace = true }
-crossterm = "0.29.0"
+crossterm = { workspace = true }
 dialoguer = { workspace = true }
 dirs2 = { workspace = true }
 getset = { workspace = true }
-libmoshpit = { version = "0.9.4", path = "../libmoshpit" }
+libmoshpit = { workspace = true }
 serde = { workspace = true }
-serde_json = "1.0.150"
-terminal_size = "0.4.4"
-toml = "1.1.2"
+serde_json = { workspace = true }
+terminal_size = { workspace = true }
 tokio = { workspace = true, features = ["io-std", "signal", "sync", "time"] }
 tokio-util = { workspace = true }
+toml = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 vergen-pretty = { workspace = true }

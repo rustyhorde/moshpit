@@ -17,6 +17,11 @@ use std::{
 };
 
 use anyhow::Result;
+#[cfg(feature = "unstable")]
+use aws_lc_rs::signature::{
+    ML_DSA_44, ML_DSA_44_SIGNING, ML_DSA_65, ML_DSA_65_SIGNING, ML_DSA_87, ML_DSA_87_SIGNING,
+    PqdsaKeyPair, UnparsedPublicKey as SignatureUnparsedPublicKey,
+};
 use aws_lc_rs::{
     aead::{
         AES_128_GCM_SIV, AES_256_GCM, AES_256_GCM_SIV, Aad, CHACHA20_POLY1305, LessSafeKey,
@@ -32,14 +37,6 @@ use aws_lc_rs::{
         ML_KEM_768, ML_KEM_1024,
     },
     rand::fill,
-};
-#[cfg(feature = "unstable")]
-use aws_lc_rs::{
-    signature::UnparsedPublicKey as SignatureUnparsedPublicKey,
-    unstable::signature::{
-        ML_DSA_44, ML_DSA_44_SIGNING, ML_DSA_65, ML_DSA_65_SIGNING, ML_DSA_87, ML_DSA_87_SIGNING,
-        PqdsaKeyPair,
-    },
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bon::Builder;
@@ -2004,11 +2001,12 @@ mod tests {
     #[test]
     fn ml_dsa_identity_transcript_signature_verifies() {
         use aws_lc_rs::{
-            encoding::AsRawBytes as _, signature::KeyPair as _, unstable::signature::PqdsaKeyPair,
+            encoding::AsRawBytes as _,
+            signature::{KeyPair as _, ML_DSA_44_SIGNING, PqdsaKeyPair},
         };
 
-        let key_pair = PqdsaKeyPair::generate(&aws_lc_rs::unstable::signature::ML_DSA_44_SIGNING)
-            .expect("test ML-DSA-44 key generation");
+        let key_pair =
+            PqdsaKeyPair::generate(&ML_DSA_44_SIGNING).expect("test ML-DSA-44 key generation");
         let private_key = key_pair
             .private_key()
             .as_raw_bytes()
@@ -3044,8 +3042,7 @@ mod tests {
     fn ml_dsa_sign_verify_ml_dsa_65_and_87() {
         use aws_lc_rs::{
             encoding::AsRawBytes as _,
-            signature::KeyPair as _,
-            unstable::signature::{ML_DSA_65_SIGNING, ML_DSA_87_SIGNING, PqdsaKeyPair},
+            signature::{KeyPair as _, ML_DSA_65_SIGNING, ML_DSA_87_SIGNING, PqdsaKeyPair},
         };
 
         let negotiated = NegotiatedAlgorithms {

@@ -8,3 +8,11 @@ scripts/logs/
 TODO.md
 /.rake
 /tmp
+
+# scripts/release/build.fish local release-build workspace
+/release-assets/
+/dist-*.tar.gz
+/mp-*-unknown-linux-musl
+/mpa-*-unknown-linux-musl
+/mps-*-unknown-linux-musl
+/mp-keygen-*-unknown-linux-musl

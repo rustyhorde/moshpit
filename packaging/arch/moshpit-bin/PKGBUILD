@@ -12,7 +12,7 @@ conflicts=('moshpit')
 depends=('moshpit-keygen-bin')
 makedepends=()
 
-_base="https://github.com/rustyhorde/moshpit/releases/download/v${pkgver}"
+_base="https://git.jasonozias.com/dl/moshpit/v${pkgver}"
 
 source=("${_base}/dist-mp.tar.gz")
 source_x86_64=("mp-x86_64::${_base}/mp-x86_64-unknown-linux-musl")

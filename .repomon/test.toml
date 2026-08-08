@@ -1,0 +1,49 @@
+name = "moshpit-test"
+
+# Every branch except master: master already gets the fuller `cargo rake
+# most` (a superset of `test`) from ci.toml — this is what covers PR
+# pushes, since repomon has no PR-event concept, only push.
+[on.push.branches_ignore]
+names = ["master"]
+
+[on.push.tags]
+names = []
+
+[jobs.test-linux]
+runs_on = ["linux"]
+
+[jobs.test-linux.steps.checkout]
+uses = "actions/checkout"
+
+[jobs.test-linux.steps.test]
+name = "🧪 Test (Linux) 🧪"
+run = "cargo rake test"
+
+[jobs.test-macos]
+runs_on = ["macos"]
+
+# This runner's $SHELL/FISH_VERSION resolves librake's shell-family
+# detection to Fish even though the `fish` binary isn't actually reachable
+# there (likely a stale login-shell env var, not an installed fish) —
+# "fuzz nextest"'s fish variant then fails with "could not launch 'fish':
+# No such file or directory". Pin to the already-correct `sh` variant
+# instead of fixing the runner's shell config.
+[jobs.test-macos.env]
+RAKE_SHELL = "sh"
+
+[jobs.test-macos.steps.checkout]
+uses = "actions/checkout"
+
+[jobs.test-macos.steps.test]
+name = "🧪 Test (macOS) 🧪"
+run = "cargo rake test"
+
+[jobs.test-windows]
+runs_on = ["windows"]
+
+[jobs.test-windows.steps.checkout]
+uses = "actions/checkout"
+
+[jobs.test-windows.steps.test]
+name = "🧪 Test (Windows) 🧪"
+run = "cargo rake test"

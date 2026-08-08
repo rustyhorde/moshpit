@@ -53,7 +53,7 @@ pub(crate) trait UnlockBackend: Send + Sync {
 
     /// Set the master passphrase when creating a new vault (first launch).
     ///
-    /// The default implementation delegates to [`retrieve_passphrase`].
+    /// The default implementation delegates to [`Self::retrieve_passphrase`].
     /// Backends that support interactive setup (e.g. passphrase with
     /// confirmation) should override this.
     fn set_passphrase(&self) -> Result<String> {

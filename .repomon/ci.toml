@@ -1,0 +1,49 @@
+name = "moshpit-ci"
+
+# Only master: an absent branches filter matches every branch push (see
+# librepomon's Push::ref_kind_matches doc), which would fire full cargo
+# rake most on every feature-branch push too — see test.toml for those.
+[on.push.branches]
+names = ["master"]
+
+[on.push.tags]
+names = []
+
+# Three separate job tables, not one shared runs_on = [...] job: repomon
+# dispatches one job instance per matching runner kind, and only a
+# per-platform job table gives each its own name/log stream in `rpmt`.
+
+[jobs.rake-linux]
+runs_on = ["linux"]
+
+[jobs.rake-linux.steps.checkout]
+uses = "actions/checkout"
+
+[jobs.rake-linux.steps.rake]
+name = "🔥 Rake Most (Linux) 🔥"
+run = "cargo rake most"
+
+[jobs.rake-macos]
+runs_on = ["macos"]
+
+# See the matching note in test.toml: `cargo rake most` depends on `test`,
+# which hits the same fish-launch failure on this runner without this.
+[jobs.rake-macos.env]
+RAKE_SHELL = "sh"
+
+[jobs.rake-macos.steps.checkout]
+uses = "actions/checkout"
+
+[jobs.rake-macos.steps.rake]
+name = "🔥 Rake Most (macOS) 🔥"
+run = "cargo rake most"
+
+[jobs.rake-windows]
+runs_on = ["windows"]
+
+[jobs.rake-windows.steps.checkout]
+uses = "actions/checkout"
+
+[jobs.rake-windows.steps.rake]
+name = "🔥 Rake Most (Windows) 🔥"
+run = "cargo rake most"

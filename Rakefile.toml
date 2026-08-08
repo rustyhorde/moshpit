@@ -34,8 +34,38 @@ update = true
 check = ["docker", "--version"]
 hint = "install Docker: https://docs.docker.com/get-docker/"
 
+[tool.os.nfpm]
+check = ["nfpm", "--version"]
+install = ["fish", "scripts/release/install-nfpm.fish"]
+
+[tool.os.makepkg]
+check = ["makepkg", "--version"]
+hint = "install base-devel: sudo pacman -S --needed base-devel"
+
+[tool.os.apt-ftparchive]
+check = ["apt-ftparchive", "--version"]
+hint = "install apt: sudo pacman -S --needed apt"
+
+[tool.os.createrepo_c]
+check = ["createrepo_c", "--version"]
+hint = "install createrepo_c: sudo pacman -S --needed createrepo_c"
+
+[tool.os.gpg]
+check = ["gpg", "--version"]
+hint = "install gnupg: sudo pacman -S --needed gnupg"
+
+[tool.os.libclang]
+check = ["clang", "--version"]
+hint = "libmoshpit/fuzz needs libclang for aws-lc-rs's bindgen feature: Linux: sudo pacman -S clang llvm (or your distro's clang/libclang-dev); Windows: choco install llvm -y; macOS: usually bundled with Xcode Command Line Tools (xcode-select --install)"
+
 [tool.fish.puc]
 hint = "The 'puc' fish function is required to run this target"
+
+[tool.cargo.audit]
+crate = "cargo-audit"
+check = ["cargo", "audit", "--version"]
+install = ["cargo", "install", "cargo-audit", "--force", "--locked"]
+update = true
 
 # ---------------------------------------------------------------------------
 # update
@@ -70,6 +100,20 @@ name = "fmt check"
 cmd = ["cargo", "fmt", "--all", "--", "--check"]
 
 # ---------------------------------------------------------------------------
+# audit
+# ---------------------------------------------------------------------------
+
+[target.audit]
+tools = ["audit"]
+
+[[target.audit.command]]
+name = "audit"
+# `--deny warnings`: matches the strictness of the removed audit.yml
+# workflow (rustyhorde/audit-check with `deny: warnings`), which failed on
+# unmaintained/yanked warnings, not just active vulnerabilities.
+cmd = ["cargo", "audit", "--deny", "warnings"]
+
+# ---------------------------------------------------------------------------
 # clippy
 # ---------------------------------------------------------------------------
 
@@ -96,8 +140,7 @@ cmd = ["cargo", "matrix", "build"]
 # ---------------------------------------------------------------------------
 
 [target.test]
-depends_on = ["build"]
-tools = ["matrix", "nextest"]
+tools = ["matrix", "nextest", "libclang"]
 
 [[target.test.command]]
 name = "nextest"
@@ -109,8 +152,16 @@ cmd = ["cargo", "matrix", "test", "--doc", "-p", "libmoshpit"]
 
 [[target.test.command]]
 name = "fuzz nextest"
+platform = ["linux", "macos"]
 fish = "cd libmoshpit/fuzz; and cargo matrix nextest run"
 sh = "cd libmoshpit/fuzz && cargo matrix nextest run"
+# libfuzzer-sys (libmoshpit/fuzz's dependency) only supports linux/macos, so
+# this step is skipped on Windows rather than given a `ps` variant. Under
+# GitHub Actions this target was never invoked on Windows at all
+# (moshpit.yml called `cargo matrix test` directly, bypassing
+# Rakefile.toml); it only became reachable there once `.repomon/ci.toml`/
+# `test.toml` started running `cargo rake most`/`test` uniformly across all
+# three platforms.
 
 # ---------------------------------------------------------------------------
 # docs
@@ -145,7 +196,7 @@ cmd = ["cargo", "llvm-cov", "report", "--html"]
 # ---------------------------------------------------------------------------
 
 [target.fuzz]
-tools = ["fuzz"]
+tools = ["fuzz", "libclang"]
 
 [[target.fuzz.command]]
 name = "fuzz_frame"
@@ -185,7 +236,7 @@ cmd = ["cargo", "fuzz", "run", "--fuzz-dir", "libmoshpit/fuzz", "fuzz_zstd_decom
 
 [target.fuzz-unstable]
 depends_on = ["fuzz"]
-tools = ["fuzz"]
+tools = ["fuzz", "libclang"]
 
 [[target.fuzz-unstable.command]]
 name = "fuzz_pubkey_parse"
@@ -317,6 +368,19 @@ fish = "cp target/x86_64-unknown-linux-musl/release/mpa ~/mpa"
 sh = "cp target/x86_64-unknown-linux-musl/release/mpa $HOME/mpa"
 
 # ---------------------------------------------------------------------------
+# release  (see scripts/release/RUNBOOK.md)
+# ---------------------------------------------------------------------------
+
+[target.release]
+tools = ["nfpm", "makepkg", "apt-ftparchive", "createrepo_c", "gpg"]
+
+[[target.release.command]]
+name = "release"
+platform = ["linux"]
+fish = "fish scripts/release/release.fish"
+sh = "fish scripts/release/release.fish"
+
+# ---------------------------------------------------------------------------
 # clean
 # ---------------------------------------------------------------------------
 
@@ -335,7 +399,7 @@ ps = "Remove-Item -Force lcov.info -ErrorAction Ignore"
 # ---------------------------------------------------------------------------
 
 [target.most]
-depends_on = ["fmt", "clippy", "build", "test", "docs", "coverage"]
+depends_on = ["fmt", "clippy", "build", "test", "docs", "coverage", "audit"]
 
 [target.daily]
 depends_on = ["all", "^fuzz", "^install"]
@@ -347,7 +411,7 @@ depends_on = ["install", "clean"]
 depends_on = ["all", "^fuzz", "^install", "^musl"]
 
 [target.all]
-depends_on = ["puc", "fmt", "clippy", "build", "test", "docs", "coverage", "fuzz", "install", "musl", "clean"]
+depends_on = ["puc", "fmt", "clippy", "build", "test", "docs", "coverage", "audit", "fuzz", "install", "musl", "clean"]
 
 [target.default]
 depends_on = ["most"]

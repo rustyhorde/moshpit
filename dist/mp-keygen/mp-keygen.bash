@@ -1,4 +1,4 @@
-_mp-keygen() {
+_mp__keygen() {
     local i cur prev opts cmd
     COMPREPLY=()
     if [[ "${BASH_VERSINFO[0]}" -ge 4 ]]; then
@@ -61,7 +61,7 @@ _mp-keygen() {
             return 0
             ;;
         mp__subcmd__keygen__subcmd__fingerprint)
-            opts="-h --help <PUBLIC_KEY>"
+            opts="-h --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -75,12 +75,28 @@ _mp-keygen() {
             return 0
             ;;
         mp__subcmd__keygen__subcmd__generate)
-            opts="-h --help"
+            opts="-n -o -f -s -k -h --no-passphrase --output-path --force --server --passphrase-stdin --key-type --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
             case "${prev}" in
+                --output-path)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                -o)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                --key-type)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                -k)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 *)
                     COMPREPLY=()
                     ;;
@@ -159,12 +175,20 @@ _mp-keygen() {
             return 0
             ;;
         mp__subcmd__keygen__subcmd__verify)
-            opts="-r -h --randomart --help <SIGNATURE>"
+            opts="-k -r -h --key --randomart --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
             fi
             case "${prev}" in
+                --key)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
+                -k)
+                    COMPREPLY=($(compgen -f "${cur}"))
+                    return 0
+                    ;;
                 *)
                     COMPREPLY=()
                     ;;
@@ -176,7 +200,7 @@ _mp-keygen() {
 }
 
 if [[ "${BASH_VERSINFO[0]}" -eq 4 && "${BASH_VERSINFO[1]}" -ge 4 || "${BASH_VERSINFO[0]}" -gt 4 ]]; then
-    complete -F _mp-keygen -o nosort -o bashdefault -o default mp-keygen
+    complete -F _mp__keygen -o nosort -o bashdefault -o default mp-keygen
 else
-    complete -F _mp-keygen -o bashdefault -o default mp-keygen
+    complete -F _mp__keygen -o bashdefault -o default mp-keygen
 fi

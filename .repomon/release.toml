@@ -1,0 +1,85 @@
+name = "moshpit-release"
+
+# Empty list, table present: never fires on an ordinary branch push (see
+# audit.toml's comment for why this differs from an omitted table).
+[on.push.branches]
+names = []
+
+[on.push.tags]
+names = ["v[0-9]+\\.[0-9]+\\.[0-9]+(-.*)?"]
+
+# Linux is split into two independent jobs (x86_64/aarch64) so they can land
+# on two different Linux runners in parallel rather than serialize on one —
+# see scripts/release/repomon/linux-build-*.sh.
+
+[jobs.linux-build-x86_64]
+runs_on = ["linux"]
+
+[jobs.linux-build-x86_64.env]
+VERGEN_IDEMPOTENT = "1"
+
+[jobs.linux-build-x86_64.steps.checkout]
+uses = "actions/checkout"
+
+[jobs.linux-build-x86_64.steps.build]
+name = "🔨 Build (Linux x86_64) 🔨"
+run = "sh scripts/release/repomon/linux-build-x86_64.sh"
+
+[jobs.linux-build-x86_64.steps.handoff]
+name = "📤 Hand off (Linux x86_64) 📤"
+run = "sh scripts/release/repomon/linux-handoff.sh mp-x86_64-unknown-linux-musl mp-unstable-x86_64-unknown-linux-musl mps-x86_64-unknown-linux-musl mps-unstable-x86_64-unknown-linux-musl mp-keygen-x86_64-unknown-linux-musl mp-keygen-unstable-x86_64-unknown-linux-musl mpa-x86_64-unknown-linux-musl mpa-unstable-x86_64-unknown-linux-musl mpa-fido2-x86_64-unknown-linux-musl mpa-fido2-unstable-x86_64-unknown-linux-musl mpa-systemd-creds-x86_64-unknown-linux-musl mpa-systemd-creds-unstable-x86_64-unknown-linux-musl mpa-full-x86_64-unknown-linux-musl mpa-full-unstable-x86_64-unknown-linux-musl"
+
+[jobs.linux-build-aarch64]
+runs_on = ["linux"]
+
+[jobs.linux-build-aarch64.env]
+VERGEN_IDEMPOTENT = "1"
+
+[jobs.linux-build-aarch64.steps.checkout]
+uses = "actions/checkout"
+
+[jobs.linux-build-aarch64.steps.build]
+name = "🔨 Build (Linux aarch64) 🔨"
+run = "sh scripts/release/repomon/linux-build-aarch64.sh"
+
+[jobs.linux-build-aarch64.steps.handoff]
+name = "📤 Hand off (Linux aarch64) 📤"
+run = "sh scripts/release/repomon/linux-handoff.sh mp-aarch64-unknown-linux-musl mp-unstable-aarch64-unknown-linux-musl mps-aarch64-unknown-linux-musl mps-unstable-aarch64-unknown-linux-musl mp-keygen-aarch64-unknown-linux-musl mp-keygen-unstable-aarch64-unknown-linux-musl mpa-aarch64-unknown-linux-musl mpa-unstable-aarch64-unknown-linux-musl mpa-fido2-aarch64-unknown-linux-musl mpa-fido2-unstable-aarch64-unknown-linux-musl mpa-systemd-creds-aarch64-unknown-linux-musl mpa-systemd-creds-unstable-aarch64-unknown-linux-musl mpa-full-aarch64-unknown-linux-musl mpa-full-unstable-aarch64-unknown-linux-musl"
+
+# macOS/Windows only ship mp + mp-keygen — mps (the server) stays
+# Linux-only for now, and mpa (the agent) is Linux-only (its unlock
+# backends are Linux-specific: systemd creds, D-Bus, etc.).
+
+[jobs.macos-build]
+runs_on = ["macos"]
+
+[jobs.macos-build.env]
+VERGEN_IDEMPOTENT = "1"
+
+[jobs.macos-build.steps.checkout]
+uses = "actions/checkout"
+
+[jobs.macos-build.steps.build]
+name = "🍎 Build (macOS) 🍎"
+run = "sh scripts/release/repomon/macos-build.sh"
+
+[jobs.macos-build.steps.handoff]
+name = "📤 Hand off (macOS) 📤"
+run = "sh scripts/release/repomon/macos-handoff.sh"
+
+[jobs.windows-build]
+runs_on = ["windows"]
+
+[jobs.windows-build.env]
+VERGEN_IDEMPOTENT = "1"
+
+[jobs.windows-build.steps.checkout]
+uses = "actions/checkout"
+
+[jobs.windows-build.steps.build]
+name = "🪟 Build (Windows) 🪟"
+run = "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/release/repomon/windows-build.ps1"
+
+[jobs.windows-build.steps.handoff]
+name = "📤 Hand off (Windows) 📤"
+run = "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/release/repomon/windows-handoff.ps1"

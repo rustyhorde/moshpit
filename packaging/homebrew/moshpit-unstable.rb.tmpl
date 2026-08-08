@@ -6,7 +6,7 @@ class MoshpitUnstable < Formula
 
   on_macos do
     if Hardware::CPU.arm?
-      url "https://github.com/rustyhorde/moshpit/releases/download/vPKGVER/mp-unstable-aarch64-apple-darwin.tar.gz"
+      url "https://git.jasonozias.com/dl/moshpit/vPKGVER/mp-unstable-aarch64-apple-darwin.tar.gz"
       sha256 "MP_UNSTABLE_MACOS_SHA256"
     end
   end
@@ -25,7 +25,7 @@ class MoshpitUnstable < Formula
   def caveats
     <<~EOS
       Generate or verify keys with mp-keygen:
-        brew install rustyhorde/moshpit/moshpit-keygen-unstable
+        brew install jozias/moshpit/moshpit-keygen-unstable
 
       Copy the example config to get started:
         mkdir -p "$HOME/Library/Application Support/moshpit"

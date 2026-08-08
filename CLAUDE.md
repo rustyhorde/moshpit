@@ -31,9 +31,13 @@ cargo clippy --all-targets -- -D warnings
 # Format check
 cargo fmt --check
 
-# Full local verification before pushing (fmt + clippy + tests + docs + coverage).
+# Full local verification before pushing (fmt + clippy + tests + docs + coverage + audit).
 # Heavy stages are opt-in: --fuzz, --install, --musl/--unstable (MUSL Docker build).
 cargo rake
+
+# Run the full local release pipeline (see scripts/release/RUNBOOK.md) —
+# tag-triggered, not part of `cargo rake` by default.
+cargo rake release
 
 # Generate docs
 cargo doc --no-deps --open
@@ -42,6 +46,7 @@ cargo doc --no-deps --open
 cargo xtask dist mp
 cargo xtask dist mps
 cargo xtask dist mp-keygen
+cargo xtask dist mpa
 # Output lands in dist/<binary>/ — this is tarred into dist-<binary>.tar.gz for releases
 ```
 
@@ -58,7 +63,7 @@ The `cargo xtask` alias is defined in `.cargo/config.toml` and expands to `cargo
 
 ### Workspace layout
 
-Five crates:
+Six crates:
 
 | Crate | Binary | Purpose |
 |-------|--------|---------|
@@ -66,9 +71,10 @@ Five crates:
 | `moshpit` | `mp` | Client: connects to a moshpits server |
 | `moshpits` | `mps` | Server: listens, manages PTYs, streams terminal state |
 | `keygen` | `mp-keygen` | Key generation, fingerprinting, and verification |
+| `agent` | `mpa` | Vault agent: unlocks/stores identity key material (unlock backends: passphrase, FIDO2, systemd-creds; several others are stubs, see `agent/src/unlock/`) |
 | `xtask` | `xtask` | Build task runner (completions + man pages only) |
 
-All binaries depend on `libmoshpit`. The three application crates have the same internal structure: `cli.rs` (clap args) → `config.rs` (merged config) → `runtime.rs` (async main loop).
+All binaries depend on `libmoshpit`. The four application crates have the same internal structure: `cli.rs` (clap args) → `config.rs` (merged config) → `runtime.rs` (async main loop).
 
 ### Connection protocol (two phases)
 
@@ -102,25 +108,20 @@ All crypto is through `aws-lc-rs` (no `ring`, no system OpenSSL). Building on Li
 
 ## CI Pipeline
 
-CI (`moshpit.yml`) runs rustfmt → clippy (nightly, all platforms) → tests (1.95.0, stable, beta, nightly on Linux/macOS/Windows) → coverage. Clippy runs on nightly and all warnings are errors (`-D warnings`). Tests use the reusable `rustyhorde/workflows` workflow with all features enabled.
-
-The `package-test.yml` workflow simulates a release tarball build by running `--locked` builds against a git archive, catching issues with `Cargo.lock` and `cargo xtask dist` before a real release.
+CI is `repomon` (self-hosted, git-push-triggered) — see `.repomon/*.toml` and `scripts/release/RUNBOOK.md`. `.github/workflows/` has been removed entirely; there is no GitHub-side required-checks list to maintain anymore. `.repomon/ci.toml` runs `cargo rake most` (fmt, clippy, build, test, docs, coverage, audit) on every push to `master`, one job per platform (Linux/macOS/Windows); `.repomon/test.toml` runs the lighter `cargo rake test` on a push to any *other* branch (`on.push.branches_ignore = ["master"]`, so the two never double-run on the same push), same one-job-per-platform layout — each against whatever single toolchain is installed on that repomon runner. There is no multi-channel (MSRV/stable/beta/nightly) matrix like the old GitHub Actions workflow had; `.repomon/audit.toml` runs `cargo audit` + a fuzz smoke test on every push (and on release tags).
 
 ## Release Process
 
-Tagging `v<semver>` triggers `release.yml`, which:
-1. Builds static MUSL binaries for `x86_64` via `cross` (cross-rs/cross v0.2.5 in Docker)
-2. Runs `cargo xtask dist` natively to generate man pages, completions, licenses, and example configs, then tars them per binary (`dist-mp.tar.gz`, `dist-mps.tar.gz`, `dist-mp-keygen.tar.gz`)
-3. Creates a GitHub release with all 3 binaries + 3 dist tarballs + the source tarball
-4. Computes SHA256 of every release asset and updates both source and binary PKGBUILDs, opens a PR
-5. Publishes to 6 AUR packages: `moshpit-keygen`, `moshpit`, `moshpits` (source/compile) and `moshpit-keygen-bin`, `moshpit-bin`, `moshpits-bin` (binary/pre-compiled)
+`cargo rake release` runs the full local release pipeline — see `scripts/release/RUNBOOK.md` for one-time setup, cutting a release, and troubleshooting. Pushing a `v<semver>` tag fans out `.repomon/release.toml`'s Linux (x86_64 + aarch64 musl, via `cross` + moshpit's own Docker cross images), macOS (`aarch64-apple-darwin`), and Windows (`x86_64-pc-windows-msvc`, incl. MSI installers via WiX v3/`cargo-wix`) build jobs to self-hosted `repomon` runners; `cargo rake release` then packages the results (nfpm DEB/RPM, a self-hosted pacman repo, a self-hosted APT/RPM repo, a self-hosted Homebrew tap) and publishes to `/opt/releases/moshpit/` on the self-hosted server, plus crates.io. No GitHub Release object, AUR, or GitHub-hosted package/tap repo is involved.
 
-`Cross.toml` at the workspace root configures `cross` to pass `VERGEN_IDEMPOTENT` into the Docker build container. The source AUR packages compile with glibc natively on Arch; the `-bin` packages install MUSL static binaries and work without Rust/cmake/gcc installed.
+Only `mp`/`mp-keygen` ship for macOS and Windows — `mps` (the server) stays Linux-only for now, and `mpa` (the agent) is Linux-only (its unlock backends are Linux-specific). The package matrix is consolidated relative to the pre-migration AUR matrix: 14 `-bin` packages — `moshpit`/`moshpits`/`moshpit-keygen` × {standard, unstable}, plus `moshpit-agent` built 4 ways (base/`fido2`/`systemd-creds`/`full`) × {standard, unstable} — dropping the never-precompiled source-build packages and the still-stubbed unlock-backend variants (`tpm`/`ssh-agent-piggyback`-only/`secret-service`/`fprintd`/`macos-keychain`).
+
+`Cross.toml` at the workspace root configures `cross` to pass `VERGEN_IDEMPOTENT` into the Docker build container.
 
 ## Key Configuration Details
 
 - **Rust edition**: 2024 (all crates)
-- **MSRV**: 1.95.0 — when updating `rust-version` in any `Cargo.toml`, also update the required status check names on the `master` branch (GitHub → Settings → Branches → master protection rule). The MSRV check names embed the version string, e.g. `🧪 Test (Linux) 🧪 (ubuntu-latest, 1.95.0, x86_64-unknown-linux-gnu)` — replace the old version with the new one for all three platform variants (Linux × 1, MacOS × 1, Windows × 2 targets).
+- **MSRV**: 1.95.0. There is no GitHub-side required-status-checks list to maintain anymore (CI is `repomon`, not GitHub Actions — see "CI Pipeline" above), and repomon's CI jobs run against whatever single toolchain is installed on each runner rather than a matrix, so bumping `rust-version` no longer has a check-name-renaming follow-up step.
 - **`unstable` feature flag**: Exists in libmoshpit/moshpit/moshpits/keygen but is currently a no-op placeholder
 - **Config precedence** (both client and server): env vars > CLI flags > TOML config file. Implemented by `libmoshpit::load` (the `config` crate is last-source-wins, so sources are added file → CLI → env). Each binary's `Cli::collect` emits only values the user actually passed (tracked via `Cli::parse_argv`/`explicit_args`) so clap defaults don't clobber the file/env; fields needing a fallback carry `#[serde(default)]`. The client's config file is optional (`load(..., false)`); the server's is required (`load(..., true)`).
 - **Client env prefix**: `MOSHPIT_`; **Server env prefix**: `MOSHPITS_`. Env var names are `<PREFIX>_<FIELD>` with underscores preserved (e.g. `MOSHPIT_SERVER_PORT`, `MOSHPITS_TERM_TYPE`). Nested tables (e.g. `[preferred_algorithms]`) are **not** settable via a single env var — use the TOML table or the dedicated CLI flags.

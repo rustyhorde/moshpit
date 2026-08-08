@@ -71,8 +71,8 @@ pub(crate) enum Commands {
     ///   mpa start --foreground          # foreground; same output, keeps running
     #[clap(about = "Start the agent daemon")]
     Start {
-        /// Override the socket path (default: $XDG_RUNTIME_DIR/moshpit-agent-<uid>.sock
-        /// or ~/.mp/agent.sock).
+        /// Override the socket path (default: `$XDG_RUNTIME_DIR/moshpit-agent-<uid>.sock`
+        /// or `~/.mp/agent.sock`).
         #[clap(short, long, value_name = "PATH")]
         socket: Option<String>,
         /// Path to the vault file (default: ~/.mp/agent-vault).
@@ -120,7 +120,7 @@ pub(crate) enum Commands {
     /// Remove an identity from the running agent.
     #[clap(about = "Remove an identity from the agent")]
     RemoveKey {
-        /// Fingerprint of the key to remove (SHA256:<base64> form).
+        /// Fingerprint of the key to remove (`SHA256:<base64>` form).
         #[clap(value_name = "FINGERPRINT")]
         fingerprint: String,
     },
