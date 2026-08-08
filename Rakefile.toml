@@ -151,6 +151,12 @@ cmd = ["cargo", "matrix", "test", "--doc", "-p", "libmoshpit"]
 name = "fuzz nextest"
 fish = "cd libmoshpit/fuzz; and cargo matrix nextest run"
 sh = "cd libmoshpit/fuzz && cargo matrix nextest run"
+# Added for the repomon Windows test-windows job: under GitHub Actions this
+# target was never invoked on Windows (moshpit.yml called `cargo matrix
+# test` directly, bypassing Rakefile.toml), so the missing `ps` variant was
+# latent until `.repomon/ci.toml`/`test.toml` started running `cargo rake
+# most`/`test` uniformly across all three platforms.
+ps = "Set-Location libmoshpit/fuzz; cargo matrix nextest run"
 
 # ---------------------------------------------------------------------------
 # docs
