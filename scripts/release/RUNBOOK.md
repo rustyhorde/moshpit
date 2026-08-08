@@ -139,6 +139,17 @@ source-build PKGBUILDs, and the `tpm`/`ssh-agent-piggyback`/
      `sudo pacman -S clang llvm` (Linux) or `choco install llvm -y`
      (Windows); macOS normally already has it via Xcode Command Line Tools
      (`xcode-select --install` if not).
+   - **NASM on the Windows repomon-runner** — `aws-lc-sys`'s build script
+     assembles hand-optimized x86_64 ASM (AES-NI/SHA-NI paths) on
+     `x86_64-pc-windows-msvc` and panics with "NASM command not found!" if
+     `nasm.exe` isn't on PATH; every crate depends on `aws-lc-rs`, so this
+     blocks `cargo build`/`test` entirely, not just fuzz. Install with
+     `choco install nasm -y` (or `winget install NASM.NASM`), verify with
+     `nasm -v` in a fresh shell, then restart the `repomon-runner` Scheduled
+     Task (or log off/on) — it snapshots PATH at start, per
+     `repomon-runner/windows/Install-RepomonRunnerTask.ps1`, so an
+     in-place install alone won't be picked up. Not needed on Linux/macOS:
+     `aws-lc-sys` only invokes NASM for the MSVC target.
 
 ## Cutting a release
 
