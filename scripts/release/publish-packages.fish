@@ -27,7 +27,11 @@ if rel_is_rc
     exit 0
 end
 
-set -l gpg_user jason.g.ozias@pm.me
+# Fingerprint, not the "jason.g.ozias@pm.me" email — see publish-arch.fish
+# for why: that email is ambiguous in this machine's keyring against the
+# operator's personal key, and gpg silently resolves an ambiguous
+# --local-user match instead of erroring.
+set -l gpg_user 7452D2FCB49882326B7580E85A25FB9A0E414B67
 set -l dest /opt/releases/moshpit
 test -d $dest/apt
 and test -d $dest/rpm

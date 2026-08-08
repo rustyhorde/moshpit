@@ -46,7 +46,14 @@ if rel_is_rc
     exit 0
 end
 
-set -l gpg_user jason.g.ozias@pm.me
+# Fingerprint, not the "jason.g.ozias@pm.me" email — that email string is
+# ambiguous in this machine's keyring (it also matches a UID on the
+# operator's personal key), and gpg/makepkg silently resolve an ambiguous
+# --key/--local-user match to whichever key it finds first rather than
+# erroring, which previously caused packages/repos to be signed with the
+# wrong key (see the v0.9.4/v0.9.5 re-sign incident). Always pin by
+# fingerprint here to keep this unambiguous.
+set -l gpg_user 7452D2FCB49882326B7580E85A25FB9A0E414B67
 set -l dest /opt/releases/moshpit/arch
 test -d $dest/x86_64
 and test -d $dest/aarch64
