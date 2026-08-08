@@ -29,8 +29,12 @@ end
 
 # Sets RELEASE_TAG / RELEASE_PKGVER from whatever release-shaped tag points
 # at HEAD. If a single final (non-RC) tag is present, it wins over any
-# leftover -rcN dry-run tags on the same commit. Dies on genuine ambiguity:
-# multiple final tags, or multiple RC tags with no final tag to prefer.
+# leftover -rcN dry-run tags on the same commit. If only RC tags are
+# present (the common case while iterating on a release candidate), the
+# highest one wins — RC tags are a build-only dry run (see release.fish),
+# so stacking several on the same commit while testing is harmless and
+# shouldn't require deleting the earlier ones first. Dies only on genuine
+# ambiguity: multiple final tags.
 #
 # If RELEASE_TAG/RELEASE_PKGVER are already set (exported by an orchestrator
 # that resolved them once up front), reuse them as-is instead of
@@ -65,7 +69,12 @@ function rel_resolve_tag
     else if test (count $tags) -eq 1
         set -g RELEASE_TAG $tags[1]
     else
-        rel_die "HEAD has multiple RC tags and no final release tag ($tags); remove the extra one(s) before releasing"
+        # No final tag: multiple RC tags on HEAD. Pick the highest (sort -V
+        # orders vX.Y.Z-rc.N tags numerically by their rc component) rather
+        # than dying — these are dry-run-only, so leftover earlier RCs from
+        # prior testing rounds are expected, not an error.
+        set -g RELEASE_TAG (printf '%s\n' $tags | sort -V | tail -n1)
+        rel_log "HEAD has multiple RC tags with no final release tag; using highest $RELEASE_TAG (ignoring "(string join ' ' (string match -v $RELEASE_TAG -- $tags))")"
     end
 
     set -g RELEASE_PKGVER (string replace -r '^v' '' -- $RELEASE_TAG)
