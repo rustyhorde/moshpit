@@ -76,8 +76,9 @@
 //! # Key agent
 //!
 //! `mpa` is an optional key-agent daemon.  The [`agent`] module provides the Unix-socket
-//! protocol types ([`AgentRequest`], [`AgentResponse`]) and an async client ([`AgentClient`])
-//! that `mp` uses to delegate identity-key operations without reading key files directly.
+//! protocol types ([`AgentRequest`], [`AgentResponse`]) and an async client (`AgentClient`,
+//! Unix-only) that `mp` uses to delegate identity-key operations without reading key files
+//! directly.
 //!
 //! # Feature flags
 //!
