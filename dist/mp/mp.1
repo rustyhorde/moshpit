@@ -1,6 +1,6 @@
 .ie \n(.g .ds Aq \(aq
 .el .ds Aq '
-.TH mp 1  "mp 0.8.21" 
+.TH mp 1  "mp 0.9.4" 
 .SH NAME
 mp \- Connect to a moshpits server
 .SH SYNOPSIS
@@ -51,13 +51,15 @@ Send NAT warmup keepalives at UDP session start (opt\-in)
 \fB\-\-nat\-warmup\-count\fR \fI<N>\fR [default: 3]
 Number of NAT warmup keepalives to send (default: 3)
 .TP
-\fB\-\-diff\-mode\fR \fI<MODE>\fR [default: reliable]
-UDP diff transport mode: reliable (default), datagram, or statesync
+\fB\-\-diff\-mode\fR \fI<MODE>\fR [default: auto]
+Diff mode: auto (statesync over TCP, reliable over UDP), reliable, datagram, or statesync
 .br
 
 .br
 \fIPossible values:\fR
 .RS 14
+.IP \(bu 2
+auto
 .IP \(bu 2
 reliable
 .IP \(bu 2
@@ -90,4 +92,4 @@ Print version
 <\fISERVER_DESTINATION\fR>
 The IP address of the server to connect to (user@address or address)
 .SH VERSION
-v0.8.21
+v0.9.4

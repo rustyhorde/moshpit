@@ -34,17 +34,30 @@ _mp-keygen() {
         case $line[1] in
             (generate)
 _arguments "${_arguments_options[@]}" : \
+'-o+[Write keys to this path (skips the interactive path prompt)]:PATH:_default' \
+'--output-path=[Write keys to this path (skips the interactive path prompt)]:PATH:_default' \
+'-k+[Identity key algorithm\: x25519 (default), p384, p256; with unstable\: mldsa44, mldsa65, mldsa87]:TYPE:_default' \
+'--key-type=[Identity key algorithm\: x25519 (default), p384, p256; with unstable\: mldsa44, mldsa65, mldsa87]:TYPE:_default' \
+'-n[Skip the passphrase prompt and create an unencrypted key]' \
+'--no-passphrase[Skip the passphrase prompt and create an unencrypted key]' \
+'-f[Overwrite existing key files without confirmation]' \
+'--force[Overwrite existing key files without confirmation]' \
+'-s[Generate a server host key (allows unencrypted keys)]' \
+'--server[Generate a server host key (allows unencrypted keys)]' \
+'(-n --no-passphrase)--passphrase-stdin[Read passphrase from stdin instead of prompting]' \
 '-h[Print help]' \
 '--help[Print help]' \
 && ret=0
 ;;
 (verify)
 _arguments "${_arguments_options[@]}" : \
-'-r[Verify a randomart image instead of a fingerprint]' \
-'--randomart[Verify a randomart image instead of a fingerprint]' \
+'-k+[Path to the public key file]:PATH:_default' \
+'--key=[Path to the public key file]:PATH:_default' \
+'-r[Also display the randomart image]' \
+'--randomart[Also display the randomart image]' \
 '-h[Print help]' \
 '--help[Print help]' \
-':signature -- The fingerprint or randomart to verify:_default' \
+':fingerprint -- The SHA256 fingerprint to verify (e.g. SHA256\:S8hOl...):_default' \
 && ret=0
 ;;
 (fingerprint)
@@ -94,8 +107,8 @@ esac
 (( $+functions[_mp-keygen_commands] )) ||
 _mp-keygen_commands() {
     local commands; commands=(
-'generate:Generate a new asymmetric public/private key pair' \
-'verify:Verify a public key fingerprint or randomart image' \
+'generate:Generate a new identity public/private key pair' \
+'verify:Verify a public key fingerprint against a key file' \
 'fingerprint:Display the fingerprint of the given public key' \
 'help:Print this message or the help of the given subcommand(s)' \
     )
@@ -114,8 +127,8 @@ _mp-keygen__subcmd__generate_commands() {
 (( $+functions[_mp-keygen__subcmd__help_commands] )) ||
 _mp-keygen__subcmd__help_commands() {
     local commands; commands=(
-'generate:Generate a new asymmetric public/private key pair' \
-'verify:Verify a public key fingerprint or randomart image' \
+'generate:Generate a new identity public/private key pair' \
+'verify:Verify a public key fingerprint against a key file' \
 'fingerprint:Display the fingerprint of the given public key' \
 'help:Print this message or the help of the given subcommand(s)' \
     )

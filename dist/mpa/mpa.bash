@@ -91,7 +91,7 @@ _mpa() {
             return 0
             ;;
         mpa__subcmd__add__subcmd__key)
-            opts="-h --passphrase-stdin --no-hint --help <KEY_PATH>"
+            opts="-h --passphrase-stdin --no-hint --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0
@@ -273,7 +273,7 @@ _mpa() {
             return 0
             ;;
         mpa__subcmd__remove__subcmd__key)
-            opts="-h --help <FINGERPRINT>"
+            opts="-h --help"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0

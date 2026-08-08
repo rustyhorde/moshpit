@@ -7,7 +7,8 @@ complete -c mp -l predict -d 'Local-echo prediction: adaptive (default), always,
 always\t''
 never\t''"
 complete -c mp -l nat-warmup-count -d 'Number of NAT warmup keepalives to send (default: 3)' -r
-complete -c mp -l diff-mode -d 'UDP diff transport mode: reliable (default), datagram, or statesync' -r -f -a "reliable\t''
+complete -c mp -l diff-mode -d 'Diff mode: auto (statesync over TCP, reliable over UDP), reliable, datagram, or statesync' -r -f -a "auto\t''
+reliable\t''
 datagram\t''
 statesync\t''"
 complete -c mp -l escape-key -d 'Force-quit prefix key, e.g. ctrl-^ (default), ctrl-a, ctrl-] — combined with . to quit' -r
