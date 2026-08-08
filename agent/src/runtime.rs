@@ -202,7 +202,7 @@ async fn handle_connection(mut stream: UnixStream, state: ConnectionState) {
 fn sign_data(id: &Identity, data: &[u8]) -> AgentResponse {
     #[cfg(feature = "unstable")]
     {
-        use aws_lc_rs::unstable::signature::{
+        use aws_lc_rs::signature::{
             ML_DSA_44_SIGNING, ML_DSA_65_SIGNING, ML_DSA_87_SIGNING, PqdsaKeyPair,
         };
         use libmoshpit::KEY_ALGORITHM_ML_DSA_44;

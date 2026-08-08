@@ -29,9 +29,8 @@ use aws_lc_rs::{
 #[cfg(feature = "unstable")]
 use aws_lc_rs::{
     encoding::AsRawBytes as _,
-    signature::KeyPair as _,
-    unstable::signature::{
-        ML_DSA_44_SIGNING, ML_DSA_65_SIGNING, ML_DSA_87_SIGNING, PqdsaKeyPair,
+    signature::{
+        KeyPair as _, ML_DSA_44_SIGNING, ML_DSA_65_SIGNING, ML_DSA_87_SIGNING, PqdsaKeyPair,
         PqdsaSigningAlgorithm,
     },
 };

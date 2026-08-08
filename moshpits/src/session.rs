@@ -26,10 +26,10 @@ pub(crate) const SCROLLBACK_CAPACITY: usize = 65_536;
 pub(crate) struct SessionOutputHandle {
     /// Per-connection UUID used to tag outbound [`EncryptedFrame::Bytes`] datagrams.
     pub kex_uuid: Uuid,
-    /// Data channel to the live [`crate::UdpSender`] (PTY diffs, screen state).
+    /// Data channel to the live [`libmoshpit::UdpSender`] (PTY diffs, screen state).
     /// Set to `None` when the client has disconnected and the PTY is running headless.
     pub data_tx: Option<Sender<EncryptedFrame>>,
-    /// Control channel to the live [`crate::UdpSender`] (Keepalive, Shutdown).
+    /// Control channel to the live [`libmoshpit::UdpSender`] (Keepalive, Shutdown).
     /// Polled before the data channel inside `UdpSender` to prevent HOL-blocking.
     pub control_tx: Option<Sender<EncryptedFrame>>,
     /// Cancellation token for the current connection's UDP tasks.  Cancelled on resume
