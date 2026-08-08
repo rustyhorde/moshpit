@@ -533,6 +533,11 @@ agent) are Linux-only, so neither is distributed here — only the client and ke
 ```bash
 brew tap jozias/moshpit https://git.jasonozias.com/homebrew-moshpit.git
 
+# Homebrew's tap-trust security model only auto-trusts official Homebrew
+# taps; formulae are executable Ruby, so any third-party tap — including
+# this one — needs an explicit one-time opt-in per machine:
+brew trust jozias/moshpit
+
 # Client + key tooling (the typical macOS setup — connect to a remote server)
 brew install moshpit moshpit-keygen
 ```

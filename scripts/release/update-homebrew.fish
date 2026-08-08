@@ -11,6 +11,7 @@
 # /opt/repos already exports every repo under /opt/repos) — no SSH, no
 # second host. Users tap it with:
 #   brew tap jozias/moshpit https://git.jasonozias.com/homebrew-moshpit.git
+#   brew trust jozias/moshpit  # one-time per machine — see docs.brew.sh/Tap-Trust
 
 source (path dirname (status --current-filename))/lib.fish
 
@@ -103,3 +104,4 @@ rm -rf $work
 
 rel_log "published. Verify with:"
 rel_log "  brew tap jozias/moshpit https://git.jasonozias.com/homebrew-moshpit.git"
+rel_log "  brew trust jozias/moshpit  # required one-time per machine — tap-trust security model"
