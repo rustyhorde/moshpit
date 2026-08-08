@@ -12,7 +12,7 @@ license = "MIT OR Apache-2.0"
 readme = "README.md"
 repository = "https://git.jasonozias.com/moshpit.git"
 rust-version = "1.96.0"
-version = "0.9.5"
+version = "0.9.6"
 
 [workspace.dependencies]
 ansi-control-codes = { version = "1.0.1", features = ["parser", "explain"] }
@@ -33,7 +33,7 @@ dialoguer = "0.12.0"
 dirs2 = "3.0.1"
 getset = "0.1.7"
 libc = "1.0.0-alpha.4"
-libmoshpit = { version = "0.9.5", path = "libmoshpit" }
+libmoshpit = { version = "0.9.6", path = "libmoshpit" }
 nix = { version = "0.31.3", features = ["process", "signal", "socket", "user"] }
 pkg-config = "0.3.33"
 portable-pty = "0.9.0"
